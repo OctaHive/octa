@@ -240,6 +240,10 @@ impl Octafile {
     current
   }
 
+  pub fn is_root(&self) -> bool {
+    self._parent.is_none()
+  }
+
   pub fn hierarchy_path(&self) -> Vec<String> {
     let mut path = Vec::new();
     let mut current = self;
@@ -249,10 +253,6 @@ impl Octafile {
         path.push(name.clone());
       }
       current = parent;
-    }
-
-    if let Some(name) = &current.name {
-      path.push(name.clone());
     }
 
     path.reverse();

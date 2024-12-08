@@ -113,40 +113,6 @@ impl TaskNode {
     }
   }
 
-  /// Executes the task and returns the result
-  pub async fn execute(&self) -> ExecutorResult<TaskResult> {
-    info!("Starting task {}", self.name);
-
-    // Debug information about dependency results
-    if enabled!(Level::DEBUG) {
-      let deps = self.deps_res.lock().await;
-
-      for (name, res) in &*deps {
-        debug!("Dependency {} results: {}", name, res);
-      }
-      drop(deps);
-    }
-
-    let result = match &self.cmd {
-      Some(cmd) => self
-        .execute_command(cmd)
-        .await
-        .map(|res| TaskResult::Single(res))
-        .or_else(|e| {
-          if self.ignore_errors {
-            error!("Task {} failed but errors ignored. Error: {}", self.name, e);
-            Ok(TaskResult::Single(String::new()))
-          } else {
-            Err(ExecutorError::TaskFailed(e.to_string()))
-          }
-        })?,
-      None => TaskResult::Single(String::new()),
-    };
-
-    info!("Completed task {} with result {}", self.name, result);
-    Ok(result)
-  }
-
   /// Executes a shell command and returns its output
   async fn execute_command(&self, cmd: &str) -> ExecutorResult<String> {
     let rendered_cmd = self.render_template(cmd).await?;
@@ -235,11 +201,11 @@ impl TaskNode {
     let output_res = String::from_utf8_lossy(&output.stdout);
     let stderr_res = String::from_utf8_lossy(&output.stderr);
 
-    if output_res.is_empty() {
+    if !output_res.is_empty() {
       info!("{}", output_res.trim());
     }
 
-    if stderr_res.is_empty() {
+    if !stderr_res.is_empty() {
       info!("{}", stderr_res.trim());
     }
 

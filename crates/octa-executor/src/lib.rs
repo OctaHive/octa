@@ -69,31 +69,40 @@ impl TaskGraphBuilder {
   }
 
   fn collect_vars(&self, cmd: &FindResult) -> Vars {
-    let mut command_path = cmd.octafile.hierarchy_path();
-    let octafile = cmd.octafile.root();
     let mut vars = Vars::new();
-    vars.set_value(octafile.vars.clone());
+    let mut current = cmd.octafile.root();
+    vars.set_value(current.vars.clone());
 
-    while !command_path.is_empty() {
-      let first: Option<String> = command_path.drain(0..1).next();
+    debug!("Collecting variables for command: {}", cmd.name);
 
-      if let Some(key) = first {
-        vars = match octafile.get_included(&key).unwrap() {
-          Some(octafile) => {
-            let mut tmp = Vars::new();
+    // Store the current Arc to keep it alive through iterations
+    #[allow(unused_assignments)]
+    let mut current_arc = None;
 
-            tmp.set_parent(Some(vars));
-            tmp.set_value(octafile.vars.clone());
+    for segment in &cmd.octafile.hierarchy_path() {
+      debug!("Processing hierarchy segment: {}", segment);
 
-            tmp
-          },
-          None => {
-            break;
-          },
-        };
+      match current.get_included(segment).unwrap() {
+        Some(nested_octafile) => {
+          let mut new_vars = Vars::new();
+          new_vars.set_parent(Some(vars));
+          new_vars.set_value(nested_octafile.vars.clone());
+
+          // Store Arc and update current reference
+          current_arc = Some(nested_octafile);
+          current = current_arc.as_ref().unwrap().as_ref();
+          vars = new_vars;
+
+          debug!("Updated variables for segment {}", segment);
+        },
+        None => {
+          debug!("No nested octafile found for segment {}", segment);
+          break;
+        },
       }
     }
 
+    debug!("Final collected variables: {:#?}", vars);
     vars
   }
 
