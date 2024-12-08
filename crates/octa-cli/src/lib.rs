@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
+use octa_finder::OctaFinder;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 
@@ -24,6 +25,9 @@ pub(crate) struct Cli {
 
   #[arg(short, long, default_value_t = false)]
   pub verbose: bool,
+
+  #[arg(short, long, default_value_t = false)]
+  pub list_tasks: bool,
 }
 
 pub async fn run() -> OctaResult<()> {
@@ -75,6 +79,18 @@ pub async fn run() -> OctaResult<()> {
       }
     }
   });
+
+  if args.list_tasks {
+    let finder = OctaFinder::new();
+    let commands = finder.find_by_path(Arc::clone(&octafile), "**");
+    let found_commands: Vec<String> = commands.iter().map(|c| c.name.clone()).collect();
+
+    for cmd in found_commands.into_iter().rev() {
+      println!("{}", cmd);
+    }
+
+    return Ok(());
+  }
 
   // Create DAG
   let builder = TaskGraphBuilder::new();

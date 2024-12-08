@@ -74,14 +74,32 @@ impl OctaFinder {
   /// Handles recursive (**) search pattern
   fn handle_recursive_search(
     &self,
-    _octafile: Arc<Octafile>,
-    _search_segments: &[&str],
-    _depth: usize,
-    _results: &mut Vec<FindResult>,
-    _path: &str,
+    octafile: Arc<Octafile>,
+    search_segments: &[&str],
+    depth: usize,
+    results: &mut Vec<FindResult>,
+    path: &str,
   ) {
-    // TODO: Implement recursive search
-    debug!("Recursive search not yet implemented");
+    let included = octafile.get_all_included().unwrap();
+    if !included.is_empty() {
+      for (name, octafile) in included {
+        self.search_recursive(
+          Arc::clone(&octafile),
+          search_segments,
+          depth,
+          results,
+          self.join_path(path, &name),
+        );
+      }
+    }
+
+    for (key, task) in octafile.tasks.iter() {
+      results.push(FindResult {
+        name: self.join_path(path, &key),
+        octafile: Arc::clone(&octafile),
+        task: task.clone(),
+      });
+    }
   }
 
   /// Handles exact segment match search

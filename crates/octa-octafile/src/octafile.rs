@@ -29,6 +29,7 @@ type Envs = HashMap<String, String>;
 pub struct Task {
   pub dir: Option<PathBuf>,                  // Working directory for the task
   pub vars: Option<HashMap<String, String>>, // Task-specific variables
+  pub tpl: Option<String>,                   // Task template
   pub cmd: Option<String>,                   // Command to execute
   pub cmds: Option<Vec<String>>,             // List of commands
   pub platforms: Option<Vec<String>>,        // Supported platforms

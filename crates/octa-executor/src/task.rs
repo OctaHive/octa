@@ -4,6 +4,7 @@ use std::{
   fmt::{self, Display, Formatter},
   hash::{Hash, Hasher},
   path::PathBuf,
+  process::Stdio,
   sync::Arc,
   time::Duration,
 };
@@ -76,7 +77,8 @@ impl Display for TaskResult {
 #[derive(Debug, Clone)]
 pub struct TaskNode {
   pub name: String,                                      // Task name
-  pub cmd: Option<String>,                               // Command to execute
+  pub cmds: Option<Vec<String>>,                         // Command to execute
+  pub tpl: Option<String>,                               // Template to render
   pub dir: PathBuf,                                      // Working directory
   pub ignore_errors: bool,                               // Whether to continue on error
   pub vars: Vars,                                        // Task variables
@@ -102,9 +104,17 @@ impl Hash for TaskNode {
 
 impl TaskNode {
   pub fn new(name: String, task: Task, dir: PathBuf, vars: Vars, cancel_token: CancellationToken) -> Self {
+    let cmds = match (task.cmd, task.cmds) {
+      (Some(_), Some(_)) => None,
+      (Some(cmd), None) => Some(vec![cmd.clone()]),
+      (None, Some(cmd)) => Some(cmd.clone()),
+      (None, None) => None,
+    };
+
     Self {
       name,
-      cmd: task.cmd.clone(),
+      cmds,
+      tpl: task.tpl,
       ignore_errors: task.ignore_error.unwrap_or_default(),
       vars,
       dir,
@@ -129,6 +139,8 @@ impl TaskNode {
       cmd
         .current_dir(dir)
         .args(["/C", &rendered_cmd])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     };
@@ -139,6 +151,8 @@ impl TaskNode {
       cmd
         .current_dir(&dir)
         .arg("-c")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .arg(&rendered_cmd)
         .kill_on_drop(true)
         .process_group(0);
@@ -288,24 +302,41 @@ impl Executable for TaskNode {
       }
     }
 
-    match &self.cmd {
-      Some(cmd) => match self.execute_command(cmd).await {
-        Ok(res) => {
-          info!("Completed task {}", self.name);
+    match (&self.cmds, &self.tpl) {
+      (Some(_), Some(_)) => Ok(TaskResult::Single(String::new())),
+      (Some(cmds), None) => {
+        let mut result = vec![];
 
-          Ok(TaskResult::Single(res))
-        },
-        Err(ExecutorError::TaskCancelled(_)) => Ok(TaskResult::Single(String::new())),
-        Err(e) => {
-          if self.ignore_errors {
-            error!("Task {} failed but errors ignored. Error: {}", self.name, e);
-            Ok(TaskResult::Single(String::new()))
-          } else {
-            Err(ExecutorError::TaskFailed(e.to_string()))
+        for cmd in cmds {
+          match self.execute_command(cmd).await {
+            Ok(res) => {
+              result.push(res);
+            },
+            Err(ExecutorError::TaskCancelled(_)) => {},
+            Err(e) => {
+              if self.ignore_errors {
+                error!("Task {} failed but errors ignored. Error: {}", self.name, e);
+              } else {
+                return Err(ExecutorError::TaskFailed(e.to_string()));
+              }
+            },
           }
-        },
+        }
+
+        debug!("Completed task {}", self.name);
+
+        if result.len() == 1 {
+          Ok(TaskResult::Single(result.get(0).unwrap().clone()))
+        } else {
+          Ok(TaskResult::Group(result))
+        }
       },
-      None => Ok(TaskResult::Single(String::new())),
+      (None, Some(tpl)) => {
+        let rendered_cmd = self.render_template(tpl).await?;
+
+        Ok(TaskResult::Single(rendered_cmd))
+      },
+      (None, None) => Ok(TaskResult::Single(String::new())),
     }
   }
 }
