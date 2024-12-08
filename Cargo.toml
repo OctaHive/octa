@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/octa-cli",
+  "crates/octa-octafile",
+  "crates/octa-dag",
+  "crates/octa-finder",
+  "crates/octa-executor",
+]
+
+[workspace.package]
+license = "MIT"
+authors = ["octa contributors <xxx@ccc.dev>"]
+homepage = "https://github.com/OctaHive/octa"
+repository = "https://github.com/OctaHive/octa"
+edition = "2021"
+readme = "README.md"
+
+[workspace.dependencies]
+anyhow = "1.0.93"
+async-trait = "0.1.83"
+lazy_static = "1.5.0"
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.133"
+serde_yml = "0.0.12"
+sys-info = "0.9.1"
+tera = { version = "1.20.0", features = ["builtins"] }
+thiserror = "2.0.3"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
+tokio = { version = "1.41.1", features = ["full"] }
+tokio-util = "0.7.12"
+uuid = "1.11.0"
+
+# default to small, optimized workspace release binaries
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+incremental = false
+opt-level = "s"
+strip = true

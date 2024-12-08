@@ -1,0 +1,29 @@
+[package]
+name = "octa-executor"
+description = "Execute tasks"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+include = ["src/"]
+
+[dependencies]
+octa-octafile = { version = "0.1.0", path = "../octa-octafile" }
+octa-dag = { version = "0.1.0", path = "../octa-dag" }
+octa-finder = { version = "0.1.0", path = "../octa-finder" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+lazy_static = { workspace = true }
+serde = { workspace = true }
+sys-info = { workspace = true }
+tera = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
