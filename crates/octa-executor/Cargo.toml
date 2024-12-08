@@ -17,6 +17,7 @@ octa-finder = { version = "0.1.0", path = "../octa-finder" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 lazy_static = { workspace = true }
+futures = "0.3.31"
 serde = { workspace = true }
 sys-info = { workspace = true }
 tera = { workspace = true }
@@ -25,5 +26,9 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.48", features = ["Win32_System_Threading"] }
+[target.'cfg(unix)'.dependencies]
+nix = "0.26"
 
 [dev-dependencies]

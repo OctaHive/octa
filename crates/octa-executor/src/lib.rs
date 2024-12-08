@@ -12,6 +12,7 @@ use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
 use octa_octafile::{Octafile, Task};
 pub use task::TaskNode;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use vars::Vars;
 
@@ -36,7 +37,12 @@ impl TaskGraphBuilder {
     }
   }
 
-  pub fn build(mut self, octafile: Arc<Octafile>, command: &str) -> ExecutorResult<DAG<TaskNode>> {
+  pub fn build(
+    mut self,
+    octafile: Arc<Octafile>,
+    command: &str,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<DAG<TaskNode>> {
     debug!("Building DAG for command: {}", command);
 
     let commands = self.finder.find_by_path(Arc::clone(&octafile), command);
@@ -48,7 +54,7 @@ impl TaskGraphBuilder {
     debug!("Found commands for pattern {}: {:?}", command, found_commands);
 
     for cmd in commands {
-      self.add_command_to_dag(cmd)?;
+      self.add_command_to_dag(cmd, cancel_token.clone())?;
     }
 
     if self.dag.node_count() == 0 {
@@ -91,15 +97,15 @@ impl TaskGraphBuilder {
     vars
   }
 
-  fn add_command_to_dag(&mut self, cmd: FindResult) -> ExecutorResult<()> {
-    let task = Arc::new(self.create_task_from_command(&cmd));
+  fn add_command_to_dag(&mut self, cmd: FindResult, cancel_token: CancellationToken) -> ExecutorResult<()> {
+    let task = Arc::new(self.create_task_from_command(&cmd, cancel_token.clone()));
 
     self.dag.add_node(Arc::clone(&task));
-    self.process_dependencies(cmd.octafile, task, &cmd.task, cmd.name)
+    self.process_dependencies(cmd.octafile, task, &cmd.task, cmd.name, cancel_token)
   }
 
   /// Creates a task from a command with proper variable handling
-  fn create_task_from_command(&self, cmd: &FindResult) -> TaskNode {
+  fn create_task_from_command(&self, cmd: &FindResult, cancel_token: CancellationToken) -> TaskNode {
     let task = cmd.task.clone();
 
     let parent_vars = self.collect_vars(&cmd);
@@ -123,7 +129,7 @@ impl TaskGraphBuilder {
     // Get working directory with fallback to taskfile directory
     let work_dir = task.dir.clone().or_else(|| Some(cmd.octafile.dir.clone())).unwrap();
 
-    TaskNode::new(cmd.name.clone(), task, work_dir, vars)
+    TaskNode::new(cmd.name.clone(), task, work_dir, vars, cancel_token)
   }
 
   fn process_dependencies(
@@ -132,27 +138,34 @@ impl TaskGraphBuilder {
     parent: Arc<TaskNode>,
     task: &Task,
     curr_path: String,
+    cancel_token: CancellationToken,
   ) -> ExecutorResult<()> {
     let Some(deps) = &task.deps else { return Ok(()) };
     if deps.is_empty() {
       return Ok(());
     };
 
-    for dep_info in self.collect_dependencies(octafile, deps, &curr_path) {
-      self.add_dependency(dep_info, &parent)?;
+    for dep_info in self.collect_dependencies(octafile, deps, &curr_path, cancel_token.clone()) {
+      self.add_dependency(dep_info, &parent, cancel_token.clone())?;
     }
 
     Ok(())
   }
 
-  fn collect_dependencies(&self, octafile: Arc<Octafile>, deps: &[String], curr_path: &str) -> Vec<DependencyInfo> {
+  fn collect_dependencies(
+    &self,
+    octafile: Arc<Octafile>,
+    deps: &[String],
+    curr_path: &str,
+    cancel_token: CancellationToken,
+  ) -> Vec<DependencyInfo> {
     deps
       .iter()
       .flat_map(|dep| self.finder.find_by_path(octafile.clone(), dep))
       .map(|cmd| {
         let cmd_name = self.join_path(curr_path, &cmd.name);
 
-        let task = Arc::new(self.create_task_from_command(&cmd));
+        let task = Arc::new(self.create_task_from_command(&cmd, cancel_token.clone()));
 
         DependencyInfo {
           task,
@@ -164,7 +177,12 @@ impl TaskGraphBuilder {
       .collect()
   }
 
-  fn add_dependency(&mut self, dep_info: DependencyInfo, parent: &Arc<TaskNode>) -> ExecutorResult<()> {
+  fn add_dependency(
+    &mut self,
+    dep_info: DependencyInfo,
+    parent: &Arc<TaskNode>,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<()> {
     self.dag.add_node(Arc::clone(&dep_info.task));
     self.dag.add_dependency(&dep_info.task, parent)?;
 
@@ -173,6 +191,7 @@ impl TaskGraphBuilder {
       Arc::clone(&dep_info.task),
       &dep_info.original_task,
       dep_info.path,
+      cancel_token,
     )
   }
 

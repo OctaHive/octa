@@ -7,6 +7,12 @@ pub type ExecutorResult<T> = Result<T, ExecutorError>;
 
 #[derive(Error, Debug)]
 pub enum ExecutorError {
+  #[error("Shutdown timeout exceeded")]
+  ShutdownTimeout,
+
+  #[error("Task {0} cancelled")]
+  TaskCancelled(String),
+
   #[error("Cycle detected in task dependencies")]
   CycleDetected,
 

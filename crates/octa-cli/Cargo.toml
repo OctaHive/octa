@@ -24,6 +24,7 @@ colored = "2.1"
 dotenvy = "0.15.7"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

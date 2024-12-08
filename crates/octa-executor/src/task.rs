@@ -5,12 +5,16 @@ use std::{
   hash::{Hash, Hasher},
   path::PathBuf,
   sync::Arc,
+  time::Duration,
 };
 
 use async_trait::async_trait;
 use serde::{Serialize, Serializer};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use tera::{Context, Tera};
-use tokio::sync::Mutex;
+use tokio::{select, sync::Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, enabled, error, info, Level};
 
 use octa_dag::Identifiable;
@@ -77,6 +81,7 @@ pub struct TaskNode {
   pub ignore_errors: bool,                               // Whether to continue on error
   pub vars: Vars,                                        // Task variables
   pub deps_res: Arc<Mutex<HashMap<String, TaskResult>>>, // Dependencies results
+  cancel_token: CancellationToken,
 }
 
 // Implement equality based on task ID
@@ -96,7 +101,7 @@ impl Hash for TaskNode {
 }
 
 impl TaskNode {
-  pub fn new(name: String, task: Task, dir: PathBuf, vars: Vars) -> Self {
+  pub fn new(name: String, task: Task, dir: PathBuf, vars: Vars, cancel_token: CancellationToken) -> Self {
     Self {
       name,
       cmd: task.cmd.clone(),
@@ -104,6 +109,7 @@ impl TaskNode {
       vars,
       dir,
       deps_res: Arc::new(Mutex::new(HashMap::default())),
+      cancel_token,
     }
   }
 
@@ -144,32 +150,81 @@ impl TaskNode {
   /// Executes a shell command and returns its output
   async fn execute_command(&self, cmd: &str) -> ExecutorResult<String> {
     let rendered_cmd = self.render_template(cmd).await?;
-    let os_type = sys_info::os_type().map(|os| os.to_lowercase()).unwrap_or_default();
 
     debug!("Execute command: {}", rendered_cmd);
     let dir = self.interpolate_dir(self.dir.clone())?;
 
-    let output = match os_type.as_str() {
-      "windows" => tokio::process::Command::new("cmd")
+    #[cfg(windows)]
+    let mut command = {
+      const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+      const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+      let mut cmd = tokio::process::Command::new("cmd");
+      cmd
         .current_dir(dir)
         .args(["/C", &rendered_cmd])
-        .output()
-        .await
-        .map_err(|e| {
-          ExecutorError::CommandFailed(format!("Failed to execute command for task {}: {}", self.name, e))
-        })?,
-      _ => tokio::process::Command::new("sh")
-        .current_dir(dir)
-        .arg("-c")
-        .arg(&rendered_cmd)
-        .output()
-        .await
-        .map_err(|e| {
-          ExecutorError::CommandFailed(format!("Failed to execute command for task {}: {}", self.name, e))
-        })?,
+        .kill_on_drop(true)
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     };
 
-    if !output.status.success() {
+    #[cfg(not(windows))]
+    let mut command = {
+      let mut cmd = tokio::process::Command::new("sh");
+      cmd
+        .current_dir(&dir)
+        .arg("-c")
+        .arg(&rendered_cmd)
+        .kill_on_drop(true)
+        .process_group(0);
+      cmd
+    };
+
+    let mut child = command.spawn()?;
+
+    let output = select! {
+        _ = child.wait() => {
+          child.wait_with_output().await?
+        },
+        _ = self.cancel_token.cancelled() => {
+          info!("Shutting down task {}", self.name);
+
+          // Kill the entire process group
+          #[cfg(windows)]
+          {
+            use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+            if let Some(pid) = child.id() {
+              unsafe {
+                let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+                if handle != 0 {
+                  TerminateProcess(handle, 1);
+                }
+              }
+            }
+          }
+
+          #[cfg(unix)]
+          {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+            if let Some(pid) = child.id() {
+              info!("Kill task with pid {}", pid);
+              let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
+            }
+          }
+
+          // Give the process a moment to cleanup
+          tokio::time::sleep(Duration::from_millis(100)).await;
+
+          // Force kill if still running
+          info!("Kill child command");
+          let _ = child.kill().await?;
+          child.wait_with_output().await?;
+
+          return Err(ExecutorError::TaskCancelled(self.name.clone()))
+        }
+    };
+
+    if !output.status.success() && !self.cancel_token.is_cancelled() {
       let error = String::from_utf8_lossy(&output.stderr);
       return Err(ExecutorError::CommandFailed(format!(
         "Task {} failed: {}",
@@ -180,11 +235,11 @@ impl TaskNode {
     let output_res = String::from_utf8_lossy(&output.stdout);
     let stderr_res = String::from_utf8_lossy(&output.stderr);
 
-    if output_res.len() != 0 {
+    if output_res.is_empty() {
       info!("{}", output_res.trim());
     }
 
-    if stderr_res.len() != 0 {
+    if stderr_res.is_empty() {
       info!("{}", stderr_res.trim());
     }
 
@@ -267,19 +322,24 @@ impl Executable for TaskNode {
       }
     }
 
-    let result = match &self.cmd {
-      Some(cmd) => self.execute_command(cmd).await.or_else(|e| {
-        if self.ignore_errors {
-          error!("Task {} failed but errors ignored. Error: {}", self.name, e);
-          Ok(String::new())
-        } else {
-          Err(ExecutorError::TaskFailed(e.to_string()))
-        }
-      })?,
-      None => String::new(),
-    };
+    match &self.cmd {
+      Some(cmd) => match self.execute_command(cmd).await {
+        Ok(res) => {
+          info!("Completed task {}", self.name);
 
-    info!("Completed task {}", self.name);
-    Ok(TaskResult::Single(result))
+          Ok(TaskResult::Single(res))
+        },
+        Err(ExecutorError::TaskCancelled(_)) => Ok(TaskResult::Single(String::new())),
+        Err(e) => {
+          if self.ignore_errors {
+            error!("Task {} failed but errors ignored. Error: {}", self.name, e);
+            Ok(TaskResult::Single(String::new()))
+          } else {
+            Err(ExecutorError::TaskFailed(e.to_string()))
+          }
+        },
+      },
+      None => Ok(TaskResult::Single(String::new())),
+    }
   }
 }

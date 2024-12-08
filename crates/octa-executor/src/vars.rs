@@ -1,6 +1,6 @@
 use std::{
   collections::HashMap,
-  fmt::{Display, Formatter, Result as FmtResult},
+  fmt::{Display, Formatter},
   sync::Arc,
 };
 
@@ -16,7 +16,7 @@ use crate::{
 };
 
 lazy_static! {
-  static ref VARS_TEMPLATES: RwLock<Tera> = {
+  static ref TEMPLATE_ENGINE: RwLock<Tera> = {
     let mut tera = Tera::default();
     tera.register_function("shell", ExecuteShell);
 
@@ -27,54 +27,61 @@ lazy_static! {
 #[derive(Clone, Debug)]
 pub struct Vars {
   context: Context,
-  _parent: Option<Arc<Vars>>,
-  _child: Option<Arc<Vars>>,
-  _fullfiled: bool,
+  parent: Option<Arc<Vars>>,
+  interpolated: bool,
 }
 
 impl Vars {
   pub fn new() -> Self {
     Vars {
       context: Context::default(),
-      _parent: None,
-      _child: None,
-      _fullfiled: false,
+      parent: None,
+      interpolated: false,
     }
+  }
+
+  pub fn with_parent(parent: Vars) -> Self {
+    Self {
+      context: Context::default(),
+      parent: Some(Arc::new(parent)),
+      interpolated: false,
+    }
+  }
+
+  pub fn with_value<T: Serialize>(value: T) -> Self {
+    let mut vars = Self::new();
+    vars.set_value(value);
+    vars
+  }
+
+  pub fn with_value_and_parent<T: Serialize>(value: T, parent: Vars) -> Self {
+    let mut vars = Self::with_parent(parent);
+    vars.set_value(value);
+    vars
   }
 
   pub fn set_value<T: Serialize>(&mut self, value: T) {
     self.context = Context::from_serialize(value).unwrap_or_default();
+    self.interpolated = false;
   }
 
   pub fn set_parent(&mut self, parent: Option<Vars>) {
-    self._parent = match parent {
-      Some(parent) => Some(Arc::new(parent)),
-      None => None,
-    };
+    self.parent = parent.map(Arc::new);
+    self.interpolated = false;
   }
 
   pub fn insert<T: Serialize + ?Sized>(&mut self, key: &str, value: &T) {
     self.context.insert(key, value);
+    self.interpolated = false;
   }
 
   pub fn get(&self, key: &str) -> Option<&Value> {
     self.context.get(key)
   }
 
-  pub fn extend(&mut self, source: Vars) {
-    self.context.extend(source.context);
-  }
-
-  pub fn parent(&self) -> Option<&Arc<Vars>> {
-    self._parent.as_ref()
-  }
-
-  pub fn root(&self) -> &Vars {
-    let mut current = self;
-    while let Some(parent) = current.parent() {
-      current = parent;
-    }
-    current
+  pub fn extend(&mut self, source: Context) {
+    self.context.extend(source);
+    self.interpolated = false;
   }
 
   pub fn extend_with<T: Serialize>(&mut self, value: &T) {
@@ -83,124 +90,118 @@ impl Vars {
     }
   }
 
-  pub fn iter(self) -> VarsIter {
+  pub fn iter(&self) -> VarsIter {
     let map = self.to_hashmap();
-    let keys: Vec<String> = map.keys().cloned().collect();
-
-    VarsIter { map, keys, current: 0 }
+    VarsIter::new(map)
   }
 
   pub async fn interpolate(&mut self) -> ExecutorResult<()> {
-    // Get the chain of contexts from root to current
-    let mut contexts = Vec::new();
-    contexts.push(self.context.clone());
-
-    // Collect contexts from current to root
-    let mut current = self._parent.as_ref();
-    while let Some(parent) = current {
-      contexts.push(parent.context.clone());
-      current = parent._parent.as_ref();
+    if self.interpolated {
+      return Ok(());
     }
 
-    // Reverse to process from root to current
-    contexts.reverse();
-
-    // Process each context level with accumulated context
-    let mut accumulated_context = Context::new();
-    for context in contexts {
-      // Create temporary Vars for processing
-      let mut current_vars = Vars {
-        context,
-        _parent: None,
-        _child: None,
-        _fullfiled: false,
-      };
-
-      // Process current level with accumulated context
-      current_vars.process_value(&accumulated_context).await?;
-
-      // Add processed variables to accumulated context
-      accumulated_context.extend(current_vars.context);
-    }
-
-    // Update self with final processed values
-    self.context = accumulated_context;
+    let contexts = self.collect_context_chain();
+    let processed_context = self.process_context_chain(contexts).await?;
+    self.context = processed_context;
+    self.interpolated = true;
 
     Ok(())
   }
 
-  async fn process_value(&mut self, parent_context: &Context) -> ExecutorResult<()> {
-    let mut updates = HashMap::new();
+  fn collect_context_chain(&self) -> Vec<Context> {
+    let mut contexts = Vec::new();
+    let mut current = Some(self);
 
-    for (key, value) in self.clone().iter() {
-      let val = value.to_string().trim().to_owned();
-      debug!("Processing variable '{}' with value: '{}'", key, val);
-
-      if val.starts_with("\"{{") && val.ends_with("}}\"") {
-        debug!("Detected template in variable '{}'", key);
-
-        let mut template = VARS_TEMPLATES.write().await;
-        let res = template
-          .render_str(&val, parent_context)
-          .map_err(|e| ExecutorError::VariableInterpolateError(val, e.to_string()))?;
-
-        updates.insert(key, res);
-      }
+    while let Some(vars) = current {
+      contexts.push(vars.context.clone());
+      current = vars.parent.as_ref().map(|p| p.as_ref());
     }
 
-    // Apply all updates at once
-    for (key, value) in updates {
-      self.context.insert(&key, &value);
+    contexts.into_iter().rev().collect()
+  }
+
+  async fn process_context_chain(&self, contexts: Vec<Context>) -> ExecutorResult<Context> {
+    let mut accumulated = Context::new();
+
+    for context in contexts {
+      let processed = self.process_single_context(context, &accumulated).await?;
+      accumulated.extend(processed);
     }
 
-    Ok(())
+    Ok(accumulated)
+  }
+
+  async fn process_single_context(&self, context: Context, parent: &Context) -> ExecutorResult<Context> {
+    let mut processed = Context::new();
+    let vars = Vars {
+      context,
+      parent: None,
+      interpolated: false,
+    };
+
+    for (key, value) in vars.iter() {
+      let processed_value = self.process_template_value(&key, &value, parent).await?;
+      processed.insert(&key, &processed_value);
+    }
+
+    Ok(processed)
+  }
+
+  async fn process_template_value(&self, key: &str, value: &Value, context: &Context) -> ExecutorResult<String> {
+    let val = value.to_string().trim().to_owned();
+
+    if !self.is_template(&val) {
+      return Ok(val);
+    }
+
+    debug!("Processing template variable '{}' with value: '{}'", key, val);
+    let mut template = TEMPLATE_ENGINE.write().await;
+    template
+      .render_str(&val, context)
+      .map_err(|e| ExecutorError::VariableInterpolateError(val, e.to_string()))
+  }
+
+  fn is_template(&self, value: &str) -> bool {
+    value.starts_with("\"{{") && value.ends_with("}}\"")
   }
 
   fn to_hashmap(&self) -> HashMap<String, Value> {
-    let json = self.context.clone().into_json();
-    match json.as_object() {
-      Some(map) => map.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect(),
-      None => HashMap::new(),
-    }
+    self
+      .context
+      .clone()
+      .into_json()
+      .as_object()
+      .map(|map| map.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect())
+      .unwrap_or_default()
   }
 }
 
 impl Display for Vars {
-  fn fmt(&self, f: &mut Formatter) -> FmtResult {
-    write!(f, "[\n")?;
-
-    let mut first = true; // Flag to handle commas between key-value pairs
-    for (key, value) in self.to_hashmap() {
-      if !first {
-        write!(f, ", ")?;
+  fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    writeln!(f, "[")?;
+    for (i, (key, value)) in self.iter().enumerate() {
+      if i > 0 {
+        writeln!(f, ",")?;
       }
-
-      write!(f, "\"{}\": \"{}\"\n", key, value)?;
-      first = false;
+      write!(f, "  \"{}\": \"{}\"", key, value)?;
     }
-
-    write!(f, "\n]")
+    writeln!(f, "\n]")
   }
 }
 
 impl From<Context> for Vars {
   fn from(context: Context) -> Self {
-    let json = context.clone().into_json();
-    let mut vars = Vars::new();
-
-    let map: HashMap<String, Value> = match json.as_object() {
-      Some(map) => map.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect(),
-      None => HashMap::new(),
-    };
-
-    vars.set_value(map);
-    vars
+    Self {
+      context,
+      parent: None,
+      interpolated: false,
+    }
   }
 }
 
-impl Into<Context> for Vars {
-  fn into(self) -> Context {
-    Context::from(self.context)
+impl From<Vars> for Context {
+  fn from(vars: Vars) -> Self {
+    vars.context
   }
 }
 
@@ -209,10 +210,7 @@ impl Serialize for Vars {
   where
     S: Serializer,
   {
-    // Clone the context first, then convert to json
-    let context = self.context.clone();
-    let map = context.into_json();
-    map.serialize(serializer)
+    self.context.clone().into_json().serialize(serializer)
   }
 }
 
@@ -223,8 +221,7 @@ impl<'de> Deserialize<'de> for Vars {
   {
     let map = HashMap::<String, Value>::deserialize(deserializer)?;
     let mut vars = Vars::new();
-    vars.set_value(Some(map));
-
+    vars.context = Context::from_serialize(map).unwrap_or_default();
     Ok(vars)
   }
 }
@@ -232,29 +229,23 @@ impl<'de> Deserialize<'de> for Vars {
 pub struct VarsIter {
   map: HashMap<String, Value>,
   keys: Vec<String>,
-  current: usize,
+  position: usize,
+}
+
+impl VarsIter {
+  fn new(map: HashMap<String, Value>) -> Self {
+    let keys: Vec<String> = map.keys().cloned().collect();
+    Self { map, keys, position: 0 }
+  }
 }
 
 impl Iterator for VarsIter {
   type Item = (String, Value);
 
   fn next(&mut self) -> Option<Self::Item> {
-    if self.current >= self.keys.len() {
-      return None;
-    }
-
-    let key = &self.keys[self.current];
-    self.current += 1;
-
-    self.map.get(key).map(|value| (key.clone(), value.clone()))
-  }
-}
-
-impl IntoIterator for Vars {
-  type Item = (String, Value);
-  type IntoIter = VarsIter;
-
-  fn into_iter(self) -> Self::IntoIter {
-    self.iter()
+    self.keys.get(self.position).map(|key| {
+      self.position += 1;
+      (key.clone(), self.map.get(key).unwrap().clone())
+    })
   }
 }

@@ -5,8 +5,10 @@ use std::{
     atomic::{AtomicUsize, Ordering},
     Arc,
   },
+  time::Duration,
 };
 
+use futures::future::join_all;
 use octa_dag::{Identifiable, DAG};
 use tokio::{
   select,
@@ -21,12 +23,15 @@ use crate::{
   task::{Executable, TaskResult},
 };
 
+// Add shutdown timeout constant
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Executor manages the execution of tasks in a directed acyclic graph (DAG)
 pub struct Executor<T: Eq + Hash + Identifiable + Executable + Send + std::marker::Sync + 'static> {
   dag: Arc<DAG<T>>,                              // Task dependency graph
-  cancel_token: CancellationToken,               // For graceful shutdown
   in_degree: Arc<Mutex<HashMap<String, usize>>>, // Tracks task dependencies
   active_tasks: Arc<AtomicUsize>,                // Number of running tasks
+  finished: CancellationToken,
 }
 
 impl<T: Eq + Hash + Identifiable + Executable + Send + std::marker::Sync + 'static> Executor<T> {
@@ -40,14 +45,39 @@ impl<T: Eq + Hash + Identifiable + Executable + Send + std::marker::Sync + 'stat
 
     Self {
       dag: Arc::new(dag),
-      cancel_token: CancellationToken::new(),
       in_degree: Arc::new(Mutex::new(in_degree)),
       active_tasks: Arc::new(AtomicUsize::new(0)),
+      finished: CancellationToken::new(),
+    }
+  }
+
+  // Add graceful shutdown method
+  async fn shutdown(&self, handles: Vec<JoinHandle<ExecutorResult<()>>>) -> ExecutorResult<()> {
+    info!("Initiating graceful shutdown");
+
+    // Create a timeout future for all handles
+    let shutdown_timeout = tokio::time::timeout(SHUTDOWN_TIMEOUT, join_all(handles));
+
+    match shutdown_timeout.await {
+      Ok(results) => {
+        // Check if any tasks failed during shutdown
+        for result in results {
+          if let Err(e) = result {
+            error!("Task failed during shutdown: {}", e);
+          }
+        }
+        info!("Graceful shutdown completed");
+        Ok(())
+      },
+      Err(_) => {
+        error!("Shutdown timeout exceeded, forcing shutdown");
+        Err(ExecutorError::ShutdownTimeout)
+      },
     }
   }
 
   /// Executes all tasks in the DAG
-  pub async fn execute(&self) -> ExecutorResult<()> {
+  pub async fn execute(&self, cancel_token: CancellationToken) -> ExecutorResult<()> {
     info!("Starting task execution");
 
     self.initialize_in_degrees().await?;
@@ -57,32 +87,49 @@ impl<T: Eq + Hash + Identifiable + Executable + Send + std::marker::Sync + 'stat
 
     self.schedule_initial_tasks(&tx).await?;
 
-    self.process_tasks(rx, &tx, &mut handles).await?;
-
-    // Wait for all task completions
-    for handle in handles {
-      handle.await??;
+    match self.process_tasks(cancel_token.clone(), rx, &tx, &mut handles).await {
+      Ok(_) => {
+        if cancel_token.is_cancelled() {
+          // Handle graceful shutdown
+          self.shutdown(handles).await?;
+        } else {
+          // Normal completion
+          for handle in handles {
+            handle.await??;
+          }
+          info!("All tasks completed successfully");
+        }
+      },
+      Err(e) => {
+        error!("Error during task processing: {}", e);
+        cancel_token.cancel();
+        self.shutdown(handles).await?;
+        return Err(e);
+      },
     }
 
-    info!("All tasks completed successfully");
     Ok(())
   }
 
   /// Processes tasks as they become available
   async fn process_tasks(
     &self,
+    cancel_token: CancellationToken,
     mut rx: mpsc::Receiver<Arc<T>>,
     tx: &mpsc::Sender<Arc<T>>,
     handles: &mut Vec<JoinHandle<ExecutorResult<()>>>,
   ) -> ExecutorResult<()> {
     while let Some(task) = select! {
-        task = rx.recv() => task,
-        _ = self.cancel_token.cancelled() => {
-          debug!("Execution cancelled, shutting down executor");
-          return Ok(());
-        }
+      task = rx.recv() => task,
+      _ = cancel_token.cancelled() => {
+        debug!("Execution cancelled, stop processing task");
+        return Ok(());
+      }
+      _ = self.finished.cancelled() => {
+        return Ok(());
+      }
     } {
-      let handle = self.spawn_task(task, tx.clone());
+      let handle = self.spawn_task(cancel_token.clone(), task, tx.clone());
       handles.push(handle);
     }
 
@@ -90,22 +137,32 @@ impl<T: Eq + Hash + Identifiable + Executable + Send + std::marker::Sync + 'stat
   }
 
   /// Spawns a new task execution
-  fn spawn_task(&self, task: Arc<T>, tx: mpsc::Sender<Arc<T>>) -> JoinHandle<ExecutorResult<()>> {
+  fn spawn_task(
+    &self,
+    cancel_token: CancellationToken,
+    task: Arc<T>,
+    tx: mpsc::Sender<Arc<T>>,
+  ) -> JoinHandle<ExecutorResult<()>> {
     let dag = self.dag.clone();
-    let cancel = self.cancel_token.clone();
+    let cancel = cancel_token.clone();
+    let finished = self.finished.clone();
     let in_degree = self.in_degree.clone();
     let active_tasks = self.active_tasks.clone();
     let task_name = task.id().clone();
 
     tokio::spawn(async move {
       debug!("Executing task: {}", task_name);
-      match task.execute().await {
+
+      let result = task.execute().await;
+
+      match result {
         Ok(output) => {
           if cancel.is_cancelled() {
+            debug!("Task {} cancelled during execution", task_name);
             return Ok(());
           }
 
-          Self::process_task_success(&dag, task, output, &cancel, &in_degree, &active_tasks, &tx).await?;
+          Self::process_task_success(&dag, task, output, &finished, &in_degree, &active_tasks, &tx).await?;
         },
         Err(e) => {
           error!("Task {} failed: {}", task_name, e);
@@ -123,7 +180,7 @@ impl<T: Eq + Hash + Identifiable + Executable + Send + std::marker::Sync + 'stat
     dag: &DAG<T>,
     task: Arc<T>,
     output: TaskResult,
-    cancel: &CancellationToken,
+    finished: &CancellationToken,
     in_degree: &Mutex<HashMap<String, usize>>,
     active_tasks: &AtomicUsize,
     tx: &mpsc::Sender<Arc<T>>,
@@ -153,7 +210,7 @@ impl<T: Eq + Hash + Identifiable + Executable + Send + std::marker::Sync + 'stat
 
     // Check if all tasks are complete
     if active_tasks.fetch_sub(1, Ordering::SeqCst) == 1 {
-      cancel.cancel();
+      finished.cancel();
     }
 
     Ok(())
