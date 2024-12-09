@@ -1,5 +1,5 @@
 use octa_dag::error::DAGError;
-use octa_octafile::error::OctafileError;
+use octa_octafile::OctafileError;
 use thiserror::Error;
 use tokio::task;
 

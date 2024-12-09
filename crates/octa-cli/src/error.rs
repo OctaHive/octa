@@ -2,7 +2,7 @@ use dotenvy::Error as DotenvError;
 use thiserror::Error;
 
 use octa_executor::error::ExecutorError;
-use octa_octafile::error::OctafileError;
+use octa_octafile::OctafileError;
 
 pub type OctaResult<T> = Result<T, OctaError>;
 

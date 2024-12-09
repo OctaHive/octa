@@ -1,6 +1,7 @@
 pub mod error;
-mod executor;
+pub mod executor;
 mod function;
+mod summary;
 mod task;
 pub mod vars;
 
@@ -73,11 +74,11 @@ impl TaskGraphBuilder {
     let mut current = cmd.octafile.root();
     vars.set_value(current.vars.clone());
 
-    debug!("Collecting variables for command: {}", cmd.name);
-
-    // Store the current Arc to keep it alive through iterations
+    // Keep track of the current Arc
     #[allow(unused_assignments)]
-    let mut current_arc = None;
+    let mut current_arc: Option<Arc<Octafile>> = None;
+
+    debug!("Collecting variables for command: {}", cmd.name);
 
     for segment in &cmd.octafile.hierarchy_path() {
       debug!("Processing hierarchy segment: {}", segment);
@@ -89,8 +90,8 @@ impl TaskGraphBuilder {
           new_vars.set_value(nested_octafile.vars.clone());
 
           // Store Arc and update current reference
-          current_arc = Some(nested_octafile);
-          current = current_arc.as_ref().unwrap().as_ref();
+          current_arc = Some(Arc::clone(&nested_octafile));
+          current = current_arc.as_ref().unwrap();
           vars = new_vars;
 
           debug!("Updated variables for segment {}", segment);
@@ -138,7 +139,15 @@ impl TaskGraphBuilder {
     // Get working directory with fallback to taskfile directory
     let work_dir = task.dir.clone().or_else(|| Some(cmd.octafile.dir.clone())).unwrap();
 
-    TaskNode::new(cmd.name.clone(), task, work_dir, vars, cancel_token)
+    TaskNode::new(
+      cmd.octafile.clone(),
+      cmd.name.clone(),
+      task,
+      work_dir,
+      cmd.task.run.clone(),
+      vars,
+      cancel_token,
+    )
   }
 
   fn process_dependencies(

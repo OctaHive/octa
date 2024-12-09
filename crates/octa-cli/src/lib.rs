@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use clap::Parser;
 use error::OctaResult;
-use octa_executor::{Executor, TaskGraphBuilder};
+use octa_executor::{executor::ExecutorConfig, Executor, TaskGraphBuilder};
 use octa_octafile::Octafile;
 use tracing::info;
 
@@ -83,7 +83,10 @@ pub async fn run() -> OctaResult<()> {
   if args.list_tasks {
     let finder = OctaFinder::new();
     let commands = finder.find_by_path(Arc::clone(&octafile), "**");
-    let found_commands: Vec<String> = commands.iter().map(|c| c.name.clone()).collect();
+    let filtered = commands
+      .into_iter()
+      .filter(|cmd| cmd.task.internal.unwrap_or(false) != true);
+    let found_commands: Vec<String> = filtered.map(|c| c.name.clone()).collect();
 
     for cmd in found_commands.into_iter().rev() {
       println!("{}", cmd);
@@ -101,7 +104,14 @@ pub async fn run() -> OctaResult<()> {
     dag.print_graph();
   }
 
-  let executor = Executor::new(dag);
+  let executor = Executor::new(
+    dag,
+    ExecutorConfig {
+      show_summary: true,
+      silent: false,
+    },
+    None,
+  );
   executor.execute(cancel_token.clone()).await?;
 
   Ok(())

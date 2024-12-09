@@ -10,7 +10,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use serde::{Serialize, Serializer};
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize, Serializer};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use tera::{Context, Tera};
@@ -19,20 +20,43 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, enabled, error, info, Level};
 
 use octa_dag::Identifiable;
-use octa_octafile::Task;
+use octa_octafile::{AllowedRun, Cmds, Octafile, Task};
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
+  executor::ExecutorConfig,
   vars::Vars,
+  Executor, TaskGraphBuilder,
 };
 
 const USER_WORKING_DIR: &str = "USER_WORKING_DIR";
 const TASKFILE_DIR: &str = "TASKFILE_DIR";
 const ROOT_DIR: &str = "ROOT_DIR";
 
+pub trait TaskItem {
+  fn run_mode(&self) -> RunMode;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunMode {
+  Always,
+  Once,
+  Changed,
+}
+
+impl From<AllowedRun> for RunMode {
+  fn from(value: AllowedRun) -> Self {
+    match value {
+      AllowedRun::Once => RunMode::Once,
+      AllowedRun::Always => RunMode::Always,
+      AllowedRun::Changed => RunMode::Changed,
+    }
+  }
+}
+
 #[async_trait]
-pub trait Executable {
-  async fn execute(&self) -> ExecutorResult<TaskResult>;
+pub trait Executable<T> {
+  async fn execute(&self, cache: Arc<Mutex<IndexMap<T, TaskResult>>>) -> ExecutorResult<TaskResult>;
   async fn set_result(&self, task_name: String, res: TaskResult);
 }
 
@@ -76,11 +100,13 @@ impl Display for TaskResult {
 /// Represents a single executable task with its configuration and state
 #[derive(Debug, Clone)]
 pub struct TaskNode {
+  pub octafile: Arc<Octafile>,                           // Task octafile
   pub name: String,                                      // Task name
-  pub cmds: Option<Vec<String>>,                         // Command to execute
+  pub cmds: Option<Vec<TaskNodeCmds>>,                   // Command to execute
   pub tpl: Option<String>,                               // Template to render
   pub dir: PathBuf,                                      // Working directory
   pub ignore_errors: bool,                               // Whether to continue on error
+  pub run_mode: RunMode,                                 // Run mode
   pub vars: Vars,                                        // Task variables
   pub deps_res: Arc<Mutex<HashMap<String, TaskResult>>>, // Dependencies results
   cancel_token: CancellationToken,
@@ -102,18 +128,99 @@ impl Hash for TaskNode {
   }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct TaskNodeComplexCmd {
+  task: String,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum TaskNodeCmds {
+  Simple(String),
+  Complex(TaskNodeComplexCmd),
+}
+
+impl Hash for TaskNodeCmds {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    match self {
+      TaskNodeCmds::Simple(s) => {
+        0u8.hash(state);
+        s.hash(state);
+      },
+      TaskNodeCmds::Complex(c) => {
+        1u8.hash(state);
+        c.task.hash(state);
+      },
+    }
+  }
+}
+
+impl PartialEq for TaskNodeCmds {
+  fn eq(&self, other: &Self) -> bool {
+    match (self, other) {
+      (TaskNodeCmds::Simple(s1), TaskNodeCmds::Simple(s2)) => s1 == s2,
+      (TaskNodeCmds::Complex(c1), TaskNodeCmds::Complex(c2)) => c1.task == c2.task,
+      _ => false,
+    }
+  }
+}
+
+impl Hash for TaskNodeComplexCmd {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    self.task.hash(state);
+  }
+}
+
+impl PartialEq for TaskNodeComplexCmd {
+  fn eq(&self, other: &Self) -> bool {
+    self.task == other.task
+  }
+}
+
+impl Eq for TaskNodeComplexCmd {}
+
+impl Eq for TaskNodeCmds {}
+
+impl From<Cmds> for TaskNodeCmds {
+  fn from(src: Cmds) -> Self {
+    match src {
+      Cmds::Simple(s) => TaskNodeCmds::Simple(s),
+      Cmds::Complex(c) => {
+        let complex = TaskNodeComplexCmd { task: c.task };
+        TaskNodeCmds::Complex(complex)
+      },
+    }
+  }
+}
+
 impl TaskNode {
-  pub fn new(name: String, task: Task, dir: PathBuf, vars: Vars, cancel_token: CancellationToken) -> Self {
-    let cmds = match (task.cmd, task.cmds) {
-      (Some(_), Some(_)) => None,
-      (Some(cmd), None) => Some(vec![cmd.clone()]),
-      (None, Some(cmd)) => Some(cmd.clone()),
-      (None, None) => None,
+  pub fn new(
+    octafile: Arc<Octafile>,
+    name: String,
+    task: Task,
+    dir: PathBuf,
+    run_mode: Option<AllowedRun>,
+    vars: Vars,
+    cancel_token: CancellationToken,
+  ) -> Self {
+    let cmds: Option<Vec<TaskNodeCmds>> = match (task.cmd, task.cmds) {
+      (Some(cmd), None) => Some(vec![cmd.clone().into()]),
+      (None, Some(cmds)) => {
+        let res: Vec<TaskNodeCmds> = cmds.clone().into_iter().map(TaskNodeCmds::from).collect();
+        Some(res)
+      },
+      (Some(_), Some(_)) => unreachable!(),
+      (None, None) => unreachable!(),
+    };
+    let run_mode = match run_mode {
+      Some(run_mode) => run_mode.into(),
+      None => RunMode::Always,
     };
 
     Self {
+      octafile,
       name,
       cmds,
+      run_mode,
       tpl: task.tpl,
       ignore_errors: task.ignore_error.unwrap_or_default(),
       vars,
@@ -272,6 +379,47 @@ impl TaskNode {
       Ok(PathBuf::from(rendered))
     }
   }
+
+  async fn execute_cmds(
+    &self,
+    cmds: &Vec<TaskNodeCmds>,
+    cache: Arc<Mutex<IndexMap<TaskNode, TaskResult>>>,
+  ) -> ExecutorResult<TaskResult> {
+    let mut result = vec![];
+
+    for cmd in cmds {
+      match cmd {
+        TaskNodeCmds::Simple(s) => match self.execute_command(s).await {
+          Ok(res) => {
+            result.push(res);
+          },
+          Err(ExecutorError::TaskCancelled(_)) => {},
+          Err(e) => {
+            if self.ignore_errors {
+              error!("Task {} failed but errors ignored. Error: {}", self.name, e);
+            } else {
+              return Err(ExecutorError::TaskFailed(e.to_string()));
+            }
+          },
+        },
+        TaskNodeCmds::Complex(c) => {
+          let builder = TaskGraphBuilder::new();
+          let octafile = self.octafile.root().clone();
+          let dag = builder.build(octafile, &c.task, self.cancel_token.clone())?;
+          let executor = Executor::new(dag, ExecutorConfig::default(), Some(cache.clone()));
+          executor.execute(self.cancel_token.clone()).await?;
+        },
+      }
+    }
+
+    debug!("Completed task {}", self.name);
+
+    if result.len() == 1 {
+      Ok(TaskResult::Single(result.get(0).unwrap().clone()))
+    } else {
+      Ok(TaskResult::Group(result))
+    }
+  }
 }
 
 impl Identifiable for TaskNode {
@@ -280,8 +428,14 @@ impl Identifiable for TaskNode {
   }
 }
 
+impl TaskItem for TaskNode {
+  fn run_mode(&self) -> RunMode {
+    self.run_mode.clone()
+  }
+}
+
 #[async_trait]
-impl Executable for TaskNode {
+impl Executable<TaskNode> for TaskNode {
   /// Stores the result of a dependent task
   async fn set_result(&self, task_name: String, res: TaskResult) {
     let mut deps_res = self.deps_res.lock().await;
@@ -290,8 +444,16 @@ impl Executable for TaskNode {
   }
 
   /// Executes the task and returns the result
-  async fn execute(&self) -> ExecutorResult<TaskResult> {
+  async fn execute(&self, cache: Arc<Mutex<IndexMap<TaskNode, TaskResult>>>) -> ExecutorResult<TaskResult> {
     info!("Starting task {}", self.name);
+
+    if self.run_mode != RunMode::Always {
+      let cache_lock = cache.lock().await;
+      if let Some(cached_result) = cache_lock.get(self) {
+        debug!("Cache hit for task: {}", self.name);
+        return Ok(cached_result.clone());
+      }
+    }
 
     // Debug information about dependency results
     if enabled!(Level::DEBUG) {
@@ -302,41 +464,25 @@ impl Executable for TaskNode {
       }
     }
 
-    match (&self.cmds, &self.tpl) {
-      (Some(_), Some(_)) => Ok(TaskResult::Single(String::new())),
-      (Some(cmds), None) => {
-        let mut result = vec![];
-
-        for cmd in cmds {
-          match self.execute_command(cmd).await {
-            Ok(res) => {
-              result.push(res);
-            },
-            Err(ExecutorError::TaskCancelled(_)) => {},
-            Err(e) => {
-              if self.ignore_errors {
-                error!("Task {} failed but errors ignored. Error: {}", self.name, e);
-              } else {
-                return Err(ExecutorError::TaskFailed(e.to_string()));
-              }
-            },
-          }
-        }
-
-        debug!("Completed task {}", self.name);
-
-        if result.len() == 1 {
-          Ok(TaskResult::Single(result.get(0).unwrap().clone()))
-        } else {
-          Ok(TaskResult::Group(result))
-        }
-      },
+    let result = match (&self.cmds, &self.tpl) {
+      // This variant should validate on load octafile stage
+      (Some(_), Some(_)) => unreachable!(),
+      (Some(cmds), None) => self.execute_cmds(cmds, cache.clone()).await,
       (None, Some(tpl)) => {
         let rendered_cmd = self.render_template(tpl).await?;
 
         Ok(TaskResult::Single(rendered_cmd))
       },
-      (None, None) => Ok(TaskResult::Single(String::new())),
+      // This variant should be catched on octafile validation stage
+      (None, None) => unreachable!(),
+    }?;
+
+    if self.run_mode != RunMode::Always {
+      let mut cache_lock = cache.lock().await;
+      cache_lock.insert(self.clone(), result.clone());
+      debug!("Cached result for task: {}", self.name);
     }
+
+    Ok(result)
   }
 }
