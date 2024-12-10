@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 octa-finder = { version = "0.1.0", path = "../octa-finder" }
 octa-octafile = { version = "0.1.0", path = "../octa-octafile" }
+octa-dag = { version = "0.1.0", path = "../octa-dag" }
 octa-executor = { version = "0.1.0", path = "../octa-executor" }
 anyhow = { workspace = true }
 clap_complete = "4"

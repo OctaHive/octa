@@ -26,18 +26,32 @@ lazy_static! {
 
 #[derive(Clone, Debug)]
 pub struct Vars {
-  context: Context,
-  parent: Option<Arc<Vars>>,
-  interpolated: bool,
+  context: Context,          // Tera context for current variables
+  parent: Option<Arc<Vars>>, // Link to parent variables
+  interpolated: bool,        // Inindicator that the values have been interpolated
 }
 
-impl Vars {
-  pub fn new() -> Self {
-    Vars {
+impl PartialEq for Vars {
+  fn eq(&self, other: &Self) -> bool {
+    self.context == other.context
+  }
+}
+
+impl Eq for Vars {}
+
+impl Default for Vars {
+  fn default() -> Self {
+    Self {
       context: Context::default(),
       parent: None,
       interpolated: false,
     }
+  }
+}
+
+impl Vars {
+  pub fn new() -> Self {
+    Vars::default()
   }
 
   pub fn with_parent(parent: Vars) -> Self {
@@ -49,7 +63,7 @@ impl Vars {
   }
 
   pub fn with_value<T: Serialize>(value: T) -> Self {
-    let mut vars = Self::new();
+    let mut vars = Self::default();
     vars.set_value(value);
     vars
   }
@@ -87,6 +101,7 @@ impl Vars {
   pub fn extend_with<T: Serialize>(&mut self, value: &T) {
     if let Ok(context) = Context::from_serialize(value) {
       self.extend(context.into());
+      self.interpolated = false;
     }
   }
 
@@ -141,7 +156,8 @@ impl Vars {
 
     for (key, value) in vars.iter() {
       let processed_value = self.process_template_value(&key, &value, parent).await?;
-      processed.insert(&key, &processed_value);
+
+      processed.insert(&key, &processed_value.trim_matches('"')); // remove extra quotes in value
     }
 
     Ok(processed)

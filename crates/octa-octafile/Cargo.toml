@@ -12,6 +12,7 @@ include = ["src/"]
 
 [dependencies]
 anyhow = { workspace = true }
+dirs = "5.0"
 serde = { workspace = true }
 serde_yml = { workspace = true }
 sys-info = { workspace = true }

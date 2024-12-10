@@ -28,6 +28,9 @@ pub(crate) struct Cli {
 
   #[arg(short, long, default_value_t = false)]
   pub list_tasks: bool,
+
+  #[arg(short, long, default_value_t = false)]
+  pub global: bool,
 }
 
 pub async fn run() -> OctaResult<()> {
@@ -45,7 +48,7 @@ pub async fn run() -> OctaResult<()> {
   tracing_subscriber::fmt().with_max_level(level).init();
 
   // Load octafile
-  let octafile = Octafile::load(args.config)?;
+  let octafile = Octafile::load(args.config, args.global)?;
 
   let cancel_token = CancellationToken::new();
   // Start task for catching interrupt
@@ -96,7 +99,7 @@ pub async fn run() -> OctaResult<()> {
   }
 
   // Create DAG
-  let builder = TaskGraphBuilder::new();
+  let builder = TaskGraphBuilder::new()?;
   let dag = builder.build(octafile, &args.command, cancel_token.clone())?;
 
   // Print graph

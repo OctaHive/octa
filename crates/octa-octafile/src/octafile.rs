@@ -16,19 +16,23 @@ use crate::{
   task::Task,
 };
 
-const OCTAFILE_DEFAULT_NAMES: [&str; 4] = ["Octafile.yml", "octafile.yml", "Octafile.yaml", "octafile.yaml"];
+const OCTAFILE_DEFAULT_NAMES: [&str; 6] = [
+  "Octafile.yml",
+  "octafile.yml",
+  "Octafile.yaml",
+  "octafile.yaml",
+  "Octafile.lock.yml",
+  "octafile.lock.yml",
+];
 
-type Vars = HashMap<String, String>;
-type Envs = HashMap<String, String>;
+pub type Vars = HashMap<String, String>;
+pub type Envs = HashMap<String, String>;
 
 /// Main taskfile structure representing the entire configuration
 #[derive(Serialize, Deserialize)]
 pub struct Octafile {
   // Octafile schema version
   pub version: u32,
-
-  // Name of octafile. Using for debug
-  pub name: Option<String>,
 
   // Taskfile global vars
   pub vars: Option<Vars>,
@@ -45,6 +49,10 @@ pub struct Octafile {
   // Working directory for the octafile
   #[serde(skip)]
   pub dir: PathBuf,
+
+  // Name of octafile
+  #[serde(skip)]
+  _name: String,
 
   // Internal list of octafiles
   #[serde(skip)]
@@ -65,7 +73,7 @@ impl fmt::Debug for Octafile {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("Octafile")
       .field("version", &self.version)
-      .field("name", &self.name)
+      .field("name", &self._name)
       .field("includes", &self.includes)
       .field("tasks", &self.tasks)
       .field("dir", &self.dir)
@@ -74,11 +82,24 @@ impl fmt::Debug for Octafile {
 }
 
 impl Octafile {
-  pub fn load(path: Option<PathBuf>) -> OctafileResult<Arc<Self>> {
+  pub fn load(path: Option<PathBuf>, global: bool) -> OctafileResult<Arc<Self>> {
     let path = match path {
-      Some(path) => path,
-      None => Octafile::find_octafile()?.ok_or(OctafileError::NotSearchedError)?,
-    };
+      Some(path) => Octafile::find_octafile(Some(path)),
+      None => {
+        if global == true {
+          let home = dirs::home_dir();
+
+          if let Some(home) = home {
+            Ok(Some(home))
+          } else {
+            return Err(OctafileError::NotSearchedError);
+          }
+        } else {
+          Octafile::find_octafile(None)
+        }
+      },
+    }?
+    .ok_or(OctafileError::NotSearchedError)?;
     let path = path.canonicalize().map_err(OctafileError::IoError)?;
 
     debug!("Loading octafile: {}", path.display());
@@ -135,15 +156,17 @@ impl Octafile {
     self._parent.is_none()
   }
 
+  pub fn name(&self) -> String {
+    self._name.clone()
+  }
+
   /// Return path from root octafile to current
   pub fn hierarchy_path(&self) -> Vec<String> {
     let mut path = Vec::new();
     let mut current = self;
 
     while let Some(parent) = current.parent() {
-      if let Some(name) = &current.name {
-        path.push(name.clone());
-      }
+      path.push(current._name.clone());
       current = parent;
     }
 
@@ -159,31 +182,61 @@ impl Octafile {
     };
 
     for (name, include) in includes {
-      let path = match octafile.dir.join(&include.octafile).canonicalize() {
-        Ok(path) => Ok(path),
-        Err(_) => {
-          if let Some(optional) = include.optional {
-            if optional {
-              continue;
-            }
-          }
+      let path = match include {
+        IncludeInfo::Simple(path) => {
+          let path = match octafile.dir.join(path).canonicalize() {
+            Ok(path) => Octafile::find_octafile(Some(path.clone()))?
+              .ok_or(OctafileError::NotFoundError(path.display().to_string())),
+            Err(_) => Err(OctafileError::NotFoundError(path.clone())),
+          }?;
 
-          Err(OctafileError::NotFoundError(include.octafile.clone()))
+          path
         },
-      }?;
+        IncludeInfo::Complex(complex) => match octafile.dir.join(&complex.octafile).canonicalize() {
+          Ok(path) => {
+            Octafile::find_octafile(Some(path))?.ok_or(OctafileError::NotFoundError(complex.octafile.clone()))?
+          },
+          Err(_) => {
+            if let Some(optional) = complex.optional {
+              if optional {
+                continue;
+              }
+            }
+
+            return Err(OctafileError::NotFoundError(complex.octafile.clone()));
+          },
+        },
+      };
 
       debug!("Loading included octafile: {}", path.display());
       let mut include_octafile = match Self::read_octafile(&path) {
         Ok(mut t) => {
           t._parent = Some(Arc::clone(&octafile));
+          t._name = name.clone();
+
+          if let IncludeInfo::Complex(inc_info) = include {
+            if let Some(vars) = inc_info.vars.clone() {
+              t.vars = match t.vars.take() {
+                Some(mut file_vars) => {
+                  file_vars.extend(vars);
+                  Some(file_vars)
+                },
+                None => Some(vars),
+              };
+            }
+          }
+
           t
         },
         Err(OctafileError::NotFoundError(e)) => {
-          if include.optional.unwrap_or(false) {
-            info!("Skipping optional {} octafile. Reason:: not found", path.display());
+          if let IncludeInfo::Complex(inc_info) = include {
+            if inc_info.optional.unwrap_or(false) {
+              info!("Skipping optional {} octafile. Reason:: not found", path.display());
 
-            continue;
+              continue;
+            }
           }
+
           return Err(OctafileError::NotFoundError(e));
         },
         Err(e) => return Err(e),
@@ -236,6 +289,32 @@ impl Octafile {
     })?;
     self.dir = octafile_dir.to_path_buf();
 
+    let mut env_vars: HashMap<String, String> = env::vars().collect();
+
+    self.env = match (self.env.take(), &self._parent) {
+      (Some(env), Some(parent)) => {
+        if let Some(mut parent_env) = parent.env.clone() {
+          parent_env.extend(env);
+          Some(parent_env)
+        } else {
+          Some(env)
+        }
+      },
+      (None, Some(parent)) => {
+        if let Some(parent_env) = parent.env.clone() {
+          Some(parent_env)
+        } else {
+          Some(env_vars)
+        }
+      },
+      (Some(env), None) => {
+        env_vars.extend(env);
+
+        Some(env_vars)
+      },
+      (None, None) => Some(env_vars),
+    };
+
     Ok(())
   }
 
@@ -258,21 +337,34 @@ impl Octafile {
   }
 
   /// Try to find octafile config traversing to root directory from current directory
-  fn find_octafile() -> OctafileResult<Option<PathBuf>> {
+  fn find_octafile(path: Option<PathBuf>) -> OctafileResult<Option<PathBuf>> {
     let mut current_dir = env::current_dir()?;
 
-    loop {
-      for taskfile_name in OCTAFILE_DEFAULT_NAMES {
-        let potential_path = current_dir.join(taskfile_name);
-        if potential_path.exists() {
-          return Ok(Some(potential_path));
+    if let Some(path) = path {
+      if path.is_dir() {
+        for taskfile_name in OCTAFILE_DEFAULT_NAMES {
+          let potential_path = path.join(taskfile_name);
+          if potential_path.exists() {
+            return Ok(Some(potential_path));
+          }
         }
-      }
-
-      if let Some(parent) = current_dir.parent() {
-        current_dir = parent.to_path_buf();
       } else {
-        break;
+        return Ok(Some(path));
+      }
+    } else {
+      loop {
+        for taskfile_name in OCTAFILE_DEFAULT_NAMES {
+          let potential_path = current_dir.join(taskfile_name);
+          if potential_path.exists() {
+            return Ok(Some(potential_path));
+          }
+        }
+
+        if let Some(parent) = current_dir.parent() {
+          current_dir = parent.to_path_buf();
+        } else {
+          break;
+        }
       }
     }
 
@@ -302,16 +394,14 @@ mod tests {
   fn test_load_basic_octafile() {
     let content = r#"
       version: 1
-      name: basic
       tasks:
         test:
           cmd: echo "hello"
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content);
 
-    let octafile = Octafile::load(Some(file_path)).unwrap();
+    let octafile = Octafile::load(Some(file_path), false).unwrap();
     assert_eq!(octafile.version, 1);
-    assert_eq!(octafile.name, Some("basic".to_string()));
     assert!(octafile.tasks.contains_key("test"));
   }
 
@@ -319,7 +409,6 @@ mod tests {
   fn test_nested_includes() {
     let root_content = r#"
       version: 1
-      name: root
       includes:
         child:
           octafile: child/Octafile.yml
@@ -330,7 +419,6 @@ mod tests {
 
     let child_content = r#"
       version: 1
-      name: child
       tasks:
         child_task:
           cmd: echo "child"
@@ -345,15 +433,15 @@ mod tests {
     fs::write(&root_path, root_content).unwrap();
     fs::write(&child_path, child_content).unwrap();
 
-    let root = Octafile::load(Some(root_path)).unwrap();
+    let root = Octafile::load(Some(root_path), false).unwrap();
 
     // Test basic structure
-    assert_eq!(root.name, Some("root".to_string()));
+    assert_eq!(root._name, "".to_string());
     assert!(root.is_root());
 
     // Test includes
     let child = root.get_included("child").unwrap().unwrap();
-    assert_eq!(child.name, Some("child".to_string()));
+    assert_eq!(child._name, "child".to_string());
     assert!(!child.is_root());
 
     // Test hierarchy
@@ -375,7 +463,7 @@ mod tests {
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content);
 
-    let octafile = Octafile::load(Some(file_path)).unwrap();
+    let octafile = Octafile::load(Some(file_path), false).unwrap();
     assert!(octafile.get_included("optional").unwrap().is_none());
   }
 
@@ -384,7 +472,6 @@ mod tests {
     let content = format!(
       r#"
         version: 1
-        name: test
         tasks:
           platform_task:
             cmd: echo "test"
@@ -396,7 +483,7 @@ mod tests {
     );
 
     let (_temp_dir, file_path) = create_temp_octafile(&content);
-    let octafile = Octafile::load(Some(file_path)).unwrap();
+    let octafile = Octafile::load(Some(file_path), false).unwrap();
 
     assert!(octafile.tasks.contains_key("platform_task"));
     assert!(octafile.tasks.contains_key("generic_task"));
@@ -406,7 +493,6 @@ mod tests {
   fn test_complex_commands() {
     let content = r#"
       version: 1
-      name: test
       tasks:
         simple:
           cmd: echo "simple"
@@ -420,7 +506,7 @@ mod tests {
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content);
 
-    let octafile = Octafile::load(Some(file_path)).unwrap();
+    let octafile = Octafile::load(Some(file_path), false).unwrap();
     let tasks = &octafile.tasks;
 
     match &tasks["simple"].cmd {
@@ -438,7 +524,7 @@ mod tests {
   fn test_error_handling() {
     // Test nonexistent file
     assert!(matches!(
-      Octafile::load(Some(PathBuf::from("nonexistent.yml"))),
+      Octafile::load(Some(PathBuf::from("nonexistent.yml")), false),
       Err(OctafileError::IoError(_))
     ));
 
@@ -446,7 +532,7 @@ mod tests {
     let content = "invalid: : yaml:";
     let (_temp_dir, file_path) = create_temp_octafile(content);
     assert!(matches!(
-      Octafile::load(Some(file_path)),
+      Octafile::load(Some(file_path), false),
       Err(OctafileError::ParseError(_, _))
     ));
 
@@ -463,8 +549,8 @@ mod tests {
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content);
     assert!(matches!(
-      Octafile::load(Some(file_path)),
-      Err(OctafileError::IoError(_))
+      Octafile::load(Some(file_path), false),
+      Err(OctafileError::NotFoundError(_))
     ));
   }
 
@@ -479,7 +565,7 @@ mod tests {
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content);
 
-    let octafile = Octafile::load(Some(file_path.clone())).unwrap();
+    let octafile = Octafile::load(Some(file_path.clone()), false).unwrap();
     assert_eq!(
       octafile.dir,
       file_path.canonicalize().unwrap().parent().unwrap().to_path_buf()
@@ -490,7 +576,6 @@ mod tests {
   fn test_root_reference_consistency() {
     let root_content = r#"
       version: 1
-      name: root
       includes:
         child:
           octafile: child/Octafile.yml
@@ -501,7 +586,6 @@ mod tests {
 
     let child_content = r#"
       version: 1
-      name: child
       includes:
         grandchild:
           octafile: grandchild/Octafile.yml
@@ -512,7 +596,6 @@ mod tests {
 
     let grandchild_content = r#"
       version: 1
-      name: grandchild
       tasks:
         simple:
           cmd: echo "simple"
@@ -534,7 +617,7 @@ mod tests {
     fs::write(&child_path, child_content).unwrap();
     fs::write(&grandchild_path, grandchild_content).unwrap();
 
-    let root = Octafile::load(Some(root_path)).unwrap();
+    let root = Octafile::load(Some(root_path), false).unwrap();
     let child = root.get_included("child").unwrap().unwrap();
     let grandchild = child.get_included("grandchild").unwrap().unwrap();
 
@@ -548,7 +631,6 @@ mod tests {
   fn test_find_octafile() {
     let content = r#"
       version: 1
-      name: root
       tasks:
         simple:
           cmd: echo "simple"
@@ -567,7 +649,7 @@ mod tests {
     let original_dir = env::current_dir().unwrap();
     env::set_current_dir(&nested_dir).unwrap();
 
-    let found = Octafile::find_octafile().unwrap();
+    let found = Octafile::find_octafile(None).unwrap();
     assert!(found.is_some());
     assert_eq!(
       found.unwrap().canonicalize().unwrap(),
@@ -582,7 +664,7 @@ mod tests {
       fs::write(&octafile_path, content).unwrap();
 
       env::set_current_dir(temp_dir.path()).unwrap();
-      let found = Octafile::find_octafile().unwrap();
+      let found = Octafile::find_octafile(None).unwrap();
       assert!(found.is_some());
       assert_eq!(
         found.unwrap().canonicalize().unwrap(),
@@ -593,7 +675,7 @@ mod tests {
     // Test with no Octafile
     let empty_dir = TempDir::new().unwrap();
     env::set_current_dir(empty_dir.path()).unwrap();
-    assert!(Octafile::find_octafile().unwrap().is_none());
+    assert!(Octafile::find_octafile(None).unwrap().is_none());
 
     // Restore original directory
     env::set_current_dir(original_dir).unwrap();
@@ -603,7 +685,6 @@ mod tests {
   fn test_hierarchy_and_relationships() {
     let root_content = r#"
       version: 1
-      name: root
       includes:
         level1:
           octafile: level1/Octafile.yml
@@ -614,7 +695,6 @@ mod tests {
 
     let level1_content = r#"
       version: 1
-      name: level1
       includes:
         level2:
           octafile: level2/Octafile.yml
@@ -625,7 +705,6 @@ mod tests {
 
     let level2_content = r#"
       version: 1
-      name: level2
       tasks:
         simple:
           cmd: echo "simple"
@@ -649,7 +728,7 @@ mod tests {
     fs::write(&level2_path, level2_content).unwrap();
 
     // Load root octafile
-    let root = Octafile::load(Some(root_path)).unwrap();
+    let root = Octafile::load(Some(root_path), false).unwrap();
 
     // Test root properties
     assert!(root.is_root());
@@ -679,7 +758,6 @@ mod tests {
   fn test_get_included_methods() {
     let content = r#"
       version: 1
-      name: root
       includes:
         first:
           octafile: first/Octafile.yml
@@ -692,7 +770,6 @@ mod tests {
 
     let child_content = r#"
       version: 1
-      name: child
       tasks:
         simple:
           cmd: echo "simple"
@@ -714,7 +791,7 @@ mod tests {
     fs::write(&first_path, child_content).unwrap();
     fs::write(&second_path, child_content).unwrap();
 
-    let root = Octafile::load(Some(root_path)).unwrap();
+    let root = Octafile::load(Some(root_path), false).unwrap();
 
     // Test get_included
     let _ = root.get_included("first").unwrap().unwrap();

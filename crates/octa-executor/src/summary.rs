@@ -25,11 +25,14 @@ impl Summary {
   }
 
   pub fn print(&self) {
+    let mut total = Duration::new(0, 0);
     info!("================== Time Summary ==================");
     for item in self.tasks.iter() {
+      total = total + item.duration;
       let human = item.duration.human(Truncate::Millis);
       info!("  \"{}\": \"{}\"", item.name, human);
     }
+    info!("Total time: {}", total.human(Truncate::Millis));
     info!("==================================================");
   }
 }

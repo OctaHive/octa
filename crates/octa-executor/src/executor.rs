@@ -23,7 +23,7 @@ use tracing::{debug, error, info};
 use crate::{
   error::{ExecutorError, ExecutorResult},
   summary::{Summary, TaskSummaryItem},
-  task::{Executable, TaskItem, TaskResult},
+  task::{CacheItem, Executable, TaskItem},
 };
 
 // Add shutdown timeout constant
@@ -48,11 +48,11 @@ impl Default for ExecutorConfig {
 /// Tracks the state of task execution
 #[derive(Debug)]
 struct ExecutionState<T: Hash + Identifiable + Eq + TaskItem> {
-  dag: Arc<DAG<T>>,                              // Task dependency graph
-  in_degree: Arc<Mutex<HashMap<String, usize>>>, // Tracks task dependencies
-  active_tasks: Arc<AtomicUsize>,                // Number of running tasks
-  summary: Arc<Mutex<Summary>>,                  // Summary of task execution
-  cache: Arc<Mutex<IndexMap<T, TaskResult>>>,    // Cache for tasks
+  dag: Arc<DAG<T>>,                               // Task dependency graph
+  in_degree: Arc<Mutex<HashMap<String, usize>>>,  // Tracks task dependencies
+  active_tasks: Arc<AtomicUsize>,                 // Number of running tasks
+  summary: Arc<Mutex<Summary>>,                   // Summary of task execution
+  cache: Arc<Mutex<IndexMap<String, CacheItem>>>, // Cache for tasks
 }
 
 /// Executor manages the execution of tasks in a directed acyclic graph (DAG)
@@ -64,7 +64,7 @@ pub struct Executor<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Sen
 
 impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clone + 'static> Executor<T> {
   /// Creates a new Executor instance with the given DAG
-  pub fn new(dag: DAG<T>, config: ExecutorConfig, cache: Option<Arc<Mutex<IndexMap<T, TaskResult>>>>) -> Self {
+  pub fn new(dag: DAG<T>, config: ExecutorConfig, cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>) -> Self {
     let in_degree = dag.nodes().iter().map(|n| (n.id().clone(), 0)).collect();
 
     let cache = match cache {
@@ -88,7 +88,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
   }
 
   /// Executes all tasks in the DAG
-  pub async fn execute(&self, cancel_token: CancellationToken) -> ExecutorResult<()> {
+  pub async fn execute(&self, cancel_token: CancellationToken) -> ExecutorResult<Vec<String>> {
     self.log_info("Starting task execution");
 
     self.initialize_execution().await?;
@@ -99,7 +99,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
 
     match self.process_tasks(cancel_token.clone(), rx, &tx, &mut handles).await {
       Ok(_) => self.handle_completion(cancel_token, handles).await,
-      Err(e) => self.handle_error(e, cancel_token, handles).await,
+      Err(e) => self.handle_error(e, cancel_token).await,
     }
   }
 
@@ -114,25 +114,18 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
   async fn handle_completion(
     &self,
     cancel_token: CancellationToken,
-    handles: Vec<JoinHandle<ExecutorResult<()>>>,
-  ) -> ExecutorResult<()> {
+    handles: Vec<JoinHandle<ExecutorResult<String>>>,
+  ) -> ExecutorResult<Vec<String>> {
     if cancel_token.is_cancelled() {
-      self.shutdown(handles).await?;
+      self.shutdown(handles).await
     } else {
-      self.complete_execution(handles).await?;
+      self.complete_execution(handles).await
     }
-    Ok(())
   }
 
-  async fn handle_error(
-    &self,
-    error: ExecutorError,
-    cancel_token: CancellationToken,
-    handles: Vec<JoinHandle<ExecutorResult<()>>>,
-  ) -> ExecutorResult<()> {
+  async fn handle_error(&self, error: ExecutorError, cancel_token: CancellationToken) -> ExecutorResult<Vec<String>> {
     error!("Error during task processing: {}", error);
     cancel_token.cancel();
-    self.shutdown(handles).await?;
     Err(error)
   }
 
@@ -142,7 +135,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     cancel_token: CancellationToken,
     mut rx: mpsc::Receiver<Arc<T>>,
     tx: &mpsc::Sender<Arc<T>>,
-    handles: &mut Vec<JoinHandle<ExecutorResult<()>>>,
+    handles: &mut Vec<JoinHandle<ExecutorResult<String>>>,
   ) -> ExecutorResult<()> {
     while let Some(task) = self.receive_next_task(&mut rx, &cancel_token).await {
       handles.push(self.spawn_task(cancel_token.clone(), task, tx.clone()));
@@ -171,7 +164,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     cancel_token: CancellationToken,
     task: Arc<T>,
     tx: mpsc::Sender<Arc<T>>,
-  ) -> JoinHandle<ExecutorResult<()>> {
+  ) -> JoinHandle<ExecutorResult<String>> {
     let executor_state = ExecutorContext {
       dag: self.state.dag.clone(),
       finished: self.finished.clone(),
@@ -210,12 +203,15 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
           .ok_or_else(|| ExecutorError::TaskNotFound(node.id().clone()))? += 1;
       }
     }
+
     Ok(())
   }
 
-  async fn complete_execution(&self, handles: Vec<JoinHandle<ExecutorResult<()>>>) -> ExecutorResult<()> {
+  async fn complete_execution(&self, handles: Vec<JoinHandle<ExecutorResult<String>>>) -> ExecutorResult<Vec<String>> {
+    let mut results = vec![];
+
     for handle in handles {
-      handle.await??;
+      results.push(handle.await??);
     }
 
     self.log_info("All tasks completed successfully");
@@ -225,10 +221,10 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       summary.print();
     }
 
-    Ok(())
+    Ok(results)
   }
 
-  async fn shutdown(&self, handles: Vec<JoinHandle<ExecutorResult<()>>>) -> ExecutorResult<()> {
+  async fn shutdown(&self, handles: Vec<JoinHandle<ExecutorResult<String>>>) -> ExecutorResult<Vec<String>> {
     self.log_info("Initiating graceful shutdown");
 
     match timeout(SHUTDOWN_TIMEOUT, join_all(handles)).await {
@@ -242,15 +238,15 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
 
   fn handle_shutdown_results(
     &self,
-    results: Vec<Result<ExecutorResult<()>, tokio::task::JoinError>>,
-  ) -> ExecutorResult<()> {
+    results: Vec<Result<ExecutorResult<String>, tokio::task::JoinError>>,
+  ) -> ExecutorResult<Vec<String>> {
     for result in results {
       if let Err(e) = result.map_err(|e| ExecutorError::JoinError(e))? {
         error!("Task failed during shutdown: {}", e);
       }
     }
     self.log_info("Graceful shutdown completed");
-    Ok(())
+    Ok(vec![])
   }
 
   fn log_info(&self, message: &str) {
@@ -266,7 +262,7 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   in_degree: Arc<Mutex<HashMap<String, usize>>>,
   active_tasks: Arc<AtomicUsize>,
   summary: Arc<Mutex<Summary>>,
-  cache: Arc<Mutex<IndexMap<T, TaskResult>>>,
+  cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
 }
 
 struct TaskExecutor<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> {
@@ -286,7 +282,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
     }
   }
 
-  async fn execute(self) -> ExecutorResult<()> {
+  async fn execute(self) -> ExecutorResult<String> {
     let task_name = self.task.id();
     debug!("Executing task: {}", task_name);
 
@@ -299,10 +295,10 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
     }
   }
 
-  async fn handle_success(&self, output: TaskResult, start_time: SystemTime) -> ExecutorResult<()> {
+  async fn handle_success(&self, output: String, start_time: SystemTime) -> ExecutorResult<String> {
     if self.cancel_token.is_cancelled() {
       debug!("Task {} cancelled during execution", self.task.id());
-      return Ok(());
+      return Ok(String::from(""));
     }
 
     if let Ok(elapsed) = start_time.elapsed() {
@@ -315,13 +311,13 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
     self.process_task_success(output).await
   }
 
-  async fn handle_error(&self, error: ExecutorError) -> ExecutorResult<()> {
+  async fn handle_error(&self, error: ExecutorError) -> ExecutorResult<String> {
     error!("Task {} failed: {}", self.task.id(), error);
-    self.cancel_token.cancel();
+    self.context.finished.cancel();
     Err(error)
   }
 
-  async fn process_task_success(&self, output: TaskResult) -> ExecutorResult<()> {
+  async fn process_task_success(&self, output: String) -> ExecutorResult<String> {
     if let Some(deps) = self.context.dag.edges().get(&self.task.id()) {
       for dep in deps {
         dep.set_result(self.task.id(), output.clone()).await;
@@ -349,6 +345,6 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
       self.context.finished.cancel();
     }
 
-    Ok(())
+    Ok(output)
   }
 }

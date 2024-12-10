@@ -99,16 +99,17 @@ impl OctaFinder {
     results: &mut Vec<FindResult>,
     path: &str,
   ) {
-    let included = octafile.get_all_included().unwrap();
-    if !included.is_empty() {
-      for (name, octafile) in included {
-        self.search_recursive(
-          Arc::clone(&octafile),
-          search_segments,
-          depth,
-          results,
-          self.join_path(path, &name),
-        );
+    if let Ok(included) = octafile.get_all_included() {
+      if !included.is_empty() {
+        for (name, octafile) in included {
+          self.search_recursive(
+            Arc::clone(&octafile),
+            search_segments,
+            depth,
+            results,
+            self.join_path(path, &name),
+          );
+        }
       }
     }
 
@@ -194,6 +195,8 @@ mod tests {
       platforms: None,
       ignore_error: None,
       deps: None,
+      silent: Some(false),
+      execute_mode: None,
       run: Some(AllowedRun::Always),
     }
   }
@@ -234,7 +237,7 @@ mod tests {
     let finder = OctaFinder::new();
     let (_temp_dir, file_path) = create_gen_test_yaml(Some("root"), vec![("test", create_test_task("test"))]);
 
-    let octafile = Octafile::load(Some(file_path)).unwrap();
+    let octafile = Octafile::load(Some(file_path), false).unwrap();
     let results = finder.find_by_path(octafile, "test");
 
     assert_eq!(results.len(), 1);
@@ -268,7 +271,7 @@ mod tests {
     let root_path = temp_dir.path().join("Octafile.yml");
     std::fs::write(&root_path, root_content).unwrap();
 
-    let root = Octafile::load(Some(root_path)).unwrap();
+    let root = Octafile::load(Some(root_path), false).unwrap();
     let results = finder.find_by_path(root, "child:child_task");
 
     assert_eq!(results.len(), 1);
@@ -311,7 +314,7 @@ mod tests {
     let root_path = temp_dir.path().join("Octafile.yml");
     std::fs::write(&root_path, root_content).unwrap();
 
-    let root = Octafile::load(Some(root_path)).unwrap();
+    let root = Octafile::load(Some(root_path), false).unwrap();
     let results = finder.find_by_path(root, "*:task");
 
     assert_eq!(results.len(), 2);
@@ -411,7 +414,7 @@ mod tests {
     );
     let root_path = create_test_yaml(&temp_dir, "", &root_content);
 
-    let root = Octafile::load(Some(root_path)).unwrap();
+    let root = Octafile::load(Some(root_path), false).unwrap();
 
     // Test recursive search for all task1
     let results = finder.find_by_path(root.clone(), "**:task1");
@@ -473,7 +476,7 @@ mod tests {
     );
     let root_path = create_test_yaml(&temp_dir, "", &root_content);
 
-    let root = Octafile::load(Some(root_path)).unwrap();
+    let root = Octafile::load(Some(root_path), false).unwrap();
     let results = finder.find_by_path(root, "**:task1");
 
     assert_eq!(results.len(), 2); // Should find both task1 instances
@@ -496,7 +499,7 @@ mod tests {
     "#;
     let root_path = create_test_yaml(&temp_dir, "", root_content);
 
-    let root = Octafile::load(Some(root_path)).unwrap();
+    let root = Octafile::load(Some(root_path), false).unwrap();
     let results = finder.find_by_path(root, "**:task1");
 
     assert_eq!(results.len(), 1);
@@ -537,7 +540,7 @@ mod tests {
     );
     let root_path = create_test_yaml(&temp_dir, "", &root_content);
 
-    let root = Octafile::load(Some(root_path)).unwrap();
+    let root = Octafile::load(Some(root_path), false).unwrap();
 
     // Test recursive search for all tasks
     let results = finder.find_by_path(root, "**");
