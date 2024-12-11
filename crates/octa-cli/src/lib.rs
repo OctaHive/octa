@@ -107,6 +107,7 @@ pub async fn run() -> OctaResult<()> {
     dag.print_graph();
   }
 
+  let fingerprint = Arc::new(sled::open(".octa/fingerprint")?);
   let executor = Executor::new(
     dag,
     ExecutorConfig {
@@ -114,7 +115,8 @@ pub async fn run() -> OctaResult<()> {
       silent: false,
     },
     None,
-  );
+    fingerprint,
+  )?;
   executor.execute(cancel_token.clone()).await?;
 
   Ok(())

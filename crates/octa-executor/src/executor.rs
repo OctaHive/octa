@@ -11,6 +11,7 @@ use std::{
 use futures::future::join_all;
 use indexmap::IndexMap;
 use octa_dag::{Identifiable, DAG};
+use sled::Db;
 use tokio::{
   select,
   sync::{mpsc, Mutex},
@@ -53,6 +54,7 @@ struct ExecutionState<T: Hash + Identifiable + Eq + TaskItem> {
   active_tasks: Arc<AtomicUsize>,                 // Number of running tasks
   summary: Arc<Mutex<Summary>>,                   // Summary of task execution
   cache: Arc<Mutex<IndexMap<String, CacheItem>>>, // Cache for tasks
+  fingerprint: Arc<Db>,                           // Fingerprint db
 }
 
 /// Executor manages the execution of tasks in a directed acyclic graph (DAG)
@@ -64,7 +66,12 @@ pub struct Executor<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Sen
 
 impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clone + 'static> Executor<T> {
   /// Creates a new Executor instance with the given DAG
-  pub fn new(dag: DAG<T>, config: ExecutorConfig, cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>) -> Self {
+  pub fn new(
+    dag: DAG<T>,
+    config: ExecutorConfig,
+    cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
+    fingerprint: Arc<Db>,
+  ) -> ExecutorResult<Self> {
     let in_degree = dag.nodes().iter().map(|n| (n.id().clone(), 0)).collect();
 
     let cache = match cache {
@@ -78,13 +85,14 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       active_tasks: Arc::new(AtomicUsize::new(0)),
       summary: Arc::new(Mutex::new(Summary::new())),
       cache,
+      fingerprint,
     };
 
-    Self {
+    Ok(Self {
       state,
       config,
       finished: CancellationToken::new(),
-    }
+    })
   }
 
   /// Executes all tasks in the DAG
@@ -172,6 +180,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       active_tasks: self.state.active_tasks.clone(),
       summary: self.state.summary.clone(),
       cache: self.state.cache.clone(),
+      fingerprint: self.state.fingerprint.clone(),
     };
 
     tokio::spawn(async move {
@@ -263,6 +272,7 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   active_tasks: Arc<AtomicUsize>,
   summary: Arc<Mutex<Summary>>,
   cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
+  fingerprint: Arc<Db>,
 }
 
 struct TaskExecutor<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> {
@@ -287,7 +297,10 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
     debug!("Executing task: {}", task_name);
 
     let start_time = SystemTime::now();
-    let result = self.task.execute(self.context.cache.clone()).await;
+    let result = self
+      .task
+      .execute(self.context.cache.clone(), self.context.fingerprint.clone())
+      .await;
 
     match result {
       Ok(output) => self.handle_success(output, start_time).await,

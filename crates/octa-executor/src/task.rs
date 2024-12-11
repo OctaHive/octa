@@ -9,6 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use sled::Db;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use tera::{Context, Tera};
@@ -17,17 +18,34 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, enabled, error, info, Level};
 
 use octa_dag::{Identifiable, DAG};
-use octa_octafile::AllowedRun;
+use octa_octafile::{AllowedRun, SourceStrategies};
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
   executor::ExecutorConfig,
+  hash_source::HashSource,
+  timestamp_source::TimestampSource,
   vars::Vars,
   Executor,
 };
 
 pub trait TaskItem {
   fn run_mode(&self) -> RunMode;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceMethod {
+  Timestamp,
+  Hash,
+}
+
+impl From<SourceStrategies> for SourceMethod {
+  fn from(value: SourceStrategies) -> Self {
+    match value {
+      SourceStrategies::Timestamp => SourceMethod::Timestamp,
+      SourceStrategies::Hash => SourceMethod::Hash,
+    }
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +67,11 @@ impl From<AllowedRun> for RunMode {
 
 #[async_trait]
 pub trait Executable<T> {
-  async fn execute(&self, cache: Arc<Mutex<IndexMap<String, CacheItem>>>) -> ExecutorResult<String>;
+  async fn execute(
+    &self,
+    cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
+    fingerprint: Arc<Db>,
+  ) -> ExecutorResult<String>;
   async fn set_result(&self, task_name: String, res: String);
 }
 
@@ -70,10 +92,12 @@ pub struct TaskNode {
   pub silent: bool,                                  // Should task print to stdout or stderr
   pub run_mode: RunMode,                             // Run mode
   pub vars: Vars,                                    // Task variables
+  pub sources: Option<Vec<String>>,                  // Sources for fingerprinting
+  pub source_strategy: SourceMethod,                 // Source validation strategy
   pub deps_res: Arc<Mutex<HashMap<String, String>>>, // Dependencies results
   pub dag: Option<DAG<TaskNode>>,                    // Execution plan for complex command
-  cmd_type: CmdType,
-  cancel_token: CancellationToken,
+  cmd_type: CmdType,                                 // Type of task for internal use
+  cancel_token: CancellationToken,                   // Using for canceling task execution
 }
 
 // Implement equality based on task ID
@@ -112,6 +136,8 @@ impl TaskNode {
     cancel_token: CancellationToken,
     cmd: Option<String>,
     tpl: Option<String>,
+    sources: Option<Vec<String>>,
+    source_strategy: Option<SourceStrategies>,
     silent: Option<bool>,
     ignore_errors: Option<bool>,
     run_mode: Option<AllowedRun>,
@@ -123,12 +149,19 @@ impl TaskNode {
       None => RunMode::Always,
     };
 
+    let source_strategy = match source_strategy {
+      Some(source_strategy) => source_strategy.into(),
+      None => SourceMethod::Hash,
+    };
+
     Self {
       name,
       cmd,
       tpl,
       cancel_token,
       run_mode,
+      sources,
+      source_strategy,
       vars,
       dir,
       ignore_errors: ignore_errors.unwrap_or_default(),
@@ -361,6 +394,24 @@ impl TaskNode {
       info!("{}", message);
     }
   }
+
+  async fn check_sources(&self, fingerprint: Arc<Db>) -> ExecutorResult<bool> {
+    let source_strategy: Box<dyn SourceStrategy + Send> = match self.source_strategy {
+      SourceMethod::Hash => Box::new(HashSource::new(Arc::clone(&fingerprint))),
+      SourceMethod::Timestamp => Box::new(TimestampSource::new(Arc::clone(&fingerprint))),
+    };
+
+    if let Some(sources) = &self.sources {
+      source_strategy.changed(sources.clone()).await
+    } else {
+      Ok(false)
+    }
+  }
+}
+
+#[async_trait]
+pub trait SourceStrategy: Send {
+  async fn changed(&self, sources: Vec<String>) -> ExecutorResult<bool>;
 }
 
 impl Identifiable for TaskNode {
@@ -385,7 +436,17 @@ impl Executable<TaskNode> for TaskNode {
   }
 
   /// Executes the task and returns the result
-  async fn execute(&self, cache: Arc<Mutex<IndexMap<String, CacheItem>>>) -> ExecutorResult<String> {
+  async fn execute(
+    &self,
+    cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
+    fingerprint: Arc<Db>,
+  ) -> ExecutorResult<String> {
+    if !self.check_sources(fingerprint.clone()).await? {
+      self.log_info(format!("All files are up to date"));
+
+      return Ok("".to_string());
+    };
+
     self.log_info(format!("Starting task {}", self.name));
 
     // Debug information about dependency results
@@ -398,7 +459,7 @@ impl Executable<TaskNode> for TaskNode {
     }
 
     if let Some(dag) = self.dag.clone() {
-      let executor = Executor::new(dag, ExecutorConfig::default(), Some(cache.clone()));
+      let executor = Executor::new(dag, ExecutorConfig::default(), Some(cache.clone()), fingerprint.clone())?;
       let results = executor.execute(self.cancel_token.clone()).await?;
 
       return Ok(results.join("\n"));

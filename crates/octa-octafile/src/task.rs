@@ -42,6 +42,23 @@ impl From<String> for AllowedPlatforms {
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+pub enum SourceStrategies {
+  Timestamp,
+  Hash,
+}
+
+impl From<String> for SourceStrategies {
+  fn from(value: String) -> Self {
+    match value.as_str() {
+      "timestamp" => SourceStrategies::Timestamp,
+      "hash" => SourceStrategies::Hash,
+      _ => unimplemented!(),
+    }
+  }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum AllowedRun {
   Always,
   Once,
@@ -81,16 +98,18 @@ impl From<String> for Deps {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Task {
-  pub dir: Option<PathBuf>,                     // Working directory for the task
-  pub vars: Option<HashMap<String, String>>,    // Task-specific variables
-  pub tpl: Option<String>,                      // Task template
-  pub cmd: Option<Cmds>,                        // Command to execute
-  pub cmds: Option<Vec<Cmds>>,                  // List of commands
-  pub internal: Option<bool>,                   // Show command in list of available commands
-  pub platforms: Option<Vec<AllowedPlatforms>>, // Supported platforms
-  pub ignore_error: Option<bool>,               // Whether to continue on error
-  pub deps: Option<Vec<Deps>>,                  // Task dependencies
-  pub run: Option<AllowedRun>,                  // When task should run
-  pub silent: Option<bool>,                     // Should task print to stdout or stderr
-  pub execute_mode: Option<ExecuteMode>,        // How execute task commands
+  pub dir: Option<PathBuf>,                      // Working directory for the task
+  pub vars: Option<HashMap<String, String>>,     // Task-specific variables
+  pub tpl: Option<String>,                       // Task template
+  pub cmd: Option<Cmds>,                         // Command to execute
+  pub cmds: Option<Vec<Cmds>>,                   // List of commands
+  pub internal: Option<bool>,                    // Show command in list of available commands
+  pub platforms: Option<Vec<AllowedPlatforms>>,  // Supported platforms
+  pub ignore_error: Option<bool>,                // Whether to continue on error
+  pub deps: Option<Vec<Deps>>,                   // Task dependencies
+  pub run: Option<AllowedRun>,                   // When task should run
+  pub silent: Option<bool>,                      // Should task print to stdout or stderr
+  pub execute_mode: Option<ExecuteMode>,         // How execute task commands
+  pub sources: Option<Vec<String>>,              // Sources for fingerprinting
+  pub source_strategy: Option<SourceStrategies>, // Strategy for compare sources
 }

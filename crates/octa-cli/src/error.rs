@@ -16,4 +16,7 @@ pub enum OctaError {
 
   #[error(transparent)]
   ExecuteGraphLoad(#[from] ExecutorError),
+
+  #[error("Failed to open fingerprint db")]
+  OpenFingerprintDbError(#[from] sled::Error),
 }

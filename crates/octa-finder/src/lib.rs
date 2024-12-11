@@ -196,6 +196,8 @@ mod tests {
       ignore_error: None,
       deps: None,
       silent: Some(false),
+      sources: None,
+      source_strategy: None,
       execute_mode: None,
       run: Some(AllowedRun::Always),
     }

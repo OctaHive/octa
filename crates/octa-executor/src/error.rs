@@ -1,3 +1,6 @@
+use std::time::SystemTimeError;
+
+use glob::{GlobError, PatternError};
 use octa_dag::error::DAGError;
 use octa_octafile::OctafileError;
 use thiserror::Error;
@@ -33,6 +36,18 @@ pub enum ExecutorError {
 
   #[error("Command execution failed: {0}")]
   CommandFailed(String),
+
+  #[error("Failed to get or set fingerprint db")]
+  OpenFingerprintDbError(#[from] sled::Error),
+
+  #[error("Failed to calculate duration for time")]
+  CalculateDurationError(#[from] SystemTimeError),
+
+  #[error("Failed to extend source path")]
+  ExtendSourceError(#[from] PatternError),
+
+  #[error("Failed to extend source path")]
+  GlobError(#[from] GlobError),
 
   #[error("Failed to add graph dependency")]
   AddDependencyError(#[from] DAGError),

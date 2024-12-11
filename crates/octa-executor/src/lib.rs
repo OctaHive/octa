@@ -1,8 +1,10 @@
 pub mod error;
 pub mod executor;
 mod function;
+mod hash_source;
 mod summary;
 mod task;
+mod timestamp_source;
 pub mod vars;
 
 use std::{env, path::PathBuf, sync::Arc};
@@ -281,6 +283,8 @@ impl TaskGraphBuilder {
       cancel_token,
       command,
       task.tpl,
+      task.sources,
+      task.source_strategy,
       task.silent,
       task.ignore_error,
       task.run,

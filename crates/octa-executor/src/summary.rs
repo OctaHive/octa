@@ -30,9 +30,9 @@ impl Summary {
     for item in self.tasks.iter() {
       total = total + item.duration;
       let human = item.duration.human(Truncate::Millis);
-      info!("  \"{}\": \"{}\"", item.name, human);
+      info!(" \"{}\": \"{}\"", item.name, human);
     }
-    info!("Total time: {}", total.human(Truncate::Millis));
+    info!(" Total time: {}", total.human(Truncate::Millis));
     info!("==================================================");
   }
 }

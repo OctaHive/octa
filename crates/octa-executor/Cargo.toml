@@ -16,11 +16,15 @@ octa-dag = { version = "0.1.0", path = "../octa-dag" }
 octa-finder = { version = "0.1.0", path = "../octa-finder" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+byteorder = "1.4"
 indexmap = "2.7.0"
+glob = "0.3.1"
 lazy_static = { workspace = true }
 humanize-duration = "0.0.6"
 futures = "0.3.31"
 serde = { workspace = true }
+sha2 = "0.10"
+sled = "0.34"
 sys-info = { workspace = true }
 tera = { workspace = true }
 thiserror = { workspace = true }
