@@ -402,7 +402,7 @@ impl TaskNode {
     };
 
     if let Some(sources) = &self.sources {
-      source_strategy.changed(sources.clone()).await
+      source_strategy.is_changed(sources.clone()).await
     } else {
       Ok(false)
     }
@@ -411,7 +411,7 @@ impl TaskNode {
 
 #[async_trait]
 pub trait SourceStrategy: Send {
-  async fn changed(&self, sources: Vec<String>) -> ExecutorResult<bool>;
+  async fn is_changed(&self, sources: Vec<String>) -> ExecutorResult<bool>;
 }
 
 impl Identifiable for TaskNode {

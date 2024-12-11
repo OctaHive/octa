@@ -44,7 +44,7 @@ impl HashSource {
 
 #[async_trait]
 impl SourceStrategy for HashSource {
-  async fn changed(&self, sources: Vec<String>) -> ExecutorResult<bool> {
+  async fn is_changed(&self, sources: Vec<String>) -> ExecutorResult<bool> {
     let mut has_changes = false;
 
     for source in sources {

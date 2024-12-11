@@ -42,7 +42,7 @@ impl TimestampSource {
 
 #[async_trait]
 impl SourceStrategy for TimestampSource {
-  async fn changed(&self, sources: Vec<String>) -> ExecutorResult<bool> {
+  async fn is_changed(&self, sources: Vec<String>) -> ExecutorResult<bool> {
     let mut has_changes = false;
 
     for source in sources {
@@ -72,5 +72,128 @@ impl SourceStrategy for TimestampSource {
     }
 
     Ok(has_changes)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::time::SystemTime;
+  use tempfile::{NamedTempFile, TempDir};
+  use tokio::fs::create_dir_all;
+
+  #[tokio::test]
+  async fn test_glob_error() {
+    let db = sled::Config::new()
+      .temporary(true)
+      .open()
+      .expect("Failed to open in-memory Sled database");
+
+    let timestamp_source = TimestampSource::new(Arc::new(db));
+
+    assert!(!timestamp_source
+      .is_changed(vec!["SOME_MISSING_FILE".to_owned()])
+      .await
+      .is_err());
+  }
+
+  #[tokio::test]
+  async fn test_get_file_modify_time() {
+    let db = Arc::new(
+      sled::Config::new()
+        .temporary(true)
+        .open()
+        .expect("Failed to open in-memory Sled database"),
+    );
+
+    let temp_file = NamedTempFile::new().unwrap();
+
+    // First, make sure the file doesn't exist before checking the mod time
+    assert!(TimestampSource::new(Arc::clone(&db))
+      .get_file_modify_time(temp_file.path().to_path_buf())
+      .await
+      .is_ok());
+
+    let original_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+    // Wait before change
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    std::fs::write(&temp_file, "test content").unwrap();
+
+    assert!(TimestampSource::new(Arc::clone(&db))
+      .get_file_modify_time(temp_file.path().to_path_buf())
+      .await
+      .is_ok());
+
+    let new_timestamp = TimestampSource::new(Arc::clone(&db))
+      .get_file_modify_time(temp_file.path().to_path_buf())
+      .await
+      .unwrap();
+
+    assert!(original_timestamp < new_timestamp);
+  }
+
+  #[tokio::test]
+  async fn test_changed_no_changes() {
+    let db = Arc::new(
+      sled::Config::new()
+        .temporary(true)
+        .open()
+        .expect("Failed to open in-memory Sled database"),
+    );
+
+    let temp_dir = TempDir::new().unwrap();
+    let temp_file_path = temp_dir.path().join("test_file");
+    let timestamp_source = TimestampSource::new(db);
+
+    create_dir_all(temp_file_path.clone()).await.unwrap();
+
+    assert!(timestamp_source
+      .is_changed(vec![temp_file_path.display().to_string()])
+      .await
+      .is_ok());
+  }
+
+  #[tokio::test]
+  async fn test_changed_file_changes() {
+    let db = Arc::new(
+      sled::Config::new()
+        .temporary(true)
+        .open()
+        .expect("Failed to open in-memory Sled database"),
+    );
+
+    let temp_dir = TempDir::new().unwrap();
+    let temp_file_path = temp_dir.path().join("test_file");
+    let timestamp_source = TimestampSource::new(db);
+
+    std::fs::write(&temp_file_path, "initial content").unwrap();
+
+    let is_changed = timestamp_source
+      .is_changed(vec![temp_file_path.display().to_string()])
+      .await
+      .unwrap();
+
+    assert!(is_changed);
+
+    let is_changed = timestamp_source
+      .is_changed(vec![temp_file_path.display().to_string()])
+      .await
+      .unwrap();
+
+    assert!(is_changed == false);
+
+    // Wait before change
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // Modify the test file and check if it is detected as a change
+    std::fs::write(&temp_file_path, "modified content").unwrap();
+
+    let is_changed = timestamp_source
+      .is_changed(vec![temp_file_path.display().to_string()])
+      .await
+      .unwrap();
+    assert!(is_changed);
   }
 }
