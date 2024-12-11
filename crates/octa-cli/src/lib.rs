@@ -31,6 +31,9 @@ pub(crate) struct Cli {
 
   #[arg(short, long, default_value_t = false)]
   pub global: bool,
+
+  #[arg(long, default_value_t = false)]
+  pub clean_cache: bool,
 }
 
 pub async fn run() -> OctaResult<()> {
@@ -105,9 +108,18 @@ pub async fn run() -> OctaResult<()> {
   // Print graph
   if args.print_graph {
     dag.print_graph();
+
+    return Ok(());
   }
 
   let fingerprint = Arc::new(sled::open(".octa/fingerprint")?);
+
+  if args.clean_cache {
+    fingerprint.clear()?;
+
+    return Ok(());
+  }
+
   let executor = Executor::new(
     dag,
     ExecutorConfig {
