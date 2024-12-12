@@ -112,4 +112,5 @@ pub struct Task {
   pub execute_mode: Option<ExecuteMode>,         // How execute task commands
   pub sources: Option<Vec<String>>,              // Sources for fingerprinting
   pub source_strategy: Option<SourceStrategies>, // Strategy for compare sources
+  pub status: Option<Vec<String>>,               // Commands to check should run command
 }
