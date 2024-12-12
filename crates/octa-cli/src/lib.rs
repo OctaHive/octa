@@ -1,16 +1,45 @@
 use std::{path::PathBuf, sync::Arc};
 
-use octa_finder::OctaFinder;
+use chrono::Local;
+use clap::Parser;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
+use tracing_subscriber::{
+  fmt::{self, format::FmtSpan, time::FormatTime, FormatFields},
+  prelude::*,
+  EnvFilter,
+};
 
-use clap::Parser;
 use error::OctaResult;
 use octa_executor::{executor::ExecutorConfig, Executor, TaskGraphBuilder};
+use octa_finder::OctaFinder;
 use octa_octafile::Octafile;
-use tracing::info;
 
 mod error;
+
+struct ChronoLocal;
+
+impl FormatTime for ChronoLocal {
+  fn format_time(&self, w: &mut fmt::format::Writer<'_>) -> std::fmt::Result {
+    write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))
+  }
+}
+
+// Custom formatter for adding [octa] prefix
+struct OctaFormatter;
+
+impl<'a> FormatFields<'a> for OctaFormatter {
+  fn format_fields<R: __tracing_subscriber_field_RecordFields>(
+    &self,
+    writer: fmt::format::Writer<'a>,
+    fields: R,
+  ) -> std::fmt::Result {
+    let mut writer = writer;
+    write!(writer, "[octa] ")?;
+    fmt::format::DefaultFields::new().format_fields(writer, fields)
+  }
+}
 
 #[derive(Parser)]
 #[clap(author, version, about, bin_name("octo"), propagate_version(true))]
@@ -43,12 +72,30 @@ pub async fn run() -> OctaResult<()> {
   // Load environments
   let _ = dotenvy::dotenv();
 
-  // Initialize logging
-  let mut level = tracing::Level::INFO;
-  if args.verbose {
-    level = tracing::Level::DEBUG;
-  }
-  tracing_subscriber::fmt().with_max_level(level).init();
+  // Configure the subscriber with a custom format layer
+  let filter_layer = EnvFilter::try_from_default_env()
+    .or_else(|_| {
+      if args.verbose {
+        EnvFilter::try_new("debug")
+      } else {
+        EnvFilter::try_new("info")
+      }
+    })
+    .unwrap();
+
+  // Create formatting layer
+  let fmt_layer = fmt::layer()
+    .compact()
+    .with_level(false)
+    .with_target(false)
+    .with_timer(ChronoLocal)
+    .with_file(false)
+    .with_line_number(false)
+    .with_span_events(FmtSpan::CLOSE)
+    .fmt_fields(OctaFormatter);
+
+  // Combine layers and set as global default
+  tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
 
   // Load octafile
   let octafile = Octafile::load(args.config, args.global)?;

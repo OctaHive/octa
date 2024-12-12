@@ -364,11 +364,11 @@ impl TaskNode {
     }
 
     if !stdout.is_empty() {
-      info!("{}", stdout.trim());
+      println!("{}", stdout.trim());
     }
 
     if !stderr.is_empty() {
-      info!("{}", stderr.trim());
+      println!("{}", stderr.trim());
     }
   }
 
