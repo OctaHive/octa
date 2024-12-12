@@ -338,8 +338,6 @@ impl Octafile {
 
   /// Try to find octafile config traversing to root directory from current directory
   fn find_octafile(path: Option<PathBuf>) -> OctafileResult<Option<PathBuf>> {
-    let mut current_dir = env::current_dir()?;
-
     if let Some(path) = path {
       if path.is_dir() {
         for taskfile_name in OCTAFILE_DEFAULT_NAMES {
@@ -352,6 +350,7 @@ impl Octafile {
         return Ok(Some(path));
       }
     } else {
+      let mut current_dir = env::current_dir()?;
       loop {
         for taskfile_name in OCTAFILE_DEFAULT_NAMES {
           let potential_path = current_dir.join(taskfile_name);
@@ -381,10 +380,10 @@ mod tests {
   use std::fs;
   use std::path::PathBuf;
   use std::sync::Arc;
-  use tempfile::TempDir;
+  use tempfile::{Builder, TempDir};
 
-  fn create_temp_octafile(content: &str) -> (TempDir, PathBuf) {
-    let temp_dir = TempDir::new().unwrap();
+  fn create_temp_octafile(content: &str, prefix: &str) -> (TempDir, PathBuf) {
+    let temp_dir = Builder::new().prefix(prefix).tempdir().unwrap();
     let file_path = temp_dir.path().join("Octafile.yml");
     fs::write(&file_path, content).unwrap();
     (temp_dir, file_path)
@@ -398,7 +397,7 @@ mod tests {
         test:
           cmd: echo "hello"
     "#;
-    let (_temp_dir, file_path) = create_temp_octafile(content);
+    let (_temp_dir, file_path) = create_temp_octafile(content, "load_basic_octafile");
 
     let octafile = Octafile::load(Some(file_path), false).unwrap();
     assert_eq!(octafile.version, 1);
@@ -424,7 +423,7 @@ mod tests {
           cmd: echo "child"
     "#;
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = Builder::new().prefix("nested_includes").tempdir().unwrap();
     let root_path = temp_dir.path().join("Octafile.yml");
     let child_dir = temp_dir.path().join("child");
     fs::create_dir(&child_dir).unwrap();
@@ -461,7 +460,7 @@ mod tests {
         root_task:
           cmd: echo "root"
     "#;
-    let (_temp_dir, file_path) = create_temp_octafile(content);
+    let (_temp_dir, file_path) = create_temp_octafile(content, "optional_includes");
 
     let octafile = Octafile::load(Some(file_path), false).unwrap();
     assert!(octafile.get_included("optional").unwrap().is_none());
@@ -482,7 +481,7 @@ mod tests {
       sys_info::os_type().unwrap().to_lowercase()
     );
 
-    let (_temp_dir, file_path) = create_temp_octafile(&content);
+    let (_temp_dir, file_path) = create_temp_octafile(&content, "platform_specific_tasks");
     let octafile = Octafile::load(Some(file_path), false).unwrap();
 
     assert!(octafile.tasks.contains_key("platform_task"));
@@ -504,7 +503,7 @@ mod tests {
             - echo "first"
             - task: other_task
     "#;
-    let (_temp_dir, file_path) = create_temp_octafile(content);
+    let (_temp_dir, file_path) = create_temp_octafile(content, "complex_commands");
 
     let octafile = Octafile::load(Some(file_path), false).unwrap();
     let tasks = &octafile.tasks;
@@ -530,7 +529,7 @@ mod tests {
 
     // Test invalid YAML
     let content = "invalid: : yaml:";
-    let (_temp_dir, file_path) = create_temp_octafile(content);
+    let (_temp_dir, file_path) = create_temp_octafile(content, "error_handling");
     assert!(matches!(
       Octafile::load(Some(file_path), false),
       Err(OctafileError::ParseError(_, _))
@@ -547,7 +546,7 @@ mod tests {
         simple:
           cmd: echo "simple"
     "#;
-    let (_temp_dir, file_path) = create_temp_octafile(content);
+    let (_temp_dir, file_path) = create_temp_octafile(content, "error_handling");
     assert!(matches!(
       Octafile::load(Some(file_path), false),
       Err(OctafileError::NotFoundError(_))
@@ -563,7 +562,7 @@ mod tests {
           dir: custom_dir
           cmd: echo "test"
     "#;
-    let (_temp_dir, file_path) = create_temp_octafile(content);
+    let (_temp_dir, file_path) = create_temp_octafile(content, "working_directory");
 
     let octafile = Octafile::load(Some(file_path.clone()), false).unwrap();
     assert_eq!(
@@ -601,7 +600,7 @@ mod tests {
           cmd: echo "simple"
     "#;
 
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = Builder::new().prefix("root_reference_consistency").tempdir().unwrap();
     let root_path = temp_dir.path().join("Octafile.yml");
 
     // Setup directory structure
@@ -637,7 +636,7 @@ mod tests {
     "#;
 
     // Test with existing Octafile
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = Builder::new().prefix("find_octafile").tempdir().unwrap();
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content).unwrap();
 
@@ -711,7 +710,7 @@ mod tests {
     "#;
 
     // Create directory structure
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = Builder::new().prefix("hierarchy_and_relationships").tempdir().unwrap();
     let root_path = temp_dir.path().join("Octafile.yml");
 
     let level1_dir = temp_dir.path().join("level1");
@@ -776,7 +775,7 @@ mod tests {
     "#;
 
     // Setup directory structure
-    let temp_dir = TempDir::new().unwrap();
+    let temp_dir = Builder::new().prefix("get_included_methods").tempdir().unwrap();
     let root_path = temp_dir.path().join("Octafile.yml");
 
     let first_dir = temp_dir.path().join("first");

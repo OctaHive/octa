@@ -41,7 +41,7 @@ pub async fn run() -> OctaResult<()> {
   let args = Cli::parse();
 
   // Load environments
-  dotenvy::dotenv()?;
+  let _ = dotenvy::dotenv();
 
   // Initialize logging
   let mut level = tracing::Level::INFO;
