@@ -71,6 +71,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     config: ExecutorConfig,
     cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
     fingerprint: Arc<Db>,
+    summary: Option<Arc<Mutex<Summary>>>,
   ) -> ExecutorResult<Self> {
     let in_degree = dag.nodes().iter().map(|n| (n.id().clone(), 0)).collect();
 
@@ -83,7 +84,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       dag: Arc::new(dag),
       in_degree: Arc::new(Mutex::new(in_degree)),
       active_tasks: Arc::new(AtomicUsize::new(0)),
-      summary: Arc::new(Mutex::new(Summary::new())),
+      summary: summary.unwrap_or(Arc::new(Mutex::new(Summary::new()))),
       cache,
       fingerprint,
     };
@@ -96,8 +97,8 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
   }
 
   /// Executes all tasks in the DAG
-  pub async fn execute(&self, cancel_token: CancellationToken) -> ExecutorResult<Vec<String>> {
-    self.log_info("Starting task execution");
+  pub async fn execute(&self, cancel_token: CancellationToken, command: &str) -> ExecutorResult<Vec<String>> {
+    self.log_info(&format!("Starting execution plan for command {}", command));
 
     self.initialize_execution().await?;
     let (tx, rx) = self.create_task_channel();
@@ -299,7 +300,12 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
     let start_time = SystemTime::now();
     let result = self
       .task
-      .execute(self.context.cache.clone(), self.context.fingerprint.clone())
+      .execute(
+        self.context.cache.clone(),
+        self.context.summary.clone(),
+        self.context.fingerprint.clone(),
+        self.cancel_token.clone(),
+      )
       .await;
 
     match result {
@@ -316,7 +322,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
 
     if let Ok(elapsed) = start_time.elapsed() {
       self.context.summary.lock().await.add(TaskSummaryItem {
-        name: self.task.id(),
+        name: self.task.name(),
         duration: elapsed,
       });
     }
@@ -325,7 +331,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
   }
 
   async fn handle_error(&self, error: ExecutorError) -> ExecutorResult<String> {
-    error!("Task {} failed: {}", self.task.id(), error);
+    error!("Task {} failed: {}", self.task.name(), error);
     self.context.finished.cancel();
     Err(error)
   }
@@ -343,7 +349,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
           .ok_or_else(|| ExecutorError::TaskNotFound(dep.id()))?;
         *dep_count -= 1;
 
-        if *dep_count == 0 {
+        if *dep_count == 0 && !self.context.finished.is_cancelled() {
           self.context.active_tasks.fetch_add(1, Ordering::SeqCst);
           self
             .tx

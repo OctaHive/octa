@@ -10,6 +10,7 @@ use crate::error::{DAGError, DAGResult};
 
 pub trait Identifiable {
   fn id(&self) -> String;
+  fn name(&self) -> String;
 }
 
 /// Represents a Directed Acyclic Graph (DAG) for task dependencies
@@ -135,17 +136,25 @@ mod tests {
   #[derive(Debug, Eq, PartialEq, Hash, Clone)]
   struct TestNode {
     id: String,
+    name: String,
   }
 
   impl TestNode {
     fn new(id: &str) -> Arc<Self> {
-      Arc::new(Self { id: id.to_string() })
+      Arc::new(Self {
+        id: id.to_string(),
+        name: id.to_string(),
+      })
     }
   }
 
   impl Identifiable for TestNode {
     fn id(&self) -> String {
       self.id.clone()
+    }
+
+    fn name(&self) -> String {
+      self.name.clone()
     }
   }
 

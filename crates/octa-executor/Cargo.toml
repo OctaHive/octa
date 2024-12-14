@@ -15,6 +15,7 @@ octa-octafile = { version = "0.1.0", path = "../octa-octafile" }
 octa-dag = { version = "0.1.0", path = "../octa-dag" }
 octa-finder = { version = "0.1.0", path = "../octa-finder" }
 anyhow = { workspace = true }
+async-stream = "0.3"
 async-trait = { workspace = true }
 byteorder = "1.4"
 indexmap = "2.7.0"
@@ -29,6 +30,7 @@ sys-info = { workspace = true }
 tera = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-stream = "0.1"
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

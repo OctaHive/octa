@@ -54,13 +54,9 @@ impl SourceStrategy for HashSource {
             let new_hash = self.calculate_file_hash(path.clone()).await?;
             let path_str = path.display().to_string();
 
-            println!("New hash: {}", new_hash);
-
             let key = format!("{}_{}", HASH_PREFIX, path_str.clone());
             if let Some(old_hash) = self.fingerprint.get(key.clone())? {
               let old_hash_str = String::from_utf8_lossy(&old_hash);
-
-              println!("Old hash: {}", old_hash_str);
 
               if old_hash_str != new_hash {
                 has_changes = true;

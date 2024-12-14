@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use chrono::Local;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -44,7 +44,7 @@ impl<'a> FormatFields<'a> for OctaFormatter {
 #[derive(Parser)]
 #[clap(author, version, about, bin_name("octo"), propagate_version(true))]
 pub(crate) struct Cli {
-  pub command: String,
+  pub command: Option<String>,
 
   #[arg(short, long)]
   pub config: Option<PathBuf>,
@@ -148,21 +148,30 @@ pub async fn run() -> OctaResult<()> {
     return Ok(());
   }
 
-  // Create DAG
-  let builder = TaskGraphBuilder::new()?;
-  let dag = builder.build(octafile, &args.command, cancel_token.clone())?;
-
-  // Print graph
-  if args.print_graph {
-    dag.print_graph();
-
-    return Ok(());
-  }
-
   let fingerprint = Arc::new(sled::open(".octa/fingerprint")?);
 
   if args.clean_cache {
     fingerprint.clear()?;
+
+    return Ok(());
+  }
+
+  if let None = args.command {
+    Cli::command().print_help().unwrap();
+    println!();
+
+    return Ok(());
+  }
+
+  // Create DAG
+  let builder = TaskGraphBuilder::new()?;
+  let dag = builder
+    .build(octafile, args.command.as_ref().unwrap(), cancel_token.clone())
+    .await?;
+
+  // Print graph
+  if args.print_graph {
+    dag.print_graph();
 
     return Ok(());
   }
@@ -175,8 +184,11 @@ pub async fn run() -> OctaResult<()> {
     },
     None,
     fingerprint,
+    None,
   )?;
-  executor.execute(cancel_token.clone()).await?;
+  executor
+    .execute(cancel_token.clone(), args.command.as_ref().unwrap())
+    .await?;
 
   Ok(())
 }

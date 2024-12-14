@@ -44,7 +44,13 @@ impl OctaFinder {
 
     debug!("Searching in path: {}", path);
 
-    self.search_recursive(current, &search_segments, 0, &mut results, String::new());
+    let curr_path = if current.is_root() {
+      String::new()
+    } else {
+      current.hierarchy_path().join(":")
+    };
+
+    self.search_recursive(current, &search_segments, 0, &mut results, curr_path);
 
     debug!("Found {} results for path: {}", results.len(), path);
     results
