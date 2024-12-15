@@ -63,6 +63,9 @@ pub(crate) struct Cli {
 
   #[arg(long, default_value_t = false)]
   pub clean_cache: bool,
+
+  #[arg(last = true)]
+  task_args: Vec<String>,
 }
 
 struct ExecuteItem {
@@ -172,7 +175,12 @@ pub async fn run() -> OctaResult<()> {
     // Create DAG
     let builder = TaskGraphBuilder::new()?;
     let dag = builder
-      .build(Arc::clone(&octafile), command, cancel_token.clone())
+      .build(
+        Arc::clone(&octafile),
+        command,
+        cancel_token.clone(),
+        args.task_args.clone(),
+      )
       .await?;
 
     let executor = Executor::new(

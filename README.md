@@ -154,3 +154,19 @@ includes:
     vars:
       BUILD_IMAGE: debian
 ```
+
+# Providing arguments to task
+If you want to pass arguments to the invoked tasks, you can specify them after `--`. The passed arguments will be available to the commands 
+through the COMMAND_ARGS variable.
+
+```yaml
+version: 1
+
+tasks:
+  web:
+    cmd: echo {{ COMMAND_ARGS }}
+```
+
+```console
+$ octa web -- publish
+```

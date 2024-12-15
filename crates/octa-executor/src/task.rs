@@ -37,7 +37,7 @@ pub trait Executable<T> {
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     summary: Arc<Summary>,
     fingerprint: Arc<Db>,
-    cancel_tokec: CancellationToken,
+    cancel_token: CancellationToken,
   ) -> ExecutorResult<String>;
   async fn set_result(&self, task_name: String, res: String);
 }

@@ -27,8 +27,9 @@ use vars::Vars;
 type DagNode = DAG<TaskNode>;
 
 pub struct TaskGraphBuilder {
-  finder: Arc<OctaFinder>, // Finder for search task in octafile
-  dir: PathBuf,            // Current user directory
+  finder: Arc<OctaFinder>,   // Finder for search task in octafile
+  dir: PathBuf,              // Current user directory
+  command_args: Vec<String>, // Aditional task arguments from cli
 }
 
 #[derive(Debug)]
@@ -46,16 +47,22 @@ impl TaskGraphBuilder {
     Ok(Self {
       finder: Arc::new(OctaFinder::new()),
       dir: current_dir,
+      command_args: vec![],
     })
   }
 
   pub async fn build(
-    self,
+    mut self,
     octafile: Arc<Octafile>,
     command: &str,
     cancel_token: CancellationToken,
+    command_args: Vec<String>,
   ) -> ExecutorResult<DAG<TaskNode>> {
-    debug!("Building DAG for command: {}", command);
+    debug!(
+      "Building DAG for command {} with provided args {:?}",
+      command, command_args
+    );
+    self.command_args = command_args;
     let mut dag = DAG::new();
 
     let commands = self.finder.find_by_path(Arc::clone(&octafile), command);
@@ -83,6 +90,7 @@ impl TaskGraphBuilder {
     vars.insert("ROOT_DIR", &root.dir.display().to_string());
     vars.insert("TASKFILE_DIR", &root.dir.display().to_string());
     vars.insert("USER_WORKING_DIR", &self.dir.display().to_string());
+    vars.insert("COMMAND_ARGS", &self.command_args);
 
     vars
   }

@@ -11,7 +11,7 @@ pub enum IncludeInfo {
   Complex(ComplexIncludeInfo),
 }
 
-/// Represents include directive information in taskfile
+/// Represents include directive information in octafile
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ComplexIncludeInfo {
   pub octafile: String,
