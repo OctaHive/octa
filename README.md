@@ -52,7 +52,7 @@ tasks:
         --file Dockerfile .
 ```
 
-After having a octa tasks file, you can run a tasks by calling `octa` and provide the names of the task to run. Provided tasks will 
+After creating a Octafile, you can run a tasks by calling `octa` and provide the names of the task to run. Provided tasks will 
 be executed sequentially.
 
 # Task files
@@ -90,7 +90,7 @@ using either a short or an extended format.
 version: 1
 
 includes:
-  # Shart version, will look for ./web/Octafile.yml
+  # Short version, will look for ./web/Octafile.yml
   web: ./web
   
   installer: ./InstallerTasks.yml
@@ -100,8 +100,8 @@ includes:
     octafile: ./backend/Octafile.yml
 ```
 
-All imported tasks will be accessible through a namespace based on the key name in the imports section. So, you'd call task web:serve to 
-run the serve task from web/Octafile.yml or task backend:build to run the build task from the ./backend/Octafile.yml file.
+All imported tasks will be accessible through a namespace based on the key name in the imports section. So, you'd call task `web:serve` to 
+run the serve task from web/Octafile.yml or task `backend:build` to run the build task from the ./backend/Octafile.yml file.
 
 ## Advanced including options
 If you are using the extended task file import option, you can use the following settings:
@@ -109,6 +109,48 @@ If you are using the extended task file import option, you can use the following
 ##### optional
 Allows execution to continue if the imported file is not found.
 
+```yaml
+version: 1
+
+includes:
+  e2e:
+    octafile: ./e2e/Octafile.yml
+    optional: true
+
+tasks:
+  build:
+    cmds:
+      # This command will be successfully executed
+      - ./build.sh
+```
+
 ##### dir
 By default, the working directory for the imported task file will be set to the directory from which the imported file is loaded. You can 
 override this behavior by specifying a directory for the nested task file.
+
+```yaml
+version: 1
+
+includes:
+  e2e:
+    octafile: ./e2e/Octafile.yml
+    dir: ./build
+```
+
+##### vars
+You can pass variables when importing a nested task file. The provided parameters will overwrite the variables defined in the imported file.
+
+```yaml
+version: 1
+
+includes:
+  backend:
+    octafile: ./shared/Docker.yml
+    vars:
+      BUILD_IMAGE: ubuntu
+
+  web:
+    octafile: ./shared/Docker.yml
+    vars:
+      BUILD_IMAGE: debian
+```
