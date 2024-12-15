@@ -16,13 +16,15 @@ use crate::{
   task::Task,
 };
 
-const OCTAFILE_DEFAULT_NAMES: [&str; 6] = [
+const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
   "Octafile.yml",
   "octafile.yml",
   "Octafile.yaml",
   "octafile.yaml",
   "Octafile.lock.yml",
   "octafile.lock.yml",
+  "Octafile.lock.yaml",
+  "octafile.lock.yaml",
 ];
 
 pub type Vars = HashMap<String, String>;

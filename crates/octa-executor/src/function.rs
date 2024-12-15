@@ -33,6 +33,7 @@ impl Function for ExecuteShell {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+      cmd
     };
 
     #[cfg(not(windows))]
@@ -41,9 +42,9 @@ impl Function for ExecuteShell {
       cmd
         .current_dir(&current_dir)
         .arg("-c")
+        .arg(&command)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .arg(&command);
+        .stderr(Stdio::piped());
       cmd
     };
 

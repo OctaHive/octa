@@ -33,16 +33,12 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Configuration for the Executor
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
-  pub show_summary: bool,
   pub silent: bool,
 }
 
 impl Default for ExecutorConfig {
   fn default() -> Self {
-    Self {
-      show_summary: false,
-      silent: true,
-    }
+    Self { silent: true }
   }
 }
 
@@ -52,7 +48,7 @@ struct ExecutionState<T: Hash + Identifiable + Eq + TaskItem> {
   dag: Arc<DAG<T>>,                               // Task dependency graph
   in_degree: Arc<Mutex<HashMap<String, usize>>>,  // Tracks task dependencies
   active_tasks: Arc<AtomicUsize>,                 // Number of running tasks
-  summary: Arc<Mutex<Summary>>,                   // Summary of task execution
+  summary: Arc<Summary>,                          // Summary of task execution
   cache: Arc<Mutex<IndexMap<String, CacheItem>>>, // Cache for tasks
   fingerprint: Arc<Db>,                           // Fingerprint db
 }
@@ -71,7 +67,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     config: ExecutorConfig,
     cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
     fingerprint: Arc<Db>,
-    summary: Option<Arc<Mutex<Summary>>>,
+    summary: Option<Arc<Summary>>,
   ) -> ExecutorResult<Self> {
     let in_degree = dag.nodes().iter().map(|n| (n.id().clone(), 0)).collect();
 
@@ -80,11 +76,13 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       None => Arc::new(Mutex::new(IndexMap::new())),
     };
 
+    let summary = summary.unwrap_or(Arc::new(Summary::new()));
+
     let state = ExecutionState {
       dag: Arc::new(dag),
       in_degree: Arc::new(Mutex::new(in_degree)),
       active_tasks: Arc::new(AtomicUsize::new(0)),
-      summary: summary.unwrap_or(Arc::new(Mutex::new(Summary::new()))),
+      summary,
       cache,
       fingerprint,
     };
@@ -226,11 +224,6 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
 
     self.log_info("All tasks completed successfully");
 
-    if self.config.show_summary {
-      let summary = self.state.summary.lock().await;
-      summary.print();
-    }
-
     Ok(results)
   }
 
@@ -271,7 +264,7 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   finished: CancellationToken,
   in_degree: Arc<Mutex<HashMap<String, usize>>>,
   active_tasks: Arc<AtomicUsize>,
-  summary: Arc<Mutex<Summary>>,
+  summary: Arc<Summary>,
   cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
   fingerprint: Arc<Db>,
 }
@@ -321,10 +314,14 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
     }
 
     if let Ok(elapsed) = start_time.elapsed() {
-      self.context.summary.lock().await.add(TaskSummaryItem {
-        name: self.task.name(),
-        duration: elapsed,
-      });
+      self
+        .context
+        .summary
+        .add(TaskSummaryItem {
+          name: self.task.name(),
+          duration: elapsed,
+        })
+        .await;
     }
 
     self.process_task_success(output).await

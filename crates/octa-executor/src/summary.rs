@@ -1,6 +1,7 @@
 use humanize_duration::prelude::DurationExt;
 use humanize_duration::Truncate;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 use tracing::info;
 
@@ -12,22 +13,26 @@ pub struct TaskSummaryItem {
 
 #[derive(Debug)]
 pub struct Summary {
-  tasks: Vec<TaskSummaryItem>,
+  tasks: Mutex<Vec<TaskSummaryItem>>,
 }
 
 impl Summary {
   pub fn new() -> Self {
-    Self { tasks: vec![] }
+    Self {
+      tasks: Mutex::new(vec![]),
+    }
   }
 
-  pub fn add(&mut self, item: TaskSummaryItem) {
-    self.tasks.push(item)
+  pub async fn add(&self, item: TaskSummaryItem) {
+    let mut tasks = self.tasks.lock().await;
+    tasks.push(item)
   }
 
-  pub fn print(&self) {
+  pub async fn print(&self) {
     let mut total = Duration::new(0, 0);
+    let tasks = self.tasks.lock().await;
     info!("================== Time Summary ==================");
-    for item in self.tasks.iter() {
+    for item in tasks.iter() {
       total = total + item.duration;
       let human = item.duration.human(Truncate::Millis);
       info!(" \"{}\": {}", item.name, human);
@@ -40,54 +45,58 @@ impl Summary {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use test_log::test;
   use tracing_test::traced_test;
 
-  #[test]
-  fn test_new() {
+  #[tokio::test]
+  async fn test_new() {
     let summary = Summary::new();
-    assert!(summary.tasks.is_empty());
+    let tasks = summary.tasks.lock().await;
+    assert!(tasks.is_empty());
   }
 
-  #[test]
-  fn test_add() {
-    let mut summary = Summary::new();
+  #[tokio::test]
+  async fn test_add() {
+    let summary = Summary::new();
+
     let duration1 = Duration::from_millis(200);
     let item1 = TaskSummaryItem {
       name: "task1".to_string(),
       duration: duration1,
     };
-    summary.add(item1.clone());
-    assert!(summary.tasks.len() == 1);
-    assert_eq!(summary.tasks[0], item1);
+    summary.add(item1.clone()).await;
+    let tasks = summary.tasks.lock().await;
+    assert!(tasks.len() == 1);
+    assert_eq!(tasks[0], item1);
+    drop(tasks);
 
     let duration2 = Duration::from_millis(350);
     let item2 = TaskSummaryItem {
       name: "task2".to_string(),
       duration: duration2,
     };
-    summary.add(item2.clone());
-    assert!(summary.tasks.len() == 2);
+    summary.add(item2.clone()).await;
+    let tasks = summary.tasks.lock().await;
+    assert!(tasks.len() == 2);
   }
 
   #[traced_test]
-  #[test]
-  fn test_print() {
-    let mut summary = Summary::new();
+  #[tokio::test]
+  async fn test_print() {
+    let summary = Summary::new();
     let duration1 = Duration::from_millis(200);
     let item1 = TaskSummaryItem {
       name: "task1".to_string(),
       duration: duration1,
     };
-    summary.add(item1.clone());
+    summary.add(item1.clone()).await;
     let duration2 = Duration::from_millis(350);
     let item2 = TaskSummaryItem {
       name: "task2".to_string(),
       duration: duration2,
     };
-    summary.add(item2.clone());
+    summary.add(item2.clone()).await;
 
-    summary.print();
+    summary.print().await;
 
     assert!(logs_contain("================== Time Summary =================="));
     assert!(logs_contain("\"task1\": 200ms"));

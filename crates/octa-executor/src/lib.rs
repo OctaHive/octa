@@ -2,7 +2,7 @@ pub mod error;
 pub mod executor;
 mod function;
 mod hash_source;
-mod summary;
+pub mod summary;
 mod task;
 mod timestamp_source;
 pub mod vars;
@@ -524,7 +524,7 @@ mod tests {
       vars: None,
       dir: None,
       tpl: None,
-      status: None,
+      predonditions: None,
       sources: None,
       source_strategy: None,
       platforms: None,

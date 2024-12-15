@@ -11,8 +11,8 @@ use tracing_subscriber::{
   EnvFilter,
 };
 
-use error::OctaResult;
-use octa_executor::{executor::ExecutorConfig, Executor, TaskGraphBuilder};
+use error::{OctaError, OctaResult};
+use octa_executor::{executor::ExecutorConfig, summary::Summary, Executor, TaskGraphBuilder, TaskNode};
 use octa_finder::OctaFinder;
 use octa_octafile::Octafile;
 
@@ -42,15 +42,15 @@ impl<'a> FormatFields<'a> for OctaFormatter {
 }
 
 #[derive(Parser)]
-#[clap(author, version, about, bin_name("octo"), propagate_version(true))]
+#[clap(author, version, about, bin_name("octa"), name("octa"), propagate_version(true))]
 pub(crate) struct Cli {
-  pub command: Option<String>,
+  pub commands: Option<Vec<String>>,
 
   #[arg(short, long)]
   pub config: Option<PathBuf>,
 
   #[arg(short, long, default_value_t = false)]
-  pub print_graph: bool,
+  pub parallel: bool,
 
   #[arg(short, long, default_value_t = false)]
   pub verbose: bool,
@@ -63,6 +63,11 @@ pub(crate) struct Cli {
 
   #[arg(long, default_value_t = false)]
   pub clean_cache: bool,
+}
+
+struct ExecuteItem {
+  executor: Executor<TaskNode>,
+  command: String,
 }
 
 pub async fn run() -> OctaResult<()> {
@@ -156,39 +161,67 @@ pub async fn run() -> OctaResult<()> {
     return Ok(());
   }
 
-  if let None = args.command {
+  if let None = args.commands {
     Cli::command().print_help().unwrap();
     println!();
 
     return Ok(());
   }
 
-  // Create DAG
-  let builder = TaskGraphBuilder::new()?;
-  let dag = builder
-    .build(octafile, args.command.as_ref().unwrap(), cancel_token.clone())
-    .await?;
+  let summary = Arc::new(Summary::new());
+  let mut tasks = vec![];
+  for command in args.commands.as_ref().unwrap() {
+    // Create DAG
+    let builder = TaskGraphBuilder::new()?;
+    let dag = builder
+      .build(Arc::clone(&octafile), command, cancel_token.clone())
+      .await?;
 
-  // Print graph
-  if args.print_graph {
-    dag.print_graph();
-
-    return Ok(());
+    let executor = Executor::new(
+      dag,
+      ExecutorConfig { silent: false },
+      None,
+      Arc::clone(&fingerprint),
+      Some(summary.clone()),
+    )?;
+    tasks.push(ExecuteItem {
+      executor,
+      command: command.to_string(),
+    });
   }
 
-  let executor = Executor::new(
-    dag,
-    ExecutorConfig {
-      show_summary: true,
-      silent: false,
-    },
-    None,
-    fingerprint,
-    None,
-  )?;
-  executor
-    .execute(cancel_token.clone(), args.command.as_ref().unwrap())
-    .await?;
+  if args.parallel {
+    let mut handles = Vec::with_capacity(tasks.len());
+    let mut results = Vec::with_capacity(tasks.len());
+
+    // Spawn all tasks
+    for task in tasks {
+      let cancel_token = cancel_token.clone();
+      let handle = tokio::spawn(async move { task.executor.execute(cancel_token, &task.command).await });
+      handles.push(handle);
+    }
+
+    // Wait for all tasks to complete
+    for handle in handles {
+      match handle.await {
+        Ok(result) => results.push(result),
+        Err(e) => return Err(error::OctaError::Runtime(e.to_string())),
+      }
+    }
+
+    // Check if any task failed
+    for result in results {
+      if let Err(e) = result {
+        return Err(OctaError::ExecutionError(e));
+      }
+    }
+  } else {
+    for task in tasks {
+      task.executor.execute(cancel_token.clone(), &task.command).await?;
+    }
+  }
+
+  summary.print().await;
 
   Ok(())
 }

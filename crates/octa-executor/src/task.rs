@@ -37,7 +37,7 @@ pub trait Executable<T> {
   async fn execute(
     &self,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    summary: Arc<Mutex<Summary>>,
+    summary: Arc<Summary>,
     fingerprint: Arc<Db>,
     cancel_tokec: CancellationToken,
   ) -> ExecutorResult<String>;
@@ -608,13 +608,15 @@ impl TaskNode {
 
   #[cfg(windows)]
   fn terminate_windows_process(&self, child: &mut tokio::process::Child) {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
     if let Some(pid) = child.id() {
       unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
         if handle != 0 {
-          TerminateProcess(handle, 1);
+          TerminateProcess(handle as HANDLE, 1);
+          CloseHandle(handle as HANDLE);
         }
       }
     }
@@ -659,7 +661,7 @@ impl TaskNode {
     &self,
     dag: DAG<TaskNode>,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    summary: Arc<Mutex<Summary>>,
+    summary: Arc<Summary>,
     fingerprint: Arc<Db>,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
@@ -693,7 +695,7 @@ impl Executable<TaskNode> for TaskNode {
   async fn execute(
     &self,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    summary: Arc<Mutex<Summary>>,
+    summary: Arc<Summary>,
     fingerprint: Arc<Db>,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
@@ -776,7 +778,7 @@ mod tests {
       .open()
       .expect("Failed to open in-memory Sled database");
 
-    let summary = Arc::new(Mutex::new(Summary::new()));
+    let summary = Arc::new(Summary::new());
 
     let task = create_test_task("test_task", Some("echo 'hello world'"), None, None);
 
@@ -813,7 +815,7 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Mutex::new(Summary::new()));
+    let summary = Arc::new(Summary::new());
 
     let result = task
       .execute(cache, summary, fingerprint, CancellationToken::new())
@@ -832,7 +834,7 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Mutex::new(Summary::new()));
+    let summary = Arc::new(Summary::new());
 
     // First execution
     let result1 = task
@@ -882,7 +884,7 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Mutex::new(Summary::new()));
+    let summary = Arc::new(Summary::new());
 
     // First execution
     let result1 = task
@@ -917,7 +919,7 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Mutex::new(Summary::new()));
+    let summary = Arc::new(Summary::new());
 
     let result = task
       .execute(cache, summary, fingerprint, CancellationToken::new())
@@ -946,7 +948,7 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Mutex::new(Summary::new()));
+    let summary = Arc::new(Summary::new());
 
     // Cancel the task after a short delay
     let cancel_handle = tokio::spawn({
@@ -984,7 +986,7 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Mutex::new(Summary::new()));
+    let summary = Arc::new(Summary::new());
 
     let result = task
       .execute(cache, summary, fingerprint, CancellationToken::new())
@@ -1011,7 +1013,7 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Mutex::new(Summary::new()));
+    let summary = Arc::new(Summary::new());
 
     let result = task
       .execute(cache, summary, fingerprint, CancellationToken::new())
@@ -1044,7 +1046,7 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Mutex::new(Summary::new()));
+    let summary = Arc::new(Summary::new());
 
     let result = parent_task
       .execute(cache, summary, fingerprint, CancellationToken::new())
