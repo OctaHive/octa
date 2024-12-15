@@ -1,3 +1,5 @@
+[![codecov](https://codecov.io/github/OctaHive/octa/branch/main/graph/badge.svg?token=Q1UWZ4QHGZ)](https://codecov.io/github/OctaHive/octa)
+
 # Inspiration
 This project was inspired by the go-task build project. However, when we rewriting our project’s build system to go-task, I found some 
 functionality missing, so I decided to create my own builder. 
