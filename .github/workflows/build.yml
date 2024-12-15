@@ -2,13 +2,9 @@ name: Build
 
 on:
   push:
-    branches:
-      - "*"
-    paths:
-      - README.md
-      - "crates/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
+    tags:
+      - "v*"
+      - test-release
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,7 +13,6 @@ env:
 jobs:
   build:
     name: Build for ${{ matrix.platform.os_name }}
-    if: startsWith( github.ref, 'refs/tags/v' ) || github.ref == 'refs/tags/test-release'
     runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
