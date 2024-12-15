@@ -1,4 +1,6 @@
 [![codecov](https://codecov.io/github/OctaHive/octa/branch/main/graph/badge.svg?token=Q1UWZ4QHGZ)](https://codecov.io/github/OctaHive/octa)
+![build](https://github.com/OctaHive/octa/actions/workflows/tests.yml/badge.svg)
+![License: MIT](https://img.shields.io/github/license/adrianmrit/mom)
 
 # Inspiration
 This project was inspired by the go-task build project. However, when we rewriting our project’s build system to go-task, I found some 
