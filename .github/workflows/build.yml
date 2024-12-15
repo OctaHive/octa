@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   TARGET_DIR: target_ci
+  GITHUB_TOKEN: ${{ github.token }}
 
 jobs:
   build:
