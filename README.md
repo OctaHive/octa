@@ -15,8 +15,9 @@ If you have homebrew installed, you can install octa with:
 
 ```
 
-## Cargo
 ## Binary releases
+Binaries are also available for Windows, Linux and macOS under [releases](https://github.com/OctaHive/octa/releases). To install, download the binary for 
+your system and add to your `$PATH`.
 
 # JSON scheme
 
@@ -71,5 +72,43 @@ The purpose of using .lock variants is to provide a committed version of the fil
 customize the Octafile by creating their own Octafile.yml, which would be excluded from version control using .gitignore.
 
 When executing a task, the program begins searching for configuration files in the current working directory and proceeds upward 
-toward the root directory. It follows a specific order, stopping as soon as it finds either a matching task, a octafile.{yml,yaml} 
+toward the root directory. It follows a specific order, stopping as soon as it finds either a matching file, a octafile.{yml,yaml} 
 file, or reaches the root directory with no further folders to check.
+
+To run a task from your global Octafile located in your home directory, use the --global or -g flag. This is ideal for managing 
+personal tasks that aren’t tied to a specific project.
+
+You can also run tasks from a specific file by simply passing it with the `--config` or `-c` flag, e.g., `octa -c project_tasks.yml build`.
+
+# Including task files
+If you have a large project with deep nesting structure, keeping all tasks in a single file can be inconvenient. Additionally, different 
+teams may be responsible for building different parts of the project. To address this, you can split your tasks across multiple files and 
+include the necessary Octafiles in the main project file. To import these files, list them in the `includes` section. You can specify them 
+using either a short or an extended format.
+
+```yaml
+version: 1
+
+includes:
+  # Shart version, will look for ./web/Octafile.yml
+  web: ./web
+  
+  installer: ./InstallerTasks.yml
+  
+  # Extended version allows for specifying additional options to configure inclusions
+  backend:
+    octafile: ./backend/Octafile.yml
+```
+
+All imported tasks will be accessible through a namespace based on the key name in the imports section. So, you'd call task web:serve to 
+run the serve task from web/Octafile.yml or task backend:build to run the build task from the ./backend/Octafile.yml file.
+
+## Advanced including options
+If you are using the extended task file import option, you can use the following settings:
+
+##### optional
+Allows execution to continue if the imported file is not found.
+
+##### dir
+By default, the working directory for the imported task file will be set to the directory from which the imported file is loaded. You can 
+override this behavior by specifying a directory for the nested task file.
