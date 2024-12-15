@@ -781,7 +781,7 @@ mod tests {
 
     let summary = Arc::new(Summary::new());
 
-    let task = create_test_task("test_task", Some("echo 'hello world'"), None, None);
+    let task = create_test_task("test_task", Some("echo hello world"), None, None);
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
@@ -831,7 +831,7 @@ mod tests {
       .temporary(true)
       .open()
       .expect("Failed to open in-memory Sled database");
-    let task = create_test_task("cache_task", Some("echo 'cached result'"), None, Some(RunMode::Once));
+    let task = create_test_task("cache_task", Some("echo cached result"), None, Some(RunMode::Once));
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
@@ -1031,7 +1031,7 @@ mod tests {
       .expect("Failed to open in-memory Sled database");
 
     let mut nested_dag = DAG::new();
-    let nested_task = create_test_task("nested_task", Some("echo 'nested'"), None, None);
+    let nested_task = create_test_task("nested_task", Some("echo nested"), None, None);
     nested_dag.add_node(Arc::new(nested_task));
 
     let task_config = TaskConfig::builder()
