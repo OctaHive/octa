@@ -1,2 +1,5 @@
 - Change env like var
 - Add options for dotenv to load environment from specified paths
+- Add .octaignore for ignore some sources
+- Add validation to yaml file
+- Provide env variables when run a task
