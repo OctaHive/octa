@@ -138,6 +138,7 @@ pub async fn run() -> OctaResult<()> {
     }
   });
 
+  // List all tasks and exit
   if args.list_tasks {
     let finder = OctaFinder::new();
     let commands = finder.find_by_path(Arc::clone(&octafile), "**");
