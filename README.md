@@ -157,7 +157,7 @@ includes:
 
 # Providing arguments to task
 If you want to pass arguments to the invoked tasks, you can specify them after `--`. The passed arguments will be available to the commands 
-through the COMMAND_ARGS variable.
+through the `COMMAND_ARGS` variable.
 
 ```yaml
 version: 1
@@ -170,3 +170,35 @@ tasks:
 ```console
 $ octa web -- publish
 ```
+
+# Environment variables
+<TBD>
+
+# Variables
+The vars property is used to define variables that will be available to all tasks in the file. This behaves like the env property, but the 
+variables are not exported to the environment, and can be more complex than strings.
+
+Here the example of usage vars:
+
+```yaml
+version: 1
+
+vars:
+  STR: "Hello World"
+  NUM: 1
+  
+tasks:
+  say_hi:
+    cmd: echo {{ STR }}
+    
+  plus_one:
+    cmd: echo {{ NUM + 1 }}
+```
+
+You can use different data types as values. The following data types are supported:
+* string
+* bool
+* number
+* float
+* array
+* object

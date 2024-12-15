@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_yml::Value;
 
 use crate::{Cmds, Vars};
 
@@ -99,7 +100,7 @@ impl From<String> for Deps {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Task {
   pub dir: Option<PathBuf>,                      // Working directory for the task
-  pub vars: Option<HashMap<String, String>>,     // Task-specific variables
+  pub vars: Option<HashMap<String, Value>>,      // Task-specific variables
   pub tpl: Option<String>,                       // Task template
   pub cmd: Option<Cmds>,                         // Command to execute
   pub cmds: Option<Vec<Cmds>>,                   // List of commands

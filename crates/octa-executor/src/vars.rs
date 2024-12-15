@@ -150,25 +150,32 @@ impl Vars {
 
     for (key, value) in vars.iter() {
       let processed_value = self.process_template_value(&key, &value, parent).await?;
-
-      processed.insert(&key, &processed_value.trim_matches('"')); // remove extra quotes in value
+      processed.insert(&key, &processed_value);
     }
 
     Ok(processed)
   }
 
-  async fn process_template_value(&self, key: &str, value: &Value, context: &Context) -> ExecutorResult<String> {
+  async fn process_template_value(&self, key: &str, value: &Value, context: &Context) -> ExecutorResult<Value> {
     let val = value.to_string().trim().to_owned();
 
     if !self.is_template(&val) {
-      return Ok(val);
+      return Ok(value.clone());
     }
 
     debug!("Processing template variable '{}' with value: '{}'", key, val);
     let mut template = TEMPLATE_ENGINE.write().await;
-    template
+    let res = template
       .render_str(&val, context)
-      .map_err(|e| ExecutorError::VariableInterpolateError(val, e.to_string()))
+      .map_err(|e| ExecutorError::VariableInterpolateError(val, e.to_string()))?;
+    let res = res.trim_matches('"').to_owned(); // remove extra quotes in value
+
+    let val = match serde_json::from_str(&res) {
+      Ok(val) => val,
+      Err(_) => Value::String(res),
+    };
+
+    Ok(val)
   }
 
   fn is_template(&self, value: &str) -> bool {

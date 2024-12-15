@@ -1003,6 +1003,7 @@ dependencies = [
  "octa-finder",
  "octa-octafile",
  "serde",
+ "serde_json",
  "sha2",
  "sled",
  "sys-info",

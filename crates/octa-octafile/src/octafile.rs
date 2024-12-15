@@ -8,6 +8,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use serde_yml::Value;
 use tracing::{debug, info};
 
 use crate::{
@@ -27,7 +28,7 @@ const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
   "octafile.lock.yaml",
 ];
 
-pub type Vars = HashMap<String, String>;
+pub type Vars = HashMap<String, Value>;
 pub type Envs = HashMap<String, String>;
 
 /// Main taskfile structure representing the entire configuration
