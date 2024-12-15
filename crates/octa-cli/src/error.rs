@@ -8,6 +8,9 @@ pub type OctaResult<T> = Result<T, OctaError>;
 
 #[derive(Error, Debug)]
 pub enum OctaError {
+  #[error("Failed to execute task: {0}")]
+  Runtime(String),
+
   #[error("Failed to load .env file")]
   Dotenv(#[from] DotenvError),
 
@@ -15,7 +18,7 @@ pub enum OctaError {
   OctafileLoad(#[from] OctafileError),
 
   #[error(transparent)]
-  ExecuteGraphLoad(#[from] ExecutorError),
+  ExecutionError(#[from] ExecutorError),
 
   #[error("Failed to open fingerprint db")]
   OpenFingerprintDbError(#[from] sled::Error),
