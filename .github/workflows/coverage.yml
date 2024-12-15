@@ -19,5 +19,7 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           files: lcov.info
+          name: codecov-octa
           token: ${{ secrets.CODECOV }}
+          verbose: true
           fail_ci_if_error: true
