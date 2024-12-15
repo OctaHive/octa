@@ -608,13 +608,13 @@ impl TaskNode {
 
   #[cfg(windows)]
   fn terminate_windows_process(&self, child: &mut tokio::process::Child) {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
 
     if let Some(pid) = child.id() {
       unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if handle != 0 && handle as HANDLE != INVALID_HANDLE_VALUE {
+        if handle as HANDLE != INVALID_HANDLE_VALUE {
           let handle_ptr = handle as HANDLE;
           TerminateProcess(handle_ptr, 1);
           CloseHandle(handle_ptr);
