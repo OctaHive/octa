@@ -15,9 +15,8 @@ jobs:
     name: Build for ${{ matrix.platform.os_name }}
     runs-on: ${{ matrix.platform.os }}
     strategy:
-      fail-fast: false
       matrix:
-        include:
+        platform:
           - os_name: Linux-amd64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
