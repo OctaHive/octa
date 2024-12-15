@@ -5,6 +5,11 @@ functionality missing, so I decided to create my own builder.
 # Installation
 
 ## Homebrew
+If you have homebrew installed, you can install octa with:
+```console
+
+```
+
 ## Cargo
 ## Binary releases
 
