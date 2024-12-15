@@ -327,7 +327,7 @@ impl TaskNode {
     vars.interpolate().await?;
 
     if let Some(ref cache) = cache {
-      if let Some(cached) = self.check_cache(&vars, &cache).await? {
+      if let Some(cached) = self.check_cache(&vars, cache).await? {
         return Ok(cached);
       }
     }
@@ -349,7 +349,7 @@ impl TaskNode {
     })?;
 
     if let Some(ref cache) = cache {
-      self.update_cache(&result, vars, &cache).await?;
+      self.update_cache(&result, vars, cache).await?;
     }
 
     Ok(result)
@@ -372,7 +372,7 @@ impl TaskNode {
       let is_silent = self.silent;
       Some(tokio::spawn(async move {
         let mut captured = Vec::new();
-        while let Some(line) = lines.next_line().await.unwrap_or_else(|_| None) {
+        while let Some(line) = lines.next_line().await.unwrap_or(None) {
           if !line.is_empty() {
             captured.push(line.clone());
             if !is_silent {
@@ -393,7 +393,7 @@ impl TaskNode {
       let is_silent = self.silent;
       Some(tokio::spawn(async move {
         let mut captured = Vec::new();
-        while let Some(line) = lines.next_line().await.unwrap_or_else(|_| None) {
+        while let Some(line) = lines.next_line().await.unwrap_or(None) {
           if !line.is_empty() {
             captured.push(line.clone());
             if !is_silent {
@@ -456,7 +456,7 @@ impl TaskNode {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Force kill if still running
-    let _ = child.kill().await?;
+    child.kill().await?;
 
     // Create a new command to get the output
     let _output = child.wait().await?;

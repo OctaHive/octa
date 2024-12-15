@@ -27,9 +27,7 @@ impl TimestampSource {
         if let Ok(modified) = metadata.modified() {
           match modified.duration_since(UNIX_EPOCH) {
             Ok(duration) => Ok(duration.as_secs()),
-            Err(e) => {
-              return Err(ExecutorError::CalculateDurationError(e));
-            },
+            Err(e) => Err(ExecutorError::CalculateDurationError(e)),
           }
         } else {
           Ok(0)

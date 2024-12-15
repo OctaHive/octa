@@ -13,6 +13,12 @@ pub struct FindResult {
 
 pub struct OctaFinder {}
 
+impl Default for OctaFinder {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl OctaFinder {
   pub fn new() -> Self {
     Self {}
@@ -123,7 +129,7 @@ impl OctaFinder {
       let key = search_segments[1];
       if let Some(task) = octafile.tasks.get(key) {
         results.push(FindResult {
-          name: self.join_path(path, &key),
+          name: self.join_path(path, key),
           octafile: Arc::clone(&octafile),
           task: task.clone(),
         });
@@ -131,7 +137,7 @@ impl OctaFinder {
     } else {
       for (key, task) in octafile.tasks.iter() {
         results.push(FindResult {
-          name: self.join_path(path, &key),
+          name: self.join_path(path, key),
           octafile: Arc::clone(&octafile),
           task: task.clone(),
         });

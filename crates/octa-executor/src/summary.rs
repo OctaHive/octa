@@ -16,6 +16,12 @@ pub struct Summary {
   tasks: Mutex<Vec<TaskSummaryItem>>,
 }
 
+impl Default for Summary {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl Summary {
   pub fn new() -> Self {
     Self {
@@ -33,7 +39,7 @@ impl Summary {
     let tasks = self.tasks.lock().await;
     info!("================== Time Summary ==================");
     for item in tasks.iter() {
-      total = total + item.duration;
+      total += item.duration;
       let human = item.duration.human(Truncate::Millis);
       info!(" \"{}\": {}", item.name, human);
     }

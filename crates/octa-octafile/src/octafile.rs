@@ -88,7 +88,7 @@ impl Octafile {
     let path = match path {
       Some(path) => Octafile::find_octafile(Some(path)),
       None => {
-        if global == true {
+        if global {
           let home = dirs::home_dir();
 
           if let Some(home) = home {
@@ -185,15 +185,12 @@ impl Octafile {
 
     for (name, include) in includes {
       let path = match include {
-        IncludeInfo::Simple(path) => {
-          let path = match octafile.dir.join(path).canonicalize() {
-            Ok(path) => Octafile::find_octafile(Some(path.clone()))?
-              .ok_or(OctafileError::NotFoundError(path.display().to_string())),
-            Err(_) => Err(OctafileError::NotFoundError(path.clone())),
-          }?;
-
-          path
-        },
+        IncludeInfo::Simple(path) => match octafile.dir.join(path).canonicalize() {
+          Ok(path) => {
+            Octafile::find_octafile(Some(path.clone()))?.ok_or(OctafileError::NotFoundError(path.display().to_string()))
+          },
+          Err(_) => Err(OctafileError::NotFoundError(path.clone())),
+        }?,
         IncludeInfo::Complex(complex) => match octafile.dir.join(&complex.octafile).canonicalize() {
           Ok(path) => {
             Octafile::find_octafile(Some(path))?.ok_or(OctafileError::NotFoundError(complex.octafile.clone()))?

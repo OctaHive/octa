@@ -244,7 +244,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     results: Vec<Result<ExecutorResult<String>, tokio::task::JoinError>>,
   ) -> ExecutorResult<Vec<String>> {
     for result in results {
-      if let Err(e) = result.map_err(|e| ExecutorError::JoinError(e))? {
+      if let Err(e) = result.map_err(ExecutorError::JoinError)? {
         error!("Task failed during shutdown: {}", e);
       }
     }

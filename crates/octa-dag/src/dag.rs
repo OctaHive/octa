@@ -20,6 +20,12 @@ pub struct DAG<T: Eq + Hash + Identifiable> {
   edges: HashMap<String, HashSet<Arc<T>>>, // Adjacency list for dependencies
 }
 
+impl<T: Eq + Hash + Identifiable> Default for DAG<T> {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl<T: Eq + Hash + Identifiable> DAG<T> {
   /// Creates a new empty DAG
   pub fn new() -> Self {
@@ -66,7 +72,7 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
   /// Detects cycles in the graph
   pub fn has_cycle(&self) -> DAGResult<bool> {
     let mut in_degree = self.calculate_in_degrees();
-    Ok(self.perform_topological_sort(&mut in_degree)?)
+    self.perform_topological_sort(&mut in_degree)
   }
 
   /// Prints the graph structure for debugging

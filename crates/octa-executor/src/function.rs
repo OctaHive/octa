@@ -42,7 +42,7 @@ impl Function for ExecuteShell {
       cmd
         .current_dir(&current_dir)
         .arg("-c")
-        .arg(&command)
+        .arg(command)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
       cmd
@@ -52,7 +52,7 @@ impl Function for ExecuteShell {
       .output()
       .map_err(|e| tera::Error::msg(format!("Failed to execute command {} for arg: {}", sh, e)))?;
 
-    let res = Value::String(String::from_utf8_lossy(&output.stdout.trim_ascii()).to_string());
+    let res = Value::String(String::from_utf8_lossy(output.stdout.trim_ascii()).to_string());
 
     debug!("Command output result: {:?}", res);
 

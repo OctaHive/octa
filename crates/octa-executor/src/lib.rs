@@ -24,6 +24,8 @@ pub use task::TaskNode;
 use task::{CmdType, TaskConfig};
 use vars::Vars;
 
+type DagNode = DAG<TaskNode>;
+
 pub struct TaskGraphBuilder {
   finder: Arc<OctaFinder>, // Finder for search task in octafile
   dir: PathBuf,            // Current user directory
@@ -68,7 +70,7 @@ impl TaskGraphBuilder {
       self.add_command_to_dag(&mut dag, cmd, cancel_token.clone()).await?;
     }
 
-    self.validate_dag(&dag, &command)?;
+    self.validate_dag(&dag, command)?;
 
     Ok(dag)
   }
@@ -87,7 +89,7 @@ impl TaskGraphBuilder {
 
   fn process_hierarchy_vars(&self, cmd: &FindResult, vars: &mut Vars) {
     let full_path = cmd.octafile.hierarchy_path();
-    let mut current = Arc::clone(&cmd.octafile.root());
+    let mut current = Arc::clone(cmd.octafile.root());
 
     debug!(
       "Processing hierarchy variables for command {} in path {}",
@@ -173,7 +175,7 @@ impl TaskGraphBuilder {
     &'a self,
     cmd: &'a FindResult,
     cancel_token: CancellationToken,
-  ) -> Pin<Box<dyn Future<Output = ExecutorResult<Option<DAG<TaskNode>>>> + 'a>> {
+  ) -> Pin<Box<dyn Future<Output = ExecutorResult<Option<DagNode>>> + 'a>> {
     Box::pin(async move {
       match &cmd.task.cmds {
         Some(cmds) => self.build_nested_dag(cmd, cmds, cancel_token).await,
@@ -187,7 +189,7 @@ impl TaskGraphBuilder {
     cmd: &FindResult,
     cmds: &Vec<Cmds>,
     cancel_token: CancellationToken,
-  ) -> ExecutorResult<Option<DAG<TaskNode>>> {
+  ) -> ExecutorResult<Option<DagNode>> {
     let mut nest_dag = DAG::new();
     let mut prev_node = None;
     // Index we use for simple command for set different name
@@ -198,7 +200,7 @@ impl TaskGraphBuilder {
         Cmds::Simple(_s) => {
           self.handle_simple_command(&mut nest_dag, cmd, command, index, &mut prev_node)?;
 
-          index = index + 1;
+          index += 1;
         },
         Cmds::Complex(c) => {
           self
@@ -213,7 +215,7 @@ impl TaskGraphBuilder {
 
   fn handle_simple_command(
     &self,
-    dag: &mut DAG<TaskNode>,
+    dag: &mut DagNode,
     cmd: &FindResult,
     command: &Cmds,
     index: usize,
@@ -252,7 +254,7 @@ impl TaskGraphBuilder {
 
   async fn handle_complex_command(
     &self,
-    nest_dag: &mut DAG<TaskNode>,
+    nest_dag: &mut DagNode,
     cmd: &FindResult,
     complex: &octa_octafile::ComplexCmd,
     prev_node: &mut Option<Arc<TaskNode>>,
@@ -280,7 +282,7 @@ impl TaskGraphBuilder {
         self.validate_dag(nested_dag, &cmd.name)?;
       }
 
-      let mut vars = self.collect_vars(&cmd);
+      let mut vars = self.collect_vars(cmd);
       vars.extend_with(&complex.vars);
 
       let nested_task = Arc::new(self.create_task_from_command(&nested_cmd, nested_dag, Some(vars), None));
@@ -315,22 +317,19 @@ impl TaskGraphBuilder {
   fn create_task_from_command(
     &self,
     cmd: &FindResult,
-    dag: Option<DAG<TaskNode>>,
+    dag: Option<DagNode>,
     execute_vars: Option<Vars>,
     cmd_type: Option<CmdType>,
   ) -> TaskNode {
     let task = cmd.task.clone();
 
-    let mut vars = self.collect_vars(&cmd);
+    let mut vars = self.collect_vars(cmd);
     vars.extend_with(&execute_vars);
 
     // Get task directory with fallback to taskfile directory
     let work_dir = task.dir.unwrap_or(cmd.octafile.dir.clone());
 
-    let command = match task.cmd {
-      Some(cmd) => Some(cmd.to_string()),
-      None => None,
-    };
+    let command = task.cmd.map(|cmd| cmd.to_string());
 
     let task_config = TaskConfig::builder()
       .id(cmd.name.clone())
@@ -350,9 +349,10 @@ impl TaskGraphBuilder {
     TaskNode::new(task_config.build().unwrap())
   }
 
+  #[allow(clippy::too_many_arguments)]
   fn process_dependencies<'a>(
     &'a self,
-    dag: &'a mut DAG<TaskNode>,
+    dag: &'a mut DagNode,
     octafile: Arc<Octafile>,
     parent: Arc<TaskNode>,
     task: &'a Task,
@@ -460,7 +460,7 @@ impl TaskGraphBuilder {
 
   fn add_dependency<'a>(
     &'a self,
-    dag: &'a mut DAG<TaskNode>,
+    dag: &'a mut DagNode,
     dep_info: DependencyInfo,
     parent: &'a Arc<TaskNode>,
     cancel_token: CancellationToken,
@@ -497,7 +497,7 @@ impl TaskGraphBuilder {
     }
   }
 
-  fn validate_dag(&self, dag: &DAG<TaskNode>, command: &str) -> ExecutorResult<()> {
+  fn validate_dag(&self, dag: &DagNode, command: &str) -> ExecutorResult<()> {
     if dag.node_count() == 0 {
       return Err(ExecutorError::TaskNotFound(command.to_string()));
     }

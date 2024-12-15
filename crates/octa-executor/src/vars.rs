@@ -24,7 +24,7 @@ lazy_static! {
   };
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Vars {
   context: Context,          // Tera context for current variables
   parent: Option<Arc<Vars>>, // Link to parent variables
@@ -39,19 +39,13 @@ impl PartialEq for Vars {
 
 impl Eq for Vars {}
 
-impl Default for Vars {
-  fn default() -> Self {
+impl Vars {
+  pub fn new() -> Self {
     Self {
       context: Context::default(),
       parent: None,
       interpolated: false,
     }
-  }
-}
-
-impl Vars {
-  pub fn new() -> Self {
-    Vars::default()
   }
 
   pub fn with_parent(parent: Vars) -> Self {
@@ -100,7 +94,7 @@ impl Vars {
 
   pub fn extend_with<T: Serialize>(&mut self, value: &T) {
     if let Ok(context) = Context::from_serialize(value) {
-      self.extend(context.into());
+      self.extend(context);
       self.interpolated = false;
     }
   }
@@ -187,7 +181,7 @@ impl Vars {
       .clone()
       .into_json()
       .as_object()
-      .map(|map| map.iter().map(|(k, v)| (k.clone(), Value::from(v.clone()))).collect())
+      .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
       .unwrap_or_default()
   }
 }

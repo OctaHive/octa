@@ -141,9 +141,7 @@ pub async fn run() -> OctaResult<()> {
   if args.list_tasks {
     let finder = OctaFinder::new();
     let commands = finder.find_by_path(Arc::clone(&octafile), "**");
-    let filtered = commands
-      .into_iter()
-      .filter(|cmd| cmd.task.internal.unwrap_or(false) != true);
+    let filtered = commands.into_iter().filter(|cmd| !cmd.task.internal.unwrap_or(false));
     let found_commands: Vec<String> = filtered.map(|c| c.name.clone()).collect();
 
     for cmd in found_commands.into_iter().rev() {
@@ -161,7 +159,7 @@ pub async fn run() -> OctaResult<()> {
     return Ok(());
   }
 
-  if let None = args.commands {
+  if args.commands.is_none() {
     Cli::command().print_help().unwrap();
     println!();
 
