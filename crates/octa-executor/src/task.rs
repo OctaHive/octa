@@ -10,8 +10,6 @@ use std::{
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use sled::Db;
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 use tera::{Context, Tera};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::{select, sync::Mutex};
@@ -592,6 +590,8 @@ impl TaskNode {
   /// Platform-specific command setup for Windows
   #[cfg(windows)]
   fn setup_windows_command(&self, cmd: &str, dir: &PathBuf) -> tokio::process::Command {
+    use std::os::windows::process::CommandExt;
+
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -614,9 +614,10 @@ impl TaskNode {
     if let Some(pid) = child.id() {
       unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if handle != 0 {
-          TerminateProcess(handle as HANDLE, 1);
-          CloseHandle(handle as HANDLE);
+        if handle != 0 && handle as HANDLE != INVALID_HANDLE_VALUE {
+          let handle_ptr = handle as HANDLE;
+          TerminateProcess(handle_ptr, 1);
+          CloseHandle(handle_ptr);
         }
       }
     }
