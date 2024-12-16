@@ -49,5 +49,7 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
-      - name: Run cargo clippy
+      - name: Run cargo fmt
         run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy -- -D warnings

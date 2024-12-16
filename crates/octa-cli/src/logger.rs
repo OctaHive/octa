@@ -24,7 +24,7 @@ struct OctaFieldFormatter<'a> {
   level: &'a tracing::Level, // Example of custom context
 }
 
-impl<'a, 'writer> FormatFields<'writer> for OctaFieldFormatter<'a> {
+impl<'writer> FormatFields<'writer> for OctaFieldFormatter<'_> {
   fn format_fields<R: __tracing_subscriber_field_RecordFields>(
     &self,
     writer: Writer<'writer>,
@@ -52,7 +52,7 @@ impl<'a, 'writer> OctaFieldVisitor<'a, 'writer> {
   }
 }
 
-impl<'a, 'writer> tracing::field::Visit for OctaFieldVisitor<'a, 'writer> {
+impl tracing::field::Visit for OctaFieldVisitor<'_, '_> {
   fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
     if self.result.is_err() {
       return;
@@ -60,7 +60,7 @@ impl<'a, 'writer> tracing::field::Visit for OctaFieldVisitor<'a, 'writer> {
 
     if field.name() == "message" {
       // Use level context to determine message color
-      let style = match self.level.clone() {
+      let style = match *self.level {
         tracing::Level::ERROR => Style::new().fg(Color::Red),
         tracing::Level::WARN => Style::new().fg(Color::Yellow),
         tracing::Level::INFO => Style::new().fg(Color::Green),
@@ -74,14 +74,14 @@ impl<'a, 'writer> tracing::field::Visit for OctaFieldVisitor<'a, 'writer> {
     }
   }
 
-  fn record_str(&mut self, field: &tracing::field::Field, value: &str) -> () {
+  fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
     if self.result.is_err() {
       return;
     }
 
     if field.name() == "message" {
       // Use level context to determine message color
-      let style = match self.level.clone() {
+      let style = match *self.level {
         tracing::Level::ERROR => Style::new().fg(Color::Red),
         tracing::Level::WARN => Style::new().fg(Color::Yellow),
         tracing::Level::INFO => Style::new().fg(Color::White),
