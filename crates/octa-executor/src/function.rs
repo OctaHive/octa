@@ -5,6 +5,7 @@ use std::{
 };
 
 #[cfg(windows)]
+#[allow(unused_imports)]
 use std::os::windows::process::CommandExt;
 use tera::{Function, Result, Value};
 use tracing::{debug, info};
@@ -29,7 +30,7 @@ impl Function for ExecuteShell {
       let mut cmd = Command::new("cmd");
       cmd
         .current_dir(current_dir)
-        .args(["/C", &command])
+        .args(["/C", command])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
