@@ -599,6 +599,9 @@ impl TaskNode {
   /// Platform-specific command setup for Windows
   #[cfg(windows)]
   fn setup_windows_command(&self, cmd: &str, dir: &PathBuf) -> tokio::process::Command {
+    #[allow(unused_imports)]
+    use std::os::windows::process::CommandExt;
+
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
 

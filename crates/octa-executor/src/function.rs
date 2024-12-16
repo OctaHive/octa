@@ -4,6 +4,9 @@ use std::{
   process::{Command, Stdio},
 };
 
+#[cfg(windows)]
+#[allow(unused_imports)]
+use std::os::windows::process::CommandExt;
 use tera::{Function, Result, Value};
 use tracing::{debug, info};
 
