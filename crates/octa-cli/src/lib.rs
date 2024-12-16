@@ -20,6 +20,8 @@ mod error;
 
 struct ChronoLocal;
 
+const OCTA_DATA_DIR: &str = ".octa";
+
 impl FormatTime for ChronoLocal {
   fn format_time(&self, w: &mut fmt::format::Writer<'_>) -> std::fmt::Result {
     write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))
@@ -57,6 +59,9 @@ pub(crate) struct Cli {
 
   #[arg(short, long, default_value_t = false)]
   pub list_tasks: bool,
+
+  #[arg(short, long, default_value_t = false)]
+  pub dry: bool,
 
   #[arg(short, long, default_value_t = false)]
   pub global: bool,
@@ -154,7 +159,7 @@ pub async fn run() -> OctaResult<()> {
     return Ok(());
   }
 
-  let fingerprint = Arc::new(sled::open(".octa/fingerprint")?);
+  let fingerprint = Arc::new(sled::open(format!("{}/fingerprint", OCTA_DATA_DIR))?);
 
   if args.clean_cache {
     fingerprint.clear()?;

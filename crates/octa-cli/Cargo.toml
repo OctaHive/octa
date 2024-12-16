@@ -17,9 +17,7 @@ path = "src/main.rs"
 [dependencies]
 octa-finder = { version = "0.1.0", path = "../octa-finder" }
 octa-octafile = { version = "0.1.0", path = "../octa-octafile" }
-octa-dag = { version = "0.1.0", path = "../octa-dag" }
 octa-executor = { version = "0.1.0", path = "../octa-executor" }
-anyhow = { workspace = true }
 clap_complete = "4"
 clap = { version = "4.5", features = ["derive", "env"] }
 chrono = "0.4.39"
@@ -33,7 +31,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.8"
+tempfile = "3.14"
 pretty_assertions = "1.4"
 assert_cmd = "2.0.16"
 predicates = "3.1.2"

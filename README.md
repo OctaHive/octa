@@ -186,6 +186,10 @@ version: 1
 vars:
   STR: "Hello World"
   NUM: 1
+  FLOAT: 1.35
+  OBJ:
+    val: 1
+  ARR: ["A", "B", "C"]
   
 tasks:
   say_hi:
@@ -193,6 +197,12 @@ tasks:
     
   plus_one:
     cmd: echo {{ NUM + 1 }}
+    
+  print_obj:
+    cmd: echo {{ OBJ.val }}
+
+  print_arr:
+    cmd: echo {{ ARR[0] }}
 ```
 
 You can use different data types as values. The following data types are supported:

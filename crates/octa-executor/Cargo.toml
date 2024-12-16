@@ -17,7 +17,7 @@ octa-finder = { version = "0.1.0", path = "../octa-finder" }
 anyhow = { workspace = true }
 async-stream = "0.3"
 async-trait = { workspace = true }
-byteorder = "1.4"
+byteorder = "1.5"
 indexmap = "2.7.0"
 glob = "0.3.1"
 lazy_static = { workspace = true }
@@ -41,6 +41,5 @@ windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 nix = "0.26"
 
 [dev-dependencies]
-tempfile = "3.8"
-test-log = "0.2"
+tempfile = "3.14"
 tracing-test = "0.2"

@@ -87,6 +87,10 @@ impl TaskGraphBuilder {
     let root = cmd.octafile.root();
 
     vars.set_value(root.vars.clone());
+
+    if let Some(env) = cmd.octafile.env.as_ref() {
+      vars.extend_with(env);
+    }
     vars.insert("ROOT_DIR", &root.dir.display().to_string());
     vars.insert("TASKFILE_DIR", &root.dir.display().to_string());
     vars.insert("USER_WORKING_DIR", &self.dir.display().to_string());
