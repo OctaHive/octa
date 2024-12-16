@@ -201,6 +201,7 @@ mod tests {
       cmd: Some(format!("echo {}", name).into()),
       dir: None,
       vars: None,
+      desc: None,
       tpl: None,
       cmds: None,
       internal: Some(false),

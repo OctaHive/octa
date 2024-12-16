@@ -532,6 +532,7 @@ mod tests {
     Task {
       cmd: Some(Cmds::Simple("echo test".to_string())),
       cmds: None,
+      desc: None,
       deps: None,
       vars: None,
       dir: None,

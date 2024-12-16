@@ -100,6 +100,7 @@ impl From<String> for Deps {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Task {
   pub dir: Option<PathBuf>,                      // Working directory for the task
+  pub desc: Option<String>,                      // Task description
   pub vars: Option<HashMap<String, Value>>,      // Task-specific variables
   pub tpl: Option<String>,                       // Task template
   pub cmd: Option<Cmds>,                         // Command to execute
