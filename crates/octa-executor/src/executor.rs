@@ -51,6 +51,7 @@ struct ExecutionState<T: Hash + Identifiable + Eq + TaskItem> {
   summary: Arc<Summary>,                          // Summary of task execution
   cache: Arc<Mutex<IndexMap<String, CacheItem>>>, // Cache for tasks
   fingerprint: Arc<Db>,                           // Fingerprint db
+  dry: bool,                                      // Dry mode
 }
 
 /// Executor manages the execution of tasks in a directed acyclic graph (DAG)
@@ -67,6 +68,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     config: ExecutorConfig,
     cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
     fingerprint: Arc<Db>,
+    dry: bool,
     summary: Option<Arc<Summary>>,
   ) -> ExecutorResult<Self> {
     let in_degree = dag.nodes().iter().map(|n| (n.id().clone(), 0)).collect();
@@ -84,6 +86,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       active_tasks: Arc::new(AtomicUsize::new(0)),
       summary,
       cache,
+      dry,
       fingerprint,
     };
 
@@ -158,8 +161,8 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     select! {
         task = rx.recv() => task,
         _ = cancel_token.cancelled() => {
-            debug!("Execution cancelled, stop processing task");
-            None
+          debug!("Execution cancelled, stop processing task");
+          None
         }
         _ = self.finished.cancelled() => None
     }
@@ -180,6 +183,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       summary: self.state.summary.clone(),
       cache: self.state.cache.clone(),
       fingerprint: self.state.fingerprint.clone(),
+      dry: self.state.dry,
     };
 
     tokio::spawn(async move {
@@ -267,6 +271,7 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   summary: Arc<Summary>,
   cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
   fingerprint: Arc<Db>,
+  dry: bool,
 }
 
 struct TaskExecutor<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> {
@@ -297,6 +302,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
         self.context.cache.clone(),
         self.context.summary.clone(),
         self.context.fingerprint.clone(),
+        self.context.dry,
         self.cancel_token.clone(),
       )
       .await;

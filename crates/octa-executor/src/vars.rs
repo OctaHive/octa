@@ -4,25 +4,14 @@ use std::{
   sync::Arc,
 };
 
-use lazy_static::lazy_static;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tera::{Context, Tera, Value};
-use tokio::sync::RwLock;
 use tracing::debug;
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
-  function::ExecuteShell,
+  function::{ExecuteShell, ExecuteShellDry},
 };
-
-lazy_static! {
-  static ref TEMPLATE_ENGINE: RwLock<Tera> = {
-    let mut tera = Tera::default();
-    tera.register_function("shell", ExecuteShell);
-
-    RwLock::new(tera)
-  };
-}
 
 #[derive(Clone, Debug, Default)]
 pub struct Vars {
@@ -104,13 +93,20 @@ impl Vars {
     VarsIter::new(map)
   }
 
-  pub async fn interpolate(&mut self) -> ExecutorResult<()> {
+  pub async fn interpolate(&mut self, dry: bool) -> ExecutorResult<()> {
+    let mut tera = Tera::default();
+    if dry {
+      tera.register_function("shell", ExecuteShellDry);
+    } else {
+      tera.register_function("shell", ExecuteShell);
+    }
+
     if self.interpolated {
       return Ok(());
     }
 
     let contexts = self.collect_context_chain();
-    let processed_context = self.process_context_chain(contexts).await?;
+    let processed_context = self.process_context_chain(contexts, &mut tera).await?;
     self.context = processed_context;
     self.interpolated = true;
 
@@ -129,18 +125,23 @@ impl Vars {
     contexts.into_iter().rev().collect()
   }
 
-  async fn process_context_chain(&self, contexts: Vec<Context>) -> ExecutorResult<Context> {
+  async fn process_context_chain(&self, contexts: Vec<Context>, tera: &mut Tera) -> ExecutorResult<Context> {
     let mut accumulated = Context::new();
 
     for context in contexts {
-      let processed = self.process_single_context(context, &accumulated).await?;
+      let processed = self.process_single_context(context, &accumulated, tera).await?;
       accumulated.extend(processed);
     }
 
     Ok(accumulated)
   }
 
-  async fn process_single_context(&self, context: Context, parent: &Context) -> ExecutorResult<Context> {
+  async fn process_single_context(
+    &self,
+    context: Context,
+    parent: &Context,
+    tera: &mut Tera,
+  ) -> ExecutorResult<Context> {
     let mut processed = Context::new();
     let vars = Vars {
       context,
@@ -149,14 +150,20 @@ impl Vars {
     };
 
     for (key, value) in vars.iter() {
-      let processed_value = self.process_template_value(&key, &value, parent).await?;
+      let processed_value = self.process_template_value(&key, &value, parent, tera).await?;
       processed.insert(&key, &processed_value);
     }
 
     Ok(processed)
   }
 
-  async fn process_template_value(&self, key: &str, value: &Value, context: &Context) -> ExecutorResult<Value> {
+  async fn process_template_value(
+    &self,
+    key: &str,
+    value: &Value,
+    context: &Context,
+    tera: &mut Tera,
+  ) -> ExecutorResult<Value> {
     let val = value.to_string().trim().to_owned();
 
     if !self.is_template(&val) {
@@ -164,8 +171,7 @@ impl Vars {
     }
 
     debug!("Processing template variable '{}' with value: '{}'", key, val);
-    let mut template = TEMPLATE_ENGINE.write().await;
-    let res = template
+    let res = tera
       .render_str(&val, context)
       .map_err(|e| ExecutorError::VariableInterpolateError(val, e.to_string()))?;
     let res = res.trim_matches('"').to_owned(); // remove extra quotes in value

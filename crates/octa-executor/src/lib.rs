@@ -620,7 +620,7 @@ mod tests {
     let mut vars = Vars::new();
     builder.process_hierarchy_vars(&cmd, &mut vars);
 
-    vars.interpolate().await?;
+    vars.interpolate(false).await?;
 
     // Updated assertions for Tera values
     assert_eq!(vars.get("NESTED_VAR").and_then(|v| v.as_str()), Some("nested_value"));

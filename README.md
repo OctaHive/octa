@@ -212,3 +212,8 @@ You can use different data types as values. The following data types are support
 * float
 * array
 * object
+
+# Dry mode
+Sometimes you may want to check how your task works without executing any commands. For 
+this purpose, you can run the task in dry mode using the `--dry` flag. In dry mode, Octa 
+will only print the commands that would be run, without actually executing them.

@@ -37,6 +37,7 @@ pub trait Executable<T> {
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     summary: Arc<Summary>,
     fingerprint: Arc<Db>,
+    dry: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String>;
   async fn set_result(&self, task_name: String, res: String);
@@ -300,11 +301,17 @@ impl TaskNode {
   }
 
   /// Executes a shell command and returns its output
-  async fn execute_command(&self, cmd: &str, cancel_token: CancellationToken) -> ExecutorResult<String> {
-    let rendered_cmd = self.render_template(cmd, None).await?;
+  async fn execute_command(&self, cmd: &str, dry: bool, cancel_token: CancellationToken) -> ExecutorResult<String> {
+    let rendered_cmd = self.render_template(cmd, None, dry).await?;
     debug!("Execute command: {}", rendered_cmd);
 
-    let dir = self.interpolate_dir(self.dir.clone()).await?;
+    if dry {
+      info!("Execute command in dry mode: {}", rendered_cmd);
+
+      return Ok("".to_owned());
+    }
+
+    let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
 
     // Platform specific command setup
     #[cfg(windows)]
@@ -321,10 +328,11 @@ impl TaskNode {
     &self,
     template: &str,
     cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
+    dry: bool,
   ) -> ExecutorResult<String> {
     // Interpolate vars
     let mut vars = self.vars.clone();
-    vars.interpolate().await?;
+    vars.interpolate(dry).await?;
 
     if let Some(ref cache) = cache {
       if let Some(cached) = self.check_cache(&vars, cache).await? {
@@ -464,7 +472,7 @@ impl TaskNode {
     Err(ExecutorError::TaskCancelled(self.name.clone()))
   }
 
-  async fn interpolate_dir(&self, dir: PathBuf) -> ExecutorResult<PathBuf> {
+  async fn interpolate_dir(&self, dir: PathBuf, dry: bool) -> ExecutorResult<PathBuf> {
     let dir_str = dir.to_string_lossy();
 
     if !dir_str.contains("{{") || !dir_str.contains("}}") {
@@ -476,7 +484,7 @@ impl TaskNode {
 
       let mut tera = Tera::default();
       let mut vars = self.vars.clone();
-      vars.interpolate().await?;
+      vars.interpolate(dry).await?;
 
       let context: Context = vars.into();
 
@@ -494,16 +502,17 @@ impl TaskNode {
     &self,
     cmd: String,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
+    dry: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
     let mut vars = self.vars.clone();
-    vars.interpolate().await?;
+    vars.interpolate(dry).await?;
 
     if let Some(cached) = self.check_cache(&vars, &cache).await? {
       return Ok(cached);
     }
 
-    match self.execute_command(&cmd, cancel_token).await {
+    match self.execute_command(&cmd, dry, cancel_token).await {
       Ok(result) => {
         self.update_cache(&result, vars, &cache).await?;
         debug!("Completed task {}", self.name);
@@ -664,9 +673,17 @@ impl TaskNode {
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     summary: Arc<Summary>,
     fingerprint: Arc<Db>,
+    dry: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
-    let executor = Executor::new(dag, ExecutorConfig::default(), Some(cache), fingerprint, Some(summary))?;
+    let executor = Executor::new(
+      dag,
+      ExecutorConfig::default(),
+      Some(cache),
+      fingerprint,
+      dry,
+      Some(summary),
+    )?;
 
     let results = executor.execute(cancel_token.clone(), &self.name).await?;
     Ok(results.join("\n"))
@@ -698,6 +715,7 @@ impl Executable<TaskNode> for TaskNode {
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     summary: Arc<Summary>,
     fingerprint: Arc<Db>,
+    dry: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
     if !self.check_sources(fingerprint.clone()).await? {
@@ -713,7 +731,7 @@ impl Executable<TaskNode> for TaskNode {
 
     if let Some(dag) = self.dag.clone() {
       return self
-        .execute_nested_dag(dag, cache, summary, fingerprint, cancel_token.clone())
+        .execute_nested_dag(dag, cache, summary, fingerprint, dry, cancel_token.clone())
         .await;
     }
 
@@ -722,9 +740,9 @@ impl Executable<TaskNode> for TaskNode {
       (Some(_), Some(_)) => {
         unreachable!("Both cmd and tpl cannot be Some - should be validated during octafile loading")
       },
-      (Some(cmd), None) => self.execute_cmd(cmd.clone(), cache, cancel_token.clone()).await,
+      (Some(cmd), None) => self.execute_cmd(cmd.clone(), cache, dry, cancel_token.clone()).await,
       (None, Some(tpl)) => {
-        let rendered_cmd = self.render_template(tpl, Some(cache)).await?;
+        let rendered_cmd = self.render_template(tpl, Some(cache), dry).await?;
 
         Ok(rendered_cmd)
       },
@@ -787,7 +805,7 @@ mod tests {
     let fingerprint = Arc::new(db);
 
     let result = task
-      .execute(cache, summary, fingerprint, CancellationToken::new())
+      .execute(cache, summary, fingerprint, false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result.trim(), "hello world");
@@ -819,7 +837,7 @@ mod tests {
     let summary = Arc::new(Summary::new());
 
     let result = task
-      .execute(cache, summary, fingerprint, CancellationToken::new())
+      .execute(cache, summary, fingerprint, false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result, "Hello world!");
@@ -843,6 +861,7 @@ mod tests {
         cache.clone(),
         summary.clone(),
         fingerprint.clone(),
+        false,
         CancellationToken::new(),
       )
       .await
@@ -851,7 +870,13 @@ mod tests {
 
     // Second execution should return cached result
     let result2 = task
-      .execute(cache.clone(), summary, fingerprint.clone(), CancellationToken::new())
+      .execute(
+        cache.clone(),
+        summary,
+        fingerprint.clone(),
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result1, result2);
@@ -893,6 +918,7 @@ mod tests {
         cache.clone(),
         summary.clone(),
         fingerprint.clone(),
+        false,
         CancellationToken::new(),
       )
       .await
@@ -903,7 +929,13 @@ mod tests {
 
     // Second execution should run again due to source changes
     let result2 = task
-      .execute(cache.clone(), summary, fingerprint.clone(), CancellationToken::new())
+      .execute(
+        cache.clone(),
+        summary,
+        fingerprint.clone(),
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result1, result2);
@@ -923,7 +955,7 @@ mod tests {
     let summary = Arc::new(Summary::new());
 
     let result = task
-      .execute(cache, summary, fingerprint, CancellationToken::new())
+      .execute(cache, summary, fingerprint, false, CancellationToken::new())
       .await;
     assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
   }
@@ -960,7 +992,7 @@ mod tests {
       }
     });
 
-    let result = task.execute(cache, summary, fingerprint, cancel_token).await;
+    let result = task.execute(cache, summary, fingerprint, false, cancel_token).await;
     assert!(matches!(result, Err(ExecutorError::TaskCancelled(_))));
 
     cancel_handle.await.unwrap();
@@ -990,7 +1022,7 @@ mod tests {
     let summary = Arc::new(Summary::new());
 
     let result = task
-      .execute(cache, summary, fingerprint, CancellationToken::new())
+      .execute(cache, summary, fingerprint, false, CancellationToken::new())
       .await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), "");
@@ -1017,7 +1049,7 @@ mod tests {
     let summary = Arc::new(Summary::new());
 
     let result = task
-      .execute(cache, summary, fingerprint, CancellationToken::new())
+      .execute(cache, summary, fingerprint, false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result, "Result: dep_output");
@@ -1050,7 +1082,7 @@ mod tests {
     let summary = Arc::new(Summary::new());
 
     let result = parent_task
-      .execute(cache, summary, fingerprint, CancellationToken::new())
+      .execute(cache, summary, fingerprint, false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result.trim(), "nested");

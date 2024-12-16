@@ -1,12 +1,12 @@
 use std::{path::PathBuf, sync::Arc};
 
-use chrono::Local;
 use clap::{CommandFactory, Parser};
+use logger::{ChronoLocal, OctaFormatter};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{
-  fmt::{self, format::FmtSpan, time::FormatTime, FormatFields},
+  fmt::{self, format::FmtSpan},
   prelude::*,
   EnvFilter,
 };
@@ -17,31 +17,9 @@ use octa_finder::OctaFinder;
 use octa_octafile::Octafile;
 
 mod error;
-
-struct ChronoLocal;
+mod logger;
 
 const OCTA_DATA_DIR: &str = ".octa";
-
-impl FormatTime for ChronoLocal {
-  fn format_time(&self, w: &mut fmt::format::Writer<'_>) -> std::fmt::Result {
-    write!(w, "{}", Local::now().format("%Y-%m-%d %H:%M:%S"))
-  }
-}
-
-// Custom formatter for adding [octa] prefix
-struct OctaFormatter;
-
-impl<'a> FormatFields<'a> for OctaFormatter {
-  fn format_fields<R: __tracing_subscriber_field_RecordFields>(
-    &self,
-    writer: fmt::format::Writer<'a>,
-    fields: R,
-  ) -> std::fmt::Result {
-    let mut writer = writer;
-    write!(writer, "[octa] ")?;
-    fmt::format::DefaultFields::new().format_fields(writer, fields)
-  }
-}
 
 #[derive(Parser)]
 #[clap(author, version, about, bin_name("octa"), name("octa"), propagate_version(true))]
@@ -99,19 +77,21 @@ pub async fn run() -> OctaResult<()> {
   // Create formatting layer
   let fmt_layer = fmt::layer()
     .compact()
-    .with_level(false)
-    .with_target(false)
     .with_timer(ChronoLocal)
     .with_file(false)
     .with_line_number(false)
     .with_span_events(FmtSpan::CLOSE)
-    .fmt_fields(OctaFormatter);
+    .event_format(OctaFormatter);
 
   // Combine layers and set as global default
   tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
 
   // Load octafile
   let octafile = Octafile::load(args.config, args.global)?;
+
+  if args.dry {
+    warn!("Octa run in dry mode");
+  }
 
   let cancel_token = CancellationToken::new();
   // Start task for catching interrupt
@@ -193,6 +173,7 @@ pub async fn run() -> OctaResult<()> {
       ExecutorConfig { silent: false },
       None,
       Arc::clone(&fingerprint),
+      args.dry,
       Some(summary.clone()),
     )?;
     tasks.push(ExecuteItem {

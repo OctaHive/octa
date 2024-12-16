@@ -7,7 +7,7 @@ use std::{
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use tera::{Function, Result, Value};
-use tracing::debug;
+use tracing::{debug, info};
 
 pub struct ExecuteShell;
 
@@ -57,5 +57,21 @@ impl Function for ExecuteShell {
     debug!("Command output result: {:?}", res);
 
     Ok(res)
+  }
+}
+
+pub struct ExecuteShellDry;
+
+impl Function for ExecuteShellDry {
+  fn call(&self, args: &HashMap<String, Value>) -> Result<Value> {
+    let sh = args
+      .get("command")
+      .ok_or_else(|| tera::Error::msg("Missing 'command' argument"))?;
+    let current_dir = env::current_dir().map_err(|_| tera::Error::msg("Can;t get current directory"))?;
+    let command = sh.as_str().ok_or_else(|| tera::Error::msg("Wrong command format"))?;
+
+    info!("Execute command in directory {}: {}", current_dir.display(), command);
+
+    Ok(Value::Null)
   }
 }
