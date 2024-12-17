@@ -253,8 +253,6 @@ tasks:
 ```
 
 ### Task template
-Here’s the translation of the text to English:
-
 Sometimes you need to simply template text and return the result to a task that depends on the 
 current one. To do this, you can specify a `tpl` for the task, and when the task is executed, 
 the result will be templated using the specified variables and returned as the result of the task. 
@@ -322,7 +320,7 @@ you need to call the same command with slight parameter variations. To achieve t
 it from appearing in the list of available tasks when using the `--list-tasks` command.
 
 # Task directory
-By default, tasks are executed in the directory where the Taskfile is located. However, you can easily 
+By default, tasks are executed in the directory where the Octafile is located. However, you can easily 
 change the working directory for a task by specifying the `dir` parameter.
 
 ```yaml
