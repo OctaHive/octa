@@ -1,0 +1,26 @@
+version: 1
+
+tasks:
+  docker-compose-service:
+    vars:
+      SERVICE: service
+      PROJECT: octa
+      DOCKER_REPO: docker.octa.com
+      VERSION: 1.0.0
+    tpl: >-
+      {{ PROJECT }}-{{ SERVICE }}:
+        image: {{ DOCKER_REPO }}/{{ SERVICE }}:{{ VERSION }}
+        restart: "always"
+        network_mode: "host"
+        logging:
+          driver: json-file
+          options:
+            max-size: "10m"
+            max-file: "10"
+        environment:
+          - LOG_LEVEL=Debug
+
+  docker-compose:
+    cmd: echo "{{ deps_result['docker-compose-service'] }}"
+    deps:
+      - docker-compose-service

@@ -19,8 +19,6 @@ If you have homebrew installed, you can install octa with:
 Binaries are also available for Windows, Linux and macOS under [releases](https://github.com/OctaHive/octa/releases). To install, download the binary for 
 your system and add to your `$PATH`.
 
-# JSON scheme
-
 # Getting started
 Create a file called `Octafile.yml` in the root of your project and add your tasks to tasks section. In `cmds` section of task you should 
 provide a set of commands for your task. Here the simple example of Octafile for building go service and docker image for service.
@@ -219,9 +217,21 @@ this purpose, you can run the task in dry mode using the `--dry` flag. In dry mo
 will only print the commands that would be run, without actually executing them.
 
 # Tasks
-The tasks property in Octafile is used to define the tasks in the file. The value of the 
-property is a map of key-value pairs, where the key is the name of the task, and the value 
-is the task definition.
+Here’s a revised version of the text:
+
+The tasks property in the Octafile is used to define the tasks within the file. Its value 
+is a map of key-value pairs, where the key represents the task name, and the value is either
+the task definition or a task command for simple mode usage.
+
+```yaml
+version: 1
+
+task:
+  simple: echo Simple Task
+  
+  complex:
+    cmd: echo Complex task
+```
 
 ## Task command
 Each task can have commands that will be executed in the command line (defaults to cmd in 
@@ -243,6 +253,41 @@ tasks:
 ```
 
 ### Task template
+Here’s the translation of the text to English:
+
+Sometimes you need to simply template text and return the result to a task that depends on the 
+current one. To do this, you can specify a `tpl` for the task, and when the task is executed, 
+the result will be templated using the specified variables and returned as the result of the task. 
+This allows you to generate configurations, such as generating a docker-compose file for your project.
+
+```yaml
+version: 1
+
+tasks:
+  docker-compose-service:
+    vars:
+      SERVICE: service
+      PROJECT: octa
+      DOCKER_REPO: docker.octa.com
+      VERSION: 1.0.0
+    tpl: >-
+      {{ PROJECT }}-{{ SERVICE }}:
+        image: {{ DOCKER_REPO }}/{{ SERVICE }}:{{ VERSION }}
+        restart: "always"
+        network_mode: "host"
+        logging:
+          driver: json-file
+          options:
+            max-size: "10m"
+            max-file: "10"
+        environment:
+          - LOG_LEVEL=Debug
+
+  docker-compose:
+    cmd: echo "{{ deps_result['docker-compose-service'] }}"
+    deps:
+      - docker-compose-service
+```
 
 ### Internal task
 By default, all tasks defined in the file are available for execution via the command-line utility. 
