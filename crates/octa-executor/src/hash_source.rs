@@ -75,3 +75,122 @@ impl SourceStrategy for HashSource {
     Ok(has_changes)
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tempfile::{NamedTempFile, TempDir};
+
+  #[tokio::test]
+  async fn test_glob_error() {
+    let db = sled::Config::new()
+      .temporary(true)
+      .open()
+      .expect("Failed to open in-memory Sled database");
+
+    let hash_source = HashSource::new(Arc::new(db));
+
+    assert!(!hash_source
+      .is_changed(vec!["SOME_MISSING_FILE".to_owned()])
+      .await
+      .is_err());
+  }
+
+  #[tokio::test]
+  async fn test_calculate_file_hash() {
+    let db = Arc::new(
+      sled::Config::new()
+        .temporary(true)
+        .open()
+        .expect("Failed to open in-memory Sled database"),
+    );
+
+    let temp_file = NamedTempFile::new().unwrap();
+    let hash_source = HashSource::new(Arc::clone(&db));
+
+    // First, make sure the file doesn't exist before checking the hash
+    assert!(hash_source
+      .calculate_file_hash(temp_file.path().to_path_buf())
+      .await
+      .is_ok());
+
+    let old_hash = hash_source
+      .calculate_file_hash(temp_file.path().to_path_buf())
+      .await
+      .unwrap();
+
+    std::fs::write(&temp_file, "test content").unwrap();
+
+    assert!(hash_source
+      .calculate_file_hash(temp_file.path().to_path_buf())
+      .await
+      .is_ok());
+
+    let new_hash = hash_source
+      .calculate_file_hash(temp_file.path().to_path_buf())
+      .await
+      .unwrap();
+
+    assert!(old_hash != new_hash);
+  }
+
+  #[tokio::test]
+  async fn test_changed_no_changes() {
+    let db = Arc::new(
+      sled::Config::new()
+        .temporary(true)
+        .open()
+        .expect("Failed to open in-memory Sled database"),
+    );
+
+    let temp_dir = TempDir::new().unwrap();
+    let temp_file_path = temp_dir.path().join("test_file");
+    let timestamp_source = HashSource::new(db);
+
+    std::fs::write(&temp_file_path, "initial content").unwrap();
+
+    assert!(timestamp_source
+      .is_changed(vec![temp_file_path.display().to_string()])
+      .await
+      .is_ok());
+  }
+
+  #[tokio::test]
+  async fn test_changed_file_changes() {
+    let db = Arc::new(
+      sled::Config::new()
+        .temporary(true)
+        .open()
+        .expect("Failed to open in-memory Sled database"),
+    );
+
+    let temp_dir = TempDir::new().unwrap();
+    let temp_file_path = temp_dir.path().join("test_file");
+    let timestamp_source = HashSource::new(db);
+
+    std::fs::write(&temp_file_path, "initial content").unwrap();
+
+    let is_changed = timestamp_source
+      .is_changed(vec![temp_file_path.display().to_string()])
+      .await
+      .unwrap();
+
+    assert!(is_changed);
+
+    let is_changed = timestamp_source
+      .is_changed(vec![temp_file_path.display().to_string()])
+      .await
+      .unwrap();
+
+    assert!(is_changed == false);
+
+    // Modify the test file and check if it is detected as a change
+    std::fs::write(&temp_file_path, "modified content").unwrap();
+
+    let is_changed = timestamp_source
+      .is_changed(vec![temp_file_path.display().to_string()])
+      .await
+      .unwrap();
+    assert!(is_changed);
+  }
+}

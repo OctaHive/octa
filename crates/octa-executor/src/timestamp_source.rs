@@ -78,7 +78,6 @@ mod tests {
   use super::*;
   use std::time::SystemTime;
   use tempfile::{NamedTempFile, TempDir};
-  use tokio::fs::create_dir_all;
 
   #[tokio::test]
   async fn test_glob_error() {
@@ -145,7 +144,7 @@ mod tests {
     let temp_file_path = temp_dir.path().join("test_file");
     let timestamp_source = TimestampSource::new(db);
 
-    create_dir_all(temp_file_path.clone()).await.unwrap();
+    std::fs::write(&temp_file_path, "initial content").unwrap();
 
     assert!(timestamp_source
       .is_changed(vec![temp_file_path.display().to_string()])

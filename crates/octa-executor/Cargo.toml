@@ -19,6 +19,7 @@ async-stream = "0.3"
 async-trait = { workspace = true }
 byteorder = "1.5"
 indexmap = "2.7.0"
+lazy_static = { workspace = true }
 glob = "0.3.1"
 humanize-duration = "0.0.6"
 futures = "0.3.31"
@@ -35,6 +36,7 @@ tokio-stream = "0.1"
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+regex = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 [target.'cfg(unix)'.dependencies]

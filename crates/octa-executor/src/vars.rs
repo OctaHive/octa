@@ -4,6 +4,8 @@ use std::{
   sync::Arc,
 };
 
+use lazy_static::lazy_static;
+use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tera::{Context, Tera, Value};
 use tracing::debug;
@@ -12,6 +14,10 @@ use crate::{
   error::{ExecutorError, ExecutorResult},
   function::{ExecuteShell, ExecuteShellDry},
 };
+
+lazy_static! {
+  static ref TEMPLATE_REGEX: Regex = Regex::new(r"\{\{\s*[^{}]+\s*\}\}").unwrap();
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Vars {
@@ -185,7 +191,7 @@ impl Vars {
   }
 
   fn is_template(&self, value: &str) -> bool {
-    value.starts_with("\"{{") && value.ends_with("}}\"")
+    TEMPLATE_REGEX.is_match(value)
   }
 
   fn to_hashmap(&self) -> HashMap<String, Value> {
@@ -206,7 +212,7 @@ impl Display for Vars {
       if i > 0 {
         writeln!(f, ",")?;
       }
-      write!(f, "  \"{}\": \"{}\"", key, value)?;
+      write!(f, "  \"{}\": {}", key, value)?;
     }
     writeln!(f, "\n]")
   }
@@ -270,5 +276,171 @@ impl Iterator for VarsIter {
       self.position += 1;
       (key.clone(), self.map.get(key).unwrap().clone())
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use serde_json::json;
+
+  #[test]
+  fn test_new_vars() {
+    let vars = Vars::new();
+    assert!(vars.parent.is_none());
+    assert!(!vars.expanded);
+    assert_eq!(vars.context, Context::new());
+  }
+
+  #[test]
+  fn test_with_parent() {
+    let parent = Vars::new();
+    let vars = Vars::with_parent(parent);
+    assert!(vars.parent.is_some());
+    assert!(!vars.expanded);
+  }
+
+  #[test]
+  fn test_with_value() {
+    let value = json!({
+      "key": "value",
+      "number": 42
+    });
+    let vars = Vars::with_value(&value);
+
+    assert_eq!(vars.get("key").unwrap(), &Value::String("value".to_string()));
+    assert_eq!(vars.get("number").unwrap(), &Value::Number(42.into()));
+  }
+
+  #[test]
+  fn test_with_value_and_parent() {
+    let parent = Vars::with_value(&json!({"parent_key": "parent_value"}));
+    let vars = Vars::with_value_and_parent(&json!({"child_key": "child_value"}), parent);
+
+    assert!(vars.parent.is_some());
+    assert_eq!(
+      vars.get("child_key").unwrap(),
+      &Value::String("child_value".to_string())
+    );
+  }
+
+  #[test]
+  fn test_insert() {
+    let mut vars = Vars::new();
+    vars.insert("key", &"value");
+    assert_eq!(vars.get("key").unwrap(), &Value::String("value".to_string()));
+  }
+
+  #[test]
+  fn test_extend() {
+    let mut vars = Vars::new();
+    let mut context = Context::new();
+    context.insert("key", &"value");
+    vars.extend(context);
+
+    assert_eq!(vars.get("key").unwrap(), &Value::String("value".to_string()));
+  }
+
+  #[test]
+  fn test_extend_with() {
+    let mut vars = Vars::new();
+    let value = json!({
+      "key": "value"
+    });
+    vars.extend_with(&value);
+
+    assert_eq!(vars.get("key").unwrap(), &Value::String("value".to_string()));
+  }
+
+  #[test]
+  fn test_vars_iterator() {
+    let vars = Vars::with_value(&json!({
+      "key1": "value1",
+      "key2": "value2"
+    }));
+
+    let items: Vec<_> = vars.iter().collect();
+    assert_eq!(items.len(), 2);
+    assert!(items
+      .iter()
+      .any(|(k, v)| k == "key1" && v == &Value::String("value1".to_string())));
+    assert!(items
+      .iter()
+      .any(|(k, v)| k == "key2" && v == &Value::String("value2".to_string())));
+  }
+
+  #[test]
+  fn test_serialize_deserialize() {
+    let original = Vars::with_value(&json!({
+      "key": "value",
+      "number": 42
+    }));
+
+    let serialized = serde_json::to_string(&original).unwrap();
+    let deserialized: Vars = serde_json::from_str(&serialized).unwrap();
+
+    assert_eq!(original, deserialized);
+  }
+
+  #[test]
+  fn test_display() {
+    let vars = Vars::with_value(&json!({
+      "key": "value",
+      "number": 42
+    }));
+
+    let display = format!("{}", vars);
+    println!("{}", display);
+
+    assert!(display.contains("\"key\": \"value\""));
+    assert!(display.contains("\"number\": 42"));
+  }
+
+  #[test]
+  fn test_is_template() {
+    let vars = Vars::new();
+    assert!(vars.is_template("\"{{ template }}\""));
+    assert!(!vars.is_template("normal string"));
+    assert!(vars.is_template("{{incomplete}}"));
+  }
+
+  #[test]
+  fn test_context_conversion() {
+    let mut context = Context::new();
+    context.insert("key", &"value");
+
+    // Test From<Context> for Vars
+    let vars: Vars = context.clone().into();
+    assert_eq!(vars.get("key").unwrap(), &Value::String("value".to_string()));
+
+    // Test From<Vars> for Context
+    let context_back: Context = vars.into();
+    assert_eq!(context_back.get("key").unwrap(), &Value::String("value".to_string()));
+  }
+
+  #[tokio::test]
+  async fn test_expand_simple() {
+    let mut vars = Vars::with_value(&json!({
+      "name": "{{ 'John' }}",
+    }));
+
+    vars.expand(true).await.unwrap();
+    assert_eq!(vars.get("name").unwrap(), &Value::String("John".to_string()));
+  }
+
+  #[tokio::test]
+  async fn test_expand_with_parent() {
+    let parent = Vars::with_value(&json!({
+      "first": "John"
+    }));
+    let mut vars = Vars::with_value_and_parent(
+      &json!({
+        "full": "{{ first }} Doe"
+      }),
+      parent,
+    );
+
+    vars.expand(true).await.unwrap();
+    assert_eq!(vars.get("full").unwrap(), &Value::String("John Doe".to_string()));
   }
 }

@@ -7,9 +7,9 @@ This project was inspired by the go-task build project. However, when we rewriti
 functionality missing, so I decided to create my own builder. 
 
 # The differences from go-task
-* Support run nested tasks using wildcards
-* Support return task result, this usefull for example when you need process task result in parent task
-* Support rendering templates as a task result
+* Support run nested tasks using wildcards, for example `*:docker` run all nested docker tasks
+* Support returning task results. This is useful, for example, when you need to process the result of a task in its parent task.
+* Support rendering templates and return as a task result
 
 # Installation
 
@@ -25,7 +25,7 @@ Binaries are also available for Windows, Linux and macOS under [releases](https:
 your system and add to your `$PATH`.
 
 # Getting started
-Create a file called `Octafile.yml` in the root of your project and add your tasks to tasks section. In `cmds` section of task you should 
+Create a file called `Octafile.yml` in the root of your project and add your tasks to `tasks` section. In `cmds` attribute of task you need 
 provide a set of commands for your task. Here the simple example of Octafile for building go service and docker image for service.
 
 ```yaml
@@ -60,7 +60,7 @@ be executed sequentially.
 
 # Task files
 The tasks are defined using the YAML format. So to start create your build tasks you need create task config file. 
-The system currently supports configuration files in the following formats:
+The system currently supports configuration files in the following name variants:
 
 - Octafile.yml
 - octafile.yml
