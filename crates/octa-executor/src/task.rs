@@ -1,5 +1,7 @@
 use std::{
+  borrow::Cow,
   collections::HashMap,
+  env,
   hash::{Hash, Hasher},
   path::PathBuf,
   process::Stdio,
@@ -20,6 +22,7 @@ use octa_dag::{Identifiable, DAG};
 use octa_octafile::{AllowedRun, SourceStrategies};
 
 use crate::{
+  envs::Envs,
   error::{ExecutorError, ExecutorResult},
   executor::ExecutorConfig,
   hash_source::HashSource,
@@ -119,6 +122,7 @@ pub struct TaskConfig {
   // Runtime behavior
   pub run_mode: RunMode,             // Run mode
   pub vars: Vars,                    // Task variables
+  pub envs: Envs,                    // Task environments
   pub sources: Option<Vec<String>>,  // Sources for fingerprinting
   pub source_strategy: SourceMethod, // Source validation strategy
 
@@ -146,6 +150,7 @@ pub struct TaskConfigBuilder {
 
   pub run_mode: Option<RunMode>,
   pub vars: Option<Vars>,
+  pub envs: Option<Envs>,
   pub sources: Option<Vec<String>>,
   pub source_strategy: Option<SourceMethod>,
 
@@ -181,6 +186,11 @@ impl TaskConfigBuilder {
 
   pub fn vars(mut self, vars: Vars) -> Self {
     self.vars = Some(vars);
+    self
+  }
+
+  pub fn envs(mut self, envs: Envs) -> Self {
+    self.envs = Some(envs);
     self
   }
 
@@ -230,6 +240,7 @@ impl TaskConfigBuilder {
       silent: self.silent.unwrap_or(false),
       run_mode: self.run_mode.unwrap_or(RunMode::Always),
       vars: self.vars.ok_or("Missing mandatory field: vars")?,
+      envs: self.envs.ok_or("Missing mandatory field: envs")?,
       sources: self.sources,
       source_strategy: self.source_strategy.unwrap_or(SourceMethod::Hash),
       cmd_type: self.cmd_type.unwrap_or(CmdType::Normal),
@@ -255,6 +266,7 @@ pub struct TaskNode {
   // Runtime behavior
   pub run_mode: RunMode,             // Run mode
   pub vars: Vars,                    // Task variables
+  pub envs: Envs,                    // Task environments
   pub sources: Option<Vec<String>>,  // Sources for fingerprinting
   pub source_strategy: SourceMethod, // Source validation strategy
 
@@ -291,6 +303,7 @@ impl TaskNode {
       sources: config.sources,
       source_strategy: config.source_strategy,
       vars: config.vars,
+      envs: config.envs,
       dir: config.dir,
       ignore_errors: config.ignore_errors,
       silent: config.silent,
@@ -332,7 +345,10 @@ impl TaskNode {
   ) -> ExecutorResult<String> {
     // Interpolate vars
     let mut vars = self.vars.clone();
-    vars.interpolate(dry).await?;
+    vars.expand(dry).await?;
+
+    let mut envs = self.envs.clone();
+    envs.expand().await?;
 
     if let Some(ref cache) = cache {
       if let Some(cached) = self.check_cache(&vars, cache).await? {
@@ -340,10 +356,20 @@ impl TaskNode {
       }
     }
 
+    let get_env = |name: &str| match envs.get(name) {
+      Some(val) => Some(Cow::Borrowed(val.as_str())),
+      None => match env::var(name) {
+        Ok(val) => Some(Cow::Owned(val)),
+        Err(_) => None,
+      },
+    };
+
+    let val = shellexpand::env_with_context_no_errors(&template, get_env);
+
     let mut tera = Tera::default();
     let template_name = format!("task_{}", self.name);
 
-    tera.add_raw_template(&template_name, template).map_err(|e| {
+    tera.add_raw_template(&template_name, val.as_ref()).map_err(|e| {
       ExecutorError::TemplateParseFailed(format!("Failed to parse template for task {}: {:?}", self.name, e))
     })?;
 
@@ -480,19 +506,19 @@ impl TaskNode {
 
       Ok(dir)
     } else {
-      debug!("Interpolating directory path: {}", dir_str);
+      debug!("Expanding directory path: {}", dir_str);
 
       let mut tera = Tera::default();
       let mut vars = self.vars.clone();
-      vars.interpolate(dry).await?;
+      vars.expand(dry).await?;
 
       let context: Context = vars.into();
 
       let rendered = tera
         .render_str(&dir_str, &context)
-        .map_err(|e| ExecutorError::ValueInterpolateError(dir_str.to_string(), e.to_string()))?;
+        .map_err(|e| ExecutorError::ValueExpandError(dir_str.to_string(), e.to_string()))?;
 
-      debug!("Interpolated path: {}", rendered);
+      debug!("Expanded path: {}", rendered);
 
       Ok(PathBuf::from(rendered.trim_matches('"'))) // Remove extra quotes from result
     }
@@ -506,7 +532,7 @@ impl TaskNode {
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
     let mut vars = self.vars.clone();
-    vars.interpolate(dry).await?;
+    vars.expand(dry).await?;
 
     if let Some(cached) = self.check_cache(&vars, &cache).await? {
       return Ok(cached);
@@ -609,6 +635,7 @@ impl TaskNode {
     command
       .current_dir(dir)
       .args(["/C", cmd])
+      .envs(self.envs.clone())
       .stdout(Stdio::piped())
       .stderr(Stdio::piped())
       .kill_on_drop(true)
@@ -641,6 +668,7 @@ impl TaskNode {
       .current_dir(dir)
       .arg("-c")
       .arg(cmd)
+      .envs(self.envs.clone())
       .stdout(Stdio::piped())
       .stderr(Stdio::piped())
       .kill_on_drop(true)
@@ -782,6 +810,7 @@ mod tests {
       .name(name.to_string())
       .dir(PathBuf::from("."))
       .vars(Vars::new())
+      .envs(Envs::new())
       .tpl(tpl)
       .cmd(cmd)
       .run_mode(Some(run_mode.unwrap_or(RunMode::Always)))
@@ -827,6 +856,7 @@ mod tests {
       .name("template_task".to_string())
       .dir(PathBuf::from("."))
       .vars(vars)
+      .envs(Envs::new())
       .tpl(Some("Hello {{ name }}!".to_owned()))
       .build()
       .unwrap();
@@ -899,6 +929,7 @@ mod tests {
       .name("source_task".to_string())
       .dir(PathBuf::from("."))
       .vars(Vars::new())
+      .envs(Envs::new())
       .cmd(Some("echo 'test'".to_string()))
       .run_mode(Some(AllowedRun::Changed))
       .sources(Some(vec![test_file.to_str().unwrap().to_string()]))
@@ -974,6 +1005,7 @@ mod tests {
       .name("long_task".to_string())
       .dir(PathBuf::from("."))
       .vars(Vars::new())
+      .envs(Envs::new())
       .cmd(Some("sleep 5".to_string()))
       .build()
       .unwrap();
@@ -1011,6 +1043,7 @@ mod tests {
       .name("ignore_error_task".to_string())
       .dir(PathBuf::from("."))
       .vars(Vars::new())
+      .envs(Envs::new())
       .cmd(Some("nonexistent_command".to_string()))
       .ignore_errors(Some(true))
       .build()
@@ -1072,6 +1105,7 @@ mod tests {
       .name("parent_task".to_string())
       .dir(PathBuf::from("."))
       .vars(Vars::new())
+      .envs(Envs::new())
       .dag(Some(nested_dag))
       .build()
       .unwrap();

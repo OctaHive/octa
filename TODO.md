@@ -1,6 +1,4 @@
-- Change env behavior like var
 - Add options for dotenv to load environment from specified paths
 - Add .octaignore for ignore some sources paths or files
 - Add validation to yaml file
-- Provide env variables when run a task
 - Create task directory if it not exist

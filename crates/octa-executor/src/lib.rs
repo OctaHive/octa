@@ -1,3 +1,4 @@
+pub mod envs;
 pub mod error;
 pub mod executor;
 mod function;
@@ -10,6 +11,7 @@ pub mod vars;
 use std::{env, future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 use async_stream::stream;
+use envs::Envs;
 use futures::StreamExt;
 use tokio_stream::iter;
 use tokio_util::sync::CancellationToken;
@@ -19,7 +21,7 @@ use error::{ExecutorError, ExecutorResult};
 pub use executor::Executor;
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
-use octa_octafile::{Cmds, Deps, ExecuteMode, Octafile, Task};
+use octa_octafile::{Cmds, ComplexCmd, Deps, ExecuteMode, Octafile, Task};
 pub use task::TaskNode;
 use task::{CmdType, TaskConfig};
 use vars::Vars;
@@ -88,15 +90,23 @@ impl TaskGraphBuilder {
 
     vars.set_value(root.vars.clone());
 
-    if let Some(env) = cmd.octafile.env.as_ref() {
-      vars.extend_with(env);
-    }
     vars.insert("ROOT_DIR", &root.dir.display().to_string());
     vars.insert("TASKFILE_DIR", &root.dir.display().to_string());
     vars.insert("USER_WORKING_DIR", &self.dir.display().to_string());
     vars.insert("COMMAND_ARGS", &self.command_args);
 
     vars
+  }
+
+  fn initialize_global_envs(&self, cmd: &FindResult) -> Envs {
+    let mut envs = Envs::new();
+    let root = cmd.octafile.root();
+
+    if let Some(env) = &root.env {
+      envs.set_value(env.clone());
+    }
+
+    envs
   }
 
   fn process_hierarchy_vars(&self, cmd: &FindResult, vars: &mut Vars) {
@@ -129,6 +139,37 @@ impl TaskGraphBuilder {
     }
   }
 
+  fn process_hierarchy_envs(&self, cmd: &FindResult, envs: &mut Envs) {
+    let full_path = cmd.octafile.hierarchy_path();
+    let mut current = Arc::clone(cmd.octafile.root());
+
+    debug!(
+      "Processing hierarchy environments for command {} in path {}",
+      cmd.name,
+      full_path.join(":")
+    );
+
+    for segment in full_path {
+      match current.get_included(&segment).unwrap() {
+        Some(nested_octafile) => {
+          let mut new_envs = Envs::new();
+          new_envs.set_parent(Some(envs.clone()));
+          if let Some(env) = &nested_octafile.env {
+            new_envs.set_value(env.clone());
+          }
+
+          *envs = new_envs;
+          current = Arc::clone(&nested_octafile);
+          debug!("Updated environments for segment {}", segment);
+        },
+        None => {
+          debug!("No nested octafile found for segment {}", segment);
+          break;
+        },
+      }
+    }
+  }
+
   fn add_task_vars(&self, cmd: &FindResult, vars: Vars) -> Vars {
     // Add variables from current task
     match cmd.task.vars.clone() {
@@ -146,6 +187,31 @@ impl TaskGraphBuilder {
         new_vars
       },
     }
+  }
+
+  fn add_task_envs(&self, cmd: &FindResult, envs: Envs) -> Envs {
+    // Add environments from current task
+    match cmd.task.env.clone() {
+      Some(task_envs) => {
+        let mut new_envs = Envs::new();
+        new_envs.set_parent(Some(envs));
+        new_envs.set_value(task_envs);
+
+        new_envs
+      },
+      None => {
+        let mut new_envs = Envs::new();
+        new_envs.set_parent(Some(envs));
+
+        new_envs
+      },
+    }
+  }
+
+  fn collect_envs(&self, cmd: &FindResult) -> Envs {
+    let mut envs = self.initialize_global_envs(cmd);
+    self.process_hierarchy_envs(cmd, &mut envs);
+    self.add_task_envs(cmd, envs)
   }
 
   fn collect_vars(&self, cmd: &FindResult) -> Vars {
@@ -167,12 +233,10 @@ impl TaskGraphBuilder {
     };
 
     if let Some(nested_dag) = &nested_dag {
-      if nested_dag.node_count() == 0 {
-        return Err(ExecutorError::TaskNotFound(cmd.name.to_string()));
-      }
+      self.validate_dag(nested_dag, &cmd.name)?;
     }
 
-    let task = Arc::new(self.create_task_from_command(&cmd, nested_dag, None, None));
+    let task = Arc::new(self.create_task_from_command(&cmd, nested_dag, None, None, None));
 
     let arc_task = Arc::clone(&task);
     dag.add_node(arc_task.clone());
@@ -243,7 +307,7 @@ impl TaskGraphBuilder {
       },
     };
 
-    let nested_task = Arc::new(self.create_task_from_command(&cmd, None, None, Some(CmdType::Internal)));
+    let nested_task = Arc::new(self.create_task_from_command(&cmd, None, None, None, Some(CmdType::Internal)));
 
     dag.add_node(nested_task.clone());
 
@@ -268,7 +332,7 @@ impl TaskGraphBuilder {
     &self,
     nest_dag: &mut DagNode,
     cmd: &FindResult,
-    complex: &octa_octafile::ComplexCmd,
+    complex: &ComplexCmd,
     prev_node: &mut Option<Arc<TaskNode>>,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<()> {
@@ -294,10 +358,13 @@ impl TaskGraphBuilder {
         self.validate_dag(nested_dag, &cmd.name)?;
       }
 
-      let mut vars = self.collect_vars(cmd);
-      vars.extend_with(&complex.vars);
-
-      let nested_task = Arc::new(self.create_task_from_command(&nested_cmd, nested_dag, Some(vars), None));
+      let nested_task = Arc::new(self.create_task_from_command(
+        &nested_cmd,
+        nested_dag,
+        complex.vars.clone(),
+        complex.envs.clone(),
+        None,
+      ));
 
       nest_dag.add_node(Arc::clone(&nested_task));
 
@@ -330,13 +397,20 @@ impl TaskGraphBuilder {
     &self,
     cmd: &FindResult,
     dag: Option<DagNode>,
-    execute_vars: Option<Vars>,
+    execute_vars: Option<octa_octafile::Vars>,
+    execute_envs: Option<octa_octafile::Envs>,
     cmd_type: Option<CmdType>,
   ) -> TaskNode {
     let task = cmd.task.clone();
 
     let mut vars = self.collect_vars(cmd);
     vars.extend_with(&execute_vars);
+
+    let mut envs = self.collect_envs(cmd);
+
+    if let Some(env) = execute_envs {
+      envs.extend(env.clone());
+    }
 
     // Get task directory with fallback to taskfile directory
     let work_dir = task.dir.unwrap_or(cmd.octafile.dir.clone());
@@ -348,6 +422,7 @@ impl TaskGraphBuilder {
       .name(cmd.name.clone())
       .dir(work_dir)
       .vars(vars)
+      .envs(envs)
       .tpl(task.tpl)
       .sources(task.sources)
       .dag(dag)
@@ -446,7 +521,7 @@ impl TaskGraphBuilder {
               self.validate_dag(nested_dag, &cmd.name)?;
             }
 
-            let task = Arc::new(self.create_task_from_command(&cmd, nested_dag, None, None));
+            let task = Arc::new(self.create_task_from_command(&cmd, nested_dag, None, None, None));
 
             Ok::<_, ExecutorError>(DependencyInfo {
               task,
@@ -525,27 +600,13 @@ impl TaskGraphBuilder {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use octa_octafile::{AllowedRun, Octafile};
+  use octa_octafile::Octafile;
   use tempfile::TempDir;
 
   fn create_test_task() -> Task {
     Task {
       cmd: Some(Cmds::Simple("echo test".to_string())),
-      cmds: None,
-      desc: None,
-      deps: None,
-      vars: None,
-      dir: None,
-      tpl: None,
-      predonditions: None,
-      sources: None,
-      source_strategy: None,
-      platforms: None,
-      run: Some(AllowedRun::Always),
-      silent: None,
-      ignore_error: None,
-      execute_mode: None,
-      internal: None,
+      ..Task::default()
     }
   }
 
@@ -621,7 +682,7 @@ mod tests {
     let mut vars = Vars::new();
     builder.process_hierarchy_vars(&cmd, &mut vars);
 
-    vars.interpolate(false).await?;
+    vars.expand(false).await?;
 
     // Updated assertions for Tera values
     assert_eq!(vars.get("NESTED_VAR").and_then(|v| v.as_str()), Some("nested_value"));

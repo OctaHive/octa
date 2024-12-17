@@ -17,7 +17,7 @@ use crate::{
 pub struct Vars {
   context: Context,          // Tera context for current variables
   parent: Option<Arc<Vars>>, // Link to parent variables
-  interpolated: bool,        // Inindicator that the values have been interpolated
+  expanded: bool,            // Inindicator that the values have been expanded
 }
 
 impl PartialEq for Vars {
@@ -33,7 +33,7 @@ impl Vars {
     Self {
       context: Context::default(),
       parent: None,
-      interpolated: false,
+      expanded: false,
     }
   }
 
@@ -41,7 +41,7 @@ impl Vars {
     Self {
       context: Context::default(),
       parent: Some(Arc::new(parent)),
-      interpolated: false,
+      expanded: false,
     }
   }
 
@@ -59,17 +59,17 @@ impl Vars {
 
   pub fn set_value<T: Serialize>(&mut self, value: T) {
     self.context = Context::from_serialize(value).unwrap_or_default();
-    self.interpolated = false;
+    self.expanded = false;
   }
 
   pub fn set_parent(&mut self, parent: Option<Vars>) {
     self.parent = parent.map(Arc::new);
-    self.interpolated = false;
+    self.expanded = false;
   }
 
   pub fn insert<T: Serialize + ?Sized>(&mut self, key: &str, value: &T) {
     self.context.insert(key, value);
-    self.interpolated = false;
+    self.expanded = false;
   }
 
   pub fn get(&self, key: &str) -> Option<&Value> {
@@ -78,13 +78,13 @@ impl Vars {
 
   pub fn extend(&mut self, source: Context) {
     self.context.extend(source);
-    self.interpolated = false;
+    self.expanded = false;
   }
 
   pub fn extend_with<T: Serialize>(&mut self, value: &T) {
     if let Ok(context) = Context::from_serialize(value) {
       self.extend(context);
-      self.interpolated = false;
+      self.expanded = false;
     }
   }
 
@@ -93,7 +93,7 @@ impl Vars {
     VarsIter::new(map)
   }
 
-  pub async fn interpolate(&mut self, dry: bool) -> ExecutorResult<()> {
+  pub async fn expand(&mut self, dry: bool) -> ExecutorResult<()> {
     let mut tera = Tera::default();
     if dry {
       tera.register_function("shell", ExecuteShellDry);
@@ -101,14 +101,14 @@ impl Vars {
       tera.register_function("shell", ExecuteShell);
     }
 
-    if self.interpolated {
+    if self.expanded {
       return Ok(());
     }
 
     let contexts = self.collect_context_chain();
     let processed_context = self.process_context_chain(contexts, &mut tera).await?;
     self.context = processed_context;
-    self.interpolated = true;
+    self.expanded = true;
 
     Ok(())
   }
@@ -146,7 +146,7 @@ impl Vars {
     let vars = Vars {
       context,
       parent: None,
-      interpolated: false,
+      expanded: false,
     };
 
     for (key, value) in vars.iter() {
@@ -173,7 +173,7 @@ impl Vars {
     debug!("Processing template variable '{}' with value: '{}'", key, val);
     let res = tera
       .render_str(&val, context)
-      .map_err(|e| ExecutorError::VariableInterpolateError(val, e.to_string()))?;
+      .map_err(|e| ExecutorError::VariableExpandError(val, e.to_string()))?;
     let res = res.trim_matches('"').to_owned(); // remove extra quotes in value
 
     let val = match serde_json::from_str(&res) {
@@ -217,7 +217,7 @@ impl From<Context> for Vars {
     Self {
       context,
       parent: None,
-      interpolated: false,
+      expanded: false,
     }
   }
 }

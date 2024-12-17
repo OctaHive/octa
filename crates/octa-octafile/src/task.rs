@@ -1,12 +1,11 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 use serde::{
   de::{MapAccess, Visitor},
   Deserialize, Deserializer, Serialize,
 };
-use serde_yml::Value;
 
-use crate::{Cmds, Vars};
+use crate::{octafile::Envs, Cmds, Vars};
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -102,9 +101,10 @@ impl From<String> for Deps {
 
 #[derive(Serialize, Debug, Clone, Default)]
 pub struct Task {
+  pub env: Option<Envs>,                         // Task environment variables
   pub dir: Option<PathBuf>,                      // Working directory for the task
   pub desc: Option<String>,                      // Task description
-  pub vars: Option<HashMap<String, Value>>,      // Task-specific variables
+  pub vars: Option<Vars>,                        // Task-specific variables
   pub tpl: Option<String>,                       // Task template
   pub cmd: Option<Cmds>,                         // Command to execute
   pub cmds: Option<Vec<Cmds>>,                   // List of commands

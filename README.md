@@ -6,6 +6,11 @@
 This project was inspired by the go-task build project. However, when we rewriting our project’s build system to go-task, I found some 
 functionality missing, so I decided to create my own builder. 
 
+# The differences from go-task
+* Support run nested tasks using wildcards
+* Support return task result, this usefull for example when you need process task result in parent task
+* Support rendering templates as a task result
+
 # Installation
 
 ## Homebrew
@@ -170,7 +175,60 @@ $ octa web -- publish
 ```
 
 # Environment variables
-<TBD>
+The env property is used to define environment variables that will be accessible to all tasks within the file. The value of the property 
+is a map of key-value pairs, where the key is the name of the environment variable, and the value is the value of the environment variable.
+Environment variables can be defined at different levels – at the task file level, at the task level, and when invoking a task from another 
+task. As a result, commands executed within a task will receive the expandable version of the environment variables. System environment 
+variables will also be added to the resulting set of variables.
+
+```yaml
+version: 1
+
+env:
+  NAME: Bob
+  
+tasks:
+  print-env: echo $NAME
+  
+  print-system-env: echo ${EXT_NAME:-"Alice"}
+```
+
+So the output this task will be:
+
+```console
+$ ./octa print-env
+
+2024-12-17 11:23:23 [octa] Starting execution plan for command print-env
+2024-12-17 11:23:23 [octa] Starting task print-env
+Bob
+2024-12-17 11:23:23 [octa] All tasks completed successfully
+2024-12-17 11:23:23 [octa] ================== Time Summary ==================
+2024-12-17 11:23:23 [octa]  "print-env": 13ms
+2024-12-17 11:23:23 [octa]  Total time: 13ms
+2024-12-17 11:23:23 [octa] ==================================================
+
+$ ./octa print-system-env
+
+2024-12-17 11:23:41 [octa] Starting execution plan for command print-system-env
+2024-12-17 11:23:41 [octa] Starting task print-system-env
+Alice
+2024-12-17 11:23:41 [octa] All tasks completed successfully
+2024-12-17 11:23:41 [octa] ================== Time Summary ==================
+2024-12-17 11:23:41 [octa]  "print-system-env": 13ms
+2024-12-17 11:23:41 [octa]  Total time: 13ms
+2024-12-17 11:23:41 [octa] ==================================================
+
+$ EXT_NAME=Karol ./octa print-system-env
+
+2024-12-17 11:23:51 [octa] Starting execution plan for command print-system-env
+2024-12-17 11:23:51 [octa] Starting task print-system-env
+Karol
+2024-12-17 11:23:51 [octa] All tasks completed successfully
+2024-12-17 11:23:51 [octa] ================== Time Summary ==================
+2024-12-17 11:23:51 [octa]  "print-system-env": 17ms
+2024-12-17 11:23:51 [octa]  Total time: 17ms
+2024-12-17 11:23:51 [octa] ==================================================
+```
 
 # Variables
 The vars property is used to define variables that will be available to all tasks in the file. This behaves like the env property, but the 

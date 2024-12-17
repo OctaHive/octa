@@ -37,10 +37,10 @@ pub struct Octafile {
   // Octafile schema version
   pub version: u32,
 
-  // Taskfile global vars
+  // Octafile global vars
   pub vars: Option<Vars>,
 
-  // Taskfile global environment variables
+  // Octafile global environment variables
   pub env: Option<Envs>,
 
   // list of included octafiles
@@ -289,31 +289,31 @@ impl Octafile {
     })?;
     self.dir = octafile_dir.to_path_buf();
 
-    let mut env_vars: HashMap<String, String> = env::vars().collect();
+    // let mut env_vars: HashMap<String, String> = env::vars().collect();
 
-    self.env = match (self.env.take(), &self._parent) {
-      (Some(env), Some(parent)) => {
-        if let Some(mut parent_env) = parent.env.clone() {
-          parent_env.extend(env);
-          Some(parent_env)
-        } else {
-          Some(env)
-        }
-      },
-      (None, Some(parent)) => {
-        if let Some(parent_env) = parent.env.clone() {
-          Some(parent_env)
-        } else {
-          Some(env_vars)
-        }
-      },
-      (Some(env), None) => {
-        env_vars.extend(env);
+    // self.env = match (self.env.take(), &self._parent) {
+    //   (Some(env), Some(parent)) => {
+    //     if let Some(mut parent_env) = parent.env.clone() {
+    //       parent_env.extend(env);
+    //       Some(parent_env)
+    //     } else {
+    //       Some(env)
+    //     }
+    //   },
+    //   (None, Some(parent)) => {
+    //     if let Some(parent_env) = parent.env.clone() {
+    //       Some(parent_env)
+    //     } else {
+    //       Some(env_vars)
+    //     }
+    //   },
+    //   (Some(env), None) => {
+    //     env_vars.extend(env);
 
-        Some(env_vars)
-      },
-      (None, None) => Some(env_vars),
-    };
+    //     Some(env_vars)
+    //   },
+    //   (None, None) => Some(env_vars),
+    // };
 
     Ok(())
   }

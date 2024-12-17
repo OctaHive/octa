@@ -190,7 +190,6 @@ impl OctaFinder {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use octa_octafile::AllowedRun;
   use std::path::PathBuf;
   use tempfile::TempDir;
   use test_log::test;
@@ -199,21 +198,7 @@ mod tests {
   fn create_test_task(name: &str) -> Task {
     Task {
       cmd: Some(format!("echo {}", name).into()),
-      dir: None,
-      vars: None,
-      desc: None,
-      tpl: None,
-      cmds: None,
-      internal: Some(false),
-      platforms: None,
-      ignore_error: None,
-      deps: None,
-      silent: Some(false),
-      sources: None,
-      source_strategy: None,
-      predonditions: None,
-      execute_mode: None,
-      run: Some(AllowedRun::Always),
+      ..Task::default()
     }
   }
 

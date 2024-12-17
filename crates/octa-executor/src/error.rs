@@ -52,8 +52,8 @@ pub enum ExecutorError {
   #[error("Failed to add graph dependency")]
   AddDependencyError(#[from] DAGError),
 
-  #[error("Failed to interpolate value: {0}: {1}")]
-  ValueInterpolateError(String, String),
+  #[error("Failed to expand value: {0}: {1}")]
+  ValueExpandError(String, String),
 
   #[error("Channel communication error")]
   ChannelError,
@@ -67,8 +67,8 @@ pub enum ExecutorError {
   #[error("Missing working directory configuration")]
   MissingWorkDir,
 
-  #[error("Failed to interpolate variable: {0}: {1}")]
-  VariableInterpolateError(String, String),
+  #[error("Failed to expand variable: {0}: {1}")]
+  VariableExpandError(String, String),
 
   #[error("Failed to get included octafile: {0}")]
   GetCotafile(#[from] OctafileError),

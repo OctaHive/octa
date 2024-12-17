@@ -1,0 +1,9 @@
+version: 1
+
+env:
+  NAME: Bob
+
+tasks:
+  print-env: echo $NAME
+
+  print-system-env: echo ${EXT_NAME:-"Alice"}

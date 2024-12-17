@@ -26,6 +26,7 @@ serde = { workspace = true }
 serde_json = "1.0.133"
 sha2 = "0.10"
 sled = "0.34"
+shellexpand = "3.1.0"
 sys-info = { workspace = true }
 tera = { workspace = true }
 thiserror = { workspace = true }
