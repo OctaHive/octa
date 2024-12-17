@@ -312,7 +312,7 @@ tasks:
     
 ```
 
-### Task template
+## Task template
 Sometimes you need to simply template text and return the result to a task that depends on the 
 current one. To do this, you can specify a `tpl` for the task, and when the task is executed, 
 the result will be templated using the specified variables and returned as the result of the task. 
@@ -372,14 +372,14 @@ octa-service:
 2024-12-17 09:21:54 [octa] ==================================================
 ```
 
-### Internal task
+## Internal task
 By default, all tasks defined in the file are available for execution via the command-line utility. 
 Sometimes, it may be convenient to create a task that is only available internally, for example, if 
 you need to call the same command with slight parameter variations. To achieve this, you can set the 
 `internal` attribute for the task, making it unavailable for execution from the CLI utility and preventing 
 it from appearing in the list of available tasks when using the `--list-tasks` command.
 
-# Task directory
+## Task directory
 By default, tasks are executed in the directory where the Octafile is located. However, you can easily 
 change the working directory for a task by specifying the `dir` parameter.
 
@@ -407,9 +407,10 @@ tasks:
 ```
 
 # Calling another task
-In task commands, you can specify both shell commands and invoke other tasks. All commands listed within a 
-task are executed sequentially by default, but you can change this behavior using the `execute_mode` parameter. 
-This parameter supports two values: `parallel` and `sequentially`, with `sequentially` being the default.
+In task commands, you can specify both shell commands and invoke other tasks. если 
+All commands listed within a task are executed sequentially by default, but you can change this behavior using the `execute_mode` parameter. 
+This parameter supports two values: `parallel` and `sequentially`, with `sequentially` being the default. If you want to execute another task, 
+you can specify it by adding the `task:` prefix or use the extended version, which allows you to provide additional parameters:
 
 ##### vars
 Overrides variables for the invoked task.
@@ -459,4 +460,51 @@ tasks:
     cmds:
       - task: build_win
       - task: build_mac
+```
+
+# Task dependencies
+Some tasks may depend on other tasks. You can list all task dependencies in the `deps` parameter, and when the task is executed, 
+all its dependencies will run first, followed by the task itself. All dependent tasks are executed in parallel, so they should 
+not depend on each other. You can also create grouping tasks that only contain dependencies and do not have their own commands.
+
+Dependencies can be specified in two modes: you can reference another task by simply adding the name of task, or use the extended
+version, which allows you to specify additional parameters:
+
+##### vars
+Overrides variables for the depended task.
+
+##### silent
+Disables output of the task’s commands to the standard output.
+
+```yaml
+version: 1
+
+tasks:
+  prepare_one: echo Prepare one
+  prepare_two: echo Prepare two
+  
+  complex_task:
+    cmd: echo All deps task completed
+    deps:
+      - prepare_one
+      - prepare_two
+```
+
+The output of all dependent tasks is saved and made available to the parent task. This is useful when you need to execute a 
+series of subtasks and then combine their results into a single output, for example, generating a Docker Compose file for your 
+product. Alternatively, you can convert the result into the desired data type and process it as needed.
+
+```yaml
+version: 1
+
+tasks:
+  task1: echo 1
+
+  task2: echo 2
+
+  global:
+    cmd: echo {{ deps_result.task1 | int + deps_result.task2 | int }}
+    deps:
+      - task1
+      - task2
 ```

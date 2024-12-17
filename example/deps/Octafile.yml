@@ -1,0 +1,22 @@
+version: 1
+
+tasks:
+  prepare_one: echo Prepare one
+
+  prepare_two: echo Prepare two
+
+  complex_task:
+    cmd: echo All deps task completed
+    deps:
+      - prepare_one
+      - prepare_two
+
+  task1: echo 1
+
+  task2: echo 2
+
+  global:
+    cmd: echo {{ deps_result.task1 | int + deps_result.task2 | int }}
+    deps:
+      - task1
+      - task2
