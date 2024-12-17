@@ -289,9 +289,61 @@ tasks:
       - docker-compose-service
 ```
 
+If we run task `docker-compose` we see next output:
+
+```console
+2024-12-17 09:21:54 [octa] Starting execution plan for command docker-compose
+2024-12-17 09:21:54 [octa] Starting task docker-compose-service
+2024-12-17 09:21:54 [octa] Starting task docker-compose
+octa-service:
+  image: docker.octa.com/service:1.0.0
+  restart: always
+  network_mode: host
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: 10
+  environment:
+    - LOG_LEVEL=Debug
+2024-12-17 09:21:54 [octa] All tasks completed successfully
+2024-12-17 09:21:54 [octa] ================== Time Summary ==================
+2024-12-17 09:21:54 [octa]  "docker-compose-service": 0ms
+2024-12-17 09:21:54 [octa]  "docker-compose": 10ms
+2024-12-17 09:21:54 [octa]  Total time: 10ms
+2024-12-17 09:21:54 [octa] ==================================================
+```
+
 ### Internal task
 By default, all tasks defined in the file are available for execution via the command-line utility. 
 Sometimes, it may be convenient to create a task that is only available internally, for example, if 
 you need to call the same command with slight parameter variations. To achieve this, you can set the 
 `internal` attribute for the task, making it unavailable for execution from the CLI utility and preventing 
 it from appearing in the list of available tasks when using the `--list-tasks` command.
+
+# Task directory
+By default, tasks are executed in the directory where the Taskfile is located. However, you can easily 
+change the working directory for a task by specifying the `dir` parameter.
+
+```yaml
+version: 1
+
+tasks:
+  build:
+    cmd: go build main.go
+    dir: ./service
+```
+
+The directory attribute supports expansion, allowing you to use environment variables or variable values 
+within this property. For example, since Octa supports configuration traversal, you can create a main 
+Octafile in a parent directory and run a task from a service subdirectory by using the `USER_WORKING_DIR` 
+variable to set the working directory to the service directory.
+
+```yaml
+version: 1
+
+tasks:
+  build:
+    cmd: go build main.go
+    dir: "{{ USER_WORKING_DIR }}"
+```
