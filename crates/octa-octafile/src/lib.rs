@@ -8,4 +8,4 @@ pub use command::{Cmds, ComplexCmd};
 pub use error::{OctafileError, OctafileResult};
 pub use include::IncludeInfo;
 pub use octafile::{Envs, Octafile, Vars};
-pub use task::{AllowedPlatforms, AllowedRun, Deps, ExecuteMode, SourceStrategies, Task};
+pub use task::{AllowedRun, Deps, ExecuteMode, SourceStrategies, Task};

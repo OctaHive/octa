@@ -32,6 +32,8 @@ pub struct TaskGraphBuilder {
   finder: Arc<OctaFinder>,   // Finder for search task in octafile
   dir: PathBuf,              // Current user directory
   command_args: Vec<String>, // Aditional task arguments from cli
+  os_arch: String,
+  os_type: String,
 }
 
 #[derive(Debug)]
@@ -45,11 +47,15 @@ struct DependencyInfo {
 impl TaskGraphBuilder {
   pub fn new() -> ExecutorResult<Self> {
     let current_dir = env::current_dir()?;
+    let os_type = whoami::platform();
+    let os_arch = whoami::arch();
 
     Ok(Self {
       finder: Arc::new(OctaFinder::new()),
       dir: current_dir,
       command_args: vec![],
+      os_arch: os_arch.to_string().replace(" ", "").to_lowercase(),
+      os_type: os_type.to_string().replace(" ", "").to_lowercase(),
     })
   }
 
@@ -67,10 +73,12 @@ impl TaskGraphBuilder {
     self.command_args = command_args;
     let mut dag = DAG::new();
 
-    let commands = self.finder.find_by_path(Arc::clone(&octafile), command);
+    let mut commands = self.finder.find_by_path(Arc::clone(&octafile), command);
     if commands.is_empty() {
       return Err(ExecutorError::CommandNotFound(command.to_string()));
     }
+
+    commands = self.filter_command_by_platform(commands);
 
     let found_commands: Vec<String> = commands.iter().map(|c| c.name.clone()).collect();
     debug!("Found commands for pattern {}: {:?}", command, found_commands);
@@ -84,16 +92,35 @@ impl TaskGraphBuilder {
     Ok(dag)
   }
 
+  fn filter_command_by_platform(&self, commands: Vec<FindResult>) -> Vec<FindResult> {
+    commands
+      .into_iter()
+      .filter(|cmd| {
+        if let Some(platforms) = &cmd.task.platforms {
+          return platforms.contains(&self.os_type)
+            || platforms.contains(&self.os_arch)
+            || platforms.contains(&format!("{}/{}", &self.os_type, &self.os_arch).to_string());
+        }
+
+        true
+      })
+      .collect()
+  }
+
   fn initialize_global_vars(&self, cmd: &FindResult) -> Vars {
     let mut vars = Vars::new();
+    let os_type = whoami::platform();
+    let os_arch = whoami::arch();
     let root = cmd.octafile.root();
 
     vars.set_value(root.vars.clone());
 
     vars.insert("ROOT_DIR", &root.dir.display().to_string());
-    vars.insert("TASKFILE_DIR", &root.dir.display().to_string());
+    vars.insert("OCTAFILE_DIR", &root.dir.display().to_string());
     vars.insert("USER_WORKING_DIR", &self.dir.display().to_string());
     vars.insert("COMMAND_ARGS", &self.command_args);
+    vars.insert("OCTA_OS", &os_type.to_string());
+    vars.insert("OCTA_ARCH", &os_arch.to_string());
 
     vars
   }
@@ -336,10 +363,12 @@ impl TaskGraphBuilder {
     prev_node: &mut Option<Arc<TaskNode>>,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<()> {
-    let cmds = self.finder.find_by_path(Arc::clone(&cmd.octafile), &complex.task);
+    let mut cmds = self.finder.find_by_path(Arc::clone(&cmd.octafile), &complex.task);
     if cmds.is_empty() {
       return Err(ExecutorError::CommandNotFound(complex.task.clone()));
     }
+
+    cmds = self.filter_command_by_platform(cmds);
 
     let should_add_dependency = cmd
       .task
@@ -482,12 +511,15 @@ impl TaskGraphBuilder {
           stream! {
             match dep {
               Deps::Simple(dep) => {
-                for cmd in finder.find_by_path(octafile.clone(), dep) {
+                let mut cmds = finder.find_by_path(octafile.clone(), dep);
+                cmds = self.filter_command_by_platform(cmds);
+                for cmd in cmds {
                   yield cmd;
                 }
               },
               Deps::Complex(c) => {
-                let result = finder.find_by_path(octafile.clone(), &c.task);
+                let mut result = finder.find_by_path(octafile.clone(), &c.task);
+                result = self.filter_command_by_platform(result);
 
                 for mut res in result {
                   res.task.vars = match (res.task.vars.take(), &c.vars) {

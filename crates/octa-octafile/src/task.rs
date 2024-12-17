@@ -26,25 +26,6 @@ impl From<String> for ExecuteMode {
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum AllowedPlatforms {
-  Linux,
-  Windows,
-  Darwin,
-}
-
-impl From<String> for AllowedPlatforms {
-  fn from(value: String) -> Self {
-    match value.as_str() {
-      "windows" => AllowedPlatforms::Windows,
-      "darwin" => AllowedPlatforms::Darwin,
-      "linux" => AllowedPlatforms::Linux,
-      _ => unimplemented!(),
-    }
-  }
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
 pub enum SourceStrategies {
   Timestamp,
   Hash,
@@ -109,7 +90,7 @@ pub struct Task {
   pub cmd: Option<Cmds>,                         // Command to execute
   pub cmds: Option<Vec<Cmds>>,                   // List of commands
   pub internal: Option<bool>,                    // Show command in list of available commands
-  pub platforms: Option<Vec<AllowedPlatforms>>,  // Supported platforms
+  pub platforms: Option<Vec<String>>,            // Supported platforms
   pub ignore_error: Option<bool>,                // Whether to continue on error
   pub deps: Option<Vec<Deps>>,                   // Task dependencies
   pub run: Option<AllowedRun>,                   // When task should run

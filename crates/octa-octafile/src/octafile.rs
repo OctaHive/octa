@@ -260,26 +260,8 @@ impl Octafile {
     Ok(())
   }
 
-  /// Filters tasks based on the current platform
-  fn filter_task_by_platform(tasks: HashMap<String, Task>) -> HashMap<String, Task> {
-    let os_type = sys_info::os_type().map(|os| os.to_lowercase()).unwrap_or_default();
-
-    tasks
-      .into_iter()
-      .filter(|(_, cmd)| {
-        cmd
-          .platforms
-          .as_ref()
-          .map_or(true, |platforms| platforms.contains(&os_type.clone().into()))
-      })
-      .collect()
-  }
-
   /// Sets common attributes for an Octafile, including merging from parent if present
   fn set_attributes(&mut self, path: &Path) -> OctafileResult<()> {
-    // Filter tasks by current platform
-    self.tasks = Self::filter_task_by_platform(self.tasks.clone());
-
     // Set working directory
     let octafile_dir = path.parent().ok_or_else(|| {
       OctafileError::IoError(std::io::Error::new(
@@ -288,32 +270,6 @@ impl Octafile {
       ))
     })?;
     self.dir = octafile_dir.to_path_buf();
-
-    // let mut env_vars: HashMap<String, String> = env::vars().collect();
-
-    // self.env = match (self.env.take(), &self._parent) {
-    //   (Some(env), Some(parent)) => {
-    //     if let Some(mut parent_env) = parent.env.clone() {
-    //       parent_env.extend(env);
-    //       Some(parent_env)
-    //     } else {
-    //       Some(env)
-    //     }
-    //   },
-    //   (None, Some(parent)) => {
-    //     if let Some(parent_env) = parent.env.clone() {
-    //       Some(parent_env)
-    //     } else {
-    //       Some(env_vars)
-    //     }
-    //   },
-    //   (Some(env), None) => {
-    //     env_vars.extend(env);
-
-    //     Some(env_vars)
-    //   },
-    //   (None, None) => Some(env_vars),
-    // };
 
     Ok(())
   }
@@ -464,28 +420,6 @@ mod tests {
 
     let octafile = Octafile::load(Some(file_path), false).unwrap();
     assert!(octafile.get_included("optional").unwrap().is_none());
-  }
-
-  #[test]
-  fn test_platform_specific_tasks() {
-    let content = format!(
-      r#"
-        version: 1
-        tasks:
-          platform_task:
-            cmd: echo "test"
-            platforms: ["{}"]
-          generic_task:
-            cmd: echo "generic"
-      "#,
-      sys_info::os_type().unwrap().to_lowercase()
-    );
-
-    let (_temp_dir, file_path) = create_temp_octafile(&content, "platform_specific_tasks");
-    let octafile = Octafile::load(Some(file_path), false).unwrap();
-
-    assert!(octafile.tasks.contains_key("platform_task"));
-    assert!(octafile.tasks.contains_key("generic_task"));
   }
 
   #[test]

@@ -2,3 +2,4 @@
 - Add .octaignore for ignore some sources paths or files
 - Add validation to yaml file
 - Create task directory if it not exist
+- Add support architecture to platform specific task

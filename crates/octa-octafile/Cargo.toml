@@ -15,7 +15,6 @@ anyhow = { workspace = true }
 dirs = "5.0"
 serde = { workspace = true }
 serde_yml = { workspace = true }
-sys-info = { workspace = true }
 tera = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

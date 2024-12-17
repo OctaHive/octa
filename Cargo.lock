@@ -1014,7 +1014,6 @@ dependencies = [
  "sha2",
  "shellexpand",
  "sled",
- "sys-info",
  "tempfile",
  "tera",
  "thiserror 2.0.4",
@@ -1024,6 +1023,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "whoami",
  "windows-sys 0.59.0",
 ]
 
@@ -1050,7 +1050,6 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_yml",
- "sys-info",
  "tempfile",
  "tera",
  "thiserror 2.0.4",
@@ -1616,16 +1615,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sys-info"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b3a0d0aba8bf96a0e1ddfdc352fc53b3df7f39318c71854910c3c4b024ae52c"
-dependencies = [
- "cc",
- "libc",
-]
-
-[[package]]
 name = "tempfile"
 version = "3.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2010,6 +1999,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c8d87e72b64a3b4db28d11ce29237c246188f4f51057d65a7eab63b7987e423"
 
 [[package]]
+name = "wasite"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8dad83b4f25e74f184f64c43b150b91efe7647395b42289f38e50566d82855b"
+
+[[package]]
 name = "wasm-bindgen"
 version = "0.2.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2063,6 +2058,27 @@ name = "wasm-bindgen-shared"
 version = "0.2.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ee99da9c5ba11bd675621338ef6fa52296b76b83305e9b6e5c77d4c286d6d49"
+
+[[package]]
+name = "web-sys"
+version = "0.3.74"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a98bc3c33f0fe7e59ad7cd041b89034fa82a7c2d4365ca538dda6cdaf513863c"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "whoami"
+version = "1.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "372d5b87f58ec45c384ba03563b03544dc5fadc3983e434b286913f5b4a9bb6d"
+dependencies = [
+ "redox_syscall 0.5.7",
+ "wasite",
+ "web-sys",
+]
 
 [[package]]
 name = "winapi"
