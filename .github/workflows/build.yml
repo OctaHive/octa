@@ -101,5 +101,5 @@ jobs:
           draft: true
           files: "octa*"
           token: ${{ github.token }}
-          body_path: Changes.md
+          body_path: Changelog.md
         if: startsWith( github.ref, 'refs/tags/v' )

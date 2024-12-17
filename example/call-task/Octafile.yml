@@ -1,0 +1,14 @@
+version: 1
+
+tasks:
+  prev:
+    cmd: echo Start
+
+  next:
+    cmd: echo Finish
+
+  run:
+    cmds:
+      - task: prev
+      - echo Running task
+      - task: next

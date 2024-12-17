@@ -230,6 +230,8 @@ Karol
 2024-12-17 11:23:51 [octa] ==================================================
 ```
 
+Octa also supports loading variables from `.env` files. The files are searched recursively, starting from the current directory.
+
 # Variables
 The vars property is used to define variables that will be available to all tasks in the file. This behaves like the env property, but the 
 variables are not exported to the environment, and can be more complex than strings.
@@ -402,4 +404,35 @@ tasks:
   build:
     cmd: go build main.go
     dir: "{{ USER_WORKING_DIR }}"
+```
+
+# Calling another task
+In task commands, you can specify both shell commands and invoke other tasks. All commands listed within a 
+task are executed sequentially by default, but you can change this behavior using the `execute_mode` parameter. 
+This parameter supports two values: `parallel` and `sequentially`, with `sequentially` being the default.
+
+##### vars
+Overrides variables for the invoked task.
+
+##### envs
+Overrides environment variables for the invoked task.
+
+##### silent
+Disables output of the task’s commands to the standard output.
+
+```yaml
+version: 1
+
+tasks:
+  prev:
+    cmd: echo Start
+  
+  next:
+    cmd: echo Finish
+    
+  run:
+    cmds:
+      - task: prev
+      - echo Running task
+      - task: next
 ```

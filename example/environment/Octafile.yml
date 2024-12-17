@@ -7,3 +7,5 @@ tasks:
   print-env: echo $NAME
 
   print-system-env: echo ${EXT_NAME:-"Alice"}
+
+  print-file-env: echo ${FILE_NAME}
