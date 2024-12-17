@@ -217,3 +217,36 @@ You can use different data types as values. The following data types are support
 Sometimes you may want to check how your task works without executing any commands. For 
 this purpose, you can run the task in dry mode using the `--dry` flag. In dry mode, Octa 
 will only print the commands that would be run, without actually executing them.
+
+# Tasks
+The tasks property in Octafile is used to define the tasks in the file. The value of the 
+property is a map of key-value pairs, where the key is the name of the task, and the value 
+is the task definition.
+
+## Task command
+Each task can have commands that will be executed in the command line (defaults to cmd in 
+Windows and bash in Unix/Mac). There are two ways to set commands in a task: `cmd` and `cmds`. 
+The cmds variant allows you to set multiple commands, which will be executed in sequence.
+
+```yaml
+version: 1
+  
+tasks:
+  simple:
+    cmd: echo Hello World!
+    
+  multiple:
+    cmds:
+      - echo Hello Alice!
+      - echo Hello Bob!
+    
+```
+
+### Task template
+
+### Internal task
+By default, all tasks defined in the file are available for execution via the command-line utility. 
+Sometimes, it may be convenient to create a task that is only available internally, for example, if 
+you need to call the same command with slight parameter variations. To achieve this, you can set the 
+`internal` attribute for the task, making it unavailable for execution from the CLI utility and preventing 
+it from appearing in the list of available tasks when using the `--list-tasks` command.
