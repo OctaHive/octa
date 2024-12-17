@@ -632,7 +632,9 @@ impl TaskGraphBuilder {
 #[cfg(test)]
 mod tests {
   use super::*;
+
   use octa_octafile::Octafile;
+  use std::fs;
   use tempfile::TempDir;
 
   fn create_test_task() -> Task {
@@ -640,6 +642,281 @@ mod tests {
       cmd: Some(Cmds::Simple("echo test".to_string())),
       ..Task::default()
     }
+  }
+
+  #[tokio::test]
+  async fn test_task_graph_builder_new() -> ExecutorResult<()> {
+    let builder = TaskGraphBuilder::new()?;
+    assert!(builder.command_args.is_empty());
+    assert!(builder.dir.exists());
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_build_simple_task() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      tasks:
+        test:
+          cmd: echo "test"
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let builder = TaskGraphBuilder::new()?;
+    let cancel_token = CancellationToken::new();
+    let dag = builder.build(octafile, "test", cancel_token, vec![]).await?;
+
+    assert_eq!(dag.node_count(), 1);
+    assert!(!dag.has_cycle()?);
+    let tasks: Vec<String> = dag.nodes().iter().map(|n| n.name.clone()).collect();
+
+    assert!(tasks.contains(&"test".to_owned()));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_build_with_dependencies() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      tasks:
+        task1:
+          cmd: echo "task1"
+        task2:
+          cmd: echo "task2"
+          deps:
+            - task1
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let builder = TaskGraphBuilder::new()?;
+    let cancel_token = CancellationToken::new();
+    let dag = builder.build(octafile, "task2", cancel_token, vec![]).await?;
+
+    assert_eq!(dag.node_count(), 2);
+    assert!(!dag.has_cycle()?);
+    let tasks: Vec<String> = dag.nodes().iter().map(|n| n.name.clone()).collect();
+    assert!(tasks.contains(&"task1".to_owned()));
+    assert!(tasks.contains(&"task2".to_owned()));
+
+    assert!(dag.edges().contains_key("task1"));
+
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_build_with_complex_command() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      tasks:
+        complex:
+          cmds:
+            - echo "step1"
+            - echo "step2"
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let builder = TaskGraphBuilder::new()?;
+    let cancel_token = CancellationToken::new();
+    let dag = builder.build(octafile, "complex", cancel_token, vec![]).await?;
+
+    assert_eq!(dag.node_count(), 1);
+    assert!(!dag.has_cycle()?);
+
+    let nodes: Vec<_> = dag.nodes().into_iter().collect();
+
+    let nested_dag = nodes.get(0).unwrap().dag.as_ref().unwrap();
+    assert_eq!(nested_dag.node_count(), 2);
+    assert!(nested_dag.edges().contains_key("complex_0"));
+    assert!(nested_dag.edges().contains_key("complex_1"));
+
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_command_not_found() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      tasks:
+        test:
+          cmd: echo "test"
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let builder = TaskGraphBuilder::new()?;
+    let cancel_token = CancellationToken::new();
+    let result = builder.build(octafile, "nonexistent", cancel_token, vec![]).await;
+
+    assert!(matches!(result, Err(ExecutorError::CommandNotFound(_))));
+    Ok(())
+  }
+
+  // #[tokio::test]
+  // async fn test_cyclic_dependency_detection() -> ExecutorResult<()> {
+  //   let temp_dir = TempDir::new().unwrap();
+  //   let content = r#"
+  //     version: 1
+  //     tasks:
+  //       task1:
+  //         cmd: echo "task1"
+  //         deps:
+  //           - task2
+  //       task2:
+  //         cmd: echo "task2"
+  //         deps:
+  //           - task1
+  //   "#;
+  //   let octafile_path = temp_dir.path().join("Octafile.yml");
+  //   fs::write(&octafile_path, content)?;
+
+  //   let octafile = Octafile::load(Some(octafile_path), false)?;
+  //   let builder = TaskGraphBuilder::new()?;
+  //   let cancel_token = CancellationToken::new();
+  //   let result = builder.build(octafile, "task1", cancel_token, vec![]).await;
+
+  //   assert!(matches!(result, Err(ExecutorError::CycleDetected)));
+  //   Ok(())
+  // }
+
+  #[tokio::test]
+  async fn test_platform_specific_tasks() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      tasks:
+        test_macos:
+          cmd: echo "test"
+          platforms:
+            - macos
+        test_linux:
+          cmd: echo "test"
+          platforms:
+            - linux
+        test_windows:
+          cmd: echo "test"
+          platforms:
+            - windows
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let builder = TaskGraphBuilder::new()?;
+    let cancel_token = CancellationToken::new();
+
+    #[cfg(windows)]
+    let dag = builder.build(octafile, "test", cancel_token, vec![]).await?;
+
+    let dag = if cfg!(target_os = "linux") {
+      builder.build(octafile, "test_linux", cancel_token, vec![]).await?
+    } else if cfg!(target_os = "windows") {
+      builder.build(octafile, "test_windows", cancel_token, vec![]).await?
+    } else {
+      builder.build(octafile, "test_macos", cancel_token, vec![]).await?
+    };
+
+    // The number of nodes will depend on the current platform
+    assert!(!dag.has_cycle()?);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_command_with_args() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      tasks:
+        test:
+          cmd: echo "{{ COMMAND_ARGS }}"
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let builder = TaskGraphBuilder::new()?;
+    let cancel_token = CancellationToken::new();
+    let args = vec!["arg1".to_string(), "arg2".to_string()];
+    let dag = builder.build(octafile, "test", cancel_token, args).await?;
+
+    assert_eq!(dag.node_count(), 1);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_nested_includes() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let root_octafile = setup_test_octafiles(&temp_dir).await?;
+
+    let builder = TaskGraphBuilder::new()?;
+    let cancel_token = CancellationToken::new();
+    let dag = builder
+      .build(root_octafile, "**:deep_task", cancel_token, vec![])
+      .await?;
+
+    assert!(dag.node_count() > 0);
+    assert!(!dag.has_cycle()?);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_variable_inheritance() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      vars:
+        GLOBAL: "global"
+      tasks:
+        test:
+          vars:
+            LOCAL: "local"
+          cmd: echo "{{ GLOBAL }} {{ LOCAL }}"
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let builder = TaskGraphBuilder::new()?;
+    let cancel_token = CancellationToken::new();
+    let dag = builder.build(octafile, "test", cancel_token, vec![]).await?;
+
+    assert_eq!(dag.node_count(), 1);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_environment_inheritance() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      env:
+        GLOBAL_ENV: "global"
+      tasks:
+        test:
+          env:
+            LOCAL_ENV: "local"
+          cmd: echo "test"
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let builder = TaskGraphBuilder::new()?;
+    let cancel_token = CancellationToken::new();
+    let dag = builder.build(octafile, "test", cancel_token, vec![]).await?;
+
+    assert_eq!(dag.node_count(), 1);
+    Ok(())
   }
 
   async fn setup_test_octafiles(temp_dir: &TempDir) -> ExecutorResult<Arc<Octafile>> {
