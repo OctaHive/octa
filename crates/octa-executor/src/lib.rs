@@ -815,9 +815,6 @@ mod tests {
     let builder = TaskGraphBuilder::new()?;
     let cancel_token = CancellationToken::new();
 
-    #[cfg(windows)]
-    let dag = builder.build(octafile, "test", cancel_token, vec![]).await?;
-
     let dag = if cfg!(target_os = "linux") {
       builder.build(octafile, "test_linux", cancel_token, vec![]).await?
     } else if cfg!(target_os = "windows") {
