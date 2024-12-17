@@ -1,0 +1,20 @@
+version: 1
+
+vars:
+  PROJECT: Octa
+
+tasks:
+  start:
+    cmd: echo Start building for project {{ PROJECT }}
+
+  stop:
+    cmd: echo Stop building
+
+  process:
+    cmd: echo Build
+
+  build:
+    cmds:
+      - task: start
+      - task: process
+      - task: stop

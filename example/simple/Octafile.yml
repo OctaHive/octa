@@ -1,0 +1,7 @@
+version: 1
+
+vars:
+  NAME: Alex
+
+tasks:
+  echo: echo Good morning {{ NAME }}
