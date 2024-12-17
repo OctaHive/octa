@@ -390,7 +390,6 @@ mod tests {
     }));
 
     let display = format!("{}", vars);
-    println!("{}", display);
 
     assert!(display.contains("\"key\": \"value\""));
     assert!(display.contains("\"number\": 42"));

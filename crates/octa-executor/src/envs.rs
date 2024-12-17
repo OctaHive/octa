@@ -247,3 +247,146 @@ impl IntoIterator for &Envs {
     EnvsIter::new(self.context.clone())
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn test_new_envs() {
+    let envs = Envs::new();
+    assert!(envs.parent.is_none());
+    assert!(!envs.expanded);
+    assert_eq!(envs.context, EnvContext::new());
+  }
+
+  #[test]
+  fn test_with_parent() {
+    let parent = Envs::new();
+    let envs = Envs::with_parent(parent);
+    assert!(envs.parent.is_some());
+    assert!(!envs.expanded);
+  }
+
+  #[test]
+  fn test_with_value() {
+    let mut map = EnvContext::new();
+    map.insert("key".to_owned(), "value".to_owned());
+
+    let envs = Envs::with_value(map);
+
+    assert_eq!(envs.get("key").unwrap(), &"value".to_string());
+  }
+
+  #[test]
+  fn test_with_value_and_parent() {
+    let mut parent_map = EnvContext::new();
+    parent_map.insert("parent_key".to_owned(), "parent_value".to_owned());
+
+    let mut map = EnvContext::new();
+    map.insert("child_key".to_owned(), "child_value".to_owned());
+
+    let parent = Envs::with_value(parent_map);
+    let envs = Envs::with_value_and_parent(map, parent);
+
+    assert!(envs.parent.is_some());
+    assert_eq!(envs.get("child_key").unwrap(), &"child_value".to_string());
+  }
+
+  #[test]
+  fn test_insert() {
+    let mut envs = Envs::new();
+    envs.insert(&"key".to_string(), &"value".to_string());
+    assert_eq!(envs.get("key").unwrap(), &"value".to_string());
+  }
+
+  #[test]
+  fn test_extend() {
+    let mut envs = Envs::new();
+    let mut context = EnvContext::new();
+    context.insert("key".to_string(), "value".to_string());
+    envs.extend(context);
+
+    assert_eq!(envs.get("key").unwrap(), &"value".to_string());
+  }
+
+  #[test]
+  fn test_envs_iterator() {
+    let mut map = EnvContext::new();
+    map.insert("key1".to_owned(), "value1".to_owned());
+    map.insert("key2".to_owned(), "value2".to_owned());
+
+    let envs = Envs::with_value(map);
+
+    let items: Vec<_> = envs.iter().collect();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().any(|(k, v)| k == "key1" && v == &"value1".to_string()));
+    assert!(items.iter().any(|(k, v)| k == "key2" && v == &"value2".to_string()));
+  }
+
+  #[test]
+  fn test_serialize_deserialize() {
+    let mut map = EnvContext::new();
+    map.insert("key".to_owned(), "value".to_owned());
+
+    let original = Envs::with_value(map);
+
+    let serialized = serde_json::to_string(&original).unwrap();
+    let deserialized: Envs = serde_json::from_str(&serialized).unwrap();
+
+    assert_eq!(original, deserialized);
+  }
+
+  #[test]
+  fn test_display() {
+    let mut map = EnvContext::new();
+    map.insert("key".to_owned(), "value".to_owned());
+
+    let envs = Envs::with_value(map);
+
+    let display = format!("{}", envs);
+
+    assert!(display.contains("\"key\": \"value\""));
+  }
+
+  #[test]
+  fn test_context_conversion() {
+    let mut context = EnvContext::new();
+    context.insert("key".to_owned(), "value".to_owned());
+
+    // Test From<Context> for Envs
+    let envs: Envs = context.clone().into();
+    assert_eq!(envs.get("key").unwrap(), &"value".to_string());
+
+    // Test From<Envs> for Context
+    let context_back: EnvContext = envs.into();
+    assert_eq!(context_back.get("key").unwrap(), &"value".to_string());
+  }
+
+  #[tokio::test]
+  async fn test_expand_simple() {
+    let mut context = EnvContext::new();
+    context.insert("name".to_owned(), "John".to_owned());
+    context.insert("key".to_owned(), "$name".to_owned());
+
+    let mut envs = Envs::with_value(context);
+
+    envs.expand().await.unwrap();
+    assert_eq!(envs.get("name").unwrap(), &"John".to_string());
+  }
+
+  #[tokio::test]
+  async fn test_expand_with_parent() {
+    let mut parent_context = EnvContext::new();
+    parent_context.insert("first".to_owned(), "John".to_owned());
+    let mut context = EnvContext::new();
+    context.insert("full".to_owned(), "$first Doe".to_owned());
+
+    let parent = Envs::with_value(parent_context);
+
+    let mut envs = Envs::with_value_and_parent(context, parent);
+
+    envs.expand().await.unwrap();
+    assert_eq!(envs.get("full").unwrap(), &"John Doe".to_string());
+  }
+}
