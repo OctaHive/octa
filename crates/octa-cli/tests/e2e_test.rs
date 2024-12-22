@@ -10,10 +10,9 @@ fn test_no_octafile_file_discovered() {
   let mut cmd = Command::cargo_bin("octa").unwrap();
   cmd.current_dir(tmp_dir.path());
   cmd.arg("echo");
-  cmd
-    .assert()
-    .failure()
-    .stderr(predicate::str::contains("OctafileLoad(NotSearchedError)"));
+  cmd.assert().failure().stderr(predicate::str::contains(
+    "Octafile not found traversing to root directory",
+  ));
 }
 
 #[test]

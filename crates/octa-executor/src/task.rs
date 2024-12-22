@@ -583,7 +583,7 @@ impl TaskNode {
     if let Some(preconditions) = &self.preconditions {
       for precondition in preconditions {
         let rendered = tera
-          .render_str(&precondition, &context)
+          .render_str(precondition, &context)
           .map_err(|e| ExecutorError::ValueExpandError(precondition.to_owned(), e.to_string()))?;
 
         result = result && (rendered.trim() == "true" || rendered.trim() == "True" || rendered.trim() == "1");

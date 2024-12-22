@@ -209,15 +209,13 @@ mod tests {
     file_path
   }
 
-  fn create_gen_test_yaml(name: Option<&str>, tasks: Vec<(&str, Task)>) -> (tempfile::TempDir, PathBuf) {
+  fn create_gen_test_yaml(tasks: Vec<(&str, Task)>) -> (tempfile::TempDir, PathBuf) {
     let temp_dir = tempfile::TempDir::new().unwrap();
     let file_path = temp_dir.path().join("Octafile.yml");
 
     let content = {
       let mut content = String::from("version: 1\n");
-      if let Some(name) = name {
-        content.push_str(&format!("name: {}\n", name));
-      }
+
       content.push_str("tasks:\n");
       for (task_name, task) in &tasks {
         content.push_str(&format!("  {}:\n", task_name));
@@ -236,7 +234,7 @@ mod tests {
   #[test]
   fn test_find_simple_task() {
     let finder = OctaFinder::new();
-    let (_temp_dir, file_path) = create_gen_test_yaml(Some("root"), vec![("test", create_test_task("test"))]);
+    let (_temp_dir, file_path) = create_gen_test_yaml(vec![("test", create_test_task("test"))]);
 
     let octafile = Octafile::load(Some(file_path), false).unwrap();
     let results = finder.find_by_path(octafile, "test");
@@ -251,13 +249,13 @@ mod tests {
     let finder = OctaFinder::new();
 
     // Create child octafile
-    let (child_dir, child_path) = create_gen_test_yaml(Some("child"), vec![("child_task", create_test_task("child"))]);
+    let (child_dir, child_path) = create_gen_test_yaml(vec![("child_task", create_test_task("child"))]);
 
     // Create root octafile with include
     let root_content = format!(
       r#"
       version: 1
-      name: root
+
       includes:
         child:
           octafile: {}
@@ -289,15 +287,15 @@ mod tests {
     let finder = OctaFinder::new();
 
     // Create child octafiles
-    let (child1_dir, child1_path) = create_gen_test_yaml(Some("child1"), vec![("task", create_test_task("child1"))]);
+    let (child1_dir, child1_path) = create_gen_test_yaml(vec![("task", create_test_task("child1"))]);
 
-    let (child2_dir, child2_path) = create_gen_test_yaml(Some("child2"), vec![("task", create_test_task("child2"))]);
+    let (child2_dir, child2_path) = create_gen_test_yaml(vec![("task", create_test_task("child2"))]);
 
     // Create root octafile with includes
     let root_content = format!(
       r#"
       version: 1
-      name: root
+
       includes:
         child1:
           octafile: {}
@@ -347,7 +345,7 @@ mod tests {
     // Create level3 octafile
     let level3_content = r#"
       version: 1
-      name: level3
+
       tasks:
         task1:
           cmd: echo level3_task
@@ -358,7 +356,7 @@ mod tests {
     let level2_content = format!(
       r#"
         version: 1
-        name: level2
+
         includes:
           level3:
             octafile: {}
@@ -374,7 +372,7 @@ mod tests {
     let level1_content = format!(
       r#"
       version: 1
-      name: level1
+
       includes:
         level2:
           octafile: {}
@@ -389,7 +387,7 @@ mod tests {
     // Create sibling octafile
     let sibling_content = r#"
       version: 1
-      name: sibling
+
       tasks:
         task1:
           cmd: echo sibling_task
@@ -400,7 +398,7 @@ mod tests {
     let root_content = format!(
       r#"
         version: 1
-        name: root
+
         includes:
           level1:
             octafile: {}
@@ -452,7 +450,7 @@ mod tests {
     // Create a structure with optional includes
     let level1_content = r#"
       version: 1
-      name: level1
+
       tasks:
         task1:
           cmd: echo level1_task
@@ -462,7 +460,7 @@ mod tests {
     let root_content = format!(
       r#"
       version: 1
-      name: root
+
       includes:
         level1:
           octafile: {}
@@ -493,7 +491,7 @@ mod tests {
 
     let root_content = r#"
       version: 1
-      name: root
+
       tasks:
         task1:
           cmd: echo root_task
@@ -515,7 +513,7 @@ mod tests {
 
     let level1_content = r#"
       version: 1
-      name: level1
+
       tasks:
         task1:
           cmd: echo level1_task1
@@ -527,10 +525,11 @@ mod tests {
     let root_content = format!(
       r#"
       version: 1
-      name: root
+
       includes:
         level1:
           octafile: {}
+
       tasks:
         task1:
           cmd: echo root_task1

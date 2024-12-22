@@ -446,7 +446,7 @@ mod tests {
   fn test_optional_includes() {
     let content = r#"
       version: 1
-      name: root
+
       includes:
         optional:
           octafile: nonexistent.yml
