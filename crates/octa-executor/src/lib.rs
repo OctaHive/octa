@@ -73,12 +73,12 @@ impl TaskGraphBuilder {
     self.command_args = command_args;
     let mut dag = DAG::new();
 
-    let mut commands = self.finder.find_by_path(Arc::clone(&octafile), command);
+    let mut commands = self.find_and_filter_commands(&octafile, command)?;
+    commands = self.filter_internal_task(commands);
+
     if commands.is_empty() {
       return Err(ExecutorError::CommandNotFound(command.to_string()));
     }
-
-    commands = self.filter_command_by_platform(commands);
 
     for cmd in commands {
       let deps = self.process_dependencies(&mut dag, &cmd, vec![])?;
@@ -121,17 +121,7 @@ impl TaskGraphBuilder {
         for cmd in cmds {
           match cmd {
             Cmds::Simple(s) => {
-              // Создаем задачу из верхней, очищая некоторые поля
-              let simple = FindResult {
-                name: s.clone(), // Имя содержит код команды
-                octafile: command.octafile.clone(),
-                task: Task {
-                  cmds: None,
-                  cmd: Some(cmd.clone()),
-                  deps: None,
-                  ..command.task.clone()
-                },
-              };
+              let simple = self.create_simple_command(command, s);
 
               // Fix command name
               let task = self.create_task_node(
@@ -159,12 +149,7 @@ impl TaskGraphBuilder {
               index += 1;
             },
             Cmds::Complex(complex) => {
-              let mut cmds = self.finder.find_by_path(Arc::clone(&command.octafile), &complex.task);
-              if cmds.is_empty() {
-                return Err(ExecutorError::CommandNotFound(complex.task.clone()));
-              }
-
-              cmds = self.filter_command_by_platform(cmds);
+              let cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
 
               for cmd in cmds {
                 let mut deps =
@@ -240,17 +225,7 @@ impl TaskGraphBuilder {
         for cmd in cmds {
           match cmd {
             Cmds::Simple(s) => {
-              // Создаем задачу из верхней, очищая некоторые поля
-              let simple = FindResult {
-                name: s.clone(), // Имя содержит код команды
-                octafile: command.octafile.clone(),
-                task: Task {
-                  cmds: None,
-                  cmd: Some(cmd.clone()),
-                  deps: None,
-                  ..command.task.clone()
-                },
-              };
+              let simple = self.create_simple_command(command, s);
 
               let task = self.create_task_node(
                 dag,
@@ -283,12 +258,7 @@ impl TaskGraphBuilder {
               }
             },
             Cmds::Complex(complex) => {
-              let mut cmds = self.finder.find_by_path(Arc::clone(&command.octafile), &complex.task);
-              if cmds.is_empty() {
-                return Err(ExecutorError::CommandNotFound(complex.task.clone()));
-              }
-
-              cmds = self.filter_command_by_platform(cmds);
+              let cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
 
               for cmd in cmds {
                 let task =
@@ -484,6 +454,13 @@ impl TaskGraphBuilder {
     }
   }
 
+  fn filter_internal_task(&self, tasks: Vec<FindResult>) -> Vec<FindResult> {
+    tasks
+      .into_iter()
+      .filter(|t| !t.task.internal.unwrap_or(false))
+      .collect()
+  }
+
   /// Build a map tracking frequency of each dependency
   fn build_deps_frequency_map<'a>(&self, deps: &'a [Deps]) -> HashMap<&'a str, (usize, usize)> {
     let mut deps_map = HashMap::new();
@@ -506,6 +483,32 @@ impl TaskGraphBuilder {
     }
 
     deps_map
+  }
+
+  /// Find and filter commands by platform
+  fn find_and_filter_commands(&self, octafile: &Arc<Octafile>, task_name: &str) -> ExecutorResult<Vec<FindResult>> {
+    let mut cmds = self.finder.find_by_path(Arc::clone(octafile), task_name);
+    cmds = self.filter_command_by_platform(cmds);
+
+    if cmds.is_empty() {
+      return Err(ExecutorError::CommandNotFound(task_name.to_string()));
+    }
+
+    Ok(cmds)
+  }
+
+  /// Create a simple command from a complex one
+  fn create_simple_command(&self, command: &FindResult, cmd_str: &str) -> FindResult {
+    FindResult {
+      name: cmd_str.to_string(),
+      octafile: command.octafile.clone(),
+      task: Task {
+        cmds: None,
+        cmd: Some(Cmds::Simple(cmd_str.to_string())),
+        deps: None,
+        ..command.task.clone()
+      },
+    }
   }
 
   fn create_group_node(

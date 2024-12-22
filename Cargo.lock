@@ -942,6 +942,7 @@ dependencies = [
  "clap_complete",
  "colored",
  "dotenvy",
+ "lazy_static",
  "nu-ansi-term 0.50.1",
  "octa-executor",
  "octa-finder",

@@ -7,9 +7,9 @@ This project was inspired by the go-task build project. However, when we rewriti
 functionality missing, so I decided to create my own builder. 
 
 # The differences from go-task
-* Support run nested tasks using wildcards, for example `*:docker` run all nested docker tasks
-* Support returning task results. This is useful, for example, when you need to process the result of a task in its parent task.
-* Support rendering templates and return as a task result
+* Support run tasks using wildcards, for example `*:docker` run all first child docker tasks, or you can run `**:docker` and run all nested docker task
+* Support returning dependency task results. This is useful, for example, when you need to process the result of a task in its parent task.
+* Support rendering templates and return result of rendering as task result
 
 # Installation
 
@@ -549,3 +549,44 @@ tasks:
         vars:
           CONTENT: 2
 ```
+
+# Prevent run task
+Often, if your source files have not changed, there is no need to run the task. To handle this, you can specify 
+the `sources` parameter for the task, where you can list the files whose changes need to be tracked. When the 
+task is executed, Octa will check the checksums of the specified files, and if they have not changed, the task
+will complete without being executed.
+
+```yaml
+version: 1
+
+tasks:
+  build:
+    sources:
+      - ./src/*
+    cmd: echo Run build
+```
+
+If we run this task again, the command will complete without actually executing:
+
+```console
+$ ./octa build
+2024-12-22 16:59:06 [octa] Building DAG for command build with provided args []
+2024-12-22 16:59:06 [octa] Starting execution plan for command build
+2024-12-22 16:59:06 [octa] Starting task build
+Run build
+2024-12-22 16:59:06 [octa] All tasks completed successfully
+
+$ ./octa build
+2024-12-22 16:59:08 [octa] Building DAG for command build with provided args []
+2024-12-22 16:59:08 [octa] Starting execution plan for command build
+2024-12-22 16:59:08 [octa] Task build are up to date
+2024-12-22 16:59:08 [octa] All tasks completed successfully
+```
+
+You can use glob patterns when specify source targets.
+
+By default, Octa calculates file checksums, but you can switch it to track file modification 
+timestamps by setting the `source_strategy` parameter to `timestamp`.
+
+By default, Octa stores all the necessary information for tracking sources in the `.octa` directory.
+You can override this directory by setting the `OCTA_CACHE_DIR` environment variable.

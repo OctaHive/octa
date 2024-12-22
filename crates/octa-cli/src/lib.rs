@@ -1,6 +1,7 @@
 use std::{env, path::PathBuf, sync::Arc};
 
 use clap::{CommandFactory, Parser};
+use lazy_static::lazy_static;
 use logger::{ChronoLocal, OctaFormatter};
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
@@ -19,7 +20,9 @@ use octa_octafile::Octafile;
 mod error;
 mod logger;
 
-const OCTA_DATA_DIR: &str = ".octa";
+lazy_static! {
+  static ref OCTA_DATA_DIR: String = env::var("OCTA_CACHE_DIR").unwrap_or_else(|_| ".octa".to_string());
+}
 
 #[derive(Parser)]
 #[clap(author, version, about, bin_name("octa"), name("octa"), propagate_version(true))]
@@ -162,7 +165,7 @@ pub async fn run() -> OctaResult<()> {
     return Ok(());
   }
 
-  let fingerprint = Arc::new(sled::open(format!("{}/fingerprint", OCTA_DATA_DIR))?);
+  let fingerprint = Arc::new(sled::open(format!("{}/fingerprint", *OCTA_DATA_DIR))?);
 
   if args.clean_cache {
     fingerprint.clear()?;
