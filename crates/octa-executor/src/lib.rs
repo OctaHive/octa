@@ -535,11 +535,16 @@ impl TaskGraphBuilder {
   /// Collects variables from global, hierarchy and task levels
   fn collect_vars(&self, cmd: &FindResult, execute_vars: Option<octa_octafile::Vars>) -> Vars {
     let mut vars = self.initialize_global_vars(cmd);
+    let env_vars: HashMap<String, String> = env::vars().collect();
+
     self.process_hierarchy_vars(cmd, &mut vars);
     vars = self.add_task_vars(cmd, vars);
     if let Some(exec_vars) = execute_vars {
       vars.extend_with(&Some(exec_vars));
     }
+
+    vars.extend_with(&env_vars);
+
     vars
   }
 

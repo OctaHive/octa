@@ -53,7 +53,7 @@ pub(crate) struct Cli {
   #[arg(long, default_value_t = false)]
   pub summary: bool,
 
-  #[arg(long, default_value_t = false)]
+  #[arg(short, long, default_value_t = false)]
   pub force: bool,
 
   #[arg(last = true)]

@@ -17,7 +17,7 @@ impl Function for ExecuteShell {
     let sh = args
       .get("command")
       .ok_or_else(|| tera::Error::msg("Missing 'command' argument"))?;
-    let current_dir = env::current_dir().map_err(|_| tera::Error::msg("Can;t get current directory"))?;
+    let current_dir = env::current_dir().map_err(|_| tera::Error::msg("Can't get current directory"))?;
     let command = sh.as_str().ok_or_else(|| tera::Error::msg("Wrong command format"))?;
 
     debug!("Execute command in directory {}: {}", current_dir.display(), command);

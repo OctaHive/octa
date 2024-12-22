@@ -271,6 +271,58 @@ You can use different data types as values. The following data types are support
 * array
 * object
 
+When evaluating variables for a task, Octa will search for them along the entire execution path 
+in the following order:
+
+* Values passed when running the task
+* Values defined for the task
+* Values in the Octafile where the task is defined
+* Values in parent Octafiles
+* Values passed when invoking octa
+
+```yaml
+version: 1
+
+vars:
+  GREETING: Hello from Taskfile!
+
+tasks:
+  print-var:
+    cmds:
+      - echo "{{.VAR}}"
+    vars:
+      VAR: Hello!
+      
+  greet:
+    cmds:
+      - echo "{{.GREETING}}"
+```
+
+The option to pass a parameter when invoking octa:
+
+```console
+$ GREETING="Hello Bob" ./octa greet
+2024-12-22 18:36:59 [octa] Building DAG for command greet with provided args []
+2024-12-22 18:36:59 [octa] Starting execution plan for command greet
+2024-12-22 18:36:59 [octa] Starting task echo "{{GREETING}}"
+Hello Bob
+2024-12-22 18:36:59 [octa] All tasks completed successfully
+```
+
+In addition to setting variables through expanding values, you can set variables using shell command 
+execution.
+
+```yaml
+version: 1
+
+tasks:
+  build:
+    cmds:
+      - go build -ldflags="-X main.Version={{VERSION}}" main.go      
+    vars:
+      VERSION: '{{ shell(command="git describe --tags --abbrev=0") }}'
+```
+
 # Dry mode
 Sometimes you may want to check how your task works without executing any commands. For 
 this purpose, you can run the task in dry mode using the `--dry` flag. In dry mode, Octa 
@@ -590,3 +642,6 @@ timestamps by setting the `source_strategy` parameter to `timestamp`.
 
 By default, Octa stores all the necessary information for tracking sources in the `.octa` directory.
 You can override this directory by setting the `OCTA_CACHE_DIR` environment variable.
+
+If you still want the task to run even though the source files have not changed, you can use 
+the `--force` or `-f` flag.
