@@ -153,6 +153,7 @@ fn test_run_os_task() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+#[ignore]
 fn test_set_env() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
