@@ -83,7 +83,16 @@ impl TaskGraphBuilder {
     for cmd in commands {
       let deps = self.process_dependencies(&mut dag, &cmd, vec![])?;
 
-      self.process_command(&mut dag, cmd.name.clone(), &cmd, deps, &mut None, None, None)?;
+      self.process_command(
+        &mut dag,
+        cmd.name.clone(),
+        &cmd,
+        deps,
+        &mut None,
+        None,
+        None,
+        Some(run_parallel),
+      )?;
     }
 
     self.validate_dag(&dag, command)?;
@@ -101,12 +110,9 @@ impl TaskGraphBuilder {
     prev: &mut Option<ArcNode>,
     execute_vars: Option<octa_octafile::Vars>,
     execute_envs: Option<octa_octafile::Envs>,
+    run_parallel: Option<bool>,
   ) -> ExecutorResult<usize> {
-    let run_parallel = match &command.task.execute_mode {
-      Some(ExecuteMode::Parallel) => true,
-      Some(ExecuteMode::Sequentially) => false,
-      None => false,
-    };
+    let run_parallel = run_parallel.unwrap_or(matches!(&command.task.execute_mode, Some(ExecuteMode::Parallel)));
 
     match &command.task.cmds {
       Some(cmds) => {
@@ -182,6 +188,7 @@ impl TaskGraphBuilder {
                   prev,
                   complex.vars.clone(),
                   complex.envs.clone(),
+                  None,
                 )?;
 
                 index += cnt;
@@ -228,11 +235,7 @@ impl TaskGraphBuilder {
     match &command.task.cmds {
       Some(cmds) => {
         // Зависимости по умолчанию выполняются паралелльно
-        let run_parallel = match &command.task.execute_mode {
-          Some(ExecuteMode::Parallel) => true,
-          Some(ExecuteMode::Sequentially) => false,
-          None => false,
-        };
+        let run_parallel = matches!(&command.task.execute_mode, Some(ExecuteMode::Parallel));
 
         for cmd in cmds {
           match cmd {
@@ -319,11 +322,7 @@ impl TaskGraphBuilder {
       },
       None => {
         // Зависимости по умолчанию выполняются паралелльно
-        let run_parallel = match &command.task.execute_mode {
-          Some(ExecuteMode::Parallel) => true,
-          Some(ExecuteMode::Sequentially) => false,
-          None => true,
-        };
+        let run_parallel = !matches!(&command.task.execute_mode, Some(ExecuteMode::Sequentially));
 
         let task = self.create_task_node(dag, dep_name, command, execute_vars, execute_envs)?;
 
