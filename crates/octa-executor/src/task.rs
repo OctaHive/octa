@@ -37,6 +37,7 @@ pub trait Executable<T> {
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     fingerprint: Arc<Db>,
     dry: bool,
+    force: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String>;
   async fn set_result(&self, task_name: String, res: String);
@@ -722,9 +723,10 @@ impl Executable<TaskNode> for TaskNode {
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     fingerprint: Arc<Db>,
     dry: bool,
+    force: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
-    if !self.check_sources(fingerprint.clone()).await? {
+    if !force && !self.check_sources(fingerprint.clone()).await? {
       self.log_info(format!("Task {} are up to date", self.name));
 
       return Ok("".to_string());
@@ -823,7 +825,7 @@ mod tests {
     let fingerprint = Arc::new(db);
 
     let result = task
-      .execute(cache, fingerprint, false, CancellationToken::new())
+      .execute(cache, fingerprint, false, false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result.trim(), "hello world");
@@ -856,7 +858,7 @@ mod tests {
     let fingerprint = Arc::new(db);
 
     let result = task
-      .execute(cache, fingerprint, false, CancellationToken::new())
+      .execute(cache, fingerprint, false, false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result, "Hello world!");
@@ -875,14 +877,26 @@ mod tests {
 
     // First execution
     let result1 = task
-      .execute(cache.clone(), fingerprint.clone(), false, CancellationToken::new())
+      .execute(
+        cache.clone(),
+        fingerprint.clone(),
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result1.trim(), "cached result");
 
     // Second execution should return cached result
     let result2 = task
-      .execute(cache.clone(), fingerprint.clone(), false, CancellationToken::new())
+      .execute(
+        cache.clone(),
+        fingerprint.clone(),
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result1, result2);
@@ -921,7 +935,13 @@ mod tests {
 
     // First execution
     let result1 = task
-      .execute(cache.clone(), fingerprint.clone(), false, CancellationToken::new())
+      .execute(
+        cache.clone(),
+        fingerprint.clone(),
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
 
@@ -930,7 +950,13 @@ mod tests {
 
     // Second execution should run again due to source changes
     let result2 = task
-      .execute(cache.clone(), fingerprint.clone(), false, CancellationToken::new())
+      .execute(
+        cache.clone(),
+        fingerprint.clone(),
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result1, result2);
@@ -948,7 +974,9 @@ mod tests {
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
 
-    let result = task.execute(cache, fingerprint, false, CancellationToken::new()).await;
+    let result = task
+      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .await;
     assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
   }
 
@@ -985,7 +1013,7 @@ mod tests {
       }
     });
 
-    let result = task.execute(cache, fingerprint, false, cancel_token).await;
+    let result = task.execute(cache, fingerprint, false, false, cancel_token).await;
     assert!(matches!(result, Err(ExecutorError::TaskCancelled(_))));
 
     cancel_handle.await.unwrap();
@@ -1015,7 +1043,9 @@ mod tests {
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
 
-    let result = task.execute(cache, fingerprint, false, CancellationToken::new()).await;
+    let result = task
+      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), "");
   }
@@ -1040,7 +1070,7 @@ mod tests {
     let fingerprint = Arc::new(db);
 
     let result = task
-      .execute(cache, fingerprint, false, CancellationToken::new())
+      .execute(cache, fingerprint, false, false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result, "Result: dep_output");

@@ -53,6 +53,9 @@ pub(crate) struct Cli {
   #[arg(long, default_value_t = false)]
   pub summary: bool,
 
+  #[arg(long, default_value_t = false)]
+  pub force: bool,
+
   #[arg(last = true)]
   task_args: Vec<String>,
 }
@@ -195,6 +198,7 @@ pub async fn run() -> OctaResult<()> {
       None,
       Arc::clone(&fingerprint),
       args.dry,
+      args.force,
       Some(summary.clone()),
     )?;
     tasks.push(ExecuteItem {

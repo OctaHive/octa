@@ -52,6 +52,7 @@ struct ExecutionState<T: Hash + Identifiable + Eq + TaskItem> {
   cache: Arc<Mutex<IndexMap<String, CacheItem>>>, // Cache for tasks
   fingerprint: Arc<Db>,                           // Fingerprint db
   dry: bool,                                      // Dry mode
+  force: bool,
 }
 
 /// Executor manages the execution of tasks in a directed acyclic graph (DAG)
@@ -69,6 +70,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
     fingerprint: Arc<Db>,
     dry: bool,
+    force: bool,
     summary: Option<Arc<Summary>>,
   ) -> ExecutorResult<Self> {
     let in_degree = dag.nodes().iter().map(|n| (n.id().clone(), 0)).collect();
@@ -87,6 +89,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       summary,
       cache,
       dry,
+      force,
       fingerprint,
     };
 
@@ -184,6 +187,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       cache: self.state.cache.clone(),
       fingerprint: self.state.fingerprint.clone(),
       dry: self.state.dry,
+      force: self.state.force,
     };
 
     tokio::spawn(async move {
@@ -272,6 +276,7 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
   fingerprint: Arc<Db>,
   dry: bool,
+  force: bool,
 }
 
 struct TaskExecutor<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> {
@@ -302,6 +307,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
         self.context.cache.clone(),
         self.context.fingerprint.clone(),
         self.context.dry,
+        self.context.force,
         self.cancel_token.clone(),
       )
       .await;
