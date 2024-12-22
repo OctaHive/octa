@@ -119,11 +119,12 @@ pub struct TaskConfig {
   pub silent: bool,        // Should task print to stdout or stderr
 
   // Runtime behavior
-  pub run_mode: RunMode,             // Run mode
-  pub vars: Vars,                    // Task variables
-  pub envs: Envs,                    // Task environments
-  pub sources: Option<Vec<String>>,  // Sources for fingerprinting
-  pub source_strategy: SourceMethod, // Source validation strategy
+  pub run_mode: RunMode,                  // Run mode
+  pub vars: Vars,                         // Task variables
+  pub envs: Envs,                         // Task environments
+  pub sources: Option<Vec<String>>,       // Sources for fingerprinting
+  pub source_strategy: SourceMethod,      // Source validation strategy
+  pub preconditions: Option<Vec<String>>, // Task preconditions
 
   // State management
   cmd_type: CmdType, // Type of task for internal use
@@ -152,6 +153,7 @@ pub struct TaskConfigBuilder {
   pub envs: Option<Envs>,
   pub sources: Option<Vec<String>>,
   pub source_strategy: Option<SourceMethod>,
+  pub preconditions: Option<Vec<String>>,
 
   pub cmd_type: Option<CmdType>,
 }
@@ -184,6 +186,11 @@ impl TaskConfigBuilder {
 
   pub fn sources(mut self, sources: Option<Vec<String>>) -> Self {
     self.sources = sources;
+    self
+  }
+
+  pub fn preconditions(mut self, preconditions: Option<Vec<String>>) -> Self {
+    self.preconditions = preconditions;
     self
   }
 
@@ -247,6 +254,7 @@ impl TaskConfigBuilder {
       vars: self.vars.unwrap_or_default(),
       envs: self.envs.unwrap_or_default(),
       sources: self.sources,
+      preconditions: self.preconditions,
       source_strategy: self.source_strategy.unwrap_or(SourceMethod::Hash),
       cmd_type: self.cmd_type.unwrap_or(CmdType::Normal),
     })
@@ -269,11 +277,12 @@ pub struct TaskNode {
   pub silent: bool,        // Should task print to stdout or stderr
 
   // Runtime behavior
-  pub run_mode: RunMode,             // Run mode
-  pub vars: Vars,                    // Task variables
-  pub envs: Envs,                    // Task environments
-  pub sources: Option<Vec<String>>,  // Sources for fingerprinting
-  pub source_strategy: SourceMethod, // Source validation strategy
+  pub run_mode: RunMode,                  // Run mode
+  pub vars: Vars,                         // Task variables
+  pub envs: Envs,                         // Task environments
+  pub sources: Option<Vec<String>>,       // Sources for fingerprinting
+  pub source_strategy: SourceMethod,      // Source validation strategy
+  pub preconditions: Option<Vec<String>>, // Task run preconditions
 
   // State management
   pub deps_res: Arc<Mutex<HashMap<String, String>>>, // Dependencies results
@@ -314,6 +323,7 @@ impl TaskNode {
       silent: config.silent,
       deps_res: Arc::new(Mutex::new(HashMap::default())),
       cmd_type: config.cmd_type,
+      preconditions: config.preconditions,
     }
   }
 
@@ -562,6 +572,27 @@ impl TaskNode {
     }
   }
 
+  async fn check_preconditions(&self) -> ExecutorResult<bool> {
+    let mut tera = Tera::default();
+    let mut vars = self.vars.clone();
+    vars.expand(false).await?;
+
+    let context: Context = vars.into();
+    let mut result = true;
+
+    if let Some(preconditions) = &self.preconditions {
+      for precondition in preconditions {
+        let rendered = tera
+          .render_str(&precondition, &context)
+          .map_err(|e| ExecutorError::ValueExpandError(precondition.to_owned(), e.to_string()))?;
+
+        result = result && (rendered.trim() == "true" || rendered.trim() == "True" || rendered.trim() == "1");
+      }
+    }
+
+    Ok(result)
+  }
+
   /// Process command output and handle errors
   async fn process_command_output(
     &self,
@@ -726,6 +757,15 @@ impl Executable<TaskNode> for TaskNode {
     force: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
+    if !force && !self.check_preconditions().await? {
+      self.log_info(format!("Task '{}' preconditions failed", self.name));
+
+      return Err(ExecutorError::TaskCancelled(format!(
+        "Task '{}' preconditions failed",
+        self.name
+      )));
+    }
+
     if !force && !self.check_sources(fingerprint.clone()).await? {
       self.log_info(format!("Task {} are up to date", self.name));
 

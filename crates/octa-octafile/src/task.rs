@@ -99,7 +99,7 @@ pub struct Task {
   pub execute_mode: Option<ExecuteMode>,         // How execute task commands
   pub sources: Option<Vec<String>>,              // Sources for fingerprinting
   pub source_strategy: Option<SourceStrategies>, // Strategy for compare sources
-  pub predonditions: Option<Vec<String>>,        // Commands to check should run command
+  pub preconditions: Option<Vec<String>>,        // Commands to check should run command
 }
 
 impl<'de> Deserialize<'de> for Task {
@@ -149,7 +149,7 @@ impl<'de> Deserialize<'de> for Task {
             "execute_mode" => task.execute_mode = map.next_value()?,
             "sources" => task.sources = map.next_value()?,
             "source_strategy" => task.source_strategy = map.next_value()?,
-            "predonditions" => task.predonditions = map.next_value()?,
+            "preconditions" => task.preconditions = map.next_value()?,
             _ => {
               // Skip unknown fields
               let _ = map.next_value::<serde::de::IgnoredAny>()?;

@@ -31,11 +31,50 @@ const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
 pub type Vars = HashMap<String, Value>;
 pub type Envs = HashMap<String, String>;
 
+/// Enum of available file versions
+#[derive(Deserialize, Serialize, Debug, Clone, Copy)]
+#[serde(try_from = "u8")]
+pub enum Version {
+  V1 = 1,
+}
+
+impl TryFrom<u8> for Version {
+  type Error = String;
+
+  fn try_from(value: u8) -> Result<Self, Self::Error> {
+    match value {
+      1 => Ok(Version::V1),
+      _ => Err(format!("Unsupported version: {}", value)),
+    }
+  }
+}
+
+impl From<Version> for u8 {
+  fn from(version: Version) -> Self {
+    version as u8
+  }
+}
+
+impl PartialEq<u8> for Version {
+  fn eq(&self, other: &u8) -> bool {
+    (*self as u8) == *other
+  }
+}
+
+impl fmt::Display for Version {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    match self {
+      Version::V1 => write!(f, "1"),
+    }
+  }
+}
+
 /// Main taskfile structure representing the entire configuration
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Octafile {
   // Octafile schema version
-  pub version: u32,
+  pub version: Version,
 
   // Octafile global vars
   pub vars: Option<Vars>,

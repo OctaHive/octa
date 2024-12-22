@@ -74,6 +74,7 @@ impl TaskGraphBuilder {
     let mut dag = DAG::new();
 
     let mut commands = self.find_and_filter_commands(&octafile, command)?;
+    commands = self.filter_command_by_platform(commands);
     commands = self.filter_internal_task(commands);
 
     if commands.is_empty() {
@@ -149,7 +150,12 @@ impl TaskGraphBuilder {
               index += 1;
             },
             Cmds::Complex(complex) => {
-              let cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
+              let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
+              cmds = self.filter_command_by_platform(cmds);
+
+              if cmds.is_empty() {
+                continue;
+              }
 
               for cmd in cmds {
                 let mut deps =
@@ -258,7 +264,12 @@ impl TaskGraphBuilder {
               }
             },
             Cmds::Complex(complex) => {
-              let cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
+              let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
+              cmds = self.filter_command_by_platform(cmds);
+
+              if cmds.is_empty() {
+                continue;
+              }
 
               for cmd in cmds {
                 let task =
@@ -342,6 +353,7 @@ impl TaskGraphBuilder {
       .dir(cmd.task.dir.clone().unwrap_or(cmd.octafile.dir.clone()))
       .vars(vars)
       .envs(envs)
+      .preconditions(cmd.task.preconditions.clone())
       .tpl(cmd.task.tpl.clone())
       .sources(cmd.task.sources.clone())
       .silent(cmd.task.silent)
@@ -401,10 +413,11 @@ impl TaskGraphBuilder {
     for dep in deps {
       match dep {
         Deps::Simple(dep_name) => {
-          let mut commands = self.finder.find_by_path(cmd.octafile.clone(), dep_name);
+          let mut commands = self.find_and_filter_commands(&cmd.octafile, dep_name)?;
           commands = self.filter_command_by_platform(commands);
+
           if commands.is_empty() {
-            return Err(ExecutorError::CommandNotFound(dep_name.to_string()));
+            continue;
           }
 
           for cmd in commands {
@@ -414,10 +427,11 @@ impl TaskGraphBuilder {
           }
         },
         Deps::Complex(c) => {
-          let mut commands = self.finder.find_by_path(cmd.octafile.clone(), &c.task);
+          let mut commands = self.find_and_filter_commands(&cmd.octafile, &c.task)?;
           commands = self.filter_command_by_platform(commands);
+
           if commands.is_empty() {
-            return Err(ExecutorError::CommandNotFound(c.task.clone()));
+            continue;
           }
 
           for cmd in commands {
@@ -487,8 +501,7 @@ impl TaskGraphBuilder {
 
   /// Find and filter commands by platform
   fn find_and_filter_commands(&self, octafile: &Arc<Octafile>, task_name: &str) -> ExecutorResult<Vec<FindResult>> {
-    let mut cmds = self.finder.find_by_path(Arc::clone(octafile), task_name);
-    cmds = self.filter_command_by_platform(cmds);
+    let cmds = self.finder.find_by_path(Arc::clone(octafile), task_name);
 
     if cmds.is_empty() {
       return Err(ExecutorError::CommandNotFound(task_name.to_string()));
