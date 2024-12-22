@@ -16,8 +16,8 @@ functionality missing, so I decided to create my own builder.
 ## Homebrew
 If you have homebrew installed, you can install octa with:
 ```console
-
-
+brew tap OctaHive/octa
+brew install octa
 ```
 
 ## Binary releases
