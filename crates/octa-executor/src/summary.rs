@@ -1,6 +1,6 @@
 use humanize_duration::prelude::DurationExt;
 use humanize_duration::Truncate;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 use tracing::info;
@@ -14,6 +14,7 @@ pub struct TaskSummaryItem {
 #[derive(Debug)]
 pub struct Summary {
   tasks: Mutex<Vec<TaskSummaryItem>>,
+  total: Instant,
 }
 
 impl Default for Summary {
@@ -26,6 +27,7 @@ impl Summary {
   pub fn new() -> Self {
     Self {
       tasks: Mutex::new(vec![]),
+      total: Instant::now(),
     }
   }
 
@@ -35,15 +37,13 @@ impl Summary {
   }
 
   pub async fn print(&self) {
-    let mut total = Duration::new(0, 0);
     let tasks = self.tasks.lock().await;
     info!("================== Time Summary ==================");
     for item in tasks.iter() {
-      total += item.duration;
       let human = item.duration.human(Truncate::Millis);
       info!(" \"{}\": {}", item.name, human);
     }
-    info!(" Total time: {}", total.human(Truncate::Millis));
+    info!(" Total time: {}", self.total.elapsed().human(Truncate::Millis));
     info!("==================================================");
   }
 }
@@ -107,7 +107,7 @@ mod tests {
     assert!(logs_contain("================== Time Summary =================="));
     assert!(logs_contain("\"task1\": 200ms"));
     assert!(logs_contain("\"task2\": 350ms"));
-    assert!(logs_contain("Total time: 550ms"));
+    assert!(logs_contain("Total time: 0ms"));
     assert!(logs_contain("=================================================="));
   }
 }

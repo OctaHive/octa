@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{env, path::PathBuf, sync::Arc};
 
 use clap::{CommandFactory, Parser};
 use logger::{ChronoLocal, OctaFormatter};
@@ -47,6 +47,9 @@ pub(crate) struct Cli {
   #[arg(long, default_value_t = false)]
   pub clean_cache: bool,
 
+  #[arg(long, default_value_t = false)]
+  pub summary: bool,
+
   #[arg(last = true)]
   task_args: Vec<String>,
 }
@@ -74,17 +77,33 @@ pub async fn run() -> OctaResult<()> {
     })
     .unwrap();
 
-  // Create formatting layer
-  let fmt_layer = fmt::layer()
-    .compact()
-    .with_timer(ChronoLocal)
-    .with_file(false)
-    .with_line_number(false)
-    .with_span_events(FmtSpan::CLOSE)
-    .event_format(OctaFormatter);
+  let pretty_print = env::var("OCTA_TESTS").is_err();
 
-  // Combine layers and set as global default
-  tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
+  if pretty_print {
+    // Create formatting layer
+    let fmt_layer = fmt::layer()
+      .compact()
+      .with_timer(ChronoLocal)
+      .with_file(false)
+      .with_line_number(false)
+      .with_span_events(FmtSpan::CLOSE)
+      .event_format(OctaFormatter);
+
+    // Combine layers and set as global default
+    tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
+  } else {
+    // Create formatting layer
+    let fmt_layer = fmt::layer()
+      .compact()
+      .with_file(false)
+      .with_level(false)
+      .without_time()
+      .with_target(false)
+      .with_line_number(false)
+      .with_span_events(FmtSpan::CLOSE);
+
+    tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
+  }
 
   // Load octafile
   let octafile = Octafile::load(args.config, args.global)?;
@@ -164,12 +183,7 @@ pub async fn run() -> OctaResult<()> {
     // Create DAG
     let builder = TaskGraphBuilder::new()?;
     let dag = builder
-      .build(
-        Arc::clone(&octafile),
-        command,
-        cancel_token.clone(),
-        args.task_args.clone(),
-      )
+      .build(Arc::clone(&octafile), command, args.parallel, args.task_args.clone())
       .await?;
 
     let executor = Executor::new(
@@ -217,7 +231,9 @@ pub async fn run() -> OctaResult<()> {
     }
   }
 
-  summary.print().await;
+  if args.summary {
+    summary.print().await;
+  }
 
   Ok(())
 }

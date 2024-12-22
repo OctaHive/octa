@@ -300,7 +300,6 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
       .task
       .execute(
         self.context.cache.clone(),
-        self.context.summary.clone(),
         self.context.fingerprint.clone(),
         self.context.dry,
         self.cancel_token.clone(),
@@ -319,15 +318,17 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
       return Ok(String::from(""));
     }
 
-    if let Ok(elapsed) = start_time.elapsed() {
-      self
-        .context
-        .summary
-        .add(TaskSummaryItem {
-          name: self.task.name(),
-          duration: elapsed,
-        })
-        .await;
+    if !self.task.is_internal() {
+      if let Ok(elapsed) = start_time.elapsed() {
+        self
+          .context
+          .summary
+          .add(TaskSummaryItem {
+            name: self.task.name(),
+            duration: elapsed,
+          })
+          .await;
+      }
     }
 
     self.process_task_success(output).await
@@ -342,7 +343,12 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
   async fn process_task_success(&self, output: String) -> ExecutorResult<String> {
     if let Some(deps) = self.context.dag.edges().get(&self.task.id()) {
       for dep in deps {
-        dep.set_result(self.task.id(), output.clone()).await;
+        if self.task.is_internal() {
+          let res = self.task.get_deps_result().await;
+          dep.bypass_result(res).await;
+        } else {
+          dep.set_result(self.task.name(), output.clone()).await;
+        }
       }
 
       let mut degrees = self.context.in_degree.lock().await;

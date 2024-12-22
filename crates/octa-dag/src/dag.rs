@@ -4,13 +4,17 @@ use std::{
   sync::Arc,
 };
 
+use async_trait::async_trait;
 use tracing::{debug, info};
 
 use crate::error::{DAGError, DAGResult};
 
+#[async_trait]
 pub trait Identifiable {
   fn id(&self) -> String;
   fn name(&self) -> String;
+  fn is_internal(&self) -> bool;
+  async fn get_deps_result(&self) -> HashMap<String, String>;
 }
 
 /// Represents a Directed Acyclic Graph (DAG) for task dependencies
@@ -154,13 +158,22 @@ mod tests {
     }
   }
 
+  #[async_trait]
   impl Identifiable for TestNode {
     fn id(&self) -> String {
       self.id.clone()
     }
 
+    async fn get_deps_result(&self) -> HashMap<String, String> {
+      HashMap::default()
+    }
+
     fn name(&self) -> String {
       self.name.clone()
+    }
+
+    fn is_internal(&self) -> bool {
+      false
     }
   }
 

@@ -18,18 +18,15 @@ use tokio::{select, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, enabled, error, info, Level};
 
-use octa_dag::{Identifiable, DAG};
+use octa_dag::Identifiable;
 use octa_octafile::{AllowedRun, SourceStrategies};
 
 use crate::{
   envs::Envs,
   error::{ExecutorError, ExecutorResult},
-  executor::ExecutorConfig,
   hash_source::HashSource,
-  summary::Summary,
   timestamp_source::TimestampSource,
   vars::Vars,
-  Executor,
 };
 
 /// Core traits and types
@@ -38,12 +35,12 @@ pub trait Executable<T> {
   async fn execute(
     &self,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    summary: Arc<Summary>,
     fingerprint: Arc<Db>,
     dry: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String>;
   async fn set_result(&self, task_name: String, res: String);
+  async fn bypass_result(&self, result: HashMap<String, String>);
 }
 
 #[async_trait]
@@ -111,6 +108,7 @@ pub struct TaskConfig {
   // Task identification
   pub id: String,
   pub name: String,
+  pub dep_name: String,
 
   // Execution configuration
   pub cmd: Option<String>, // Command to execute
@@ -127,8 +125,7 @@ pub struct TaskConfig {
   pub source_strategy: SourceMethod, // Source validation strategy
 
   // State management
-  pub dag: Option<DAG<TaskNode>>, // Execution plan for complex command
-  cmd_type: CmdType,              // Type of task for internal use
+  cmd_type: CmdType, // Type of task for internal use
 }
 
 impl TaskConfig {
@@ -141,6 +138,7 @@ impl TaskConfig {
 pub struct TaskConfigBuilder {
   id: Option<String>,
   name: Option<String>,
+  dep_name: Option<String>,
 
   pub cmd: Option<String>,
   pub tpl: Option<String>,
@@ -155,12 +153,16 @@ pub struct TaskConfigBuilder {
   pub source_strategy: Option<SourceMethod>,
 
   pub cmd_type: Option<CmdType>,
-  pub dag: Option<DAG<TaskNode>>,
 }
 
 impl TaskConfigBuilder {
   pub fn name(mut self, name: impl Into<String>) -> Self {
     self.name = Some(name.into());
+    self
+  }
+
+  pub fn dep_name(mut self, dep_name: impl Into<String>) -> Self {
+    self.dep_name = Some(dep_name.into());
     self
   }
 
@@ -224,27 +226,28 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub fn dag(mut self, dag: Option<DAG<TaskNode>>) -> Self {
-    self.dag = dag;
-    self
-  }
-
   pub fn build(self) -> Result<TaskConfig, &'static str> {
+    let dir = match self.cmd_type {
+      Some(CmdType::Normal) => self.dir,
+      Some(CmdType::Internal) => Some(env::current_dir().unwrap()),
+      None => self.dir,
+    };
+
     Ok(TaskConfig {
       id: self.id.ok_or("Missing mandatory field: id")?,
       name: self.name.ok_or("Missing mandatory field: name")?,
+      dep_name: self.dep_name.ok_or("Missing mandatory field: dep_name")?,
       cmd: self.cmd,
       tpl: self.tpl,
-      dir: self.dir.ok_or("Missing mandatory field: dir")?,
+      dir: dir.ok_or("Missing mandatory field: dir")?,
       ignore_errors: self.ignore_errors.unwrap_or(false),
       silent: self.silent.unwrap_or(false),
       run_mode: self.run_mode.unwrap_or(RunMode::Always),
-      vars: self.vars.ok_or("Missing mandatory field: vars")?,
-      envs: self.envs.ok_or("Missing mandatory field: envs")?,
+      vars: self.vars.unwrap_or_default(),
+      envs: self.envs.unwrap_or_default(),
       sources: self.sources,
       source_strategy: self.source_strategy.unwrap_or(SourceMethod::Hash),
       cmd_type: self.cmd_type.unwrap_or(CmdType::Normal),
-      dag: self.dag,
     })
   }
 }
@@ -253,8 +256,9 @@ impl TaskConfigBuilder {
 #[derive(Debug, Clone)]
 pub struct TaskNode {
   // Task identification
-  pub id: String,
-  pub name: String, // Task name
+  pub id: String,       // Task uniq id
+  pub name: String,     // Task name
+  pub dep_name: String, // Name of task in deps
 
   // Execution configuration
   pub cmd: Option<String>, // Command to execute
@@ -272,7 +276,6 @@ pub struct TaskNode {
 
   // State management
   pub deps_res: Arc<Mutex<HashMap<String, String>>>, // Dependencies results
-  pub dag: Option<DAG<TaskNode>>,                    // Execution plan for complex command
   cmd_type: CmdType,                                 // Type of task for internal use
 }
 
@@ -281,14 +284,14 @@ impl Eq for TaskNode {}
 
 impl PartialEq for TaskNode {
   fn eq(&self, other: &Self) -> bool {
-    self.name == other.name
+    self.id == other.id
   }
 }
 
 // Implement hashing based on task name
 impl Hash for TaskNode {
   fn hash<H: Hasher>(&self, state: &mut H) {
-    self.name.hash(state);
+    self.id.hash(state);
   }
 }
 
@@ -297,6 +300,7 @@ impl TaskNode {
     Self {
       id: config.id,
       name: config.name,
+      dep_name: config.dep_name,
       cmd: config.cmd,
       tpl: config.tpl,
       run_mode: config.run_mode,
@@ -309,7 +313,6 @@ impl TaskNode {
       silent: config.silent,
       deps_res: Arc::new(Mutex::new(HashMap::default())),
       cmd_type: config.cmd_type,
-      dag: config.dag,
     }
   }
 
@@ -349,12 +352,6 @@ impl TaskNode {
 
     let mut envs = self.envs.clone();
     envs.expand().await?;
-
-    if let Some(ref cache) = cache {
-      if let Some(cached) = self.check_cache(&vars, cache).await? {
-        return Ok(cached);
-      }
-    }
 
     let get_env = |name: &str| match envs.get(name) {
       Some(val) => Some(Cow::Borrowed(val.as_str())),
@@ -534,10 +531,6 @@ impl TaskNode {
     let mut vars = self.vars.clone();
     vars.expand(dry).await?;
 
-    if let Some(cached) = self.check_cache(&vars, &cache).await? {
-      return Ok(cached);
-    }
-
     match self.execute_command(&cmd, dry, cancel_token).await {
       Ok(result) => {
         self.update_cache(&result, vars, &cache).await?;
@@ -599,7 +592,9 @@ impl TaskNode {
 
     let cache_lock = cache.lock().await;
     if let Some(cached_result) = cache_lock.get(&self.name) {
-      if &cached_result.vars == vars {
+      if self.run_mode == RunMode::Once {
+        return Ok(Some(cached_result.result.clone()));
+      } else if &cached_result.vars == vars {
         debug!("Cache hit for task: {}", self.name);
         return Ok(Some(cached_result.result.clone()));
       }
@@ -696,28 +691,6 @@ impl TaskNode {
     }
   }
 
-  async fn execute_nested_dag(
-    &self,
-    dag: DAG<TaskNode>,
-    cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    summary: Arc<Summary>,
-    fingerprint: Arc<Db>,
-    dry: bool,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
-    let executor = Executor::new(
-      dag,
-      ExecutorConfig::default(),
-      Some(cache),
-      fingerprint,
-      dry,
-      Some(summary),
-    )?;
-
-    let results = executor.execute(cancel_token.clone(), &self.name).await?;
-    Ok(results.join("\n"))
-  }
-
   /// Handle execution errors
   fn handle_execution_error(&self, error: ExecutorError) -> ExecutorResult<String> {
     if self.ignore_errors {
@@ -738,11 +711,15 @@ impl Executable<TaskNode> for TaskNode {
     deps_res.insert(task_name, res);
   }
 
+  async fn bypass_result(&self, result: HashMap<String, String>) {
+    let mut deps_res = self.deps_res.lock().await;
+    *deps_res = result
+  }
+
   /// Executes the task and returns the result
   async fn execute(
     &self,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    summary: Arc<Summary>,
     fingerprint: Arc<Db>,
     dry: bool,
     cancel_token: CancellationToken,
@@ -753,16 +730,18 @@ impl Executable<TaskNode> for TaskNode {
       return Ok("".to_string());
     };
 
+    // Interpolate vars
+    let mut vars = self.vars.clone();
+    vars.expand(dry).await?;
+
+    if let Some(cached) = self.check_cache(&vars, &cache).await? {
+      return Ok(cached);
+    }
+
     self.log_info(format!("Starting task {}", self.name));
 
     // Debug information about dependency results
     self.debug_log_dependencies().await;
-
-    if let Some(dag) = self.dag.clone() {
-      return self
-        .execute_nested_dag(dag, cache, summary, fingerprint, dry, cancel_token.clone())
-        .await;
-    }
 
     match (&self.cmd, &self.tpl) {
       // This variant should validate on load octafile stage
@@ -781,6 +760,7 @@ impl Executable<TaskNode> for TaskNode {
   }
 }
 
+#[async_trait]
 impl Identifiable for TaskNode {
   fn id(&self) -> String {
     self.id.clone()
@@ -788,6 +768,15 @@ impl Identifiable for TaskNode {
 
   fn name(&self) -> String {
     self.name.clone()
+  }
+
+  async fn get_deps_result(&self) -> HashMap<String, String> {
+    let res = self.deps_res.lock().await;
+    res.clone()
+  }
+
+  fn is_internal(&self) -> bool {
+    self.cmd_type == CmdType::Internal
   }
 }
 
@@ -808,6 +797,7 @@ mod tests {
     let task_config = TaskConfig::builder()
       .id(name.to_string())
       .name(name.to_string())
+      .dep_name(name.to_string())
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
@@ -827,15 +817,13 @@ mod tests {
       .open()
       .expect("Failed to open in-memory Sled database");
 
-    let summary = Arc::new(Summary::new());
-
     let task = create_test_task("test_task", Some("echo hello world"), None, None);
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
 
     let result = task
-      .execute(cache, summary, fingerprint, false, CancellationToken::new())
+      .execute(cache, fingerprint, false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result.trim(), "hello world");
@@ -854,6 +842,7 @@ mod tests {
     let task_config = TaskConfig::builder()
       .id("template_task".to_string())
       .name("template_task".to_string())
+      .dep_name("template_task".to_string())
       .dir(PathBuf::from("."))
       .vars(vars)
       .envs(Envs::new())
@@ -865,10 +854,9 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Summary::new());
 
     let result = task
-      .execute(cache, summary, fingerprint, false, CancellationToken::new())
+      .execute(cache, fingerprint, false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result, "Hello world!");
@@ -884,30 +872,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Summary::new());
 
     // First execution
     let result1 = task
-      .execute(
-        cache.clone(),
-        summary.clone(),
-        fingerprint.clone(),
-        false,
-        CancellationToken::new(),
-      )
+      .execute(cache.clone(), fingerprint.clone(), false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result1.trim(), "cached result");
 
     // Second execution should return cached result
     let result2 = task
-      .execute(
-        cache.clone(),
-        summary,
-        fingerprint.clone(),
-        false,
-        CancellationToken::new(),
-      )
+      .execute(cache.clone(), fingerprint.clone(), false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result1, result2);
@@ -927,6 +902,7 @@ mod tests {
     let task_config = TaskConfig::builder()
       .id("source_task".to_string())
       .name("source_task".to_string())
+      .dep_name("source_task".to_string())
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
@@ -942,17 +918,10 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Summary::new());
 
     // First execution
     let result1 = task
-      .execute(
-        cache.clone(),
-        summary.clone(),
-        fingerprint.clone(),
-        false,
-        CancellationToken::new(),
-      )
+      .execute(cache.clone(), fingerprint.clone(), false, CancellationToken::new())
       .await
       .unwrap();
 
@@ -961,13 +930,7 @@ mod tests {
 
     // Second execution should run again due to source changes
     let result2 = task
-      .execute(
-        cache.clone(),
-        summary,
-        fingerprint.clone(),
-        false,
-        CancellationToken::new(),
-      )
+      .execute(cache.clone(), fingerprint.clone(), false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result1, result2);
@@ -984,11 +947,8 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Summary::new());
 
-    let result = task
-      .execute(cache, summary, fingerprint, false, CancellationToken::new())
-      .await;
+    let result = task.execute(cache, fingerprint, false, CancellationToken::new()).await;
     assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
   }
 
@@ -1003,6 +963,7 @@ mod tests {
     let task_config = TaskConfig::builder()
       .id("long_task".to_string())
       .name("long_task".to_string())
+      .dep_name("long_task".to_string())
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
@@ -1014,7 +975,6 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Summary::new());
 
     // Cancel the task after a short delay
     let cancel_handle = tokio::spawn({
@@ -1025,7 +985,7 @@ mod tests {
       }
     });
 
-    let result = task.execute(cache, summary, fingerprint, false, cancel_token).await;
+    let result = task.execute(cache, fingerprint, false, cancel_token).await;
     assert!(matches!(result, Err(ExecutorError::TaskCancelled(_))));
 
     cancel_handle.await.unwrap();
@@ -1041,6 +1001,7 @@ mod tests {
     let task_config = TaskConfig::builder()
       .id("ignore_error_task".to_string())
       .name("ignore_error_task".to_string())
+      .dep_name("ignore_error_task".to_string())
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
@@ -1053,11 +1014,8 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Summary::new());
 
-    let result = task
-      .execute(cache, summary, fingerprint, false, CancellationToken::new())
-      .await;
+    let result = task.execute(cache, fingerprint, false, CancellationToken::new()).await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), "");
   }
@@ -1080,46 +1038,11 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let summary = Arc::new(Summary::new());
 
     let result = task
-      .execute(cache, summary, fingerprint, false, CancellationToken::new())
+      .execute(cache, fingerprint, false, CancellationToken::new())
       .await
       .unwrap();
     assert_eq!(result, "Result: dep_output");
-  }
-
-  #[tokio::test]
-  async fn test_nested_dag_execution() {
-    let db = sled::Config::new()
-      .temporary(true)
-      .open()
-      .expect("Failed to open in-memory Sled database");
-
-    let mut nested_dag = DAG::new();
-    let nested_task = create_test_task("nested_task", Some("echo nested"), None, None);
-    nested_dag.add_node(Arc::new(nested_task));
-
-    let task_config = TaskConfig::builder()
-      .id("parent_task".to_string())
-      .name("parent_task".to_string())
-      .dir(PathBuf::from("."))
-      .vars(Vars::new())
-      .envs(Envs::new())
-      .dag(Some(nested_dag))
-      .build()
-      .unwrap();
-
-    let parent_task = TaskNode::new(task_config);
-
-    let cache = Arc::new(Mutex::new(IndexMap::new()));
-    let fingerprint = Arc::new(db);
-    let summary = Arc::new(Summary::new());
-
-    let result = parent_task
-      .execute(cache, summary, fingerprint, false, CancellationToken::new())
-      .await
-      .unwrap();
-    assert_eq!(result.trim(), "nested");
   }
 }

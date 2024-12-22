@@ -508,3 +508,44 @@ tasks:
       - task1
       - task2
 ```
+
+# Task run mode
+Some of your tasks may depend on the same tasks. By default, Octa will rerun the dependent task each time, which will result in 
+the dependent task being executed multiple times. You can change this behavior by setting the `run` attribute of task. The following
+values are supported:
+
+##### always
+The task will be executed every time, regardless of whether it has been run before. This is the default value.
+
+##### once
+The task will be executed only once.
+
+##### changed
+The task will be executed only if the task parameters passed in the `vars` variable have changed.
+
+```yaml
+version: 1
+
+tasks:
+  long: 
+    cmd: sleep 10
+    run: once
+  
+  task:
+    run: changed
+    cmd: echo {{ CONTENT }}
+    deps:
+      - long
+      
+  test:
+    deps:
+      - task: task
+        vars:
+          CONTENT: 1
+      - task: task
+        vars:
+          CONTENT: 2
+      - task: task
+        vars:
+          CONTENT: 2
+```

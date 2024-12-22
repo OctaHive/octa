@@ -64,6 +64,7 @@ impl From<String> for AllowedRun {
 pub struct ComplexDep {
   pub task: String,
   pub vars: Option<Vars>,
+  pub envs: Option<Envs>,
   pub silent: Option<bool>,
 }
 
