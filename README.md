@@ -645,3 +645,23 @@ You can override this directory by setting the `OCTA_CACHE_DIR` environment vari
 
 If you still want the task to run even though the source files have not changed, you can use 
 the `--force` or `-f` flag.
+
+## Task preconditions
+Sometimes you need to check a condition before executing a task and decide whether to run it or not.
+To do this, you can specify the `preconditions` parameter for the task and list all the necessary checks there.
+In preconditions, you can use expand syntax as in variables, and you also have access to the results of subtasks.
+
+```yaml
+version: 1
+
+tasks:
+  hello:
+    cmd: echo Hello
+    preconditions:
+      - "{{ deps_result.build == 'true' }}"
+    deps:
+      - build
+
+  build:
+    cmd: echo true
+```

@@ -577,7 +577,11 @@ impl TaskNode {
     let mut vars = self.vars.clone();
     vars.expand(false).await?;
 
-    let context: Context = vars.into();
+    let mut context: Context = vars.into();
+    // Add dependency results to template context
+    let deps_res = self.deps_res.lock().await;
+    context.insert("deps_result", &*deps_res);
+
     let mut result = true;
 
     if let Some(preconditions) = &self.preconditions {

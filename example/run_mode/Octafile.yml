@@ -1,0 +1,24 @@
+version: 1
+
+tasks:
+  long:
+    run: once
+    cmd: sleep 10
+
+  task:
+    run: changed
+    cmd: echo {{ CONTENT }}
+    deps:
+      - long
+
+  test:
+    cmds:
+      - task: task
+        vars:
+          CONTENT: 1
+      - task: task
+        vars:
+          CONTENT: 2
+      - task: task
+        vars:
+          CONTENT: 2
