@@ -1,0 +1,54 @@
+name: 🐞 Bug Report
+description: Create a new bug report.
+title: "[Bug]: "
+labels: ["bug", "Needs Triage"]
+body:
+  - type: markdown
+    attributes:
+      value: ":stop_sign: _Please [search :mag: the issues](https://github.com/OctaHive/octa/issues) to check if this bug has already been reported._"
+  - type: input
+    attributes:
+      label: Octa Version
+      description: What Octa version are you using?
+      placeholder: Output of `octa --version`
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Current Behavior
+      description: Describe the problem you are experiencing. Include what you see happening and any steps you have taken to troubleshoot the issue.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Expected Behavior
+      description: Describe what you expect to happen instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: What OS are you seeing the problem on?
+      multiple: true
+      options:
+        - MacOs (arm)
+        - MacOs (amd64)
+        - Windows
+        - Linux
+  - type: textarea
+    attributes:
+      label: Minimal Reproducible Example
+      description: |
+        Please provide [the smallest, complete code snippet](https://stackoverflow.com/help/minimal-reproducible-example) that Octa's maintainers can run to reproduce the issue. Failing this, any sort of reproduction steps are better than nothing!
+
+        If the result is more than a screenful of text _or_ requires multiple files, please:
+
+        - _Attach_ (do not paste) it to this textarea, _or_
+        - Put it in a [Gist](https://gist.github.com) and paste the link, _or_
+        - Provide a link to a new or existing public repository exhibiting the issue
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Further Information
+      description: If needed, please provide additional information about your issue (attachments, links, references, etc.).

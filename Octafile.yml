@@ -1,0 +1,12 @@
+version: 1
+
+tasks:
+  build-release:
+    cmd: cargo build --release -p octa-cli
+
+  build:
+    cmd: cargo build -p octa-cli
+
+  lint:
+    cmds:
+      - cargo clippy -- -D warnings
