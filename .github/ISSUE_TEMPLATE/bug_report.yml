@@ -1,7 +1,7 @@
 name: 🐞 Bug Report
 description: Create a new bug report.
 title: "[Bug]: "
-labels: ["bug", "Needs Triage"]
+labels: ["Bug", "Needs Triage"]
 body:
   - type: markdown
     attributes:
