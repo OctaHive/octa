@@ -1,6 +1,7 @@
-use std::{env, path::PathBuf, sync::Arc};
+use std::{env, io, path::PathBuf, sync::Arc};
 
 use clap::{CommandFactory, Parser};
+use clap_complete::aot::{generate, Generator, Shell};
 use lazy_static::lazy_static;
 use logger::{ChronoLocal, OctaFormatter};
 use tokio::signal;
@@ -56,8 +57,17 @@ pub(crate) struct Cli {
   #[arg(short, long, default_value_t = false)]
   pub force: bool,
 
+  /// Generate shell completions
+  #[arg(long)]
+  completions: Option<Shell>,
+
   #[arg(last = true)]
   task_args: Vec<String>,
+}
+
+fn generate_completions<G: Generator>(gen: G, cmd: &mut clap::Command) {
+  let bin_name = cmd.get_name().to_string();
+  generate(gen, cmd, bin_name, &mut io::stdout());
 }
 
 struct ExecuteItem {
@@ -68,6 +78,12 @@ struct ExecuteItem {
 pub async fn run() -> OctaResult<()> {
   // Parse command line arguments
   let args = Cli::parse();
+
+  if let Some(shell) = args.completions {
+    let mut cmd = Cli::command();
+    generate_completions(shell, &mut cmd);
+    return Ok(());
+  }
 
   // Load environments
   let _ = dotenvy::dotenv();
