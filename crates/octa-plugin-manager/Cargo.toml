@@ -1,0 +1,23 @@
+[package]
+name = "octa-plugin-manager"
+description = "Plugin common"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+include = ["src/"]
+
+[dependencies]
+interprocess = { version = "2.2.2", features = ["tokio"] }
+octa-plugin = { version = "0.1.0", path = "../octa-plugin" }
+serde = { workspace = true }
+serde_json = "1.0.133"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.14"

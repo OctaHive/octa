@@ -4,6 +4,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::aot::{generate, Generator, Shell};
 use lazy_static::lazy_static;
 use logger::{ChronoLocal, OctaFormatter};
+use octa_plugin_manager::plugin_manager::PluginManager;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -127,6 +128,10 @@ pub async fn run() -> OctaResult<()> {
     tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
   }
 
+  let plugin_manager = PluginManager::new("./plugins");
+  plugin_manager.start_plugin("octa_plugin_shell").await.unwrap();
+  let plugin_manager = Arc::new(plugin_manager);
+
   // Load octafile
   let octafile = Octafile::load(args.config, args.global)?;
 
@@ -209,6 +214,7 @@ pub async fn run() -> OctaResult<()> {
       .await?;
 
     let executor = Executor::new(
+      plugin_manager.clone(),
       dag,
       ExecutorConfig { silent: false },
       None,
@@ -257,6 +263,8 @@ pub async fn run() -> OctaResult<()> {
   if args.summary {
     summary.print().await;
   }
+
+  plugin_manager.shutdown_all().await;
 
   Ok(())
 }

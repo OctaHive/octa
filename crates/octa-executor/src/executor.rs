@@ -11,6 +11,7 @@ use std::{
 use futures::future::join_all;
 use indexmap::IndexMap;
 use octa_dag::{Identifiable, DAG};
+use octa_plugin_manager::plugin_manager::PluginManager;
 use sled::Db;
 use tokio::{
   select,
@@ -60,11 +61,14 @@ pub struct Executor<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Sen
   state: ExecutionState<T>,
   config: ExecutorConfig,
   finished: CancellationToken,
+  plugin_manager: Arc<PluginManager>,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clone + 'static> Executor<T> {
   /// Creates a new Executor instance with the given DAG
   pub fn new(
+    plugin_manager: Arc<PluginManager>,
     dag: DAG<T>,
     config: ExecutorConfig,
     cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
@@ -97,6 +101,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       state,
       config,
       finished: CancellationToken::new(),
+      plugin_manager,
     })
   }
 
@@ -190,8 +195,10 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       force: self.state.force,
     };
 
+    let plugin_manager = Arc::clone(&self.plugin_manager);
+
     tokio::spawn(async move {
-      TaskExecutor::new(executor_state, task, tx, cancel_token)
+      TaskExecutor::new(executor_state, task, tx, cancel_token, plugin_manager)
         .execute()
         .await
     })
@@ -284,15 +291,23 @@ struct TaskExecutor<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clo
   task: Arc<T>,
   tx: mpsc::Sender<Arc<T>>,
   cancel_token: CancellationToken,
+  plugin_manager: Arc<PluginManager>,
 }
 
 impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> TaskExecutor<T> {
-  fn new(context: ExecutorContext<T>, task: Arc<T>, tx: mpsc::Sender<Arc<T>>, cancel_token: CancellationToken) -> Self {
+  fn new(
+    context: ExecutorContext<T>,
+    task: Arc<T>,
+    tx: mpsc::Sender<Arc<T>>,
+    cancel_token: CancellationToken,
+    plugin_manager: Arc<PluginManager>,
+  ) -> Self {
     Self {
       context,
       task,
       tx,
       cancel_token,
+      plugin_manager,
     }
   }
 
@@ -304,6 +319,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
     let result = self
       .task
       .execute(
+        self.plugin_manager.clone(),
         self.context.cache.clone(),
         self.context.fingerprint.clone(),
         self.context.dry,

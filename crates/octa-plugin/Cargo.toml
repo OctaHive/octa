@@ -1,0 +1,22 @@
+[package]
+name = "octa-plugin"
+description = "Plugin common"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+include = ["src/"]
+
+[dependencies]
+async-trait = { workspace = true }
+interprocess = { version = "2.2.2", features = ["tokio"] }
+lazy_static = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+futures = "0.3"
+tokio-util = { version = "0.7", features = ["codec"] }
+uuid = { workspace = true }

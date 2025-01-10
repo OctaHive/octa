@@ -14,6 +14,8 @@ include = ["src/"]
 octa-octafile = { version = "0.1.0", path = "../octa-octafile" }
 octa-dag = { version = "0.1.0", path = "../octa-dag" }
 octa-finder = { version = "0.1.0", path = "../octa-finder" }
+octa-plugin = { version = "0.1.0", path = "../octa-plugin" }
+octa-plugin-manager = { version = "0.1.0", path = "../octa-plugin-manager" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 byteorder = "1.5"

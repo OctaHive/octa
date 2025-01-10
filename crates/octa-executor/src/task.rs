@@ -3,18 +3,18 @@ use std::{
   collections::HashMap,
   env,
   hash::{Hash, Hasher},
+  io,
   path::PathBuf,
-  process::Stdio,
   sync::Arc,
-  time::Duration,
 };
 
 use async_trait::async_trait;
 use indexmap::IndexMap;
+use octa_plugin::protocol::ServerResponse;
+use octa_plugin_manager::plugin_manager::PluginManager;
 use sled::Db;
 use tera::{Context, Tera};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::{select, sync::Mutex};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, enabled, error, info, Level};
 
@@ -34,6 +34,7 @@ use crate::{
 pub trait Executable<T> {
   async fn execute(
     &self,
+    plugin_manager: Arc<PluginManager>,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     fingerprint: Arc<Db>,
     dry: bool,
@@ -327,27 +328,134 @@ impl TaskNode {
     }
   }
 
+  async fn execute_plugin_command(
+    &self,
+    plugin_manager: Arc<PluginManager>,
+    command: String,
+    args: Vec<String>,
+    dir: PathBuf,
+    envs: HashMap<String, String>,
+    cancel_token: CancellationToken,
+  ) -> io::Result<(i32, String, String)> {
+    // Changed return type
+    let mut output = String::new();
+    let mut errors = String::new();
+    let mut exit_code = None;
+
+    // Connect to plugin
+    let client = plugin_manager.get_client("octa_plugin_shell").await.unwrap();
+    let mut client = client.lock().await;
+
+    // Use a cleanup flag to track if we need to shut down
+    let mut needs_cleanup = true;
+    let result = async {
+      // Start command execution with cancellation support
+      let command_id = client
+        .execute(command.clone(), args, dir, envs, cancel_token.clone())
+        .await
+        .map_err(io::Error::from)?;
+
+      // Process output until command completes
+      loop {
+        match client.receive_output(&cancel_token).await {
+          Ok(Some(response)) => match response {
+            ServerResponse::Stdout { id, line } if id == command_id => {
+              if !self.silent {
+                println!("{}", line);
+              }
+              output.push_str(&line);
+              output.push('\n');
+            },
+            ServerResponse::Stderr { id, line } if id == command_id => {
+              if !self.silent {
+                eprintln!("{}", line);
+              }
+              errors.push_str(&line);
+              errors.push('\n');
+            },
+            ServerResponse::ExitStatus { id, code } if id == command_id => {
+              exit_code = Some(code);
+              needs_cleanup = false;
+              break;
+            },
+            ServerResponse::Error { id, message } if id == command_id => {
+              return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Plugin error: {}", message),
+              ));
+            },
+            _ => {},
+          },
+          Ok(None) => {
+            return Err(io::Error::new(
+              io::ErrorKind::ConnectionAborted,
+              "Plugin connection closed unexpectedly",
+            ));
+          },
+          Err(e) => {
+            if cancel_token.is_cancelled() {
+              return Err(io::Error::new(io::ErrorKind::Interrupted, "Command cancelled"));
+            }
+            return Err(io::Error::from(e));
+          },
+        }
+      }
+
+      Ok((exit_code.unwrap_or(-1), output, errors))
+    }
+    .await;
+
+    // Perform cleanup if needed
+    if needs_cleanup {
+      let _ = client.shutdown().await;
+    }
+
+    result
+  }
+
   /// Executes a shell command and returns its output
-  async fn execute_command(&self, cmd: &str, dry: bool, cancel_token: CancellationToken) -> ExecutorResult<String> {
+  async fn execute_command(
+    &self,
+    plugin_manager: Arc<PluginManager>,
+    cmd: &str,
+    dry: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<String> {
     let rendered_cmd = self.render_template(cmd, None, dry).await?;
     debug!("Execute command: {}", rendered_cmd);
 
     if dry {
       info!("Execute command in dry mode: {}", rendered_cmd);
-
       return Ok("".to_owned());
     }
 
     let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
 
-    // Platform specific command setup
-    #[cfg(windows)]
-    let command = self.setup_windows_command(&rendered_cmd, &dir);
-
-    #[cfg(not(windows))]
-    let command = self.setup_unix_command(&rendered_cmd, &dir);
-
-    self.run_command(command, cancel_token).await
+    debug!("Using shell plugin for command execution");
+    match self
+      .execute_plugin_command(
+        plugin_manager,
+        rendered_cmd,
+        vec![],
+        dir,
+        self.envs.clone().into(),
+        cancel_token.clone(),
+      )
+      .await
+    {
+      Ok((code, stdout, stderr)) => {
+        if code != 0 && !cancel_token.is_cancelled() {
+          Err(ExecutorError::CommandFailed(format!(
+            "Task {} failed: {}",
+            self.name, stderr
+          )))
+        } else {
+          Ok(stdout.trim().to_string())
+        }
+      },
+      Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
+      Err(e) => Err(ExecutorError::CommandFailed(e.to_string())),
+    }
   }
 
   /// Renders the command template with variables and dependency results
@@ -397,115 +505,6 @@ impl TaskNode {
     Ok(result)
   }
 
-  /// Execute command with cancellation support
-  async fn run_command(
-    &self,
-    mut command: tokio::process::Command,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
-    let mut child = command.spawn()?;
-    let mut output = Vec::new();
-    let mut errors = Vec::new();
-
-    // Handle stdout
-    let stdout_handle = if let Some(stdout) = child.stdout.take() {
-      let reader = BufReader::new(stdout);
-      let mut lines = reader.lines();
-      let is_silent = self.silent;
-      Some(tokio::spawn(async move {
-        let mut captured = Vec::new();
-        while let Some(line) = lines.next_line().await.unwrap_or(None) {
-          if !line.is_empty() {
-            captured.push(line.clone());
-            if !is_silent {
-              println!("{}", line);
-            }
-          }
-        }
-        captured
-      }))
-    } else {
-      None
-    };
-
-    // Handle stderr
-    let stderr_handle = if let Some(stderr) = child.stderr.take() {
-      let reader = BufReader::new(stderr);
-      let mut lines = reader.lines();
-      let is_silent = self.silent;
-      Some(tokio::spawn(async move {
-        let mut captured = Vec::new();
-        while let Some(line) = lines.next_line().await.unwrap_or(None) {
-          if !line.is_empty() {
-            captured.push(line.clone());
-            if !is_silent {
-              eprintln!("{}", line);
-            }
-          }
-        }
-        captured
-      }))
-    } else {
-      None
-    };
-
-    let result = select! {
-      _ = cancel_token.cancelled() => {
-        self.handle_cancellation(&mut child).await?
-      }
-      result = async {
-        // Wait for process completion and stream processing
-        let status = child.wait().await?;
-
-        // Collect stdout if available
-        if let Some(handle) = stdout_handle {
-          if let Ok(lines) = handle.await {
-            output.extend(lines);
-          }
-        }
-
-        // Collect stderr if available
-        if let Some(handle) = stderr_handle {
-          if let Ok(lines) = handle.await {
-            errors.extend(lines);
-          }
-        }
-
-        // Create synthetic Output struct
-        Ok::<std::process::Output, std::io::Error>(std::process::Output {
-          status,
-          stdout: output.join("\n").into_bytes(),
-          stderr: errors.join("\n").into_bytes(),
-        })
-      } => result?
-    };
-
-    self.process_command_output(result, cancel_token).await
-  }
-
-  /// Handle task cancellation
-  async fn handle_cancellation(&self, child: &mut tokio::process::Child) -> ExecutorResult<std::process::Output> {
-    self.log_info(format!("Shutting down task {}", self.name));
-
-    // Platform-specific process termination
-    #[cfg(windows)]
-    self.terminate_windows_process(child);
-
-    #[cfg(unix)]
-    self.terminate_unix_process(child);
-
-    // Give the process time to clean up
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Force kill if still running
-    child.kill().await?;
-
-    // Create a new command to get the output
-    let _output = child.wait().await?;
-
-    Err(ExecutorError::TaskCancelled(self.name.clone()))
-  }
-
   async fn interpolate_dir(&self, dir: PathBuf, dry: bool) -> ExecutorResult<PathBuf> {
     let dir_str = dir.to_string_lossy();
 
@@ -534,6 +533,7 @@ impl TaskNode {
 
   async fn execute_cmd(
     &self,
+    plugin_manager: Arc<PluginManager>,
     cmd: String,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     dry: bool,
@@ -542,7 +542,7 @@ impl TaskNode {
     let mut vars = self.vars.clone();
     vars.expand(dry).await?;
 
-    match self.execute_command(&cmd, dry, cancel_token).await {
+    match self.execute_command(plugin_manager, &cmd, dry, cancel_token).await {
       Ok(result) => {
         self.update_cache(&result, vars, &cache).await?;
         debug!("Completed task {}", self.name);
@@ -597,25 +597,6 @@ impl TaskNode {
     Ok(result)
   }
 
-  /// Process command output and handle errors
-  async fn process_command_output(
-    &self,
-    output: std::process::Output,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
-    if !output.status.success() && !cancel_token.is_cancelled() {
-      let error = String::from_utf8_lossy(&output.stderr);
-      return Err(ExecutorError::CommandFailed(format!(
-        "Task {} failed: {}",
-        self.name, error
-      )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    Ok(stdout.trim().to_string())
-  }
-
   /// Check if result is cached
   async fn check_cache(
     &self,
@@ -651,71 +632,6 @@ impl TaskNode {
       debug!("Cached result for task: {}", self.name);
     }
     Ok(())
-  }
-
-  /// Platform-specific command setup for Windows
-  #[cfg(windows)]
-  fn setup_windows_command(&self, cmd: &str, dir: &PathBuf) -> tokio::process::Command {
-    #[allow(unused_imports)]
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let mut command = tokio::process::Command::new("cmd");
-    command
-      .current_dir(dir)
-      .args(["/C", cmd])
-      .envs(self.envs.clone())
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .kill_on_drop(true)
-      .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    command
-  }
-
-  #[cfg(windows)]
-  fn terminate_windows_process(&self, child: &mut tokio::process::Child) {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-    if let Some(pid) = child.id() {
-      unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if handle as HANDLE != INVALID_HANDLE_VALUE {
-          let handle_ptr = handle as HANDLE;
-          TerminateProcess(handle_ptr, 1);
-          CloseHandle(handle_ptr);
-        }
-      }
-    }
-  }
-
-  /// Platform-specific command setup for Unix
-  #[cfg(not(windows))]
-  fn setup_unix_command(&self, cmd: &str, dir: &PathBuf) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("sh");
-    command
-      .current_dir(dir)
-      .arg("-c")
-      .arg(cmd)
-      .envs(self.envs.clone())
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .kill_on_drop(true)
-      .process_group(0);
-    command
-  }
-
-  #[cfg(unix)]
-  fn terminate_unix_process(&self, child: &mut tokio::process::Child) {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-
-    if let Some(pid) = child.id() {
-      self.log_info(format!("Kill task with pid {}", pid));
-      let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
-    }
   }
 
   async fn debug_log_dependencies(&self) {
@@ -755,6 +671,7 @@ impl Executable<TaskNode> for TaskNode {
   /// Executes the task and returns the result
   async fn execute(
     &self,
+    plugin_manager: Arc<PluginManager>,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     fingerprint: Arc<Db>,
     dry: bool,
@@ -794,7 +711,11 @@ impl Executable<TaskNode> for TaskNode {
       (Some(_), Some(_)) => {
         unreachable!("Both cmd and tpl cannot be Some - should be validated during octafile loading")
       },
-      (Some(cmd), None) => self.execute_cmd(cmd.clone(), cache, dry, cancel_token.clone()).await,
+      (Some(cmd), None) => {
+        self
+          .execute_cmd(plugin_manager, cmd.clone(), cache, dry, cancel_token.clone())
+          .await
+      },
       (None, Some(tpl)) => {
         let rendered_cmd = self.render_template(tpl, Some(cache), dry).await?;
 
@@ -835,7 +756,7 @@ impl TaskItem for TaskNode {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::fs;
+  use std::{fs, time::Duration};
   use tempfile::TempDir;
 
   // Helper function to create a test TaskNode
@@ -867,9 +788,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let plugin_manager = Arc::new(PluginManager::new("plugins"));
 
     let result = task
-      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .execute(
+        plugin_manager,
+        cache,
+        fingerprint,
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result.trim(), "hello world");
@@ -900,9 +829,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let plugin_manager = Arc::new(PluginManager::new("plugins"));
 
     let result = task
-      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .execute(
+        plugin_manager,
+        cache,
+        fingerprint,
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result, "Hello world!");
@@ -918,10 +855,12 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let plugin_manager = Arc::new(PluginManager::new("plugins"));
 
     // First execution
     let result1 = task
       .execute(
+        plugin_manager.clone(),
         cache.clone(),
         fingerprint.clone(),
         false,
@@ -935,6 +874,7 @@ mod tests {
     // Second execution should return cached result
     let result2 = task
       .execute(
+        plugin_manager.clone(),
         cache.clone(),
         fingerprint.clone(),
         false,
@@ -976,10 +916,12 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let plugin_manager = Arc::new(PluginManager::new("plugins"));
 
     // First execution
     let result1 = task
       .execute(
+        plugin_manager.clone(),
         cache.clone(),
         fingerprint.clone(),
         false,
@@ -995,6 +937,7 @@ mod tests {
     // Second execution should run again due to source changes
     let result2 = task
       .execute(
+        plugin_manager.clone(),
         cache.clone(),
         fingerprint.clone(),
         false,
@@ -1017,9 +960,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let plugin_manager = Arc::new(PluginManager::new("plugins"));
 
     let result = task
-      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .execute(
+        plugin_manager,
+        cache,
+        fingerprint,
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await;
     assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
   }
@@ -1047,6 +998,7 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let plugin_manager = Arc::new(PluginManager::new("plugins"));
 
     // Cancel the task after a short delay
     let cancel_handle = tokio::spawn({
@@ -1057,7 +1009,9 @@ mod tests {
       }
     });
 
-    let result = task.execute(cache, fingerprint, false, false, cancel_token).await;
+    let result = task
+      .execute(plugin_manager, cache, fingerprint, false, false, cancel_token)
+      .await;
     assert!(matches!(result, Err(ExecutorError::TaskCancelled(_))));
 
     cancel_handle.await.unwrap();
@@ -1086,9 +1040,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let plugin_manager = Arc::new(PluginManager::new("plugins"));
 
     let result = task
-      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .execute(
+        plugin_manager,
+        cache,
+        fingerprint,
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), "");
@@ -1112,9 +1074,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let plugin_manager = Arc::new(PluginManager::new("plugins"));
 
     let result = task
-      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .execute(
+        plugin_manager,
+        cache,
+        fingerprint,
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result, "Result: dep_output");
