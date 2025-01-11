@@ -19,6 +19,7 @@ octa-plugin-manager = { version = "0.1.0", path = "../octa-plugin-manager" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 byteorder = "1.5"
+dunce = "1.0.5"
 indexmap = "2.7.0"
 lazy_static = { workspace = true }
 glob = "0.3.1"

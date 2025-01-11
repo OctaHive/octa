@@ -128,8 +128,13 @@ pub async fn run() -> OctaResult<()> {
     tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
   }
 
-  let plugin_manager = PluginManager::new("./plugins");
-  plugin_manager.start_plugin("octa_plugin_shell").await.unwrap();
+  let plugins_dir = std::env::var("OCTA_PLUGINS_DIR").unwrap_or_else(|_| "plugins".to_string());
+  let plugin_manager = PluginManager::new(plugins_dir);
+  #[cfg(not(windows))]
+  let plugin_name = "octa_plugin_shell";
+  #[cfg(windows)]
+  let plugin_name = "octa_plugin_shell.exe";
+  plugin_manager.start_plugin(plugin_name).await.unwrap();
   let plugin_manager = Arc::new(plugin_manager);
 
   // Load octafile
