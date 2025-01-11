@@ -45,3 +45,114 @@ pub fn interpret_local_socket_name(name: &OsStr) -> Result<interprocess::local_s
 
   name.to_ns_name::<GenericNamespaced>()
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::path::PathBuf;
+
+  #[test]
+  fn test_make_local_socket_name_format() {
+    let unique_id = "test123";
+    let socket_name = make_local_socket_name(unique_id);
+    let pid = std::process::id();
+
+    #[cfg(unix)]
+    {
+      let path = PathBuf::from(&socket_name);
+      let file_name = path.file_name().unwrap().to_str().unwrap();
+      assert!(file_name.starts_with("octa."));
+      assert!(file_name.ends_with(".sock"));
+      assert!(file_name.contains(&pid.to_string()));
+      assert!(file_name.contains(unique_id));
+    }
+
+    #[cfg(windows)]
+    {
+      let name = socket_name.to_str().unwrap();
+      assert!(name.starts_with("octa."));
+      assert!(name.contains(&pid.to_string()));
+      assert!(name.contains(unique_id));
+    }
+  }
+
+  #[test]
+  fn test_make_local_socket_name_uniqueness() {
+    let name1 = make_local_socket_name("test1");
+    let name2 = make_local_socket_name("test2");
+    assert_ne!(name1, name2);
+  }
+
+  #[test]
+  fn test_interpret_local_socket_name() {
+    let socket_name = make_local_socket_name("test123");
+    let result = interpret_local_socket_name(&socket_name);
+    assert!(result.is_ok());
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn test_unix_socket_path_with_runtime_dir() {
+    use std::env;
+
+    // Save current OCTA_RUNTIME_DIR
+    let original_runtime_dir = env::var_os("OCTA_RUNTIME_DIR");
+
+    // Set test runtime dir
+    let test_dir = "/test/runtime/dir";
+    env::set_var("OCTA_RUNTIME_DIR", test_dir);
+
+    let socket_name = make_local_socket_name("test123");
+    let path = PathBuf::from(&socket_name);
+
+    assert!(path.starts_with(test_dir));
+
+    // Restore original OCTA_RUNTIME_DIR
+    if let Some(dir) = original_runtime_dir {
+      env::set_var("OCTA_RUNTIME_DIR", dir);
+    } else {
+      env::remove_var("OCTA_RUNTIME_DIR");
+    }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn test_unix_socket_path_with_temp_dir() {
+    use std::env;
+
+    // Save current OCTA_RUNTIME_DIR
+    let original_runtime_dir = env::var_os("OCTA_RUNTIME_DIR");
+
+    // Remove OCTA_RUNTIME_DIR to test temp dir fallback
+    env::remove_var("OCTA_RUNTIME_DIR");
+
+    let socket_name = make_local_socket_name("test123");
+    let path = PathBuf::from(&socket_name);
+
+    assert!(path.starts_with(env::temp_dir()));
+
+    // Restore original OCTA_RUNTIME_DIR
+    if let Some(dir) = original_runtime_dir {
+      env::set_var("OCTA_RUNTIME_DIR", dir);
+    }
+  }
+
+  #[test]
+  fn test_invalid_socket_name_interpretation() {
+    // Test with an invalid socket name
+    let invalid_name = OsString::from("invalid\0name");
+    let result = interpret_local_socket_name(&invalid_name);
+    assert!(result.is_err());
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn test_windows_pipe_name_format() {
+    let socket_name = make_local_socket_name("test123");
+    let name = socket_name.to_str().unwrap();
+
+    // Windows named pipes should follow specific naming conventions
+    assert!(!name.contains('\\'));
+    assert!(!name.contains('/'));
+  }
+}

@@ -92,9 +92,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.94"
+version = "1.0.95"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1fd03a028ef38ba2276dce7e33fcd6369c158a1bca17946c4b1b701891c1ff7"
+checksum = "34ac096ce696dc2fcabef30516bb13c0a68a11d30131d3df6f04711467681b04"
 
 [[package]]
 name = "assert_cmd"
@@ -462,6 +462,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "env_filter"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -768,9 +774,8 @@ dependencies = [
 
 [[package]]
 name = "interprocess"
-version = "2.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "894148491d817cb36b6f778017b8ac46b17408d522dd90f539d677ea938362eb"
+version = "2.2.1"
+source = "git+https://github.com/federico-terzi/interprocess#63ec1995994956fc356cc03a8baa6700ea6db1d5"
 dependencies = [
  "doctest-file",
  "futures-core",
@@ -999,6 +1004,8 @@ dependencies = [
  "octa-plugin-manager",
  "predicates",
  "pretty_assertions",
+ "serde",
+ "serde_yml",
  "sled",
  "tempfile",
  "thiserror 2.0.4",
@@ -1030,6 +1037,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "byteorder",
+ "dunce",
  "futures",
  "glob",
  "humanize-duration",
@@ -1094,12 +1102,18 @@ dependencies = [
 name = "octa-plugin"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "chrono",
+ "clap",
+ "ctrlc",
  "futures",
  "interprocess",
  "lazy_static",
+ "regex",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "uuid",
@@ -1110,27 +1124,30 @@ name = "octa-plugin-manager"
 version = "0.1.0"
 dependencies = [
  "interprocess",
+ "nix 0.26.4",
  "octa-plugin",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.4",
  "tokio",
  "tokio-util",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "octa_plugin_shell"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
- "ctrlc",
  "futures-util",
- "interprocess",
  "nix 0.26.4",
  "octa-plugin",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "windows-sys 0.59.0",
@@ -1533,6 +1550,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "semver"
+version = "1.0.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cb6eb87a131f756572d7fb904f6e7b68633f09cca868c5df1c4b8d1a694bbba"
 
 [[package]]
 name = "serde"

@@ -14,6 +14,9 @@ pub enum OctaError {
   #[error("Failed to load .env file")]
   Dotenv(#[from] DotenvError),
 
+  #[error("Failed to load config file: {0}")]
+  ConfigLoadError(String),
+
   #[error(transparent)]
   OctafileLoad(#[from] OctafileError),
 

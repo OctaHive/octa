@@ -1,6 +1,6 @@
 [package]
 name = "octa_plugin_shell"
-description = "Plugin for run shell comands"
+description = "Plugin for run shell commands"
 version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
@@ -15,16 +15,18 @@ name = "octa_plugin_shell"
 bench = false
 
 [dependencies]
+anyhow = { workspace = true }
 async-trait = { workspace = true }
-ctrlc = "3.4.5"
-interprocess = { version = "2.2.2", features = ["tokio"] }
 octa-plugin = { version = "0.1.0", path = "../octa-plugin" }
 futures-util = "0.3.31"
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
 [target.'cfg(unix)'.dependencies]
 nix = "0.26"
+
+[dev-dependencies]
+tempfile = "3.2"

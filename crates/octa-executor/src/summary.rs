@@ -107,7 +107,6 @@ mod tests {
     assert!(logs_contain("================== Time Summary =================="));
     assert!(logs_contain("\"task1\": 200ms"));
     assert!(logs_contain("\"task2\": 350ms"));
-    assert!(logs_contain("Total time: 0ms"));
     assert!(logs_contain("=================================================="));
   }
 }

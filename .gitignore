@@ -23,4 +23,3 @@ target/
 /.vscode
 .DS_Store
 .octa
-plugins/

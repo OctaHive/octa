@@ -210,7 +210,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     for node in self.state.dag.nodes() {
       if degrees[&node.id()] == 0 {
         self.state.active_tasks.fetch_add(1, Ordering::SeqCst);
-        tx.send(node.clone()).await.unwrap();
+        tx.send(node.clone()).await.map_err(|_| ExecutorError::ChannelError)?;
       }
     }
     Ok(())

@@ -9,6 +9,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use dunce::canonicalize;
 use indexmap::IndexMap;
 use octa_plugin::protocol::ServerResponse;
 use octa_plugin_manager::plugin_manager::PluginManager;
@@ -343,11 +344,17 @@ impl TaskNode {
     let mut exit_code = None;
 
     // Connect to plugin
-    let client = plugin_manager.get_client("octa_plugin_shell").await.unwrap();
-    let mut client = client.lock().await;
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+
+    let client = plugin_manager.get_client(plugin_name).await.unwrap();
+    let mut client_guard = client.lock().await;
+    let client = client_guard.as_mut().unwrap();
 
     // Use a cleanup flag to track if we need to shut down
-    let mut needs_cleanup = true;
+    let mut needs_cleanup = false;
     let result = async {
       // Start command execution with cancellation support
       let command_id = client
@@ -361,21 +368,20 @@ impl TaskNode {
           Ok(Some(response)) => match response {
             ServerResponse::Stdout { id, line } if id == command_id => {
               if !self.silent {
-                println!("{}", line);
+                println!("{}", line.trim());
               }
-              output.push_str(&line);
+              output.push_str(line.trim());
               output.push('\n');
             },
             ServerResponse::Stderr { id, line } if id == command_id => {
               if !self.silent {
-                eprintln!("{}", line);
+                eprintln!("{}", line.trim());
               }
-              errors.push_str(&line);
+              errors.push_str(line.trim());
               errors.push('\n');
             },
             ServerResponse::ExitStatus { id, code } if id == command_id => {
               exit_code = Some(code);
-              needs_cleanup = false;
               break;
             },
             ServerResponse::Error { id, message } if id == command_id => {
@@ -396,6 +402,8 @@ impl TaskNode {
             if cancel_token.is_cancelled() {
               return Err(io::Error::new(io::ErrorKind::Interrupted, "Command cancelled"));
             }
+
+            needs_cleanup = true;
             return Err(io::Error::from(e));
           },
         }
@@ -430,6 +438,7 @@ impl TaskNode {
     }
 
     let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
+    let dir = canonicalize(dir)?;
 
     debug!("Using shell plugin for command execution");
     match self
@@ -788,11 +797,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let plugin_manager = Arc::new(PluginManager::new("plugins"));
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
       .execute(
-        plugin_manager,
+        plugin_manager.clone(),
         cache,
         fingerprint,
         false,
@@ -802,6 +817,7 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(result.trim(), "hello world");
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -855,7 +871,13 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let plugin_manager = Arc::new(PluginManager::new("plugins"));
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // First execution
     let result1 = task
@@ -884,6 +906,7 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(result1, result2);
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -916,7 +939,13 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let plugin_manager = Arc::new(PluginManager::new("plugins"));
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // First execution
     let result1 = task
@@ -947,6 +976,7 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(result1, result2);
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -960,11 +990,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let plugin_manager = Arc::new(PluginManager::new("plugins"));
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
       .execute(
-        plugin_manager,
+        plugin_manager.clone(),
         cache,
         fingerprint,
         false,
@@ -973,6 +1009,7 @@ mod tests {
       )
       .await;
     assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -998,7 +1035,13 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let plugin_manager = Arc::new(PluginManager::new("plugins"));
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // Cancel the task after a short delay
     let cancel_handle = tokio::spawn({
@@ -1010,11 +1053,12 @@ mod tests {
     });
 
     let result = task
-      .execute(plugin_manager, cache, fingerprint, false, false, cancel_token)
+      .execute(plugin_manager.clone(), cache, fingerprint, false, false, cancel_token)
       .await;
     assert!(matches!(result, Err(ExecutorError::TaskCancelled(_))));
 
     cancel_handle.await.unwrap();
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -1040,11 +1084,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let plugin_manager = Arc::new(PluginManager::new("plugins"));
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
       .execute(
-        plugin_manager,
+        plugin_manager.clone(),
         cache,
         fingerprint,
         false,
@@ -1054,6 +1104,7 @@ mod tests {
       .await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), "");
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -1074,11 +1125,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let plugin_manager = Arc::new(PluginManager::new("plugins"));
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
       .execute(
-        plugin_manager,
+        plugin_manager.clone(),
         cache,
         fingerprint,
         false,
@@ -1088,5 +1145,6 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(result, "Result: dep_output");
+    plugin_manager.shutdown_all().await;
   }
 }

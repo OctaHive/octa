@@ -11,13 +11,20 @@ repository.workspace = true
 include = ["src/"]
 
 [dependencies]
-interprocess = { version = "2.2.2", features = ["tokio"] }
+interprocess = { git = "https://github.com/federico-terzi/interprocess", features = [
+  "tokio",
+] }
 octa-plugin = { version = "0.1.0", path = "../octa-plugin" }
+semver = "1.0.24"
 serde = { workspace = true }
 serde_json = "1.0.133"
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util = { workspace = true }
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
+[target.'cfg(unix)'.dependencies]
+nix = "0.26"
 
 [dev-dependencies]
 tempfile = "3.14"

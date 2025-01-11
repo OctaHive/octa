@@ -1,10 +1,17 @@
-use std::{env, io, path::PathBuf, sync::Arc};
+use std::{
+  env,
+  fs::File,
+  io::{self, Read},
+  path::{Path, PathBuf},
+  sync::Arc,
+};
 
 use clap::{CommandFactory, Parser};
 use clap_complete::aot::{generate, Generator, Shell};
 use lazy_static::lazy_static;
 use logger::{ChronoLocal, OctaFormatter};
 use octa_plugin_manager::plugin_manager::PluginManager;
+use serde::Deserialize;
 use tokio::signal;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -22,6 +29,24 @@ use octa_octafile::Octafile;
 mod error;
 mod logger;
 
+const DEFAULT_PLUGINS: [&str; 1] = ["shell"];
+
+#[derive(Debug, Deserialize)]
+struct PluginConfig {
+  plugins: Vec<String>,
+}
+
+fn load_config<P: AsRef<Path>>(config_path: P) -> OctaResult<PluginConfig> {
+  let mut file = File::open(config_path).map_err(|e| OctaError::ConfigLoadError(e.to_string()))?;
+  let mut contents = String::new();
+  file
+    .read_to_string(&mut contents)
+    .map_err(|e| OctaError::ConfigLoadError(e.to_string()))?;
+
+  let config: PluginConfig = serde_yml::from_str(&contents).map_err(|e| OctaError::ConfigLoadError(e.to_string()))?;
+  Ok(config)
+}
+
 lazy_static! {
   static ref OCTA_DATA_DIR: String = env::var("OCTA_CACHE_DIR").unwrap_or_else(|_| ".octa".to_string());
 }
@@ -30,6 +55,9 @@ lazy_static! {
 #[clap(author, version, about, bin_name("octa"), name("octa"), propagate_version(true))]
 pub(crate) struct Cli {
   pub commands: Option<Vec<String>>,
+
+  #[arg(short, long)]
+  pub octafile: Option<PathBuf>,
 
   #[arg(short, long)]
   pub config: Option<PathBuf>,
@@ -128,12 +156,32 @@ pub async fn run() -> OctaResult<()> {
     tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
   }
 
-  let plugin_manager = PluginManager::new("./plugins");
-  plugin_manager.start_plugin("octa_plugin_shell").await.unwrap();
+  let plugins_dir = std::env::var("OCTA_PLUGINS_DIR").unwrap_or_else(|_| "plugins".to_string());
+  let plugin_manager = PluginManager::new(plugins_dir);
+
+  let config_plugins = match args.config {
+    Some(config) => {
+      let config = load_config(config)?;
+      Ok::<Vec<String>, OctaError>(config.plugins)
+    },
+    None => Ok(vec![]),
+  }?;
+
+  let plugins = [config_plugins, DEFAULT_PLUGINS.iter().map(|s| s.to_string()).collect()].concat();
+  for plugin in plugins {
+    // Shell plugin loaded always
+    #[cfg(not(windows))]
+    let plugin_name = format!("octa_plugin_{}", plugin);
+    #[cfg(windows)]
+    let plugin_name = format!("octa_plugin_{}.exe", plugin);
+
+    plugin_manager.start_plugin(&plugin_name).await.unwrap();
+  }
+
   let plugin_manager = Arc::new(plugin_manager);
 
   // Load octafile
-  let octafile = Octafile::load(args.config, args.global)?;
+  let octafile = Octafile::load(args.octafile, args.global)?;
 
   if args.dry {
     warn!("Octa run in dry mode");

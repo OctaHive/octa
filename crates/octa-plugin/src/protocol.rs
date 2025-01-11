@@ -21,7 +21,7 @@ pub enum ClientCommand {
   Shutdown,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 pub enum ServerResponse {
   Hello(Version),
