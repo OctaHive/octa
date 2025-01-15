@@ -325,7 +325,7 @@ mod tests {
   #[tokio::test]
   async fn test_shell_plugin_version() {
     let plugin = ShellPlugin {};
-    assert_eq!(plugin.version(), "0.0.1");
+    assert_eq!(plugin.version(), env!("CARGO_PKG_VERSION").to_string());
   }
 
   #[tokio::test]

@@ -1005,6 +1005,8 @@ dependencies = [
  "octa-plugin-manager",
  "predicates",
  "pretty_assertions",
+ "serde",
+ "serde_yml",
  "sled",
  "tempfile",
  "thiserror 2.0.4",
@@ -1123,18 +1125,21 @@ name = "octa-plugin-manager"
 version = "0.1.0"
 dependencies = [
  "interprocess",
+ "nix 0.26.4",
  "octa-plugin",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.4",
  "tokio",
  "tokio-util",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "octa_plugin_shell"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1547,6 +1552,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "semver"
+version = "1.0.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3cb6eb87a131f756572d7fb904f6e7b68633f09cca868c5df1c4b8d1a694bbba"
 
 [[package]]
 name = "serde"

@@ -7,6 +7,7 @@ This project was inspired by the go-task build project. However, when we rewriti
 functionality missing, so I decided to create my own builder. 
 
 # The differences from go-task
+* Support for a plugin system to extend the builder’s functionality
 * Support run tasks using wildcards, for example `*:docker` run all first child docker tasks, or you can run `**:docker` and run all nested docker task
 * Support returning dependency task results. This is useful, for example, when you need to process the result of a task in its parent task.
 * Support rendering templates and return result of rendering as task result
@@ -81,7 +82,7 @@ file, or reaches the root directory with no further folders to check.
 To run a task from your global Octafile located in your home directory, use the --global or -g flag. This is ideal for managing 
 personal tasks that aren’t tied to a specific project.
 
-You can also run tasks from a specific file by simply passing it with the `--config` or `-c` flag, e.g., `octa -c project_tasks.yml build`.
+You can also run tasks from a specific file by simply passing it with the `--octafile` or `-o` flag, e.g., `octa -o project_tasks.yml build`.
 
 # Including task files
 If you have a large project with deep nesting structure, keeping all tasks in a single file can be inconvenient. Additionally, different 
@@ -665,3 +666,6 @@ tasks:
   build:
     cmd: echo true
 ```
+
+# Plugins
+Information about plugins you can find in plugins documentation [here](https://github.com/OctaHive/octa/blob/main/docs/plugin.md)

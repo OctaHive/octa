@@ -1,7 +1,7 @@
 [package]
 name = "octa_plugin_shell"
 description = "Plugin for run shell commands"
-version = "0.0.1"
+version = "0.1.0"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true

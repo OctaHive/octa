@@ -26,6 +26,8 @@ colored = "2.1"
 dotenvy = "0.15.7"
 nu-ansi-term = "0.50.1"
 lazy_static = { workspace = true }
+serde = { workspace = true }
+serde_yml = { workspace = true }
 sled = "0.34"
 thiserror = { workspace = true }
 tokio = { workspace = true }

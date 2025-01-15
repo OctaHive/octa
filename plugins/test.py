@@ -18,7 +18,7 @@ class CommandHandler:
     def handle_hello(self, cmd):
         response = {
             "type": "Hello",
-            "version": "1.0.0",
+            "version": "0.1.0",
             "features": []
         }
         return False, [response]

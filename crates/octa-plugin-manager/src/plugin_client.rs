@@ -1,6 +1,7 @@
 use std::{collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
 
 use interprocess::local_socket::{tokio::Stream as TokioStream, traits::tokio::Stream as StreamTrait, Name};
+use semver::{Version as SemVersion, VersionReq};
 use tokio::{
   io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
   sync::{mpsc, Mutex},
@@ -15,6 +16,7 @@ pub enum PluginClientError {
   SerdeJson(serde_json::Error),
   Protocol(String),
   ConnectionClosed,
+  VersionMismatch,
 }
 
 impl From<PluginClientError> for io::Error {
@@ -24,6 +26,7 @@ impl From<PluginClientError> for io::Error {
       PluginClientError::SerdeJson(e) => io::Error::new(io::ErrorKind::InvalidData, e),
       PluginClientError::Protocol(msg) => io::Error::new(io::ErrorKind::Other, msg),
       PluginClientError::ConnectionClosed => io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed"),
+      PluginClientError::VersionMismatch => io::Error::new(io::ErrorKind::Other, "Version mismatch"),
     }
   }
 }
@@ -47,6 +50,7 @@ impl std::fmt::Display for PluginClientError {
       PluginClientError::SerdeJson(e) => write!(f, "JSON error: {}", e),
       PluginClientError::Protocol(msg) => write!(f, "Protocol error: {}", msg),
       PluginClientError::ConnectionClosed => write!(f, "Connection closed"),
+      PluginClientError::VersionMismatch => write!(f, "Version mismatch"),
     }
   }
 }
@@ -127,18 +131,16 @@ impl PluginClient {
     // Start response handling task with the inner Arc
     Self::start_response_handler(reader, Arc::clone(&inner), Arc::clone(&shutdown_signal));
 
-    let mut client = Self {
+    let client = Self {
       inner,
       response_rx,
       shutdown_signal,
     };
 
-    client.handshake().await?;
-
     Ok(client)
   }
 
-  async fn handshake(&mut self) -> Result<(), PluginClientError> {
+  pub async fn handshake(&mut self) -> Result<(), PluginClientError> {
     let hello = ClientCommand::Hello(Version {
       version: env!("CARGO_PKG_VERSION").to_string(),
       features: vec![],
@@ -149,7 +151,16 @@ impl PluginClient {
 
     match self.response_rx.recv().await {
       // TODO: add check plugin and server version match
-      Some(ServerResponse::Hello(_version)) => Ok(()),
+      Some(ServerResponse::Hello(version)) => {
+        let octa_version = SemVersion::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        let req_version = VersionReq::parse(&version.version).unwrap();
+
+        if !req_version.matches(&octa_version) {
+          return Err(PluginClientError::VersionMismatch);
+        }
+
+        Ok(())
+      },
       Some(ServerResponse::Error { message, .. }) => Err(PluginClientError::Protocol(message)),
       Some(_) => Err(PluginClientError::Protocol("Unexpected response to Hello".into())),
       None => Err(PluginClientError::ConnectionClosed),
@@ -359,7 +370,7 @@ mod tests {
 
             // Send Hello response
             let response = ServerResponse::Hello(Version {
-              version: "1.0.0".to_string(),
+              version: env!("CARGO_PKG_VERSION").to_string(),
               features: vec![],
             });
             let response_json = serde_json::to_string(&response).unwrap() + "\n";
@@ -410,7 +421,7 @@ mod tests {
 
         let response = if buffer.contains("Hello") {
           Some(ServerResponse::Hello(Version {
-            version: "1.0.0".to_string(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![],
           }))
         } else if buffer.contains("Execute") {
@@ -448,10 +459,12 @@ mod tests {
     let mut server = TestServer::new().await;
     server.start("single".to_string()).await;
 
-    let client = tokio::time::timeout(TIMEOUT, PluginClient::connect(server.socket_name()))
+    let mut client = tokio::time::timeout(TIMEOUT, PluginClient::connect(server.socket_name()))
       .await
       .expect("Connection timeout")
       .expect("Failed to connect client");
+
+    client.handshake().await.expect("Handshake error");
 
     drop(client);
     let messages = server.stop().await;
@@ -472,6 +485,8 @@ mod tests {
       .await
       .expect("Connection timeout")
       .expect("Failed to connect client");
+
+    client.handshake().await.expect("Handshake error");
 
     let result = tokio::time::timeout(
       TIMEOUT,
@@ -514,6 +529,8 @@ mod tests {
       .await
       .expect("Connection timeout")
       .expect("Failed to connect client");
+
+    client.handshake().await.expect("Handshake error");
 
     // Send shutdown command
     tokio::time::timeout(TIMEOUT, client.shutdown())

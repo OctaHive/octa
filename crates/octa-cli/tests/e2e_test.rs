@@ -104,7 +104,7 @@ fn test_file_option() -> Result<(), Box<dyn std::error::Error>> {
   cmd.current_dir(tmp_dir.path());
   cmd.env("OCTA_TESTS", "");
   cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
-  cmd.args(["-c=sample.octafile.yml", "hello"]);
+  cmd.args(["-o=sample.octafile.yml", "hello"]);
 
   let output = cmd.output().expect("Failed to execute command");
   assert!(output.status.success());
