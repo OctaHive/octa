@@ -6,6 +6,9 @@ members = [
   "crates/octa-dag",
   "crates/octa-finder",
   "crates/octa-executor",
+  "crates/octa-plugin",
+  "crates/octa-plugin-manager",
+  "crates/octa_plugin_shell",
 ]
 
 [workspace.package]
@@ -36,7 +39,7 @@ tracing-subscriber = { version = "0.3.19", features = [
 tokio = { version = "1.41.1", features = ["full"] }
 tokio-util = "0.7.12"
 regex = "1.11.1"
-uuid = "1.11.0"
+uuid = { version = "1.0", features = ["v4"] }
 
 # default to small, optimized workspace release binaries
 [profile.release]

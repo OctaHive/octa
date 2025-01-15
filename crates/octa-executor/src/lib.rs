@@ -8,19 +8,20 @@ pub mod summary;
 pub mod task;
 mod timestamp_source;
 pub mod vars;
-pub use executor::Executor;
-pub use task::TaskNode;
-use uuid::Uuid;
 
 use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 
 use envs::Envs;
+use tracing::{debug, info};
+use uuid::Uuid;
+
 use error::{ExecutorError, ExecutorResult};
+pub use executor::Executor;
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
 use octa_octafile::{AllowedRun, Cmds, Deps, ExecuteMode, Octafile, Task};
+pub use task::TaskNode;
 use task::{CmdType, TaskConfig};
-use tracing::{debug, info};
 use vars::Vars;
 
 // Type aliases for better readability

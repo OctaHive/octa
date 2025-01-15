@@ -7,6 +7,9 @@ tasks:
   build:
     cmd: cargo build -p octa-cli
 
+  build-shell-plugin:
+    cmd: cargo build -p octa_plugin_shell
+
   lint:
     cmds:
       - cargo clippy -- -D warnings
