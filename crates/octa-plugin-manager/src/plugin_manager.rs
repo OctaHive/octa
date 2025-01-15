@@ -327,43 +327,9 @@ impl PluginManager {
   pub fn cleanup(&mut self) {
     if let Ok(mut plugins) = self.active_plugins.try_lock() {
       for (_, mut instance) in plugins.drain() {
-        #[cfg(windows)]
-        self.terminate_windows_process(&mut instance.process);
-        #[cfg(unix)]
-        self.terminate_unix_process(&mut instance.process);
-
         let _ = instance.process.start_kill();
         if let Some(path) = instance.socket_path.to_str() {
           let _ = std::fs::remove_file(path);
-        }
-      }
-    }
-  }
-
-  /// Platform-specific command terminate for Unix
-  #[cfg(not(windows))]
-  fn terminate_unix_process(&self, child: &mut tokio::process::Child) {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-
-    if let Some(pid) = child.id() {
-      let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
-    }
-  }
-
-  /// Platform-specific command terminate for Windows
-  #[cfg(windows)]
-  fn terminate_windows_process(&self, child: &mut tokio::process::Child) {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-    if let Some(pid) = child.id() {
-      unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if handle as HANDLE != INVALID_HANDLE_VALUE {
-          let handle_ptr = handle as HANDLE;
-          TerminateProcess(handle_ptr, 1);
-          CloseHandle(handle_ptr);
         }
       }
     }
