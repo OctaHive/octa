@@ -2,6 +2,7 @@ use std::{collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
 
 use interprocess::local_socket::{tokio::Stream as TokioStream, traits::tokio::Stream as StreamTrait, Name};
 use semver::{Version as SemVersion, VersionReq};
+use serde_json::Value;
 use tokio::{
   io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
   sync::{mpsc, Mutex},
@@ -201,6 +202,7 @@ impl PluginClient {
     command: String,
     args: Vec<String>,
     dir: PathBuf,
+    vars: HashMap<String, Value>,
     envs: HashMap<String, String>,
     cancel_token: CancellationToken,
   ) -> Result<String, PluginClientError> {
@@ -209,6 +211,7 @@ impl PluginClient {
       args,
       dir,
       envs,
+      vars,
     };
 
     let cmd_json = serde_json::to_string(&cmd)? + "\n";
@@ -534,6 +537,7 @@ mod tests {
         vec![],
         PathBuf::from("."),
         HashMap::new(),
+        HashMap::new(),
         CancellationToken::new(),
       ),
     )
@@ -608,6 +612,7 @@ mod tests {
         vec![],
         PathBuf::from("."),
         HashMap::new(),
+        HashMap::new(),
         CancellationToken::new(),
       )
       .await;
@@ -654,6 +659,7 @@ mod tests {
               format!("test{}", i),
               vec![],
               PathBuf::from("."),
+              HashMap::new(),
               HashMap::new(),
               CancellationToken::new(),
             )
@@ -782,6 +788,7 @@ mod tests {
           format!("test{}", i),
           vec![],
           PathBuf::from("."),
+          HashMap::new(),
           HashMap::new(),
           CancellationToken::new(),
         )

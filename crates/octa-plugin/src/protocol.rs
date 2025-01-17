@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Version {
@@ -17,6 +18,7 @@ pub enum ClientCommand {
     args: Vec<String>,
     dir: PathBuf,
     envs: HashMap<String, String>,
+    vars: HashMap<String, Value>,
   },
   Shutdown,
 }

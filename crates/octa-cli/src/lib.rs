@@ -29,7 +29,7 @@ use octa_octafile::Octafile;
 mod error;
 mod logger;
 
-const DEFAULT_PLUGINS: [&str; 1] = ["shell"];
+const DEFAULT_PLUGINS: [&str; 2] = ["shell", "tpl"];
 
 #[derive(Debug, Deserialize)]
 struct PluginConfig {

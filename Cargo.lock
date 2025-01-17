@@ -1154,6 +1154,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "octa_plugin_tpl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "octa-plugin",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "tera",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

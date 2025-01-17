@@ -410,6 +410,7 @@ mod tests {
         vec![],
         PathBuf::from("."),
         HashMap::new(),
+        HashMap::new(),
         cancel_token.clone(),
       )
       .await

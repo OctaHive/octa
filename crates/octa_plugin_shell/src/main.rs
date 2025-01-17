@@ -6,6 +6,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use octa_plugin::logger::Logger;
 use octa_plugin::{protocol::ServerResponse, serve_plugin, Plugin};
+use serde_json::Value;
 use tokio::io::AsyncWrite;
 use tokio::{
   io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -90,13 +91,14 @@ impl Plugin for ShellPlugin {
 
   async fn execute_command(
     &self,
+    id: String,
     command: String,
     _args: Vec<String>,
     dir: PathBuf,
+    vars: HashMap<String, Value>,
     envs: HashMap<String, String>,
     writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
     logger: Arc<impl Logger>,
-    id: String,
     cancel_token: CancellationToken,
   ) -> anyhow::Result<()> {
     #[cfg(windows)]
@@ -124,6 +126,7 @@ impl Plugin for ShellPlugin {
         while let Some(msg) = rx.recv().await {
           let mut lock = writer.lock().await;
           let _ = lock.write_all(msg.as_bytes()).await;
+          let _ = lock.flush().await;
         }
       }
     });
@@ -337,13 +340,14 @@ mod tests {
 
     let result = plugin
       .execute_command(
+        "test-id".to_string(),
         format!("echo {}", test_string),
         vec![],
         dir,
         HashMap::new(),
+        HashMap::new(),
         writer.clone(),
         logger.clone(),
-        "test-id".to_string(),
         cancel_token,
       )
       .await;
@@ -400,13 +404,14 @@ mod tests {
 
     let result = plugin
       .execute_command(
+        "test-id".to_string(),
         command.to_string(),
         vec![],
         dir,
         HashMap::new(),
+        HashMap::new(),
         writer.clone(),
         logger.clone(),
-        "test-id".to_string(),
         cancel_token,
       )
       .await;

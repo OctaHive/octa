@@ -9,6 +9,7 @@ members = [
   "crates/octa-plugin",
   "crates/octa-plugin-manager",
   "crates/octa_plugin_shell",
+  "crates/octa_plugin_tpl",
 ]
 
 [workspace.package]

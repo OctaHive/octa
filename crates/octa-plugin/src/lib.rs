@@ -8,6 +8,7 @@ use interprocess::local_socket::{
   ListenerOptions,
 };
 use logger::{Logger, LoggerSystem};
+use serde_json::Value;
 use socket::interpret_local_socket_name;
 use tokio::io::AsyncWrite;
 use tokio::{
@@ -46,13 +47,14 @@ pub trait Plugin: Send + Sync + 'static {
   #[allow(clippy::too_many_arguments)]
   async fn execute_command(
     &self,
+    id: String,
     command: String,
     args: Vec<String>,
     dir: PathBuf,
+    vars: HashMap<String, Value>,
     envs: HashMap<String, String>,
     writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
     logger: Arc<impl Logger>,
-    id: String,
     cancel_token: CancellationToken,
   ) -> anyhow::Result<()>;
 }
@@ -109,6 +111,7 @@ where
       args,
       dir,
       envs,
+      vars,
     } => {
       let id = Uuid::new_v4().to_string();
 
@@ -126,18 +129,20 @@ where
       // Clone what we need to move into the spawn
       let writer_clone = Arc::clone(&writer);
       let command_id = id.clone();
+      let command_logger = logger.clone();
 
       // Spawn the command execution
       let handle = tokio::spawn(async move {
         if let Err(e) = plugin
           .execute_command(
+            command_id.clone(),
             command,
             args,
             dir,
+            vars,
             envs,
             writer_clone.clone(),
-            logger,
-            command_id.clone(),
+            command_logger,
             cancel_token.clone(),
           )
           .await
@@ -175,6 +180,8 @@ where
       cancel_token.cancel();
     },
   }
+
+  logger.log("Execute command process sucessfully")?;
   Ok(())
 }
 
@@ -439,13 +446,14 @@ mod tests {
 
     async fn execute_command(
       &self,
+      id: String,
       command: String,
       args: Vec<String>,
       _dir: PathBuf,
+      _vars: HashMap<String, Value>,
       _envs: HashMap<String, String>,
       writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
       logger: Arc<impl Logger>,
-      id: String,
       cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
       logger.log(&format!("Executing command: {} {:?}", command, args))?;
@@ -522,6 +530,7 @@ mod tests {
         map.insert("ENV1".to_string(), "value1".to_string());
         map
       },
+      vars: HashMap::new(),
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -612,6 +621,7 @@ mod tests {
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
+      vars: HashMap::new(),
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -660,6 +670,7 @@ mod tests {
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
+      vars: HashMap::new(),
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -712,6 +723,7 @@ mod tests {
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
+      vars: HashMap::new(),
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -810,6 +822,7 @@ mod tests {
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
+      vars: HashMap::new(),
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -861,6 +874,7 @@ mod tests {
       args: vec![],
       dir: PathBuf::from("."),
       envs,
+      vars: HashMap::new(),
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -908,6 +922,7 @@ mod tests {
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
+      vars: HashMap::new(),
     };
 
     let _response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -970,6 +985,7 @@ mod tests {
         args: vec![],
         dir: PathBuf::from("."),
         envs: HashMap::new(),
+        vars: HashMap::new(),
       };
 
       let writer_clone = writer.clone();
@@ -1082,6 +1098,7 @@ mod tests {
       args: vec!["arg1".to_string(), "arg2".to_string()],
       dir: PathBuf::from("/test/dir"),
       envs: HashMap::new(),
+      vars: HashMap::new(),
     };
     let cmd_json = serde_json::to_string(&cmd_command).unwrap() + "\n";
     writer.write_all(cmd_json.as_bytes()).await.unwrap();

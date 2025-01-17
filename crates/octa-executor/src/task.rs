@@ -1,5 +1,4 @@
 use std::{
-  borrow::Cow,
   collections::HashMap,
   env,
   hash::{Hash, Hasher},
@@ -13,6 +12,7 @@ use dunce::canonicalize;
 use indexmap::IndexMap;
 use octa_plugin::protocol::ServerResponse;
 use octa_plugin_manager::plugin_manager::PluginManager;
+use serde_json::Value;
 use sled::Db;
 use tera::{Context, Tera};
 use tokio::sync::Mutex;
@@ -332,10 +332,13 @@ impl TaskNode {
   async fn execute_plugin_command(
     &self,
     plugin_manager: Arc<PluginManager>,
+    plugin_name: &str,
     command: String,
     args: Vec<String>,
     dir: PathBuf,
+    vars: HashMap<String, Value>,
     envs: HashMap<String, String>,
+    silent: bool,
     cancel_token: CancellationToken,
   ) -> io::Result<(i32, String, String)> {
     // Changed return type
@@ -345,9 +348,9 @@ impl TaskNode {
 
     // Connect to plugin
     #[cfg(not(windows))]
-    let plugin_name = "octa_plugin_shell";
+    let plugin_name = &format!("octa_plugin_{}", plugin_name);
     #[cfg(windows)]
-    let plugin_name = "octa_plugin_shell.exe";
+    let plugin_name = &format!("octa_plugin_{}.exe", plugin_name);
 
     let client = plugin_manager.get_client(plugin_name).await.unwrap();
     let mut client_guard = client.lock().await;
@@ -358,7 +361,7 @@ impl TaskNode {
     let result = async {
       // Start command execution with cancellation support
       let command_id = client
-        .execute(command.clone(), args, dir, envs, cancel_token.clone())
+        .execute(command.clone(), args, dir, vars, envs, cancel_token.clone())
         .await
         .map_err(io::Error::from)?;
 
@@ -367,14 +370,14 @@ impl TaskNode {
         match client.receive_output(&cancel_token).await {
           Ok(Some(response)) => match response {
             ServerResponse::Stdout { id, line } if id == command_id => {
-              if !self.silent {
+              if !silent {
                 println!("{}", line.trim());
               }
               output.push_str(line.trim());
               output.push('\n');
             },
             ServerResponse::Stderr { id, line } if id == command_id => {
-              if !self.silent {
+              if !silent {
                 eprintln!("{}", line.trim());
               }
               errors.push_str(line.trim());
@@ -429,7 +432,10 @@ impl TaskNode {
     dry: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
-    let rendered_cmd = self.render_template(cmd, None, dry).await?;
+    let rendered_cmd = self
+      .render_template(plugin_manager.clone(), cmd, None, dry, cancel_token.clone())
+      .await?;
+
     debug!("Execute command: {}", rendered_cmd);
 
     if dry {
@@ -440,14 +446,21 @@ impl TaskNode {
     let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
     let dir = canonicalize(dir)?;
 
+    // Interpolate vars
+    let mut vars = self.vars.clone();
+    vars.expand(dry).await?;
+
     debug!("Using shell plugin for command execution");
     match self
       .execute_plugin_command(
         plugin_manager,
+        "shell",
         rendered_cmd,
         vec![],
         dir,
+        vars.to_hashmap(),
         self.envs.clone().into(),
+        self.silent,
         cancel_token.clone(),
       )
       .await
@@ -470,48 +483,58 @@ impl TaskNode {
   /// Renders the command template with variables and dependency results
   async fn render_template(
     &self,
+    plugin_manager: Arc<PluginManager>,
     template: &str,
     cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
     dry: bool,
+    cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
     // Interpolate vars
     let mut vars = self.vars.clone();
     vars.expand(dry).await?;
 
+    // Interpolate environment variables
     let mut envs = self.envs.clone();
     envs.expand().await?;
 
-    let get_env = |name: &str| match envs.get(name) {
-      Some(val) => Some(Cow::Borrowed(val.as_str())),
-      None => match env::var(name) {
-        Ok(val) => Some(Cow::Owned(val)),
-        Err(_) => None,
-      },
-    };
-
-    let val = shellexpand::env_with_context_no_errors(&template, get_env);
-
-    let mut tera = Tera::default();
-    let template_name = format!("task_{}", self.name);
-
-    tera.add_raw_template(&template_name, val.as_ref()).map_err(|e| {
-      ExecutorError::TemplateParseFailed(format!("Failed to parse template for task {}: {:?}", self.name, e))
-    })?;
-
-    let mut context: Context = vars.clone().into();
     // Add dependency results to template context
     let deps_res = self.deps_res.lock().await;
-    context.insert("deps_result", &*deps_res);
+    vars.insert("deps_result", &*deps_res);
 
-    let result = tera.render(&template_name, &context).map_err(|e| {
-      ExecutorError::TemplateRenderError(format!("Failed to render template for task {}: {:?}", self.name, e))
-    })?;
+    let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
+    let dir = canonicalize(dir)?;
 
-    if let Some(ref cache) = cache {
-      self.update_cache(&result, vars, cache).await?;
+    match self
+      .execute_plugin_command(
+        plugin_manager,
+        "tpl",
+        template.to_owned(),
+        vec![],
+        dir,
+        vars.to_hashmap(),
+        self.envs.clone().into(),
+        true,
+        cancel_token.clone(),
+      )
+      .await
+    {
+      Ok((code, stdout, stderr)) => {
+        if code != 0 && !cancel_token.is_cancelled() {
+          Err(ExecutorError::CommandFailed(format!(
+            "Task {} failed: {}",
+            self.name, stderr
+          )))
+        } else {
+          if let Some(ref cache) = cache {
+            self.update_cache(&stdout.trim().to_string(), vars, cache).await?;
+          }
+
+          Ok(stdout.trim().to_string())
+        }
+      },
+      Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
+      Err(e) => Err(ExecutorError::CommandFailed(e.to_string())),
     }
-
-    Ok(result)
   }
 
   async fn interpolate_dir(&self, dir: PathBuf, dry: bool) -> ExecutorResult<PathBuf> {
@@ -726,7 +749,9 @@ impl Executable<TaskNode> for TaskNode {
           .await
       },
       (None, Some(tpl)) => {
-        let rendered_cmd = self.render_template(tpl, Some(cache), dry).await?;
+        let rendered_cmd = self
+          .render_template(plugin_manager, tpl, Some(cache), dry, cancel_token.clone())
+          .await?;
 
         Ok(rendered_cmd)
       },
@@ -805,6 +830,12 @@ mod tests {
     let plugin_name = "octa_plugin_shell.exe";
     plugin_manager.start_plugin(plugin_name).await.unwrap();
 
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
     let result = task
       .execute(
         plugin_manager.clone(),
@@ -845,11 +876,17 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
-    let plugin_manager = Arc::new(PluginManager::new("plugins"));
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
       .execute(
-        plugin_manager,
+        plugin_manager.clone(),
         cache,
         fingerprint,
         false,
@@ -859,6 +896,7 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(result, "Hello world!");
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -877,6 +915,12 @@ mod tests {
     let plugin_name = "octa_plugin_shell";
     #[cfg(windows)]
     let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
     plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // First execution
@@ -947,6 +991,12 @@ mod tests {
     let plugin_name = "octa_plugin_shell.exe";
     plugin_manager.start_plugin(plugin_name).await.unwrap();
 
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
     // First execution
     let result1 = task
       .execute(
@@ -998,6 +1048,12 @@ mod tests {
     let plugin_name = "octa_plugin_shell.exe";
     plugin_manager.start_plugin(plugin_name).await.unwrap();
 
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
     let result = task
       .execute(
         plugin_manager.clone(),
@@ -1041,6 +1097,12 @@ mod tests {
     let plugin_name = "octa_plugin_shell";
     #[cfg(windows)]
     let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
     plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // Cancel the task after a short delay
@@ -1092,6 +1154,12 @@ mod tests {
     let plugin_name = "octa_plugin_shell.exe";
     plugin_manager.start_plugin(plugin_name).await.unwrap();
 
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
     let result = task
       .execute(
         plugin_manager.clone(),
@@ -1131,6 +1199,12 @@ mod tests {
     let plugin_name = "octa_plugin_shell";
     #[cfg(windows)]
     let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
     plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
