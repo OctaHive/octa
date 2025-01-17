@@ -95,7 +95,7 @@ impl Plugin for ShellPlugin {
     command: String,
     _args: Vec<String>,
     dir: PathBuf,
-    vars: HashMap<String, Value>,
+    _vars: HashMap<String, Value>,
     envs: HashMap<String, String>,
     writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
     logger: Arc<impl Logger>,

@@ -329,6 +329,7 @@ impl TaskNode {
     }
   }
 
+  #[allow(clippy::too_many_arguments)]
   async fn execute_plugin_command(
     &self,
     plugin_manager: Arc<PluginManager>,
@@ -526,7 +527,7 @@ impl TaskNode {
           )))
         } else {
           if let Some(ref cache) = cache {
-            self.update_cache(&stdout.trim().to_string(), vars, cache).await?;
+            self.update_cache(stdout.trim(), vars, cache).await?;
           }
 
           Ok(stdout.trim().to_string())
