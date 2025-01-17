@@ -756,7 +756,7 @@ impl Executable<TaskNode> for TaskNode {
         let rendered_cmd = self
           .render_template(
             plugin_manager,
-            &tpl.to_string().trim_matches('"'),
+            tpl.to_string().trim_matches('"'),
             Some(cache),
             dry,
             cancel_token.clone(),
