@@ -51,11 +51,15 @@ jobs:
         run: |
           cargo build -p octa_plugin_shell
           cp target/debug/octa_plugin_shell plugins
+          cargo build -p octa_plugin_tpl
+          cp target/debug/octa_plugin_tpl plugins
       - name: Build plugin for Windows
         if: matrix.os == 'windows-latest'
         run: |
           cargo build -p octa_plugin_shell
           cp target/debug/octa_plugin_shell.exe plugins
+          cargo build -p octa_plugin_tpl
+          cp target/debug/octa_plugin_tpl.exe plugins
       - name: Run cargo test
         run: cargo test --workspace -- --nocapture
       - name: Upload Log to Github

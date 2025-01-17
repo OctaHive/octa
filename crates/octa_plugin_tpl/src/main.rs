@@ -30,9 +30,11 @@ impl Plugin for TemplatePlugin {
     vars: HashMap<String, Value>,
     envs: HashMap<String, String>,
     writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
-    _logger: Arc<impl Logger>,
+    logger: Arc<impl Logger>,
     _cancel_token: CancellationToken,
   ) -> anyhow::Result<()> {
+    logger.log("Start processing template command")?;
+
     let mut tera = Tera::default();
     let template_name = format!("template_{}", id);
 
