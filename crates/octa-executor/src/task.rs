@@ -115,7 +115,6 @@ pub struct TaskConfig {
 
   // Execution configuration
   pub cmd: Option<String>, // Command to execute
-  pub tpl: Option<String>, // Template to render
   pub dir: PathBuf,        // Working directory
   pub ignore_errors: bool, // Whether to continue on error
   pub silent: bool,        // Should task print to stdout or stderr
@@ -130,6 +129,8 @@ pub struct TaskConfig {
 
   // State management
   cmd_type: CmdType, // Type of task for internal use
+
+  extra: HashMap<String, Value>,
 }
 
 impl TaskConfig {
@@ -145,7 +146,6 @@ pub struct TaskConfigBuilder {
   dep_name: Option<String>,
 
   pub cmd: Option<String>,
-  pub tpl: Option<String>,
   pub dir: Option<PathBuf>,
   pub ignore_errors: Option<bool>,
   pub silent: Option<bool>,
@@ -158,6 +158,8 @@ pub struct TaskConfigBuilder {
   pub preconditions: Option<Vec<String>>,
 
   pub cmd_type: Option<CmdType>,
+
+  pub extra: HashMap<String, Value>,
 }
 
 impl TaskConfigBuilder {
@@ -178,11 +180,6 @@ impl TaskConfigBuilder {
 
   pub fn cmd(mut self, cmd: Option<impl Into<String>>) -> Self {
     self.cmd = cmd.map(Into::into);
-    self
-  }
-
-  pub fn tpl(mut self, tpl: Option<String>) -> Self {
-    self.tpl = tpl;
     self
   }
 
@@ -208,6 +205,11 @@ impl TaskConfigBuilder {
 
   pub fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
     self.dir = Some(dir.into());
+    self
+  }
+
+  pub fn extra(mut self, extra: HashMap<String, Value>) -> Self {
+    self.extra = extra;
     self
   }
 
@@ -248,7 +250,6 @@ impl TaskConfigBuilder {
       name: self.name.ok_or("Missing mandatory field: name")?,
       dep_name: self.dep_name.ok_or("Missing mandatory field: dep_name")?,
       cmd: self.cmd,
-      tpl: self.tpl,
       dir: dir.ok_or("Missing mandatory field: dir")?,
       ignore_errors: self.ignore_errors.unwrap_or(false),
       silent: self.silent.unwrap_or(false),
@@ -259,6 +260,7 @@ impl TaskConfigBuilder {
       preconditions: self.preconditions,
       source_strategy: self.source_strategy.unwrap_or(SourceMethod::Hash),
       cmd_type: self.cmd_type.unwrap_or(CmdType::Normal),
+      extra: self.extra,
     })
   }
 }
@@ -273,7 +275,6 @@ pub struct TaskNode {
 
   // Execution configuration
   pub cmd: Option<String>, // Command to execute
-  pub tpl: Option<String>, // Template to render
   pub dir: PathBuf,        // Working directory
   pub ignore_errors: bool, // Whether to continue on error
   pub silent: bool,        // Should task print to stdout or stderr
@@ -289,6 +290,8 @@ pub struct TaskNode {
   // State management
   pub deps_res: Arc<Mutex<HashMap<String, String>>>, // Dependencies results
   cmd_type: CmdType,                                 // Type of task for internal use
+
+  extra: HashMap<String, Value>,
 }
 
 // Implement equality based on task ID
@@ -314,7 +317,6 @@ impl TaskNode {
       name: config.name,
       dep_name: config.dep_name,
       cmd: config.cmd,
-      tpl: config.tpl,
       run_mode: config.run_mode,
       sources: config.sources,
       source_strategy: config.source_strategy,
@@ -326,6 +328,7 @@ impl TaskNode {
       deps_res: Arc::new(Mutex::new(HashMap::default())),
       cmd_type: config.cmd_type,
       preconditions: config.preconditions,
+      extra: config.extra,
     }
   }
 
@@ -739,7 +742,7 @@ impl Executable<TaskNode> for TaskNode {
     // Debug information about dependency results
     self.debug_log_dependencies().await;
 
-    match (&self.cmd, &self.tpl) {
+    match (&self.cmd, &self.extra.get("tpl")) {
       // This variant should validate on load octafile stage
       (Some(_), Some(_)) => {
         unreachable!("Both cmd and tpl cannot be Some - should be validated during octafile loading")
@@ -751,7 +754,13 @@ impl Executable<TaskNode> for TaskNode {
       },
       (None, Some(tpl)) => {
         let rendered_cmd = self
-          .render_template(plugin_manager, tpl, Some(cache), dry, cancel_token.clone())
+          .render_template(
+            plugin_manager,
+            &tpl.to_string().trim_matches('"'),
+            Some(cache),
+            dry,
+            cancel_token.clone(),
+          )
           .await?;
 
         Ok(rendered_cmd)
@@ -796,6 +805,12 @@ mod tests {
 
   // Helper function to create a test TaskNode
   fn create_test_task(name: &str, cmd: Option<&str>, tpl: Option<String>, run_mode: Option<RunMode>) -> TaskNode {
+    let mut extra = HashMap::new();
+    if let Some(tpl) = tpl {
+      let tpl_value = Value::String(tpl);
+      extra.insert("tpl".to_owned(), tpl_value);
+    }
+
     let task_config = TaskConfig::builder()
       .id(name.to_string())
       .name(name.to_string())
@@ -803,8 +818,8 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .tpl(tpl)
       .cmd(cmd)
+      .extra(extra)
       .run_mode(Some(run_mode.unwrap_or(RunMode::Always)))
       .build()
       .unwrap();
@@ -862,6 +877,10 @@ mod tests {
     let mut vars = Vars::new();
     vars.insert(&"name", &"world");
 
+    let mut extra = HashMap::new();
+    let tpl_value = Value::String("Hello {{ name }}!".into());
+    extra.insert("tpl".to_owned(), tpl_value);
+
     let task_config = TaskConfig::builder()
       .id("template_task".to_string())
       .name("template_task".to_string())
@@ -869,7 +888,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(vars)
       .envs(Envs::new())
-      .tpl(Some("Hello {{ name }}!".to_owned()))
+      .extra(extra)
       .build()
       .unwrap();
 
@@ -976,7 +995,6 @@ mod tests {
       .run_mode(Some(AllowedRun::Changed))
       .sources(Some(vec![test_file.to_str().unwrap().to_string()]))
       .source_strategy(Some(SourceStrategies::Hash))
-      .tpl(None)
       .build()
       .unwrap();
 

@@ -355,7 +355,6 @@ impl TaskGraphBuilder {
       .vars(vars)
       .envs(envs)
       .preconditions(cmd.task.preconditions.clone())
-      .tpl(cmd.task.tpl.clone())
       .sources(cmd.task.sources.clone())
       .silent(cmd.task.silent)
       .source_strategy(cmd.task.source_strategy.clone())
