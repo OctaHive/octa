@@ -5,13 +5,13 @@ vars:
 
 tasks:
   start:
-    cmd: echo Start building for project {{ PROJECT }}
+    shell: echo Start building for project {{ PROJECT }}
 
   stop:
-    cmd: echo Stop building
+    shell: echo Stop building
 
   process:
-    cmd: echo Build
+    shell: echo Build
 
   build:
     cmds:

@@ -4,4 +4,4 @@ tasks:
   build:
     sources:
       - ./src/*
-    cmd: echo Run build
+    shell: echo Run build

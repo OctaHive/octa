@@ -390,7 +390,7 @@ mod tests {
       version: 1
       tasks:
         test:
-          cmd: echo "hello"
+          shell: echo "hello"
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "load_basic_octafile");
 
@@ -408,14 +408,14 @@ mod tests {
           octafile: child/Octafile.yml
       tasks:
         root_task:
-          cmd: echo "root"
+          shell: echo "root"
     "#;
 
     let child_content = r#"
       version: 1
       tasks:
         child_task:
-          cmd: echo "child"
+          shell: echo "child"
     "#;
 
     let temp_dir = Builder::new().prefix("nested_includes").tempdir().unwrap();
@@ -453,7 +453,7 @@ mod tests {
           optional: true
       tasks:
         root_task:
-          cmd: echo "root"
+          shell: echo "root"
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "optional_includes");
 
@@ -486,7 +486,7 @@ mod tests {
           optional: false
       tasks:
         simple:
-          cmd: echo "simple"
+          shell: echo "simple"
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "error_handling");
     assert!(matches!(
@@ -502,7 +502,7 @@ mod tests {
       tasks:
         test:
           dir: custom_dir
-          cmd: echo "test"
+          shell: echo "test"
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "working_directory");
 
@@ -522,7 +522,7 @@ mod tests {
           octafile: child/Octafile.yml
       tasks:
         simple:
-          cmd: echo "simple"
+          shell: echo "simple"
     "#;
 
     let child_content = r#"
@@ -532,14 +532,14 @@ mod tests {
           octafile: grandchild/Octafile.yml
       tasks:
         simple:
-          cmd: echo "simple"
+          shell: echo "simple"
     "#;
 
     let grandchild_content = r#"
       version: 1
       tasks:
         simple:
-          cmd: echo "simple"
+          shell: echo "simple"
     "#;
 
     let temp_dir = Builder::new().prefix("root_reference_consistency").tempdir().unwrap();
@@ -574,7 +574,7 @@ mod tests {
       version: 1
       tasks:
         simple:
-          cmd: echo "simple"
+          shell: echo "simple"
     "#;
 
     // Test with existing Octafile
@@ -631,7 +631,7 @@ mod tests {
           octafile: level1/Octafile.yml
       tasks:
         simple:
-          cmd: echo "simple"
+          shell: echo "simple"
     "#;
 
     let level1_content = r#"
@@ -641,14 +641,14 @@ mod tests {
           octafile: level2/Octafile.yml
       tasks:
         simple:
-          cmd: echo "simple"
+          shell: echo "simple"
     "#;
 
     let level2_content = r#"
       version: 1
       tasks:
         simple:
-          cmd: echo "simple"
+          shell: echo "simple"
     "#;
 
     // Create directory structure
@@ -706,14 +706,14 @@ mod tests {
           octafile: second/Octafile.yml
       tasks:
         simple:
-          cmd: echo "simple"
+          shell: echo "simple"
     "#;
 
     let child_content = r#"
       version: 1
       tasks:
         simple:
-          cmd: echo "simple"
+          shell: echo "simple"
     "#;
 
     // Setup directory structure

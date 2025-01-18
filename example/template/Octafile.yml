@@ -21,6 +21,6 @@ tasks:
           - LOG_LEVEL=Debug
 
   docker-compose:
-    cmd: echo "{{ deps_result['docker-compose-service'] }}"
+    shell: echo "{{ deps_result['docker-compose-service'] }}"
     deps:
       - docker-compose-service

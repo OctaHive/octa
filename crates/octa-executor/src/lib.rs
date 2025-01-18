@@ -535,7 +535,7 @@ impl TaskGraphBuilder {
   fn create_simple_command(&self, command: &FindResult, cmd: &str) -> FindResult {
     let mut extra = HashMap::new();
     let cmd_value = serde_yml::Value::String(cmd.to_string());
-    extra.insert("cmd".to_owned(), cmd_value);
+    extra.insert("shell".to_owned(), cmd_value);
 
     FindResult {
       name: cmd.to_string(),
@@ -764,7 +764,7 @@ mod tests {
   fn create_test_task() -> Task {
     let mut extra = HashMap::new();
     let cmd_value = serde_yml::Value::String("echo test".to_string());
-    extra.insert("cmd".to_owned(), cmd_value);
+    extra.insert("shell".to_owned(), cmd_value);
 
     Task {
       extra,
@@ -955,7 +955,7 @@ mod tests {
         test:
           env:
             LOCAL_ENV: "local"
-          cmd: echo "test"
+          shell: echo "test"
     "#;
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;

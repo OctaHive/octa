@@ -3,11 +3,11 @@ version: 1
 tasks:
   long:
     run: once
-    cmd: sleep 10
+    shell: sleep 10
 
   task:
     run: changed
-    cmd: echo {{ CONTENT }}
+    shell: echo {{ CONTENT }}
     deps:
       - long
 

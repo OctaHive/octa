@@ -3,11 +3,11 @@ version: 1
 tasks:
   build_win:
     platforms: ["windows"]
-    cmd: echo Windows build
+    shell: echo Windows build
 
   build_mac:
     platforms: ["macos/amd64"]
-    cmd: echo Mac OS build
+    shell: echo Mac OS build
 
   build:
     cmds:

@@ -28,7 +28,7 @@ fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
     version: 1
     tasks:
       hello:
-        cmd: echo "hello world"
+        shell: echo "hello world"
     "#
     .as_bytes(),
   )?;
@@ -52,7 +52,7 @@ fn test_task_args() -> Result<(), Box<dyn std::error::Error>> {
       version: 1
       tasks:
         hello:
-          cmd: echo {{ COMMAND_ARGS }}
+          shell: echo {{ COMMAND_ARGS }}
     "#
     .as_bytes(),
   )?;
@@ -95,7 +95,7 @@ fn test_file_option() -> Result<(), Box<dyn std::error::Error>> {
 
     tasks:
       hello:
-        cmd: echo Test
+        shell: echo Test
     "#
     .as_bytes(),
   )?;
@@ -132,15 +132,15 @@ fn test_run_os_task() -> Result<(), Box<dyn std::error::Error>> {
 
       hello_windows:
         platforms: ['windows']
-        cmd: echo hello windows
+        shell: echo hello windows
 
       hello_linux:
         platforms: ['linux']
-        cmd: echo hello linux
+        shell: echo hello linux
 
       hello_macos:
         platforms: ['macos']
-        cmd: echo hello macos
+        shell: echo hello macos
     "#
     .as_bytes(),
   )?;
@@ -190,11 +190,11 @@ fn test_set_env() -> Result<(), Box<dyn std::error::Error>> {
 
         hello_windows:
           platforms: ['windows']
-          cmd: echo %greeting%
+          shell: echo %greeting%
 
         hello_linux_macos:
           platforms: ['macos', 'linux']
-          cmd: "echo $greeting"
+          shell: "echo $greeting"
     "#
     .as_bytes(),
   )?;
@@ -238,11 +238,11 @@ fn test_env_file() -> Result<(), Box<dyn std::error::Error>> {
 
         test_windows:
           platforms: ['windows']
-          cmd: "echo %VAR1%"
+          shell: "echo %VAR1%"
 
         test_linux_macos:
           platforms: ['macos', 'linux']
-          cmd: "echo $VAR1"
+          shell: "echo $VAR1"
     "#
     .as_bytes(),
   )?;
@@ -268,11 +268,11 @@ fn test_task_run_mode() -> Result<(), Box<dyn std::error::Error>> {
     tasks:
       long:
         run: once
-        cmd: sleep 1
+        shell: sleep 1
 
       task:
         run: changed
-        cmd: echo {{ CONTENT }}
+        shell: echo {{ CONTENT }}
         deps:
           - long
 
@@ -347,17 +347,17 @@ fn test_comple_executor_plan() -> Result<(), Box<dyn std::error::Error>> {
           - echo {{ CONTENT }}
 
       content:
-        cmd: echo {{ CONTENT }}
+        shell: echo {{ CONTENT }}
 
       yyy:
         vars:
           CONTENT: YYY
-        cmd: echo {{ CONTENT }}
+        shell: echo {{ CONTENT }}
         deps:
           - nnn
 
       nnn:
-        cmd: echo NNN
+        shell: echo NNN
     "#
     .as_bytes(),
   )?;

@@ -732,7 +732,7 @@ impl Executable<TaskNode> for TaskNode {
     // Debug information about dependency results
     self.debug_log_dependencies().await;
 
-    match (&self.extra.get("cmd"), self.extra.get("tpl")) {
+    match (&self.extra.get("shell"), self.extra.get("tpl")) {
       // This variant should validate on load octafile stage
       (Some(_), Some(_)) => {
         unreachable!("Both cmd and tpl cannot be Some - should be validated during octafile loading")
@@ -808,7 +808,7 @@ mod tests {
     }
     if let Some(cmd) = cmd {
       let cmd_value = Value::String(cmd.to_owned());
-      extra.insert("cmd".to_owned(), cmd_value);
+      extra.insert("shell".to_owned(), cmd_value);
     }
 
     let task_config = TaskConfig::builder()
@@ -985,7 +985,7 @@ mod tests {
 
     let mut extra = HashMap::new();
     let cmd_value = Value::String("echo 'test'".to_string());
-    extra.insert("cmd".to_owned(), cmd_value);
+    extra.insert("shell".to_owned(), cmd_value);
 
     let task_config = TaskConfig::builder()
       .id("source_task".to_string())
@@ -1100,7 +1100,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
     let mut extra = HashMap::new();
     let cmd_value = Value::String("sleep 5".to_string());
-    extra.insert("cmd".to_owned(), cmd_value);
+    extra.insert("shell".to_owned(), cmd_value);
 
     let task_config = TaskConfig::builder()
       .id("long_task".to_string())
@@ -1158,7 +1158,7 @@ mod tests {
 
     let mut extra = HashMap::new();
     let cmd_value = Value::String("nonexistent_command".to_string());
-    extra.insert("cmd".to_owned(), cmd_value);
+    extra.insert("shell".to_owned(), cmd_value);
 
     let task_config = TaskConfig::builder()
       .id("ignore_error_task".to_string())

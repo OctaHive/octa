@@ -1,6 +1,10 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{
+  de::{MapAccess, Visitor},
+  Deserialize, Deserializer, Serialize,
+};
+
 use serde_yml::Value;
 
 use crate::{octafile::Envs, Vars};
@@ -79,7 +83,7 @@ impl From<String> for Deps {
   }
 }
 
-#[derive(Serialize, Debug, Clone, Default, Deserialize)]
+#[derive(Serialize, Debug, Clone, Default)]
 pub struct Task {
   pub env: Option<Envs>,                         // Task environment variables
   pub dir: Option<PathBuf>,                      // Working directory for the task
@@ -99,4 +103,75 @@ pub struct Task {
 
   #[serde(flatten)]
   pub extra: HashMap<String, Value>, // Captures any additional attributes
+}
+
+impl<'de> Deserialize<'de> for Task {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    struct TaskVisitor;
+
+    impl<'de> Visitor<'de> for TaskVisitor {
+      type Value = Task;
+
+      fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a string or a map representing a Task")
+      }
+
+      fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+      where
+        E: serde::de::Error,
+      {
+        let mut extra = HashMap::new();
+        let cmd_value = Value::String(value.to_string());
+        extra.insert("shell".to_owned(), cmd_value);
+
+        Ok(Task {
+          extra,
+          ..Task::default()
+        })
+      }
+
+      fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+      where
+        M: MapAccess<'de>,
+      {
+        let mut task = Task::default();
+        let mut extra = HashMap::new();
+
+        while let Some(key) = map.next_key::<String>()? {
+          match key.as_str() {
+            "dir" => task.dir = map.next_value()?,
+            "desc" => task.desc = map.next_value()?,
+            "vars" => task.vars = map.next_value()?,
+            "env" => task.env = map.next_value()?,
+            "cmds" => task.cmds = map.next_value()?,
+            "internal" => task.internal = map.next_value()?,
+            "platforms" => task.platforms = map.next_value()?,
+            "ignore_error" => task.ignore_error = map.next_value()?,
+            "deps" => task.deps = map.next_value()?,
+            "run" => task.run = map.next_value()?,
+            "silent" => task.silent = map.next_value()?,
+            "execute_mode" => task.execute_mode = map.next_value()?,
+            "sources" => task.sources = map.next_value()?,
+            "source_strategy" => task.source_strategy = map.next_value()?,
+            "preconditions" => task.preconditions = map.next_value()?,
+            key => {
+              let val = Value::String(map.next_value()?);
+              extra.insert(key.to_owned(), val);
+            },
+          }
+        }
+
+        if !extra.is_empty() {
+          task.extra = extra;
+        }
+
+        Ok(task)
+      }
+    }
+
+    deserializer.deserialize_any(TaskVisitor)
+  }
 }
