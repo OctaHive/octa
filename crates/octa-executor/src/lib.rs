@@ -12,6 +12,7 @@ pub mod vars;
 use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 
 use envs::Envs;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -19,7 +20,7 @@ use error::{ExecutorError, ExecutorResult};
 pub use executor::Executor;
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
-use octa_octafile::{AllowedRun, Cmds, Deps, ExecuteMode, Octafile, Task};
+use octa_octafile::{AllowedRun, Deps, ExecuteMode, Octafile, Task};
 pub use task::TaskNode;
 use task::{CmdType, TaskConfig};
 use vars::Vars;
@@ -34,6 +35,14 @@ pub struct TaskGraphBuilder {
   command_args: Vec<String>, // Additional task arguments from cli
   os_arch: String,           // Operating system architecture
   os_type: String,           // Operating system type
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct TaskCmd {
+  task: String,
+  pub vars: Option<octa_octafile::Vars>,
+  pub envs: Option<octa_octafile::Envs>,
+  pub silent: Option<bool>,
 }
 
 impl TaskGraphBuilder {
@@ -122,7 +131,7 @@ impl TaskGraphBuilder {
 
         for cmd in cmds {
           match cmd {
-            Cmds::Simple(s) => {
+            serde_yml::Value::String(s) => {
               let simple = self.create_simple_command(command, s);
 
               // Fix command name
@@ -150,7 +159,9 @@ impl TaskGraphBuilder {
 
               index += 1;
             },
-            Cmds::Complex(complex) => {
+            complex => {
+              let complex: TaskCmd = serde_yml::from_value(complex.clone()).map_err(ExecutorError::DeserializeError)?;
+
               let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
               cmds = self.filter_command_by_platform(cmds);
 
@@ -231,7 +242,7 @@ impl TaskGraphBuilder {
 
         for cmd in cmds {
           match cmd {
-            Cmds::Simple(s) => {
+            serde_yml::Value::String(s) => {
               let simple = self.create_simple_command(command, s);
 
               let task = self.create_task_node(
@@ -264,7 +275,9 @@ impl TaskGraphBuilder {
                 *prev = Some(task)
               }
             },
-            Cmds::Complex(complex) => {
+            complex => {
+              let complex: TaskCmd = serde_yml::from_value(complex.clone()).map_err(ExecutorError::DeserializeError)?;
+
               let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
               cmds = self.filter_command_by_platform(cmds);
 
@@ -519,13 +532,13 @@ impl TaskGraphBuilder {
   }
 
   /// Create a simple command from a complex one
-  fn create_simple_command(&self, command: &FindResult, cmd_str: &str) -> FindResult {
+  fn create_simple_command(&self, command: &FindResult, cmd: &str) -> FindResult {
     let mut extra = HashMap::new();
-    let cmd_value = serde_yml::Value::String(cmd_str.to_string());
+    let cmd_value = serde_yml::Value::String(cmd.to_string());
     extra.insert("cmd".to_owned(), cmd_value);
 
     FindResult {
-      name: cmd_str.to_string(),
+      name: cmd.to_string(),
       octafile: command.octafile.clone(),
       task: Task {
         cmds: None,

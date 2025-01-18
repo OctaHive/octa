@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_yml::Value;
 
-use crate::{octafile::Envs, Cmds, Vars};
+use crate::{octafile::Envs, Vars};
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -85,7 +85,7 @@ pub struct Task {
   pub dir: Option<PathBuf>,                      // Working directory for the task
   pub desc: Option<String>,                      // Task description
   pub vars: Option<Vars>,                        // Task-specific variables
-  pub cmds: Option<Vec<Cmds>>,                   // List of commands
+  pub cmds: Option<Vec<Value>>,                  // List of commands
   pub internal: Option<bool>,                    // Show command in list of available commands
   pub platforms: Option<Vec<String>>,            // Supported platforms
   pub ignore_error: Option<bool>,                // Whether to continue on error

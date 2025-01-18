@@ -22,6 +22,9 @@ pub enum ExecutorError {
   #[error("Command not found: {0}")]
   CommandNotFound(String),
 
+  #[error("Failed to parse YAML Value: {0}")]
+  DeserializeError(#[from] serde_yml::Error),
+
   #[error("Task not found: {0}")]
   TaskNotFound(String),
 
