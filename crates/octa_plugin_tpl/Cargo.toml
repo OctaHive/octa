@@ -24,3 +24,6 @@ serde_json = { workspace = true }
 tera = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.2"

@@ -1166,6 +1166,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shellexpand",
+ "tempfile",
  "tera",
  "tokio",
  "tokio-util",
