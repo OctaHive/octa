@@ -1052,6 +1052,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "serde_yml",
  "sha2",
  "shellexpand",
  "sled",
@@ -1074,6 +1075,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "octa-octafile",
+ "serde",
+ "serde_yml",
  "tempfile",
  "test-log",
  "thiserror 2.0.4",

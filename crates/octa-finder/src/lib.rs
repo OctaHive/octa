@@ -190,14 +190,19 @@ impl OctaFinder {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::path::PathBuf;
+  use serde_yml::Value;
+  use std::{collections::HashMap, path::PathBuf};
   use tempfile::TempDir;
   use test_log::test;
   use tracing_test::traced_test;
 
   fn create_test_task(name: &str) -> Task {
+    let mut extra = HashMap::new();
+    let cmd_value = Value::String(format!("echo {}", name));
+    extra.insert("cmd".to_owned(), cmd_value);
+
     Task {
-      cmd: Some(format!("echo {}", name).into()),
+      extra,
       ..Task::default()
     }
   }
@@ -219,7 +224,8 @@ mod tests {
       content.push_str("tasks:\n");
       for (task_name, task) in &tasks {
         content.push_str(&format!("  {}:\n", task_name));
-        if let Some(ref cmd) = task.cmd {
+        if let Some(cmd) = task.extra.get("cmd") {
+          let cmd = serde_yml::to_string(&cmd).unwrap();
           content.push_str(&format!("    cmd: {}\n", cmd));
         }
       }

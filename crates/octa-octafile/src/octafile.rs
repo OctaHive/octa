@@ -462,37 +462,6 @@ mod tests {
   }
 
   #[test]
-  fn test_complex_commands() {
-    let content = r#"
-      version: 1
-      tasks:
-        simple:
-          cmd: echo "simple"
-        complex:
-          cmd:
-            task: other_task
-        multiple:
-          cmds:
-            - echo "first"
-            - task: other_task
-    "#;
-    let (_temp_dir, file_path) = create_temp_octafile(content, "complex_commands");
-
-    let octafile = Octafile::load(Some(file_path), false).unwrap();
-    let tasks = &octafile.tasks;
-
-    match &tasks["simple"].cmd {
-      Some(Cmds::Simple(_)) => (),
-      _ => panic!("Expected simple command"),
-    }
-
-    match &tasks["complex"].cmd {
-      Some(Cmds::Complex(_)) => (),
-      _ => panic!("Expected complex command"),
-    }
-  }
-
-  #[test]
   fn test_error_handling() {
     // Test nonexistent file
     assert!(matches!(

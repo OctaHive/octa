@@ -1,0 +1,72 @@
+[2025-01-18 23:59:02.006177] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.1f2e596218f6ab46.sock
+[2025-01-18 23:59:02.006726] Server started successfully
+[2025-01-18 23:59:02.034225] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.034383] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.102181] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.1b54d612ab736a73.sock
+[2025-01-18 23:59:02.102481] Server started successfully
+[2025-01-18 23:59:02.102753] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.884f47f90580661a.sock
+[2025-01-18 23:59:02.102970] Server started successfully
+[2025-01-18 23:59:02.103101] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.7971ae02db575dd6.sock
+[2025-01-18 23:59:02.103144] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.a1c10b43fdc42d9e.sock
+[2025-01-18 23:59:02.103315] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.d8cfd1507259c08c.sock
+[2025-01-18 23:59:02.103358] Server started successfully
+[2025-01-18 23:59:02.103400] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.a45c6ffcf5bc80e2.sock
+[2025-01-18 23:59:02.103430] Server started successfully
+[2025-01-18 23:59:02.103552] Server started successfully
+[2025-01-18 23:59:02.103632] Server started successfully
+[2025-01-18 23:59:02.136098] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.136106] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.136116] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.136131] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.136125] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.136449] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.136486] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.136532] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.136543] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.136548] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.136726] Received: {"type":"Shutdown"}
+[2025-01-18 23:59:02.136807] Sending: {"type": "Shutdown", "message": "Shutting down"}
+[2025-01-18 23:59:02.138199] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.138331] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.138480] Received: {"type":"Execute","payload":{"command":"test","args":[],"dir":".","envs":{},"vars":{}}}
+[2025-01-18 23:59:02.138535] Sending: {"type": "Started", "id": "test-execution-id"}
+[2025-01-18 23:59:02.138582] Sending: {"type": "Stdout", "id": "test-execution-id", "line": "test output"}
+[2025-01-18 23:59:02.138628] Sending: {"type": "ExitStatus", "id": "test-execution-id", "code": 0}
+[2025-01-18 23:59:02.196276] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.0ff7e93cf21b4986.sock
+[2025-01-18 23:59:02.196302] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.f3b69bce73cb1f88.sock
+[2025-01-18 23:59:02.196302] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.59a22977ab80ab08.sock
+[2025-01-18 23:59:02.196302] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.569be00c9141b4c0.sock
+[2025-01-18 23:59:02.196564] Server started successfully
+[2025-01-18 23:59:02.196680] Server started successfully
+[2025-01-18 23:59:02.196715] Server started successfully
+[2025-01-18 23:59:02.196814] Server started successfully
+[2025-01-18 23:59:02.197081] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.923e21fcb44e00cb.sock
+[2025-01-18 23:59:02.197351] Server started successfully
+[2025-01-18 23:59:02.239860] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.239856] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.239866] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.239856] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.239996] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.240044] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.240025] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.240043] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.240228] Received: {"type":"Shutdown"}
+[2025-01-18 23:59:02.240260] Received: {"type":"Shutdown"}
+[2025-01-18 23:59:02.240309] Sending: {"type": "Shutdown", "message": "Shutting down"}
+[2025-01-18 23:59:02.240291] Received: {"type":"Shutdown"}
+[2025-01-18 23:59:02.240347] Sending: {"type": "Shutdown", "message": "Shutting down"}
+[2025-01-18 23:59:02.240402] Sending: {"type": "Shutdown", "message": "Shutting down"}
+[2025-01-18 23:59:02.241962] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.242082] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.293612] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.cd25de9dee3cc437.sock
+[2025-01-18 23:59:02.293926] Server started successfully
+[2025-01-18 23:59:02.295498] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.f705d213d5cf8e99.sock
+[2025-01-18 23:59:02.295727] Server started successfully
+[2025-01-18 23:59:02.343021] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.343179] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:02.345341] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:02.345547] Sending: {"type": "Hello", "version": "0.1.0", "features": []}
+[2025-01-18 23:59:03.952245] Starting Unix domain socket server on: /var/folders/g3/rthpx1jj1r7_sd6yjkvcnf6m0000gn/T/octa.54082.73f8ffb355d133d1.sock
+[2025-01-18 23:59:03.952534] Server started successfully
+[2025-01-18 23:59:03.963816] Received: {"type":"Hello","payload":{"version":"0.1.0","features":[]}}
+[2025-01-18 23:59:03.963896] Sending: {"type": "Hello", "version": "0.1.0", "features": []}

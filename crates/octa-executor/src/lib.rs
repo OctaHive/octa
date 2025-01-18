@@ -347,6 +347,14 @@ impl TaskGraphBuilder {
     let envs = self.collect_envs(cmd, execute_envs);
     let vars = self.collect_vars(cmd, execute_vars);
 
+    // Because internally we work with json we convert yaml Value to json Value
+    let mut extra = HashMap::new();
+    for (key, yaml_value) in &cmd.task.extra {
+      let json_value = serde_json::to_value(yaml_value)
+        .map_err(|e| ExecutorError::ExtraValueConvertError(key.clone(), e.to_string()))?;
+      extra.insert(key.clone(), json_value);
+    }
+
     let task_config = TaskConfig::builder()
       .id(Uuid::new_v4())
       .name(cmd.name.clone())
@@ -360,7 +368,7 @@ impl TaskGraphBuilder {
       .source_strategy(cmd.task.source_strategy.clone())
       .ignore_errors(cmd.task.ignore_error)
       .run_mode(cmd.task.run.clone())
-      .cmd(cmd.task.cmd.clone().map(|cmd| cmd.to_string()));
+      .extra(extra);
 
     let task = TaskNode::new(task_config.build().unwrap());
     let arc_task = Arc::new(task);
@@ -512,12 +520,16 @@ impl TaskGraphBuilder {
 
   /// Create a simple command from a complex one
   fn create_simple_command(&self, command: &FindResult, cmd_str: &str) -> FindResult {
+    let mut extra = HashMap::new();
+    let cmd_value = serde_yml::Value::String(cmd_str.to_string());
+    extra.insert("cmd".to_owned(), cmd_value);
+
     FindResult {
       name: cmd_str.to_string(),
       octafile: command.octafile.clone(),
       task: Task {
         cmds: None,
-        cmd: Some(Cmds::Simple(cmd_str.to_string())),
+        extra,
         deps: None,
         ..command.task.clone()
       },
@@ -737,8 +749,12 @@ mod tests {
   use tempfile::TempDir;
 
   fn create_test_task() -> Task {
+    let mut extra = HashMap::new();
+    let cmd_value = serde_yml::Value::String("echo test".to_string());
+    extra.insert("cmd".to_owned(), cmd_value);
+
     Task {
-      cmd: Some(Cmds::Simple("echo test".to_string())),
+      extra,
       ..Task::default()
     }
   }

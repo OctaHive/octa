@@ -114,7 +114,6 @@ pub struct TaskConfig {
   pub dep_name: String,
 
   // Execution configuration
-  pub cmd: Option<String>, // Command to execute
   pub dir: PathBuf,        // Working directory
   pub ignore_errors: bool, // Whether to continue on error
   pub silent: bool,        // Should task print to stdout or stderr
@@ -145,7 +144,6 @@ pub struct TaskConfigBuilder {
   name: Option<String>,
   dep_name: Option<String>,
 
-  pub cmd: Option<String>,
   pub dir: Option<PathBuf>,
   pub ignore_errors: Option<bool>,
   pub silent: Option<bool>,
@@ -175,11 +173,6 @@ impl TaskConfigBuilder {
 
   pub fn id(mut self, id: impl Into<String>) -> Self {
     self.id = Some(id.into());
-    self
-  }
-
-  pub fn cmd(mut self, cmd: Option<impl Into<String>>) -> Self {
-    self.cmd = cmd.map(Into::into);
     self
   }
 
@@ -249,7 +242,6 @@ impl TaskConfigBuilder {
       id: self.id.ok_or("Missing mandatory field: id")?,
       name: self.name.ok_or("Missing mandatory field: name")?,
       dep_name: self.dep_name.ok_or("Missing mandatory field: dep_name")?,
-      cmd: self.cmd,
       dir: dir.ok_or("Missing mandatory field: dir")?,
       ignore_errors: self.ignore_errors.unwrap_or(false),
       silent: self.silent.unwrap_or(false),
@@ -274,7 +266,6 @@ pub struct TaskNode {
   pub dep_name: String, // Name of task in deps
 
   // Execution configuration
-  pub cmd: Option<String>, // Command to execute
   pub dir: PathBuf,        // Working directory
   pub ignore_errors: bool, // Whether to continue on error
   pub silent: bool,        // Should task print to stdout or stderr
@@ -316,7 +307,6 @@ impl TaskNode {
       id: config.id,
       name: config.name,
       dep_name: config.dep_name,
-      cmd: config.cmd,
       run_mode: config.run_mode,
       sources: config.sources,
       source_strategy: config.source_strategy,
@@ -742,14 +732,20 @@ impl Executable<TaskNode> for TaskNode {
     // Debug information about dependency results
     self.debug_log_dependencies().await;
 
-    match (&self.cmd, &self.extra.get("tpl")) {
+    match (&self.extra.get("cmd"), self.extra.get("tpl")) {
       // This variant should validate on load octafile stage
       (Some(_), Some(_)) => {
         unreachable!("Both cmd and tpl cannot be Some - should be validated during octafile loading")
       },
       (Some(cmd), None) => {
         self
-          .execute_cmd(plugin_manager, cmd.clone(), cache, dry, cancel_token.clone())
+          .execute_cmd(
+            plugin_manager,
+            cmd.to_string().trim_matches('"').to_string(),
+            cache,
+            dry,
+            cancel_token.clone(),
+          )
           .await
       },
       (None, Some(tpl)) => {
@@ -810,6 +806,10 @@ mod tests {
       let tpl_value = Value::String(tpl);
       extra.insert("tpl".to_owned(), tpl_value);
     }
+    if let Some(cmd) = cmd {
+      let cmd_value = Value::String(cmd.to_owned());
+      extra.insert("cmd".to_owned(), cmd_value);
+    }
 
     let task_config = TaskConfig::builder()
       .id(name.to_string())
@@ -818,7 +818,6 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .cmd(cmd)
       .extra(extra)
       .run_mode(Some(run_mode.unwrap_or(RunMode::Always)))
       .build()
@@ -984,6 +983,10 @@ mod tests {
     let test_file = temp_dir.path().join("test.txt");
     fs::write(&test_file, "initial content").unwrap();
 
+    let mut extra = HashMap::new();
+    let cmd_value = Value::String("echo 'test'".to_string());
+    extra.insert("cmd".to_owned(), cmd_value);
+
     let task_config = TaskConfig::builder()
       .id("source_task".to_string())
       .name("source_task".to_string())
@@ -991,7 +994,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .cmd(Some("echo 'test'".to_string()))
+      .extra(extra)
       .run_mode(Some(AllowedRun::Changed))
       .sources(Some(vec![test_file.to_str().unwrap().to_string()]))
       .source_strategy(Some(SourceStrategies::Hash))
@@ -1095,6 +1098,10 @@ mod tests {
       .expect("Failed to open in-memory Sled database");
 
     let cancel_token = CancellationToken::new();
+    let mut extra = HashMap::new();
+    let cmd_value = Value::String("sleep 5".to_string());
+    extra.insert("cmd".to_owned(), cmd_value);
+
     let task_config = TaskConfig::builder()
       .id("long_task".to_string())
       .name("long_task".to_string())
@@ -1102,7 +1109,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .cmd(Some("sleep 5".to_string()))
+      .extra(extra)
       .build()
       .unwrap();
 
@@ -1149,6 +1156,10 @@ mod tests {
       .open()
       .expect("Failed to open in-memory Sled database");
 
+    let mut extra = HashMap::new();
+    let cmd_value = Value::String("nonexistent_command".to_string());
+    extra.insert("cmd".to_owned(), cmd_value);
+
     let task_config = TaskConfig::builder()
       .id("ignore_error_task".to_string())
       .name("ignore_error_task".to_string())
@@ -1156,7 +1167,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .cmd(Some("nonexistent_command".to_string()))
+      .extra(extra)
       .ignore_errors(Some(true))
       .build()
       .unwrap();

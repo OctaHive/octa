@@ -85,7 +85,6 @@ pub struct Task {
   pub dir: Option<PathBuf>,                      // Working directory for the task
   pub desc: Option<String>,                      // Task description
   pub vars: Option<Vars>,                        // Task-specific variables
-  pub cmd: Option<Cmds>,                         // Command to execute
   pub cmds: Option<Vec<Cmds>>,                   // List of commands
   pub internal: Option<bool>,                    // Show command in list of available commands
   pub platforms: Option<Vec<String>>,            // Supported platforms

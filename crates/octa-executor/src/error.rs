@@ -61,6 +61,9 @@ pub enum ExecutorError {
   #[error("IO error: {0}")]
   IoError(#[from] std::io::Error),
 
+  #[error("Failed to convert {0} yaml Value to json Value: {1}")]
+  ExtraValueConvertError(String, String),
+
   #[error("Task join error: {0}")]
   JoinError(#[from] task::JoinError),
 
