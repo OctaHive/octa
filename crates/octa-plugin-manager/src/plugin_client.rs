@@ -9,7 +9,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use octa_plugin::protocol::{ClientCommand, Schema, ServerResponse, Version};
+use octa_plugin::protocol::{OctaCommand, PluginResponse, Schema, Version};
 
 #[derive(Debug)]
 pub enum PluginClientError {
@@ -62,14 +62,14 @@ impl std::fmt::Display for PluginClientError {
 #[derive(Debug)]
 pub struct PluginClient {
   inner: Arc<PluginClientInner>,
-  response_rx: mpsc::UnboundedReceiver<ServerResponse>,
+  response_rx: mpsc::UnboundedReceiver<PluginResponse>,
   shutdown_signal: Arc<CancellationToken>,
 }
 
 #[derive(Debug)]
 struct PluginClientInner {
   writer: Mutex<Option<WriteHalf<TokioStream>>>,
-  response_tx: mpsc::UnboundedSender<ServerResponse>,
+  response_tx: mpsc::UnboundedSender<PluginResponse>,
 }
 
 impl Drop for PluginClient {
@@ -123,7 +123,7 @@ impl PluginClient {
   }
 
   pub async fn handshake(&mut self) -> Result<(), PluginClientError> {
-    let hello = ClientCommand::Hello(Version {
+    let hello = OctaCommand::Hello(Version {
       version: env!("CARGO_PKG_VERSION").to_string(),
       features: vec![],
     });
@@ -141,7 +141,7 @@ impl PluginClient {
     }
 
     match self.response_rx.recv().await {
-      Some(ServerResponse::Hello(version)) => {
+      Some(PluginResponse::Hello(version)) => {
         let octa_version = SemVersion::parse(env!("CARGO_PKG_VERSION")).unwrap();
         let req_version = VersionReq::parse(&version.version).unwrap();
 
@@ -151,14 +151,14 @@ impl PluginClient {
 
         Ok(())
       },
-      Some(ServerResponse::Error { message, .. }) => Err(PluginClientError::Protocol(message)),
+      Some(PluginResponse::Error { message, .. }) => Err(PluginClientError::Protocol(message)),
       Some(_) => Err(PluginClientError::Protocol("Unexpected response to Hello".into())),
       None => Err(PluginClientError::ConnectionClosed),
     }
   }
 
   pub async fn get_schema(&mut self) -> Result<Schema, PluginClientError> {
-    let schema = ClientCommand::Schema;
+    let schema = OctaCommand::Schema;
 
     let schema_json = serde_json::to_string(&schema)? + "\n";
 
@@ -173,8 +173,8 @@ impl PluginClient {
     }
 
     match self.response_rx.recv().await {
-      Some(ServerResponse::Schema(schema)) => Ok(schema),
-      Some(ServerResponse::Error { message, .. }) => Err(PluginClientError::Protocol(message)),
+      Some(PluginResponse::Schema(schema)) => Ok(schema),
+      Some(PluginResponse::Error { message, .. }) => Err(PluginClientError::Protocol(message)),
       Some(_) => Err(PluginClientError::Protocol("Unexpected response to Hello".into())),
       None => Err(PluginClientError::ConnectionClosed),
     }
@@ -200,13 +200,13 @@ impl PluginClient {
           Ok(0) => break, // Connection closed
           Ok(_) => {
             // Parse the response once and handle any parsing errors
-            match serde_json::from_str::<ServerResponse>(buffer.trim()) {
+            match serde_json::from_str::<PluginResponse>(buffer.trim()) {
               Ok(response) => {
                 let _ = inner.response_tx.send(response.clone());
               },
               Err(e) => {
                 // Create error response for invalid JSON
-                let error_response = ServerResponse::Error {
+                let error_response = PluginResponse::Error {
                   id: "parse_error".to_string(),
                   message: format!("Invalid JSON response: {}", e),
                 };
@@ -229,7 +229,7 @@ impl PluginClient {
     envs: HashMap<String, String>,
     cancel_token: CancellationToken,
   ) -> Result<String, PluginClientError> {
-    let cmd = ClientCommand::Execute {
+    let cmd = OctaCommand::Execute {
       command,
       args,
       dir,
@@ -257,8 +257,8 @@ impl PluginClient {
     tokio::select! {
       response = self.response_rx.recv() => {
         match response {
-          Some(ServerResponse::Started { id }) => Ok(id),
-          Some(ServerResponse::Error { message, .. }) => {
+          Some(PluginResponse::Started { id }) => Ok(id),
+          Some(PluginResponse::Error { message, .. }) => {
             Err(PluginClientError::Protocol(message))
           }
           Some(resp) => Err(PluginClientError::Protocol(format!("Expected Started response, received {:?}", resp))),
@@ -274,7 +274,7 @@ impl PluginClient {
   pub async fn receive_output(
     &mut self,
     cancel_token: &CancellationToken,
-  ) -> Result<Option<ServerResponse>, PluginClientError> {
+  ) -> Result<Option<PluginResponse>, PluginClientError> {
     tokio::select! {
       response = self.response_rx.recv() => Ok(response),
       _ = cancel_token.cancelled() => {
@@ -291,7 +291,7 @@ impl PluginClient {
       return Ok(());
     }
 
-    let cmd = ClientCommand::Shutdown;
+    let cmd = OctaCommand::Shutdown;
     let cmd_json = serde_json::to_string(&cmd)? + "\n";
 
     // Try to write shutdown command
@@ -328,13 +328,13 @@ impl PluginClient {
     }
 
     match tokio::time::timeout(std::time::Duration::from_secs(5), self.response_rx.recv()).await {
-      Ok(Some(ServerResponse::Shutdown { .. })) => {
+      Ok(Some(PluginResponse::Shutdown { .. })) => {
         // Normal shutdown
         self.cleanup().await;
 
         Ok(())
       },
-      Ok(Some(ServerResponse::Error { message, .. })) => Err(PluginClientError::Protocol(message)),
+      Ok(Some(PluginResponse::Error { message, .. })) => Err(PluginClientError::Protocol(message)),
       Ok(Some(_)) => Err(PluginClientError::Protocol("Expected Shutdown response".into())),
       Ok(None) => {
         // Channel closed without response
@@ -434,7 +434,7 @@ mod tests {
             messages.push(buffer.clone());
 
             // Send Hello response
-            let response = ServerResponse::Hello(Version {
+            let response = PluginResponse::Hello(Version {
               version: env!("CARGO_PKG_VERSION").to_string(),
               features: vec![],
             });
@@ -485,18 +485,18 @@ mod tests {
         received_messages.push(buffer.clone());
 
         let response = if buffer.contains("Hello") {
-          Some(ServerResponse::Hello(Version {
+          Some(PluginResponse::Hello(Version {
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![],
           }))
         } else if buffer.contains("Schema") {
-          Some(ServerResponse::Schema(Schema { key: "key".to_owned() }))
+          Some(PluginResponse::Schema(Schema { key: "key".to_owned() }))
         } else if buffer.contains("Execute") {
-          Some(ServerResponse::Started {
+          Some(PluginResponse::Started {
             id: "test-id".to_string(),
           })
         } else if buffer.contains("Shutdown") {
-          Some(ServerResponse::Shutdown {
+          Some(PluginResponse::Shutdown {
             message: "Shutting down".to_string(),
           })
         } else {
@@ -723,7 +723,7 @@ mod tests {
         // Handle handshake
         if let Ok(_) = reader.read_line(&mut buffer).await {
           messages.push(buffer.clone());
-          let response = ServerResponse::Hello(Version {
+          let response = PluginResponse::Hello(Version {
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![],
           });
@@ -736,7 +736,7 @@ mod tests {
           if let Ok(_) = reader.read_line(&mut buffer).await {
             messages.push(buffer.clone());
 
-            let response = ServerResponse::Schema(Schema { key: "key".to_owned() });
+            let response = PluginResponse::Schema(Schema { key: "key".to_owned() });
             let response_json = serde_json::to_string(&response).unwrap() + "\n";
             writer.write_all(response_json.as_bytes()).await.unwrap();
             writer.flush().await.unwrap();
@@ -782,7 +782,7 @@ mod tests {
         // Handle handshake
         if let Ok(_) = reader.read_line(&mut buffer).await {
           messages.push(buffer.clone());
-          let response = ServerResponse::Hello(Version {
+          let response = PluginResponse::Hello(Version {
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![],
           });
@@ -860,7 +860,7 @@ mod tests {
         // Handle handshake
         if let Ok(_) = reader.read_line(&mut buffer).await {
           messages.push(buffer.clone());
-          let response = ServerResponse::Hello(Version {
+          let response = PluginResponse::Hello(Version {
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![],
           });
@@ -872,7 +872,7 @@ mod tests {
           buffer.clear();
           if let Ok(_) = reader.read_line(&mut buffer).await {
             messages.push(buffer);
-            let error_response = ServerResponse::Error {
+            let error_response = PluginResponse::Error {
               id: "shutdown_error".to_string(),
               message: "Failed to shutdown".to_string(),
             };

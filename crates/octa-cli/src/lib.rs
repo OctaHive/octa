@@ -328,13 +328,6 @@ mod tests {
   use std::path::PathBuf;
   use tempfile::TempDir;
 
-  fn create_test_octafile(dir: &TempDir, content: &str) -> PathBuf {
-    let octafile_path = dir.path().join("Octafile.yml");
-    let mut file = File::create(&octafile_path).unwrap();
-    write!(file, "{}", content).unwrap();
-    octafile_path
-  }
-
   fn create_test_config(dir: &TempDir, content: &str) -> PathBuf {
     let config_path = dir.path().join("config.yml");
     let mut file = File::create(&config_path).unwrap();

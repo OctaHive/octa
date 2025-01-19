@@ -8,7 +8,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use octa_plugin::logger::Logger;
 use octa_plugin::PluginSchema;
-use octa_plugin::{protocol::ServerResponse, serve_plugin, Plugin};
+use octa_plugin::{protocol::PluginResponse, serve_plugin, Plugin};
 use serde_json::Value;
 use tera::{Context as TeraContext, Tera};
 use tokio::io::AsyncWrite;
@@ -122,7 +122,7 @@ impl Plugin for ShellPlugin {
       .add_raw_template(&template_name, val.as_ref())
       .context("Failed to parse template")?;
 
-    let context = TeraContext::from_serialize(vars)?;
+    let context = TeraContext::from_serialize(vars).context("Failed to serialize variables to context")?;
 
     let result = tera
       .render(&template_name, &context)
@@ -173,7 +173,7 @@ impl Plugin for ShellPlugin {
                 Ok(0) => break,
                 Ok(_) => {
                   if !buffer.is_empty() {
-                    let response = ServerResponse::Stdout {
+                    let response = PluginResponse::Stdout {
                       id: id.clone(),
                       line: buffer.clone(),
                     };
@@ -210,7 +210,7 @@ impl Plugin for ShellPlugin {
                 Ok(0) => break,
                 Ok(_) => {
                   if !buffer.is_empty() {
-                    let response = ServerResponse::Stderr {
+                    let response = PluginResponse::Stderr {
                       id: id.clone(),
                       line: buffer.clone(),
                     };
@@ -249,7 +249,7 @@ impl Plugin for ShellPlugin {
         tokio::select! {
           status = child.wait() => {
             if let Ok(status) = status {
-              let response = ServerResponse::ExitStatus {
+              let response = PluginResponse::ExitStatus {
                 id: id.clone(),
                 code: status.code().unwrap_or(-1),
               };
@@ -268,7 +268,7 @@ impl Plugin for ShellPlugin {
 
             let _ = child.kill().await;
 
-            let response = ServerResponse::ExitStatus {
+            let response = PluginResponse::ExitStatus {
               id: id.clone(),
               code: -1,
             };
@@ -399,9 +399,9 @@ mod tests {
       .find(|line| line.contains("\"type\":\"Stdout\""))
       .expect("Should have stdout message");
 
-    let response: ServerResponse = serde_json::from_str(stdout_line).unwrap();
+    let response: PluginResponse = serde_json::from_str(stdout_line).unwrap();
     match response {
-      ServerResponse::Stdout { id, line } => {
+      PluginResponse::Stdout { id, line } => {
         assert_eq!(id, "test-id");
         assert!(line.contains(test_string));
       },
@@ -464,9 +464,9 @@ mod tests {
       .find(|line| line.contains("\"type\":\"ExitStatus\""))
       .expect("Should have exit status message");
 
-    let response: ServerResponse = serde_json::from_str(exit_line).unwrap();
+    let response: PluginResponse = serde_json::from_str(exit_line).unwrap();
     match response {
-      ServerResponse::ExitStatus { id, code } => {
+      PluginResponse::ExitStatus { id, code } => {
         assert_eq!(id, "test-id");
         assert_ne!(code, 0); // Should be non-zero for cancelled process
       },

@@ -4,7 +4,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use octa_plugin::{logger::Logger, protocol::ServerResponse, serve_plugin, Plugin, PluginSchema};
+use octa_plugin::{logger::Logger, protocol::PluginResponse, serve_plugin, Plugin, PluginSchema};
 use tera::{Context as TeraContext, Tera};
 use tokio::{
   io::{AsyncWrite, AsyncWriteExt},
@@ -52,28 +52,30 @@ impl Plugin for TemplatePlugin {
       .add_raw_template(&template_name, val.as_ref())
       .context("Failed to parse template")?;
 
-    let context = TeraContext::from_serialize(vars)?;
+    let context = TeraContext::from_serialize(vars).context("Failed to serialize variables to context")?;
 
     let result = tera
       .render(&template_name, &context)
       .context(format!("Failed to render template: {:?}", context))?;
 
-    let mut lock = writer.lock().await;
-
-    let response = ServerResponse::Stdout {
+    let stdout_response = PluginResponse::Stdout {
       id: id.clone(),
       line: result,
     };
-    let response_json = serde_json::to_string(&response).unwrap() + "\n";
-    let _ = lock.write_all(response_json.as_bytes()).await;
-    let _ = logger.log(&response_json.to_string());
+    let stdout_response_json = serde_json::to_string(&stdout_response).unwrap() + "\n";
 
-    let response = ServerResponse::ExitStatus {
+    let exit_response = PluginResponse::ExitStatus {
       id: id.clone(),
       code: 0,
     };
-    let response_json = serde_json::to_string(&response).unwrap() + "\n";
-    let _ = lock.write_all(response_json.as_bytes()).await;
+    let exit_response_json = serde_json::to_string(&exit_response).unwrap() + "\n";
+
+    let mut lock = writer.lock().await;
+    let _ = lock.write_all(stdout_response_json.as_bytes()).await;
+    let _ = logger.log(&stdout_response_json.to_string());
+
+    let _ = lock.write_all(exit_response_json.as_bytes()).await;
+    let _ = logger.log(&exit_response_json.to_string());
 
     let _ = lock.flush().await;
 
@@ -184,9 +186,9 @@ mod tests {
       .find(|line| line.contains("\"type\":\"Stdout\""))
       .expect("Should have stdout message");
 
-    let response: ServerResponse = serde_json::from_str(stdout_line).unwrap();
+    let response: PluginResponse = serde_json::from_str(stdout_line).unwrap();
     match response {
-      ServerResponse::Stdout { id, line } => {
+      PluginResponse::Stdout { id, line } => {
         assert_eq!(id, "test-id");
         assert!(line.contains(test_string));
       },

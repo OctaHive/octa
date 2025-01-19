@@ -52,7 +52,6 @@ pub enum PluginManagerError {
 
 type Result<T> = std::result::Result<T, PluginManagerError>;
 
-#[derive(Debug)]
 struct PluginInstance {
   process: Child,
   socket_path: OsString,
@@ -272,6 +271,7 @@ impl PluginManager {
 
   /// Shutdown a specific plugin
   pub async fn shutdown_plugin(&self, plugin_name: &str) -> Result<()> {
+    // Delete schema
     {
       let mut schemas = self.plugins_schema.lock().await;
       schemas.remove(plugin_name);
@@ -382,7 +382,7 @@ impl Drop for PluginManager {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use octa_plugin::protocol::ServerResponse;
+  use octa_plugin::protocol::PluginResponse;
   use tempfile::TempDir;
   use tokio::fs;
   use tokio::time::Duration;
@@ -465,12 +465,12 @@ mod tests {
 
     while let Ok(Some(response)) = client.receive_output(&cancel_token).await {
       match response {
-        ServerResponse::Stdout { id, line } => {
+        PluginResponse::Stdout { id, line } => {
           assert_eq!(id, "test-execution-id");
           assert_eq!(line, "test output");
           received_stdout = true;
         },
-        ServerResponse::ExitStatus { id, code } => {
+        PluginResponse::ExitStatus { id, code } => {
           assert_eq!(id, "test-execution-id");
           assert_eq!(code, 0);
           received_exit = true;

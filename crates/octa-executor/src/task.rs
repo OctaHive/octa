@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use dunce::canonicalize;
 use indexmap::IndexMap;
-use octa_plugin::protocol::ServerResponse;
+use octa_plugin::protocol::PluginResponse;
 use octa_plugin_manager::plugin_manager::PluginManager;
 use serde_json::Value;
 use sled::Db;
@@ -357,25 +357,25 @@ impl TaskNode {
       loop {
         match client.receive_output(&cancel_token).await {
           Ok(Some(response)) => match response {
-            ServerResponse::Stdout { id, line } if id == command_id => {
+            PluginResponse::Stdout { id, line } if id == command_id => {
               if !silent {
                 println!("{}", line.trim());
               }
               output.push_str(line.trim());
               output.push('\n');
             },
-            ServerResponse::Stderr { id, line } if id == command_id => {
+            PluginResponse::Stderr { id, line } if id == command_id => {
               if !silent {
                 eprintln!("{}", line.trim());
               }
               errors.push_str(line.trim());
               errors.push('\n');
             },
-            ServerResponse::ExitStatus { id, code } if id == command_id => {
+            PluginResponse::ExitStatus { id, code } if id == command_id => {
               exit_code = Some(code);
               break;
             },
-            ServerResponse::Error { id, message } if id == command_id => {
+            PluginResponse::Error { id, message } if id == command_id => {
               return Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!("Plugin error: {}", message),

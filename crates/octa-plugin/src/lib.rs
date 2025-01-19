@@ -22,7 +22,7 @@ use tokio_util::{
 };
 use uuid::Uuid;
 
-use protocol::{ClientCommand, Schema, ServerResponse, Version};
+use protocol::{OctaCommand, PluginResponse, Schema, Version};
 
 pub mod logger;
 pub mod protocol;
@@ -78,8 +78,8 @@ pub async fn stream_output(
     match line_result {
       Ok(line) => {
         let response = match output_type {
-          "stdout" => ServerResponse::Stdout { id: id.clone(), line },
-          "stderr" => ServerResponse::Stderr { id: id.clone(), line },
+          "stdout" => PluginResponse::Stdout { id: id.clone(), line },
+          "stderr" => PluginResponse::Stderr { id: id.clone(), line },
           _ => unreachable!(),
         };
 
@@ -87,7 +87,7 @@ pub async fn stream_output(
         writer.lock().await.write_all(response_json.as_bytes()).await?;
       },
       Err(e) => {
-        let error = ServerResponse::Error {
+        let error = PluginResponse::Error {
           id: id.clone(),
           message: format!("Failed to read {}: {}", output_type, e),
         };
@@ -100,7 +100,7 @@ pub async fn stream_output(
 }
 
 async fn handle_command<W>(
-  command: ClientCommand,
+  command: OctaCommand,
   writer: Arc<Mutex<W>>,
   active_commands: ActiveCommands,
   plugin: Arc<impl Plugin + 'static>,
@@ -111,7 +111,7 @@ where
   W: AsyncWrite + Send + Unpin + 'static,
 {
   match command {
-    ClientCommand::Execute {
+    OctaCommand::Execute {
       command,
       args,
       dir,
@@ -124,7 +124,7 @@ where
 
       {
         // Send started response
-        let start_response = ServerResponse::Started { id: id.clone() };
+        let start_response = PluginResponse::Started { id: id.clone() };
         let start_json = serde_json::to_string(&start_response)? + "\n";
         writer.lock().await.write_all(start_json.as_bytes()).await?;
 
@@ -152,7 +152,7 @@ where
           )
           .await
         {
-          let error = ServerResponse::Error {
+          let error = PluginResponse::Error {
             id: command_id,
             message: format!("Command execution error: {}", e),
           };
@@ -167,8 +167,8 @@ where
       // Store the handle with the original id
       active_commands.lock().await.insert(id, handle);
     },
-    ClientCommand::Schema => {
-      let response = ServerResponse::Error {
+    OctaCommand::Schema => {
+      let response = PluginResponse::Error {
         id: "protocol_error".to_string(),
         message: "Unexpected Schema command".to_owned(),
       };
@@ -180,8 +180,8 @@ where
 
       logger.log("Received unexpected Schema command")?;
     },
-    ClientCommand::Hello(_) => {
-      let response = ServerResponse::Error {
+    OctaCommand::Hello(_) => {
+      let response = PluginResponse::Error {
         id: "protocol_error".to_string(),
         message: "Unexpected Hello command".to_owned(),
       };
@@ -193,7 +193,7 @@ where
 
       logger.log("Received unexpected Hello command")?;
     },
-    ClientCommand::Shutdown => {
+    OctaCommand::Shutdown => {
       logger.log("Receiving shutdown command")?;
       cancel_token.cancel();
     },
@@ -244,7 +244,7 @@ async fn handle_conn(
                 }
               },
               Err(e) => {
-                let response = ServerResponse::Error {
+                let response = PluginResponse::Error {
                   id: "parse_error".to_string(),
                   message: format!("Invalid command format: {}", e),
                 };
@@ -277,7 +277,7 @@ async fn handle_conn(
     }
   }
 
-  let response = ServerResponse::Shutdown {
+  let response = PluginResponse::Shutdown {
     message: "Plugin shutting down".to_string(),
   };
   writer
@@ -306,13 +306,13 @@ where
   }
 
   match serde_json::from_str(&buffer) {
-    Ok(ClientCommand::Hello(client_version)) => {
+    Ok(OctaCommand::Hello(client_version)) => {
       if let Err(e) = logger.log(&format!("Client connected with version: {}", client_version.version)) {
         eprintln!("Failed to log message: {}", e);
       }
 
       // Send server Hello response with plugin version
-      let response = ServerResponse::Hello(Version {
+      let response = PluginResponse::Hello(Version {
         version: plugin.version(),
         features: vec![],
       });
@@ -322,7 +322,7 @@ where
       let _ = logger.log(&response_json.to_string());
     },
     Ok(command) => {
-      let response = ServerResponse::Error {
+      let response = PluginResponse::Error {
         id: "protocol_error".to_string(),
         message: "Expected Hello command".to_string(),
       };
@@ -336,7 +336,7 @@ where
       return Ok(());
     },
     Err(e) => {
-      let response = ServerResponse::Error {
+      let response = PluginResponse::Error {
         id: "parse_error".to_string(),
         message: format!("Invalid command format: {}", e),
       };
@@ -371,15 +371,15 @@ where
   }
 
   match serde_json::from_str(&buffer) {
-    Ok(ClientCommand::Schema) => {
-      let schema_response = ServerResponse::Schema(Schema { key: schema.key });
+    Ok(OctaCommand::Schema) => {
+      let schema_response = PluginResponse::Schema(Schema { key: schema.key });
       let response_json = serde_json::to_string(&schema_response)? + "\n";
       writer.lock().await.write_all(response_json.as_bytes()).await?;
 
       let _ = logger.log(&response_json.to_string());
     },
     Ok(command) => {
-      let response = ServerResponse::Error {
+      let response = PluginResponse::Error {
         id: "protocol_error".to_string(),
         message: "Expected Schema command".to_string(),
       };
@@ -393,7 +393,7 @@ where
       return Ok(());
     },
     Err(e) => {
-      let response = ServerResponse::Error {
+      let response = PluginResponse::Error {
         id: "parse_error".to_string(),
         message: format!("Invalid command format: {}", e),
       };
@@ -558,7 +558,7 @@ mod tests {
           return Ok(());
         }
 
-        let stdout = ServerResponse::Stdout {
+        let stdout = PluginResponse::Stdout {
           id: id.clone(),
           line: line.clone(),
         };
@@ -577,7 +577,7 @@ mod tests {
         return Err(anyhow::anyhow!("Command failed"));
       }
 
-      let response = ServerResponse::ExitStatus {
+      let response = PluginResponse::ExitStatus {
         id: id.clone(),
         code: 0,
       };
@@ -591,7 +591,7 @@ mod tests {
     }
   }
 
-  async fn read_responses(reader: impl AsyncRead + Unpin) -> Vec<ServerResponse> {
+  async fn read_responses(reader: impl AsyncRead + Unpin) -> Vec<PluginResponse> {
     let mut responses = Vec::new();
     let mut lines = BufReader::new(reader).lines();
     while let Some(line) = lines.next_line().await.unwrap() {
@@ -616,7 +616,7 @@ mod tests {
     let logger = Arc::new(MockLogger::new());
     let cancel_token = CancellationToken::new();
 
-    let command = ClientCommand::Execute {
+    let command = OctaCommand::Execute {
       command: "test".to_string(),
       args: vec!["arg1".to_string(), "arg2".to_string()],
       dir: PathBuf::from("/test/dir"),
@@ -646,11 +646,11 @@ mod tests {
 
     let responses = response_handle.await.unwrap();
 
-    assert!(matches!(responses[0], ServerResponse::Started { .. }));
-    assert!(matches!(responses[1], ServerResponse::Stdout { .. }));
-    assert!(matches!(responses[2], ServerResponse::Stdout { .. }));
-    assert!(matches!(responses[3], ServerResponse::Stdout { .. }));
-    assert!(matches!(responses[4], ServerResponse::ExitStatus { .. }));
+    assert!(matches!(responses[0], PluginResponse::Started { .. }));
+    assert!(matches!(responses[1], PluginResponse::Stdout { .. }));
+    assert!(matches!(responses[2], PluginResponse::Stdout { .. }));
+    assert!(matches!(responses[3], PluginResponse::Stdout { .. }));
+    assert!(matches!(responses[4], PluginResponse::ExitStatus { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
@@ -673,7 +673,7 @@ mod tests {
     let logger = Arc::new(MockLogger::new());
     let cancel_token = CancellationToken::new();
 
-    let command = ClientCommand::Shutdown;
+    let command = OctaCommand::Shutdown;
 
     let _response_handle = tokio::spawn(async move { read_responses(reader).await });
 
@@ -711,7 +711,7 @@ mod tests {
     let logger = Arc::new(MockLogger::new());
     let cancel_token = CancellationToken::new();
 
-    let command = ClientCommand::Execute {
+    let command = OctaCommand::Execute {
       command: "failing_command".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -735,9 +735,9 @@ mod tests {
 
     let responses = response_handle.await.unwrap();
 
-    assert!(matches!(responses[0], ServerResponse::Started { .. }));
-    assert!(matches!(responses[1], ServerResponse::Stdout { .. }));
-    assert!(matches!(responses[2], ServerResponse::Error { .. }));
+    assert!(matches!(responses[0], PluginResponse::Started { .. }));
+    assert!(matches!(responses[1], PluginResponse::Stdout { .. }));
+    assert!(matches!(responses[2], PluginResponse::Error { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
@@ -760,7 +760,7 @@ mod tests {
     let logger = Arc::new(MockLogger::new());
     let cancel_token = CancellationToken::new();
 
-    let command = ClientCommand::Execute {
+    let command = OctaCommand::Execute {
       command: "long_running".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -787,10 +787,10 @@ mod tests {
 
     let responses = response_handle.await.unwrap();
 
-    assert!(matches!(responses[0], ServerResponse::Started { .. }));
-    assert!(matches!(responses[1], ServerResponse::Stdout { .. }));
-    assert!(matches!(responses[2], ServerResponse::Stdout { .. }));
-    assert!(matches!(responses[3], ServerResponse::ExitStatus { .. }));
+    assert!(matches!(responses[0], PluginResponse::Started { .. }));
+    assert!(matches!(responses[1], PluginResponse::Stdout { .. }));
+    assert!(matches!(responses[2], PluginResponse::Stdout { .. }));
+    assert!(matches!(responses[3], PluginResponse::ExitStatus { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
@@ -813,7 +813,7 @@ mod tests {
     let logger = Arc::new(MockLogger::new());
     let cancel_token = CancellationToken::new();
 
-    let command = ClientCommand::Execute {
+    let command = OctaCommand::Execute {
       command: "to_be_cancelled".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -845,11 +845,11 @@ mod tests {
     let responses = response_handle.await.unwrap();
 
     // We should at least see the Started response
-    assert!(matches!(responses[0], ServerResponse::Started { .. }));
+    assert!(matches!(responses[0], PluginResponse::Started { .. }));
 
     // Check if we got any output before cancellation
     if responses.len() > 1 {
-      assert!(matches!(responses[1], ServerResponse::Stdout { .. }));
+      assert!(matches!(responses[1], PluginResponse::Stdout { .. }));
     }
 
     // Verify cancellation state
@@ -876,7 +876,7 @@ mod tests {
     let logger = Arc::new(MockLogger::new());
     let cancel_token = CancellationToken::new();
 
-    let command = ClientCommand::Hello(Version {
+    let command = OctaCommand::Hello(Version {
       version: "1.0.0".to_string(),
       features: vec![],
     });
@@ -889,7 +889,7 @@ mod tests {
 
     let responses = response_handle.await.unwrap();
     assert_eq!(responses.len(), 1);
-    assert!(matches!(responses[0], ServerResponse::Error { .. }));
+    assert!(matches!(responses[0], PluginResponse::Error { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
@@ -912,7 +912,7 @@ mod tests {
     let logger = Arc::new(MockLogger::new());
     let cancel_token = CancellationToken::new();
 
-    let command = ClientCommand::Execute {
+    let command = OctaCommand::Execute {
       command: "empty_output".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -936,8 +936,8 @@ mod tests {
 
     let responses = response_handle.await.unwrap();
     assert_eq!(responses.len(), 2); // Only Started and ExitStatus
-    assert!(matches!(responses[0], ServerResponse::Started { .. }));
-    assert!(matches!(responses[1], ServerResponse::ExitStatus { .. }));
+    assert!(matches!(responses[0], PluginResponse::Started { .. }));
+    assert!(matches!(responses[1], PluginResponse::ExitStatus { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
@@ -964,7 +964,7 @@ mod tests {
     envs.insert("TEST_VAR1".to_string(), "value1".to_string());
     envs.insert("TEST_VAR2".to_string(), "value2".to_string());
 
-    let command = ClientCommand::Execute {
+    let command = OctaCommand::Execute {
       command: "env_test".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -987,9 +987,9 @@ mod tests {
     assert!(result.is_ok());
 
     let responses = response_handle.await.unwrap();
-    assert!(matches!(responses[0], ServerResponse::Started { .. }));
-    assert!(matches!(responses[1], ServerResponse::Stdout { .. }));
-    assert!(matches!(responses[2], ServerResponse::ExitStatus { .. }));
+    assert!(matches!(responses[0], PluginResponse::Started { .. }));
+    assert!(matches!(responses[1], PluginResponse::Stdout { .. }));
+    assert!(matches!(responses[2], PluginResponse::ExitStatus { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
@@ -1012,7 +1012,7 @@ mod tests {
     let logger = Arc::new(MockLogger::new());
     let cancel_token = CancellationToken::new();
 
-    let command = ClientCommand::Execute {
+    let command = OctaCommand::Execute {
       command: "test".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -1075,7 +1075,7 @@ mod tests {
     // Launch multiple commands concurrently
     let mut handles = vec![];
     for i in 0..3 {
-      let command = ClientCommand::Execute {
+      let command = OctaCommand::Execute {
         command: format!("cmd{}", i),
         args: vec![],
         dir: PathBuf::from("."),
@@ -1117,11 +1117,11 @@ mod tests {
     // Verify we got all the expected responses
     let started_count = responses
       .iter()
-      .filter(|r| matches!(r, ServerResponse::Started { .. }))
+      .filter(|r| matches!(r, PluginResponse::Started { .. }))
       .count();
     let exit_count = responses
       .iter()
-      .filter(|r| matches!(r, ServerResponse::ExitStatus { .. }))
+      .filter(|r| matches!(r, PluginResponse::ExitStatus { .. }))
       .count();
 
     assert_eq!(started_count, 3);
@@ -1182,7 +1182,7 @@ mod tests {
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
 
     // Send a Hello command
-    let hello_command = ClientCommand::Hello(Version {
+    let hello_command = OctaCommand::Hello(Version {
       version: "1.0.0".to_string(),
       features: vec!["feature1".to_string()],
     });
@@ -1191,12 +1191,12 @@ mod tests {
     writer.flush().await.unwrap();
 
     // Send a Schema command
-    let schema_command = ClientCommand::Schema;
+    let schema_command = OctaCommand::Schema;
     let schema_json = serde_json::to_string(&schema_command).unwrap() + "\n";
     writer.write_all(schema_json.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
 
-    let cmd_command = ClientCommand::Execute {
+    let cmd_command = OctaCommand::Execute {
       command: "".to_owned(),
       args: vec!["arg1".to_string(), "arg2".to_string()],
       dir: PathBuf::from("/test/dir"),
@@ -1218,7 +1218,7 @@ mod tests {
 
     // Verify the response
     match &responses[0] {
-      ServerResponse::Hello(version) => {
+      PluginResponse::Hello(version) => {
         assert_eq!(version.version, "1.0.0");
         assert_eq!(version.features.len(), 0);
       },
@@ -1226,14 +1226,14 @@ mod tests {
     }
 
     match &responses[1] {
-      ServerResponse::Schema(schema) => {
+      PluginResponse::Schema(schema) => {
         assert_eq!(schema.key, "key");
       },
       _ => panic!("Expected Schema response"),
     }
 
     // Verify the response
-    assert!(matches!(&responses[2], ServerResponse::Started { .. }));
+    assert!(matches!(&responses[2], PluginResponse::Started { .. }));
 
     listener_handle.await.unwrap(); // Wait for the listener task to finish
   }

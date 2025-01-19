@@ -16,7 +16,7 @@ pub struct Schema {
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", content = "payload")]
-pub enum ClientCommand {
+pub enum OctaCommand {
   Hello(Version),
   Schema,
   Execute {
@@ -31,7 +31,7 @@ pub enum ClientCommand {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
-pub enum ServerResponse {
+pub enum PluginResponse {
   Hello(Version),
   Schema(Schema),
   Started { id: String },
