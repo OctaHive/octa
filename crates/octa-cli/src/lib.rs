@@ -319,3 +319,94 @@ pub async fn run() -> OctaResult<()> {
 
   Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::fs::File;
+  use std::io::Write;
+  use std::path::PathBuf;
+  use tempfile::TempDir;
+
+  fn create_test_octafile(dir: &TempDir, content: &str) -> PathBuf {
+    let octafile_path = dir.path().join("Octafile.yml");
+    let mut file = File::create(&octafile_path).unwrap();
+    write!(file, "{}", content).unwrap();
+    octafile_path
+  }
+
+  fn create_test_config(dir: &TempDir, content: &str) -> PathBuf {
+    let config_path = dir.path().join("config.yml");
+    let mut file = File::create(&config_path).unwrap();
+    write!(file, "{}", content).unwrap();
+    config_path
+  }
+
+  #[test]
+  fn test_cli_parse() {
+    let cli = Cli::parse_from(&["octa", "--parallel", "build"]);
+    assert!(cli.parallel);
+    assert_eq!(cli.commands, Some(vec!["build".to_string()]));
+  }
+
+  #[test]
+  fn test_load_config() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_content = r#"
+      plugins:
+        - "plugin1"
+        - "plugin2"
+    "#;
+    let config_path = create_test_config(&temp_dir, config_content);
+
+    let config = load_config(config_path).unwrap();
+    assert_eq!(config.plugins, vec!["plugin1", "plugin2"]);
+  }
+
+  #[test]
+  fn test_load_config_invalid() {
+    let temp_dir = TempDir::new().unwrap();
+    let config_content = r#"
+      invalid_yaml::::
+    "#;
+    let config_path = create_test_config(&temp_dir, config_content);
+
+    assert!(load_config(config_path).is_err());
+  }
+
+  #[test]
+  fn test_cli_task_args() {
+    let cli = Cli::parse_from(&["octa", "build", "--", "--release"]);
+    assert_eq!(cli.task_args, vec!["--release"]);
+  }
+
+  #[test]
+  fn test_cli_multiple_commands() {
+    let cli = Cli::parse_from(&["octa", "test", "build"]);
+    assert_eq!(cli.commands, Some(vec!["test".to_string(), "build".to_string()]));
+  }
+
+  #[test]
+  fn test_cli_dry_run() {
+    let cli = Cli::parse_from(&["octa", "--dry", "build"]);
+    assert!(cli.dry);
+  }
+
+  #[test]
+  fn test_cli_verbose() {
+    let cli = Cli::parse_from(&["octa", "--verbose", "build"]);
+    assert!(cli.verbose);
+  }
+
+  #[test]
+  fn test_cli_completions() {
+    let cli = Cli::parse_from(&["octa", "--completions", "bash"]);
+    assert_eq!(cli.completions, Some(Shell::Bash));
+  }
+
+  #[test]
+  fn test_cli_global() {
+    let cli = Cli::parse_from(&["octa", "--global", "build"]);
+    assert!(cli.global);
+  }
+}
