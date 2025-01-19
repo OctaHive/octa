@@ -528,6 +528,7 @@ impl<'de> Visitor<'de> for OctafileVisitor {
 mod tests {
   use super::OCTAFILE_DEFAULT_NAMES;
   use crate::*;
+  use octafile::Version;
   use pretty_assertions::assert_eq;
   use serde_yml::Value;
   use std::env;
@@ -939,5 +940,193 @@ mod tests {
     assert_eq!(all_included.len(), 2);
     assert!(all_included.contains_key("first"));
     assert!(all_included.contains_key("second"));
+  }
+
+  #[test]
+  fn test_task_string_value() {
+    let content = r#"
+      version: 1
+      tasks:
+        simple: echo "test"
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "task_string_value");
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+
+    let task = &octafile.tasks["simple"];
+    assert!(task.extra.contains_key("shell"));
+    assert_eq!(task.extra["shell"], Value::String("echo \"test\"".to_string()));
+  }
+
+  #[test]
+  fn test_task_complex_value() {
+    let content = r#"
+      version: 1
+      tasks:
+        complex:
+          desc: "Complex task"
+          cmds:
+            - echo "step 1"
+            - echo "step 2"
+          env:
+            TEST_VAR: "test value"
+          dir: "./test"
+          platforms:
+            - linux
+            - macos
+          ignore_error: true
+          deps:
+            - task: other_task
+              vars:
+                key: value
+          silent: true
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "task_complex_value");
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+
+    let task = &octafile.tasks["complex"];
+    assert_eq!(task.desc, Some("Complex task".to_string()));
+    assert!(task.cmds.is_some());
+    assert!(task.env.is_some());
+    assert_eq!(task.dir, Some(PathBuf::from("./test")));
+    assert_eq!(task.platforms, Some(vec!["linux".to_string(), "macos".to_string()]));
+    assert_eq!(task.ignore_error, Some(true));
+    assert!(task.deps.is_some());
+    assert_eq!(task.silent, Some(true));
+  }
+
+  #[test]
+  fn test_task_with_plugin_keys() {
+    let content = r#"
+      version: 1
+      tasks:
+        plugin_task:
+          plugin_key: plugin value
+          another_key: another value
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "task_with_plugin_keys");
+
+    let plugin_keys = vec!["plugin_key".to_string(), "another_key".to_string()];
+    let octafile = Octafile::load(Some(file_path), false, plugin_keys).unwrap();
+
+    let task = &octafile.tasks["plugin_task"];
+    assert!(task.extra.contains_key("plugin_key"));
+    assert!(task.extra.contains_key("another_key"));
+    assert_eq!(task.extra["plugin_key"], Value::String("plugin value".to_string()));
+  }
+
+  #[test]
+  fn test_task_with_all_optional_fields() {
+    let content = r#"
+      version: 1
+      tasks:
+        full_task:
+          desc: "Full task description"
+          cmds:
+            - echo "step 1"
+            - echo "step 2"
+          env:
+            TEST_VAR: "test value"
+          vars:
+            task_var: "task value"
+          dir: "./test"
+          internal: true
+          platforms:
+            - linux
+            - macos
+          ignore_error: true
+          deps:
+            - other_task
+          run: once
+          silent: true
+          execute_mode: parallel
+          sources:
+            - "src/**/*.rs"
+          source_strategy: hash
+          preconditions:
+            - test -f "file.txt"
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "task_with_all_fields");
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+
+    let task = &octafile.tasks["full_task"];
+    assert_eq!(task.desc, Some("Full task description".to_string()));
+    assert!(task.cmds.is_some());
+    assert!(task.env.is_some());
+    assert!(task.vars.is_some());
+    assert_eq!(task.dir, Some(PathBuf::from("./test")));
+    assert_eq!(task.internal, Some(true));
+    assert_eq!(task.platforms, Some(vec!["linux".to_string(), "macos".to_string()]));
+    assert_eq!(task.ignore_error, Some(true));
+    assert!(task.deps.is_some());
+    assert!(task.run.is_some());
+    assert_eq!(task.silent, Some(true));
+    assert!(task.execute_mode.is_some());
+    assert!(task.sources.is_some());
+    assert!(task.source_strategy.is_some());
+    assert!(task.preconditions.is_some());
+  }
+
+  #[test]
+  fn test_invalid_task_values() {
+    // Test invalid run value
+    let content = r#"
+      version: 1
+      tasks:
+        invalid_task:
+          run: invalid_value
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_task_values");
+    assert!(Octafile::load(Some(file_path), false, vec![]).is_err());
+
+    // Test invalid execute_mode value
+    let content = r#"
+      version: 1
+      tasks:
+        invalid_task:
+          execute_mode: invalid_mode
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_execute_mode");
+    assert!(Octafile::load(Some(file_path), false, vec![]).is_err());
+  }
+
+  #[test]
+  fn test_task_deps_variations() {
+    let content = r#"
+      version: 1
+      tasks:
+        task_with_deps:
+          cmds:
+            - echo "main task"
+          deps:
+            - simple_dep
+            - task: complex_dep
+              vars:
+                key: value
+              envs:
+                ENV_VAR: value
+              silent: true
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "task_deps_variations");
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+
+    let task = &octafile.tasks["task_with_deps"];
+    assert!(task.deps.is_some());
+    let deps = task.deps.as_ref().unwrap();
+    assert_eq!(deps.len(), 2);
+  }
+
+  #[test]
+  fn test_empty_octafile() {
+    let content = r#"
+        version: 1
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "empty_octafile");
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+
+    assert_eq!(octafile.version, Version::V1 as u8);
+    assert!(octafile.tasks.is_empty());
+    assert!(octafile.includes.is_none());
+    assert!(octafile.vars.is_none());
+    assert!(octafile.env.is_none());
   }
 }
