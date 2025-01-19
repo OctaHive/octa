@@ -9,7 +9,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use octa_plugin::protocol::{ClientCommand, ServerResponse, Version};
+use octa_plugin::protocol::{ClientCommand, Schema, ServerResponse, Version};
 
 #[derive(Debug)]
 pub enum PluginClientError {
@@ -151,6 +151,29 @@ impl PluginClient {
 
         Ok(())
       },
+      Some(ServerResponse::Error { message, .. }) => Err(PluginClientError::Protocol(message)),
+      Some(_) => Err(PluginClientError::Protocol("Unexpected response to Hello".into())),
+      None => Err(PluginClientError::ConnectionClosed),
+    }
+  }
+
+  pub async fn get_schema(&mut self) -> Result<Schema, PluginClientError> {
+    let schema = ClientCommand::Schema;
+
+    let schema_json = serde_json::to_string(&schema)? + "\n";
+
+    {
+      let mut writer_guard = self.inner.writer.lock().await;
+      if let Some(writer) = writer_guard.as_mut() {
+        writer.write_all(schema_json.as_bytes()).await?;
+        writer.flush().await?;
+      } else {
+        return Err(PluginClientError::WriterClosed);
+      }
+    }
+
+    match self.response_rx.recv().await {
+      Some(ServerResponse::Schema(schema)) => Ok(schema),
       Some(ServerResponse::Error { message, .. }) => Err(PluginClientError::Protocol(message)),
       Some(_) => Err(PluginClientError::Protocol("Unexpected response to Hello".into())),
       None => Err(PluginClientError::ConnectionClosed),
@@ -466,6 +489,8 @@ mod tests {
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![],
           }))
+        } else if buffer.contains("Schema") {
+          Some(ServerResponse::Schema(Schema { key: "key".to_owned() }))
         } else if buffer.contains("Execute") {
           Some(ServerResponse::Started {
             id: "test-id".to_string(),
@@ -574,6 +599,7 @@ mod tests {
       .expect("Failed to connect client");
 
     client.handshake().await.expect("Handshake error");
+    client.get_schema().await.expect("Get schema error");
 
     // Send shutdown command
     tokio::time::timeout(TIMEOUT, client.shutdown())
@@ -705,6 +731,17 @@ mod tests {
           writer.write_all(response_json.as_bytes()).await.unwrap();
           writer.flush().await.unwrap();
 
+          // Wait for Schema command
+          buffer.clear();
+          if let Ok(_) = reader.read_line(&mut buffer).await {
+            messages.push(buffer.clone());
+
+            let response = ServerResponse::Schema(Schema { key: "key".to_owned() });
+            let response_json = serde_json::to_string(&response).unwrap() + "\n";
+            writer.write_all(response_json.as_bytes()).await.unwrap();
+            writer.flush().await.unwrap();
+          }
+
           // Wait for shutdown command but don't respond
           buffer.clear();
           if let Ok(_) = reader.read_line(&mut buffer).await {
@@ -719,6 +756,7 @@ mod tests {
 
     let mut client = PluginClient::connect(server.socket_name()).await.unwrap();
     client.handshake().await.expect("Handshake failed");
+    client.get_schema().await.expect("Get schema failed");
 
     // Shutdown should succeed with timeout
     let result = client.shutdown().await;

@@ -1,12 +1,16 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::env;
 use std::time::Duration;
 use std::{path::PathBuf, process::Stdio, sync::Arc};
 
 use anyhow::Context;
 use async_trait::async_trait;
 use octa_plugin::logger::Logger;
+use octa_plugin::PluginSchema;
 use octa_plugin::{protocol::ServerResponse, serve_plugin, Plugin};
 use serde_json::Value;
+use tera::{Context as TeraContext, Tera};
 use tokio::io::AsyncWrite;
 use tokio::{
   io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -95,17 +99,40 @@ impl Plugin for ShellPlugin {
     command: String,
     _args: Vec<String>,
     dir: PathBuf,
-    _vars: HashMap<String, Value>,
+    vars: HashMap<String, Value>,
     envs: HashMap<String, String>,
     writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
     logger: Arc<impl Logger>,
     cancel_token: CancellationToken,
   ) -> anyhow::Result<()> {
+    let mut tera = Tera::default();
+    let template_name = format!("template_{}", id);
+
+    let get_env = |name: &str| match envs.get(name) {
+      Some(val) => Some(Cow::Borrowed(val.as_str())),
+      None => match env::var(name) {
+        Ok(val) => Some(Cow::Owned(val)),
+        Err(_) => None,
+      },
+    };
+
+    let val = shellexpand::env_with_context_no_errors(&command, get_env);
+
+    tera
+      .add_raw_template(&template_name, val.as_ref())
+      .context("Failed to parse template")?;
+
+    let context = TeraContext::from_serialize(vars)?;
+
+    let result = tera
+      .render(&template_name, &context)
+      .context(format!("Failed to render template: {:?}", context))?;
+
     #[cfg(windows)]
-    let mut command = setup_windows_command(&command, &dir, envs);
+    let mut command = setup_windows_command(&result, &dir, envs);
 
     #[cfg(not(windows))]
-    let mut command = setup_unix_command(&command, &dir, envs);
+    let mut command = setup_unix_command(&result, &dir, envs);
 
     let mut child = command.spawn()?;
 
@@ -265,7 +292,13 @@ impl Plugin for ShellPlugin {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  serve_plugin(ShellPlugin {}).await
+  serve_plugin(
+    ShellPlugin {},
+    PluginSchema {
+      key: "shell".to_owned(),
+    },
+  )
+  .await
 }
 
 #[cfg(test)]

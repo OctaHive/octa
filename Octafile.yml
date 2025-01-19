@@ -2,16 +2,16 @@ version: 1
 
 tasks:
   build-release:
-    cmd: cargo build --release -p octa-cli
+    shell: cargo build --release -p octa-cli
 
   build:
-    cmd: cargo build -p octa-cli
+    shell: cargo build -p octa-cli
 
   build-shell-plugin:
-    cmd: cargo build -p octa_plugin_shell
+    shell: cargo build -p octa_plugin_shell
 
   build-tpl-plugin:
-    cmd: cargo build -p octa_plugin_tpl
+    shell: cargo build -p octa_plugin_tpl
 
   lint:
     cmds:

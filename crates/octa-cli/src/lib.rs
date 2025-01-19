@@ -1,4 +1,5 @@
 use std::{
+  collections::HashMap,
   env,
   fs::File,
   io::{self, Read},
@@ -167,6 +168,7 @@ pub async fn run() -> OctaResult<()> {
     None => Ok(vec![]),
   }?;
 
+  let mut plugin_keys = HashMap::new();
   let plugins = [config_plugins, DEFAULT_PLUGINS.iter().map(|s| s.to_string()).collect()].concat();
   for plugin in plugins {
     // Shell plugin loaded always
@@ -175,13 +177,14 @@ pub async fn run() -> OctaResult<()> {
     #[cfg(windows)]
     let plugin_name = format!("octa_plugin_{}.exe", plugin);
 
-    plugin_manager.start_plugin(&plugin_name).await.unwrap();
+    let schema = plugin_manager.start_plugin(&plugin_name).await.unwrap();
+    plugin_keys.insert(plugin, schema);
   }
 
   let plugin_manager = Arc::new(plugin_manager);
 
   // Load octafile
-  let octafile = Octafile::load(args.octafile, args.global)?;
+  let octafile = Octafile::load(args.octafile, args.global, plugin_keys.keys().cloned().collect())?;
 
   if args.dry {
     warn!("Octa run in dry mode");

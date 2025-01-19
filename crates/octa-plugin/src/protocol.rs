@@ -9,10 +9,16 @@ pub struct Version {
   pub features: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Schema {
+  pub key: String,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", content = "payload")]
 pub enum ClientCommand {
   Hello(Version),
+  Schema,
   Execute {
     command: String,
     args: Vec<String>,
@@ -27,6 +33,7 @@ pub enum ClientCommand {
 #[serde(tag = "type")]
 pub enum ServerResponse {
   Hello(Version),
+  Schema(Schema),
   Started { id: String },
   Stdout { id: String, line: String },
   Stderr { id: String, line: String },

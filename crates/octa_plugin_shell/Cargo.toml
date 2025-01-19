@@ -21,6 +21,8 @@ octa-plugin = { version = "0.1.0", path = "../octa-plugin" }
 futures-util = "0.3.31"
 serde = { workspace = true }
 serde_json = { workspace = true }
+shellexpand = "3.1.0"
+tera = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util = { workspace = true }
 [target.'cfg(windows)'.dependencies]

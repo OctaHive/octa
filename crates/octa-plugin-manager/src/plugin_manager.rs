@@ -1,3 +1,4 @@
+use octa_plugin::protocol::Schema;
 use octa_plugin::socket::{interpret_local_socket_name, make_local_socket_name};
 use std::ffi::OsString;
 use std::{
@@ -61,6 +62,7 @@ struct PluginInstance {
 pub struct PluginManager {
   plugins_dir: PathBuf,
   active_plugins: Arc<Mutex<HashMap<String, PluginInstance>>>,
+  plugins_schema: Arc<Mutex<HashMap<String, Schema>>>,
 }
 
 impl PluginManager {
@@ -68,6 +70,7 @@ impl PluginManager {
     Self {
       plugins_dir: plugins_dir.into(),
       active_plugins: Arc::new(Mutex::new(HashMap::new())),
+      plugins_schema: Arc::new(Mutex::new(HashMap::new())),
     }
   }
 
@@ -91,7 +94,7 @@ impl PluginManager {
   }
 
   /// Start a plugin and establish connection
-  pub async fn start_plugin(&self, plugin_name: &str) -> Result<()> {
+  pub async fn start_plugin(&self, plugin_name: &str) -> Result<Schema> {
     let mut active_plugins = self.active_plugins.lock().await;
 
     if active_plugins.contains_key(plugin_name) {
@@ -170,12 +173,39 @@ impl PluginManager {
       },
     );
 
-    let mut client_guard = client.lock().await;
-    if let Err(err) = client_guard.as_mut().unwrap().handshake().await {
-      return Err(PluginManagerError::StartError(err.to_string()));
+    let schema = {
+      let mut client_guard = client.lock().await;
+      if let Some(ref mut client) = *client_guard {
+        client
+          .handshake()
+          .await
+          .map_err(|e| PluginManagerError::StartError(e.to_string()))?;
+        client
+          .get_schema()
+          .await
+          .map_err(|e| PluginManagerError::StartError(e.to_string()))?
+      } else {
+        return Err(PluginManagerError::StartError("Client not available".to_string()));
+      }
+    };
+
+    {
+      let mut schemas = self.plugins_schema.lock().await;
+      schemas.insert(plugin_name.to_owned(), schema.clone());
     }
 
-    Ok(())
+    Ok(schema)
+  }
+
+  pub async fn get_schema_keys(&self) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    let schemas = self.plugins_schema.lock().await;
+
+    for (plugin_name, schema) in schemas.iter() {
+      result.insert(schema.key.clone(), plugin_name.clone());
+    }
+
+    result
   }
 
   /// Platform-specific command setup for Unix
@@ -236,6 +266,11 @@ impl PluginManager {
 
   /// Shutdown a specific plugin
   pub async fn shutdown_plugin(&self, plugin_name: &str) -> Result<()> {
+    {
+      let mut schemas = self.plugins_schema.lock().await;
+      schemas.remove(plugin_name);
+    }
+
     // First get the instance
     let mut instance = {
       let mut active_plugins = self.active_plugins.lock().await;

@@ -792,7 +792,7 @@ mod tests {
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
 
-    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
     let builder = TaskGraphBuilder::new()?;
     let dag = builder.build(octafile, "test", true, vec![]).await?;
 
@@ -820,7 +820,7 @@ mod tests {
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
 
-    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
     let builder = TaskGraphBuilder::new()?;
     let dag = builder.build(octafile, "task2", true, vec![]).await?;
 
@@ -853,7 +853,7 @@ mod tests {
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
 
-    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
     let builder = TaskGraphBuilder::new()?;
     let result = builder.build(octafile, "nonexistent", true, vec![]).await;
 
@@ -883,7 +883,7 @@ mod tests {
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
 
-    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
     let builder = TaskGraphBuilder::new()?;
 
     let dag = if cfg!(target_os = "linux") {
@@ -911,7 +911,7 @@ mod tests {
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
 
-    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
     let builder = TaskGraphBuilder::new()?;
     let args = vec!["arg1".to_string(), "arg2".to_string()];
     let dag = builder.build(octafile, "test", true, args).await?;
@@ -936,7 +936,7 @@ mod tests {
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
 
-    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
     let builder = TaskGraphBuilder::new()?;
     let dag = builder.build(octafile, "test", true, vec![]).await?;
 
@@ -960,7 +960,7 @@ mod tests {
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
 
-    let octafile = Octafile::load(Some(octafile_path), false)?;
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
     let builder = TaskGraphBuilder::new()?;
     let dag = builder.build(octafile, "test", true, vec![]).await?;
 
@@ -1060,6 +1060,6 @@ mod tests {
     std::fs::write(&deep_path, deep_content)?;
 
     // Load the root octafile
-    Ok(Octafile::load(Some(root_path), false)?)
+    Ok(Octafile::load(Some(root_path), false, vec![])?)
   }
 }

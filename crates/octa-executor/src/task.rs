@@ -418,119 +418,6 @@ impl TaskNode {
     result
   }
 
-  /// Executes a shell command and returns its output
-  async fn execute_command(
-    &self,
-    plugin_manager: Arc<PluginManager>,
-    cmd: &str,
-    dry: bool,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
-    let rendered_cmd = self
-      .render_template(plugin_manager.clone(), cmd, None, dry, cancel_token.clone())
-      .await?;
-
-    debug!("Execute command: {}", rendered_cmd);
-
-    if dry {
-      info!("Execute command in dry mode: {}", rendered_cmd);
-      return Ok("".to_owned());
-    }
-
-    let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
-    let dir = canonicalize(dir)?;
-
-    // Interpolate vars
-    let mut vars = self.vars.clone();
-    vars.expand(dry).await?;
-
-    debug!("Using shell plugin for command execution");
-    match self
-      .execute_plugin_command(
-        plugin_manager,
-        "shell",
-        rendered_cmd,
-        vec![],
-        dir,
-        vars.to_hashmap(),
-        self.envs.clone().into(),
-        self.silent,
-        cancel_token.clone(),
-      )
-      .await
-    {
-      Ok((code, stdout, stderr)) => {
-        if code != 0 && !cancel_token.is_cancelled() {
-          Err(ExecutorError::CommandFailed(format!(
-            "Task {} failed: {}",
-            self.name, stderr
-          )))
-        } else {
-          Ok(stdout.trim().to_string())
-        }
-      },
-      Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
-      Err(e) => Err(ExecutorError::CommandFailed(e.to_string())),
-    }
-  }
-
-  /// Renders the command template with variables and dependency results
-  async fn render_template(
-    &self,
-    plugin_manager: Arc<PluginManager>,
-    template: &str,
-    cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
-    dry: bool,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
-    // Interpolate vars
-    let mut vars = self.vars.clone();
-    vars.expand(dry).await?;
-
-    // Interpolate environment variables
-    let mut envs = self.envs.clone();
-    envs.expand().await?;
-
-    // Add dependency results to template context
-    let deps_res = self.deps_res.lock().await;
-    vars.insert("deps_result", &*deps_res);
-
-    let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
-    let dir = canonicalize(dir)?;
-
-    match self
-      .execute_plugin_command(
-        plugin_manager,
-        "tpl",
-        template.to_owned(),
-        vec![],
-        dir,
-        vars.to_hashmap(),
-        self.envs.clone().into(),
-        true,
-        cancel_token.clone(),
-      )
-      .await
-    {
-      Ok((code, stdout, stderr)) => {
-        if code != 0 && !cancel_token.is_cancelled() {
-          Err(ExecutorError::CommandFailed(format!(
-            "Task {} failed: {}",
-            self.name, stderr
-          )))
-        } else {
-          if let Some(ref cache) = cache {
-            self.update_cache(stdout.trim(), vars, cache).await?;
-          }
-
-          Ok(stdout.trim().to_string())
-        }
-      },
-      Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
-      Err(e) => Err(ExecutorError::CommandFailed(e.to_string())),
-    }
-  }
-
   async fn interpolate_dir(&self, dir: PathBuf, dry: bool) -> ExecutorResult<PathBuf> {
     let dir_str = dir.to_string_lossy();
 
@@ -554,29 +441,6 @@ impl TaskNode {
       debug!("Expanded path: {}", rendered);
 
       Ok(PathBuf::from(rendered.trim_matches('"'))) // Remove extra quotes from result
-    }
-  }
-
-  async fn execute_cmd(
-    &self,
-    plugin_manager: Arc<PluginManager>,
-    cmd: String,
-    cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    dry: bool,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
-    let mut vars = self.vars.clone();
-    vars.expand(dry).await?;
-
-    match self.execute_command(plugin_manager, &cmd, dry, cancel_token).await {
-      Ok(result) => {
-        self.update_cache(&result, vars, &cache).await?;
-        debug!("Completed task {}", self.name);
-
-        Ok(result)
-      },
-      Err(ExecutorError::TaskCancelled(e)) => Err(ExecutorError::TaskCancelled(e)),
-      Err(e) => self.handle_execution_error(e),
     }
   }
 
@@ -670,7 +534,7 @@ impl TaskNode {
   }
 
   /// Handle execution errors
-  fn handle_execution_error(&self, error: ExecutorError) -> ExecutorResult<String> {
+  fn handle_execution_error(&self, error: io::Error) -> ExecutorResult<String> {
     if self.ignore_errors {
       error!("Task {} failed but errors ignored. Error: {}", self.name, error);
       Ok("".to_string())
@@ -732,37 +596,72 @@ impl Executable<TaskNode> for TaskNode {
     // Debug information about dependency results
     self.debug_log_dependencies().await;
 
-    match (&self.extra.get("shell"), self.extra.get("tpl")) {
-      // This variant should validate on load octafile stage
-      (Some(_), Some(_)) => {
-        unreachable!("Both cmd and tpl cannot be Some - should be validated during octafile loading")
-      },
-      (Some(cmd), None) => {
-        self
-          .execute_cmd(
-            plugin_manager,
-            cmd.to_string().trim_matches('"').to_string(),
-            cache,
-            dry,
-            cancel_token.clone(),
-          )
-          .await
-      },
-      (None, Some(tpl)) => {
-        let rendered_cmd = self
-          .render_template(
-            plugin_manager,
-            tpl.to_string().trim_matches('"'),
-            Some(cache),
-            dry,
-            cancel_token.clone(),
-          )
-          .await?;
+    let plugins_key = plugin_manager.get_schema_keys().await;
 
-        Ok(rendered_cmd)
+    let mut result: Vec<(String, Value)> = vec![];
+    for (key, value) in &self.extra {
+      if let Some(plugin_name) = plugins_key.get(key) {
+        result.push((plugin_name.clone(), value.clone()));
+      }
+    }
+
+    if result.is_empty() {
+      return Ok("".to_string());
+    }
+
+    if result.len() > 1 {
+      panic!("Several plugin keys provide in task");
+    }
+
+    // Interpolate vars
+    let mut vars = self.vars.clone();
+    vars.expand(dry).await?;
+
+    // Interpolate environment variables
+    let mut envs = self.envs.clone();
+    envs.expand().await?;
+
+    // Add dependency results to template context
+    let mut vars_with_deps_results = vars.clone();
+    let deps_res = self.deps_res.lock().await;
+    vars_with_deps_results.insert("deps_result", &*deps_res);
+
+    let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
+    let dir = canonicalize(dir)?;
+
+    match self
+      .execute_plugin_command(
+        plugin_manager,
+        result[0].0.strip_prefix("octa_plugin_").unwrap_or(&result[0].0),
+        result[0].1.to_string().trim_matches('"').to_owned(),
+        vec![],
+        dir,
+        vars_with_deps_results.to_hashmap(),
+        self.envs.clone().into(),
+        self.silent,
+        cancel_token.clone(),
+      )
+      .await
+    {
+      Ok((code, stdout, stderr)) => {
+        if code != 0 && !cancel_token.is_cancelled() {
+          if self.ignore_errors {
+            error!("Task {} failed but errors ignored. Error code: {}", self.name, code);
+            Ok("".to_string())
+          } else {
+            Err(ExecutorError::TaskFailed(format!(
+              "Task {} failed: {}",
+              self.name, stderr
+            )))
+          }
+        } else {
+          self.update_cache(stdout.trim(), vars, &cache).await?;
+
+          Ok(stdout.trim().to_string())
+        }
       },
-      // This variant just if we want only run deps
-      (None, None) => Ok("".to_string()),
+      Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
+      Err(e) => self.handle_execution_error(e),
     }
   }
 }

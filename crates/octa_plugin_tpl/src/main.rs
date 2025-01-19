@@ -4,7 +4,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use octa_plugin::{logger::Logger, protocol::ServerResponse, serve_plugin, Plugin};
+use octa_plugin::{logger::Logger, protocol::ServerResponse, serve_plugin, Plugin, PluginSchema};
 use tera::{Context as TeraContext, Tera};
 use tokio::{
   io::{AsyncWrite, AsyncWriteExt},
@@ -83,7 +83,7 @@ impl Plugin for TemplatePlugin {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  serve_plugin(TemplatePlugin {}).await
+  serve_plugin(TemplatePlugin {}, PluginSchema { key: "tpl".to_owned() }).await
 }
 
 #[cfg(test)]

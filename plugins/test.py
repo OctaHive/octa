@@ -51,6 +51,13 @@ class CommandHandler:
 
         return False, response
 
+    def handle_schema(self, cmd):
+      response = {
+          "type": "Schema",
+          "key": "key",
+      }
+      return False, [response]
+
     def handle_shutdown(self, cmd):
         response = {
             "type": "Shutdown",
@@ -61,6 +68,7 @@ class CommandHandler:
     def handle_command(self, cmd):
         handlers = {
             "Hello": self.handle_hello,
+            "Schema": self.handle_schema,
             "Execute": self.handle_execute,
             "Shutdown": self.handle_shutdown
         }

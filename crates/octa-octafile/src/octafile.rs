@@ -7,14 +7,17 @@ use std::{
   sync::{Arc, Mutex, OnceLock},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{
+  de::{DeserializeSeed, MapAccess, Visitor},
+  Deserialize, Deserializer, Serialize,
+};
 use serde_yml::Value;
 use tracing::{debug, info};
 
 use crate::{
   error::{OctafileError, OctafileResult},
   include::IncludeInfo,
-  task::Task,
+  task::{Context, Task, TaskSeed},
 };
 
 const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
@@ -32,9 +35,10 @@ pub type Vars = HashMap<String, Value>;
 pub type Envs = HashMap<String, String>;
 
 /// Enum of available file versions
-#[derive(Deserialize, Serialize, Debug, Clone, Copy)]
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, Default)]
 #[serde(try_from = "u8")]
 pub enum Version {
+  #[default]
   V1 = 1,
 }
 
@@ -70,8 +74,7 @@ impl fmt::Display for Version {
 }
 
 /// Main taskfile structure representing the entire configuration
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct Octafile {
   // Octafile schema version
   pub version: Version,
@@ -89,23 +92,23 @@ pub struct Octafile {
   pub tasks: HashMap<String, Task>,
 
   // Working directory for the octafile
-  #[serde(skip)]
+  // #[serde(skip)]
   pub dir: PathBuf,
 
   // Name of octafile
-  #[serde(skip)]
+  // #[serde(skip)]
   _name: String,
 
   // Internal list of octafiles
-  #[serde(skip)]
+  // #[serde(skip)]
   _included: Mutex<HashMap<String, Arc<Octafile>>>,
 
   // Parent octafile
-  #[serde(skip)]
+  // #[serde(skip)]
   _parent: Option<Arc<Octafile>>,
 
   // Self reference to octafile
-  #[serde(skip)]
+  // #[serde(skip)]
   _self: OnceLock<Arc<Octafile>>,
 }
 
@@ -124,7 +127,7 @@ impl fmt::Debug for Octafile {
 }
 
 impl Octafile {
-  pub fn load(path: Option<PathBuf>, global: bool) -> OctafileResult<Arc<Self>> {
+  pub fn load(path: Option<PathBuf>, global: bool, plugin_keys: Vec<String>) -> OctafileResult<Arc<Self>> {
     let path = match path {
       Some(path) => Octafile::find_octafile(Some(path)),
       None => {
@@ -146,15 +149,83 @@ impl Octafile {
 
     debug!("Loading octafile: {}", path.display());
 
-    let mut octafile = Self::read_octafile(&path)?;
+    let mut octafile = Self::read_octafile(&path, plugin_keys.clone())?;
     octafile.set_attributes(&path)?;
     octafile._self = OnceLock::new();
 
     let octafile = Arc::new(octafile);
     let _ = octafile._self.set(Arc::clone(&octafile));
-    Self::load_includes(Arc::clone(&octafile))?;
+    Self::load_includes(Arc::clone(&octafile), plugin_keys)?;
 
     Ok(octafile)
+  }
+
+  fn deserialize_with_context(value: Value, context: &Context) -> Result<Self, String> {
+    match value {
+      Value::Mapping(map) => {
+        let mut octafile = Octafile::default();
+
+        for (key, value) in map {
+          let key = match key {
+            Value::String(s) => s,
+            _ => return Err("Expected string key".to_string()),
+          };
+
+          match key.as_str() {
+            "version" => {
+              octafile.version = match value {
+                Value::Number(n) => Version::try_from(n.as_u64().unwrap_or(0) as u8).map_err(|e| e.to_string())?,
+                _ => return Err("Version must be a number".to_string()),
+              };
+            },
+            "vars" => {
+              octafile.vars = serde_yml::from_value(value).map_err(|e| e.to_string())?;
+            },
+            "env" => {
+              octafile.env = serde_yml::from_value(value).map_err(|e| e.to_string())?;
+            },
+            "includes" => {
+              octafile.includes = serde_yml::from_value(value).map_err(|e| e.to_string())?;
+            },
+            "tasks" => {
+              if let Value::Mapping(tasks_map) = value {
+                let mut tasks = HashMap::new();
+                for (task_key, task_value) in tasks_map {
+                  let task_name = match task_key {
+                    Value::String(s) => s,
+                    _ => return Err("Expected string key for tasks".to_string()),
+                  };
+
+                  let task = match task_value {
+                    Value::String(s) => {
+                      let task_visitor = crate::task::TaskVisitor { context };
+                      task_visitor
+                        .visit_str::<serde_yml::Error>(&s)
+                        .map_err(|e| e.to_string())?
+                    },
+                    _ => {
+                      let task_seed = TaskSeed { context };
+                      let task_str = serde_yml::to_string(&task_value).map_err(|e| e.to_string())?;
+                      let deserializer = serde_yml::Deserializer::from_str(&task_str);
+                      task_seed.deserialize(deserializer).map_err(|e| e.to_string())?
+                    },
+                  };
+
+                  tasks.insert(task_name, task);
+                }
+                octafile.tasks = tasks;
+              } else {
+                return Err("Expected mapping for tasks".to_string());
+              }
+            },
+            _ => {}, // Ignore unknown fields
+          }
+        }
+
+        Ok(octafile)
+      },
+      _ => Err("Expected mapping".to_string()),
+    }
   }
 
   /// Return specified included octafile
@@ -217,7 +288,7 @@ impl Octafile {
   }
 
   /// Load including octafiles
-  fn load_includes(octafile: Arc<Octafile>) -> OctafileResult<()> {
+  fn load_includes(octafile: Arc<Octafile>, plugin_keys: Vec<String>) -> OctafileResult<()> {
     let includes = match &octafile.includes {
       Some(includes) => includes,
       None => return Ok(()),
@@ -248,7 +319,7 @@ impl Octafile {
       };
 
       debug!("Loading included octafile: {}", path.display());
-      let mut include_octafile = match Self::read_octafile(&path) {
+      let mut include_octafile = match Self::read_octafile(&path, plugin_keys.clone()) {
         Ok(mut t) => {
           t._parent = Some(Arc::clone(&octafile));
           t._name = name.clone();
@@ -286,7 +357,7 @@ impl Octafile {
 
       // Recursively process nested includes
       if include_octafile.includes.is_some() {
-        Self::load_includes(Arc::clone(&include_octafile))?;
+        Self::load_includes(Arc::clone(&include_octafile), plugin_keys.clone())?;
       }
 
       octafile
@@ -314,7 +385,7 @@ impl Octafile {
   }
 
   /// Reads and parses a taskfile from the given path
-  fn read_octafile<P: AsRef<Path>>(taskfile_path: P) -> OctafileResult<Octafile> {
+  fn read_octafile<P: AsRef<Path>>(taskfile_path: P, plugin_keys: Vec<String>) -> OctafileResult<Octafile> {
     let path = taskfile_path.as_ref();
     let path_str = path.display().to_string();
 
@@ -328,7 +399,12 @@ impl Octafile {
       .read_to_string(&mut content)
       .map_err(|_| OctafileError::ReadError(path_str.clone()))?;
 
-    serde_yml::from_str(&content).map_err(|e| OctafileError::ParseError(path_str, e.to_string()))
+    let context = Context { keys: plugin_keys };
+
+    let yaml_value: Value =
+      serde_yml::from_str(&content).map_err(|e| OctafileError::ParseError(path_str.clone(), e.to_string()))?;
+
+    Octafile::deserialize_with_context(yaml_value, &context).map_err(|e| OctafileError::ParseError(path_str, e))
   }
 
   /// Try to find octafile config traversing to root directory from current directory
@@ -366,11 +442,94 @@ impl Octafile {
   }
 }
 
+impl<'de> Deserialize<'de> for Octafile {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    // Create a default context for regular deserialization
+    let context = Context { keys: vec![] };
+    let visitor = OctafileVisitor { context };
+    deserializer.deserialize_map(visitor)
+  }
+}
+
+struct OctafileVisitor {
+  context: Context,
+}
+
+impl<'de> Visitor<'de> for OctafileVisitor {
+  type Value = Octafile;
+
+  fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    formatter.write_str("a map with Octafile fields")
+  }
+
+  fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+  where
+    A: MapAccess<'de>,
+  {
+    let mut octafile = Octafile::default();
+
+    while let Some(key) = map.next_key::<String>()? {
+      match key.as_str() {
+        "version" => {
+          octafile.version = map.next_value()?;
+        },
+        "vars" => {
+          octafile.vars = map.next_value()?;
+        },
+        "env" => {
+          octafile.env = map.next_value()?;
+        },
+        "includes" => {
+          octafile.includes = map.next_value()?;
+        },
+        "tasks" => {
+          if let Value::Mapping(tasks_map) = map.next_value::<Value>()? {
+            let mut tasks = HashMap::new();
+            for (task_key, task_value) in tasks_map {
+              let task_name = match task_key {
+                Value::String(s) => s,
+                _ => return Err(serde::de::Error::custom("Expected string key for tasks")),
+              };
+
+              let task = match task_value {
+                Value::String(s) => {
+                  let task_visitor = crate::task::TaskVisitor { context: &self.context };
+                  task_visitor
+                    .visit_str::<A::Error>(&s)
+                    .map_err(serde::de::Error::custom)?
+                },
+                _ => {
+                  let task_seed = TaskSeed { context: &self.context };
+                  let task_str = serde_yml::to_string(&task_value).map_err(serde::de::Error::custom)?;
+                  let deserializer = serde_yml::Deserializer::from_str(&task_str);
+                  task_seed.deserialize(deserializer).map_err(serde::de::Error::custom)?
+                },
+              };
+
+              tasks.insert(task_name, task);
+            }
+            octafile.tasks = tasks;
+          }
+        },
+        _ => {
+          let _: serde::de::IgnoredAny = map.next_value()?;
+        },
+      }
+    }
+
+    Ok(octafile)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::OCTAFILE_DEFAULT_NAMES;
   use crate::*;
   use pretty_assertions::assert_eq;
+  use serde_yml::Value;
   use std::env;
   use std::fs;
   use std::path::PathBuf;
@@ -394,9 +553,45 @@ mod tests {
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "load_basic_octafile");
 
-    let octafile = Octafile::load(Some(file_path), false).unwrap();
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
     assert_eq!(octafile.version, 1);
     assert!(octafile.tasks.contains_key("test"));
+  }
+
+  #[test]
+  fn test_mixed_task_values() {
+    let content = r#"
+      version: 1
+      tasks:
+        simple_string: echo "simple"
+        complex_map:
+          desc: "A complex task"
+          cmds:
+            - echo "complex"
+        another_string: echo "another"
+      "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "mixed_task_values");
+
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+    assert_eq!(octafile.version, 1);
+
+    // Test string task
+    let simple_task = &octafile.tasks["simple_string"];
+    assert!(simple_task.extra.contains_key("shell"));
+    assert_eq!(simple_task.extra["shell"], Value::String("echo \"simple\"".to_string()));
+
+    // Test complex task
+    let complex_task = &octafile.tasks["complex_map"];
+    assert_eq!(complex_task.desc, Some("A complex task".to_string()));
+    assert!(complex_task.cmds.is_some());
+
+    // Test another string task
+    let another_task = &octafile.tasks["another_string"];
+    assert!(another_task.extra.contains_key("shell"));
+    assert_eq!(
+      another_task.extra["shell"],
+      Value::String("echo \"another\"".to_string())
+    );
   }
 
   #[test]
@@ -427,7 +622,7 @@ mod tests {
     fs::write(&root_path, root_content).unwrap();
     fs::write(&child_path, child_content).unwrap();
 
-    let root = Octafile::load(Some(root_path), false).unwrap();
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
 
     // Test basic structure
     assert_eq!(root._name, "".to_string());
@@ -457,7 +652,7 @@ mod tests {
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "optional_includes");
 
-    let octafile = Octafile::load(Some(file_path), false).unwrap();
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
     assert!(octafile.get_included("optional").unwrap().is_none());
   }
 
@@ -465,7 +660,7 @@ mod tests {
   fn test_error_handling() {
     // Test nonexistent file
     assert!(matches!(
-      Octafile::load(Some(PathBuf::from("nonexistent.yml")), false),
+      Octafile::load(Some(PathBuf::from("nonexistent.yml")), false, vec![]),
       Err(OctafileError::IoError(_))
     ));
 
@@ -473,7 +668,7 @@ mod tests {
     let content = "invalid: : yaml:";
     let (_temp_dir, file_path) = create_temp_octafile(content, "error_handling");
     assert!(matches!(
-      Octafile::load(Some(file_path), false),
+      Octafile::load(Some(file_path), false, vec![]),
       Err(OctafileError::ParseError(_, _))
     ));
 
@@ -490,7 +685,7 @@ mod tests {
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "error_handling");
     assert!(matches!(
-      Octafile::load(Some(file_path), false),
+      Octafile::load(Some(file_path), false, vec![]),
       Err(OctafileError::NotFoundError(_))
     ));
   }
@@ -506,7 +701,7 @@ mod tests {
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "working_directory");
 
-    let octafile = Octafile::load(Some(file_path.clone()), false).unwrap();
+    let octafile = Octafile::load(Some(file_path.clone()), false, vec![]).unwrap();
     assert_eq!(
       octafile.dir,
       file_path.canonicalize().unwrap().parent().unwrap().to_path_buf()
@@ -558,7 +753,7 @@ mod tests {
     fs::write(&child_path, child_content).unwrap();
     fs::write(&grandchild_path, grandchild_content).unwrap();
 
-    let root = Octafile::load(Some(root_path), false).unwrap();
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
     let child = root.get_included("child").unwrap().unwrap();
     let grandchild = child.get_included("grandchild").unwrap().unwrap();
 
@@ -669,7 +864,7 @@ mod tests {
     fs::write(&level2_path, level2_content).unwrap();
 
     // Load root octafile
-    let root = Octafile::load(Some(root_path), false).unwrap();
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
 
     // Test root properties
     assert!(root.is_root());
@@ -732,7 +927,7 @@ mod tests {
     fs::write(&first_path, child_content).unwrap();
     fs::write(&second_path, child_content).unwrap();
 
-    let root = Octafile::load(Some(root_path), false).unwrap();
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
 
     // Test get_included
     let _ = root.get_included("first").unwrap().unwrap();

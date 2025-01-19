@@ -10,7 +10,7 @@ use interprocess::local_socket::{
 use logger::{Logger, LoggerSystem};
 use serde_json::Value;
 use socket::interpret_local_socket_name;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncWrite, ReadHalf};
 use tokio::{
   io::{split, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, WriteHalf},
   sync::Mutex,
@@ -22,11 +22,16 @@ use tokio_util::{
 };
 use uuid::Uuid;
 
-use protocol::{ClientCommand, ServerResponse, Version};
+use protocol::{ClientCommand, Schema, ServerResponse, Version};
 
 pub mod logger;
 pub mod protocol;
 pub mod socket;
+
+#[derive(Clone)]
+pub struct PluginSchema {
+  pub key: String,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -162,6 +167,19 @@ where
       // Store the handle with the original id
       active_commands.lock().await.insert(id, handle);
     },
+    ClientCommand::Schema => {
+      let response = ServerResponse::Error {
+        id: "protocol_error".to_string(),
+        message: "Unexpected Schema command".to_owned(),
+      };
+      writer
+        .lock()
+        .await
+        .write_all(serde_json::to_string(&response)?.as_bytes())
+        .await?;
+
+      logger.log("Received unexpected Schema command")?;
+    },
     ClientCommand::Hello(_) => {
       let response = ServerResponse::Error {
         id: "protocol_error".to_string(),
@@ -188,6 +206,7 @@ where
 async fn handle_conn(
   conn: Stream,
   plugin: Arc<impl Plugin + 'static>,
+  schema: PluginSchema,
   logger: Arc<impl Logger>,
   cancel_token: CancellationToken,
 ) -> anyhow::Result<()> {
@@ -197,56 +216,9 @@ async fn handle_conn(
   let mut reader = BufReader::new(reader);
   let mut buffer = String::new();
 
-  // Wait for octa Hello
-  if reader.read_line(&mut buffer).await? == 0 {
-    return Ok(());
-  }
+  process_hello(plugin.clone(), &mut reader, writer.clone(), logger.clone()).await?;
 
-  match serde_json::from_str(&buffer) {
-    Ok(ClientCommand::Hello(client_version)) => {
-      if let Err(e) = logger.log(&format!("Client connected with version: {}", client_version.version)) {
-        eprintln!("Failed to log message: {}", e);
-      }
-
-      // Send server Hello response with plugin version
-      let response = ServerResponse::Hello(Version {
-        version: plugin.version(),
-        features: vec![],
-      });
-      let response_json = serde_json::to_string(&response)? + "\n";
-      writer.lock().await.write_all(response_json.as_bytes()).await?;
-
-      let _ = logger.log(&response_json.to_string());
-    },
-    Ok(command) => {
-      let response = ServerResponse::Error {
-        id: "protocol_error".to_string(),
-        message: "Expected Hello command".to_string(),
-      };
-      writer
-        .lock()
-        .await
-        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-        .await?;
-
-      logger.log(&format!("Waiting for Hello command but received {:?}", command))?;
-      return Ok(());
-    },
-    Err(e) => {
-      let response = ServerResponse::Error {
-        id: "parse_error".to_string(),
-        message: format!("Invalid command format: {}", e),
-      };
-      writer
-        .lock()
-        .await
-        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-        .await?;
-
-      logger.log("Failed to deserialize received command")?;
-      return Ok(());
-    },
-  }
+  process_schema(schema, &mut reader, writer.clone(), logger.clone()).await?;
 
   loop {
     buffer.clear();
@@ -317,7 +289,129 @@ async fn handle_conn(
   Ok(())
 }
 
-pub async fn serve_plugin(plugin: impl Plugin + 'static) -> anyhow::Result<()> {
+pub async fn process_hello<W>(
+  plugin: Arc<impl Plugin + 'static>,
+  reader: &mut BufReader<ReadHalf<Stream>>,
+  writer: Arc<Mutex<W>>,
+  logger: Arc<impl Logger>,
+) -> anyhow::Result<()>
+where
+  W: AsyncWrite + Send + Unpin + 'static,
+{
+  let mut buffer = String::new();
+
+  // Wait for octa Hello
+  if reader.read_line(&mut buffer).await? == 0 {
+    return Ok(());
+  }
+
+  match serde_json::from_str(&buffer) {
+    Ok(ClientCommand::Hello(client_version)) => {
+      if let Err(e) = logger.log(&format!("Client connected with version: {}", client_version.version)) {
+        eprintln!("Failed to log message: {}", e);
+      }
+
+      // Send server Hello response with plugin version
+      let response = ServerResponse::Hello(Version {
+        version: plugin.version(),
+        features: vec![],
+      });
+      let response_json = serde_json::to_string(&response)? + "\n";
+      writer.lock().await.write_all(response_json.as_bytes()).await?;
+
+      let _ = logger.log(&response_json.to_string());
+    },
+    Ok(command) => {
+      let response = ServerResponse::Error {
+        id: "protocol_error".to_string(),
+        message: "Expected Hello command".to_string(),
+      };
+      writer
+        .lock()
+        .await
+        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+        .await?;
+
+      logger.log(&format!("Waiting for Hello command but received {:?}", command))?;
+      return Ok(());
+    },
+    Err(e) => {
+      let response = ServerResponse::Error {
+        id: "parse_error".to_string(),
+        message: format!("Invalid command format: {}", e),
+      };
+      writer
+        .lock()
+        .await
+        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+        .await?;
+
+      logger.log("Failed to deserialize received command")?;
+      return Ok(());
+    },
+  }
+
+  Ok(())
+}
+
+pub async fn process_schema<W>(
+  schema: PluginSchema,
+  reader: &mut BufReader<ReadHalf<Stream>>,
+  writer: Arc<Mutex<W>>,
+  logger: Arc<impl Logger>,
+) -> anyhow::Result<()>
+where
+  W: AsyncWrite + Send + Unpin + 'static,
+{
+  let mut buffer = String::new();
+
+  // Wait for octa Hello
+  if reader.read_line(&mut buffer).await? == 0 {
+    return Ok(());
+  }
+
+  match serde_json::from_str(&buffer) {
+    Ok(ClientCommand::Schema) => {
+      let schema_response = ServerResponse::Schema(Schema { key: schema.key });
+      let response_json = serde_json::to_string(&schema_response)? + "\n";
+      writer.lock().await.write_all(response_json.as_bytes()).await?;
+
+      let _ = logger.log(&response_json.to_string());
+    },
+    Ok(command) => {
+      let response = ServerResponse::Error {
+        id: "protocol_error".to_string(),
+        message: "Expected Schema command".to_string(),
+      };
+      writer
+        .lock()
+        .await
+        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+        .await?;
+
+      logger.log(&format!("Waiting for Schema command but received {:?}", command))?;
+      return Ok(());
+    },
+    Err(e) => {
+      let response = ServerResponse::Error {
+        id: "parse_error".to_string(),
+        message: format!("Invalid command format: {}", e),
+      };
+      writer
+        .lock()
+        .await
+        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+        .await?;
+
+      logger.log("Failed to deserialize received command")?;
+      return Ok(());
+    },
+  }
+
+  Ok(())
+}
+
+pub async fn serve_plugin(plugin: impl Plugin + 'static, schema: PluginSchema) -> anyhow::Result<()> {
   let args = Args::parse();
 
   let plugin = Arc::new(plugin);
@@ -378,8 +472,9 @@ pub async fn serve_plugin(plugin: impl Plugin + 'static) -> anyhow::Result<()> {
             let plugin_clone = Arc::clone(&plugin);
             let logger_clone = Arc::clone(&logger);
             let cancel_token = cancel_token.clone();
+            let plugin_schema = schema.clone();
             let handle = tokio::spawn(async move {
-              if let Err(e) = handle_conn(conn, plugin_clone, logger_clone, cancel_token).await {
+              if let Err(e) = handle_conn(conn, plugin_clone, plugin_schema, logger_clone, cancel_token).await {
                 // TODO: change to logger
                 eprintln!("Error while handling connection: {e}");
               }
@@ -1050,6 +1145,8 @@ mod tests {
       output_lines: vec!["test".to_string()],
     });
 
+    let schema = PluginSchema { key: "key".to_owned() };
+
     // Create a listener for the socket
     let listener = ListenerOptions::new().name(socket_name_server).create_tokio().unwrap();
 
@@ -1063,7 +1160,7 @@ mod tests {
             result = listener.accept() => {
               match result {
                 Ok(stream) => {
-                  let _ = handle_conn(stream, plugin.clone(), logger.clone(), cancel_token.clone()).await;
+                  let _ = handle_conn(stream, plugin.clone(), schema.clone(), logger.clone(), cancel_token.clone()).await;
                 }
                 Err(_) => {
                   // Handle accept error if necessary
@@ -1091,6 +1188,12 @@ mod tests {
     });
     let hello_json = serde_json::to_string(&hello_command).unwrap() + "\n";
     writer.write_all(hello_json.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+
+    // Send a Schema command
+    let schema_command = ClientCommand::Schema;
+    let schema_json = serde_json::to_string(&schema_command).unwrap() + "\n";
+    writer.write_all(schema_json.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
 
     let cmd_command = ClientCommand::Execute {
@@ -1122,8 +1225,15 @@ mod tests {
       _ => panic!("Expected Hello response"),
     }
 
+    match &responses[1] {
+      ServerResponse::Schema(schema) => {
+        assert_eq!(schema.key, "key");
+      },
+      _ => panic!("Expected Schema response"),
+    }
+
     // Verify the response
-    assert!(matches!(&responses[1], ServerResponse::Started { .. }));
+    assert!(matches!(&responses[2], ServerResponse::Started { .. }));
 
     listener_handle.await.unwrap(); // Wait for the listener task to finish
   }
