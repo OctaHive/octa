@@ -94,23 +94,29 @@ impl PluginManager {
   }
 
   /// Start a plugin and establish connection
-  pub async fn start_plugin(&self, plugin_name: &str) -> Result<Schema> {
+  pub async fn start_plugin(&self, plugin_path: &str) -> Result<Schema> {
+    let plugin_full_path = self.plugins_dir.join(plugin_path);
+    let plugin_name = plugin_full_path
+      .file_stem()
+      .map(|stem| stem.to_string_lossy().into_owned())
+      .map(|stem| stem.strip_prefix("octa_plugin_").map(|s| s.to_owned()).unwrap_or(stem))
+      .unwrap_or_else(|| "(unknown)".into());
+
     let mut active_plugins = self.active_plugins.lock().await;
 
-    if active_plugins.contains_key(plugin_name) {
+    if active_plugins.contains_key(&plugin_name.clone()) {
       return Err(PluginManagerError::PluginAlreadyRunning(plugin_name.to_string()));
     }
 
-    let socket_path = self.generate_socket_path(plugin_name);
-    let plugin_path = self.plugins_dir.join(plugin_name);
+    let socket_path = self.generate_socket_path(plugin_path);
 
-    if !plugin_path.exists() {
+    if !plugin_full_path.exists() {
       return Err(PluginManagerError::PluginNotFound(
-        plugin_path.to_string_lossy().to_string(),
+        plugin_full_path.to_string_lossy().to_string(),
       ));
     }
 
-    let mut command = self.setup_command(plugin_path, socket_path.clone());
+    let mut command = self.setup_command(plugin_full_path.clone(), socket_path.clone());
     let mut process = command.spawn()?;
 
     let stdout = process
@@ -165,7 +171,7 @@ impl PluginManager {
     let client = Arc::new(Mutex::new(Some(client)));
 
     active_plugins.insert(
-      plugin_name.to_string(),
+      plugin_name.clone(),
       PluginInstance {
         process,
         socket_path,
@@ -191,7 +197,7 @@ impl PluginManager {
 
     {
       let mut schemas = self.plugins_schema.lock().await;
-      schemas.insert(plugin_name.to_owned(), schema.clone());
+      schemas.insert(plugin_name, schema.clone());
     }
 
     Ok(schema)

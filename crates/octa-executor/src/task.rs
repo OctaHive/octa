@@ -340,12 +340,6 @@ impl TaskNode {
     let mut errors = String::new();
     let mut exit_code = None;
 
-    // Connect to plugin
-    #[cfg(not(windows))]
-    let plugin_name = &format!("octa_plugin_{}", plugin_name);
-    #[cfg(windows)]
-    let plugin_name = &format!("octa_plugin_{}.exe", plugin_name);
-
     let client = plugin_manager.get_client(plugin_name).await.unwrap();
     let mut client_guard = client.lock().await;
     let client = client_guard.as_mut().unwrap();
@@ -632,7 +626,7 @@ impl Executable<TaskNode> for TaskNode {
     match self
       .execute_plugin_command(
         plugin_manager,
-        result[0].0.strip_prefix("octa_plugin_").unwrap_or(&result[0].0),
+        &result[0].0,
         result[0].1.to_string().trim_matches('"').to_owned(),
         vec![],
         dir,
