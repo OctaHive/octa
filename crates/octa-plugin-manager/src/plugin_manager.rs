@@ -421,7 +421,7 @@ mod tests {
     assert!(result.is_ok());
     assert!(result.unwrap().is_ok());
 
-    assert!(setup.plugin_manager.is_plugin_running(plugin_name).await);
+    assert!(setup.plugin_manager.is_plugin_running("test").await);
   }
 
   #[tokio::test]
@@ -436,7 +436,7 @@ mod tests {
     }
 
     // Get client
-    let client = match setup.plugin_manager.get_client(plugin_name).await {
+    let client = match setup.plugin_manager.get_client("test").await {
       Ok(client) => client,
       Err(e) => return println!("Can't get client, Err: {}", e),
     };
@@ -494,12 +494,12 @@ mod tests {
     setup.plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // Shutdown plugin
-    let result = tokio::time::timeout(TEST_TIMEOUT, setup.plugin_manager.shutdown_plugin(plugin_name)).await;
+    let result = tokio::time::timeout(TEST_TIMEOUT, setup.plugin_manager.shutdown_plugin("test")).await;
     assert!(result.is_ok());
     assert!(result.unwrap().is_ok());
 
     // Verify plugin is not running
-    assert!(!setup.plugin_manager.is_plugin_running(plugin_name).await);
+    assert!(!setup.plugin_manager.is_plugin_running("test").await);
   }
 
   #[tokio::test]
@@ -564,7 +564,7 @@ mod tests {
     // Check list
     let plugins = setup.plugin_manager.list_active_plugins().await;
     assert_eq!(plugins.len(), 1);
-    assert_eq!(plugins[0], plugin_name);
+    assert_eq!(plugins[0], "test");
   }
 
   #[tokio::test]
@@ -579,10 +579,10 @@ mod tests {
     // Verify plugin is listed
     let plugins = setup.plugin_manager.list_active_plugins().await;
     assert_eq!(plugins.len(), 1);
-    assert_eq!(plugins[0], plugin_name);
+    assert_eq!(plugins[0], "test");
 
     // Shutdown plugin
-    setup.plugin_manager.shutdown_plugin(plugin_name).await.unwrap();
+    setup.plugin_manager.shutdown_plugin("test").await.unwrap();
 
     // Verify list is empty
     let plugins = setup.plugin_manager.list_active_plugins().await;
@@ -594,15 +594,14 @@ mod tests {
   async fn test_list_multiple_plugins() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
     let setup = TestSetup::new(plugins_dir, "test.py").await;
-    let plugin_name = setup.plugin_path.file_name().unwrap().to_str().unwrap();
 
     // Start same plugin multiple times with different names
     // In real scenario, you'd have different plugins
-    let plugin_names = vec![
-      format!("{}_1", plugin_name),
-      format!("{}_2", plugin_name),
-      format!("{}_3", plugin_name),
-    ];
+    let plugin_names = vec!["test_1.py", "test_2.py", "test_3.py"];
+
+    for name in &plugin_names {
+      let _ = std::fs::remove_file(setup.plugin_path.parent().unwrap().join(name));
+    }
 
     // Create symbolic links to the test plugin with different names
     for name in &plugin_names {
@@ -616,9 +615,7 @@ mod tests {
 
     assert_eq!(plugins.len(), 3);
 
-    let mut expected = plugin_names.clone();
-    expected.sort();
-    assert_eq!(plugins, expected);
+    assert_eq!(plugins, vec!["test_1", "test_2", "test_3"]);
 
     // Cleanup symbolic links
     for name in &plugin_names {
@@ -650,7 +647,7 @@ mod tests {
     for handle in handles {
       let plugins = handle.await.unwrap();
       assert_eq!(plugins.len(), 1);
-      assert_eq!(plugins[0], plugin_name);
+      assert_eq!(plugins[0], "test");
     }
   }
 
@@ -664,7 +661,7 @@ mod tests {
     setup.plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // Shutdown plugin
-    setup.plugin_manager.shutdown_plugin(plugin_name).await.unwrap();
+    setup.plugin_manager.shutdown_plugin("test").await.unwrap();
 
     // Wait a bit to ensure cleanup
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -736,16 +733,15 @@ time.sleep(10)  # Simulate a hanging plugin
     let handles: Vec<_> = (0..5)
       .map(|i| {
         let manager = Arc::clone(&manager);
-        let plugin_name = plugin_name.to_string();
         tokio::spawn(async move {
           match i % 3 {
             0 => manager.list_active_plugins().await,
             1 => {
-              manager.get_client(&plugin_name).await.unwrap();
+              manager.get_client("test").await.unwrap();
               vec![]
             },
             _ => {
-              manager.get_socket_path(&plugin_name).await;
+              manager.get_socket_path("test").await;
               vec![]
             },
           }
@@ -771,7 +767,7 @@ time.sleep(10)  # Simulate a hanging plugin
     // Get socket path before cleanup
     let socket_path = setup
       .plugin_manager
-      .get_socket_path(plugin_name)
+      .get_socket_path("test")
       .await
       .expect("Failed to get socket path");
 
