@@ -326,7 +326,7 @@ pub async fn run() -> OctaResult<()> {
   let mut tasks = vec![];
   for command in args.commands.as_ref().unwrap() {
     // Create DAG
-    let builder = TaskGraphBuilder::new()?;
+    let builder = TaskGraphBuilder::new(plugin_manager.clone())?;
     let dag = builder
       .build(Arc::clone(&octafile), command, args.parallel, args.task_args.clone())
       .await?;

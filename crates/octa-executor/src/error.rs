@@ -16,6 +16,9 @@ pub enum ExecutorError {
   #[error("Task {0} cancelled")]
   TaskCancelled(String),
 
+  #[error("Missing plugin keys in task")]
+  TaskParsedError,
+
   #[error("Cycle detected in task dependencies")]
   CycleDetected,
 
