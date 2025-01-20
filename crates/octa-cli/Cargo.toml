@@ -1,7 +1,7 @@
 [package]
 name = "octa-cli"
 description = "Command line interface for Octa builder"
-version = "0.1.0"
+version = "0.2.0"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -15,11 +15,11 @@ name = "octa"
 path = "src/main.rs"
 
 [dependencies]
-octa-finder = { version = "0.1.0", path = "../octa-finder" }
-octa-octafile = { version = "0.1.0", path = "../octa-octafile" }
-octa-executor = { version = "0.1.0", path = "../octa-executor" }
-octa-plugin-manager = { version = "0.1.0", path = "../octa-plugin-manager" }
-octa-plugin = { version = "0.1.0", path = "../octa-plugin" }
+octa-finder = { version = "0.2.0", path = "../octa-finder" }
+octa-octafile = { version = "0.2.0", path = "../octa-octafile" }
+octa-executor = { version = "0.2.0", path = "../octa-executor" }
+octa-plugin-manager = { version = "0.2.0", path = "../octa-plugin-manager" }
+octa-plugin = { version = "0.2.0", path = "../octa-plugin" }
 clap_complete = "4"
 clap = { version = "4.5", features = ["derive", "env"] }
 chrono = "0.4.39"

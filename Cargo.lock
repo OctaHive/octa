@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "octa-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "assert_cmd",
  "chrono",
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "octa-dag"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "octa-executor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1072,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "octa-finder"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "octa-octafile",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "octa-octafile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1104,7 +1104,7 @@ dependencies = [
 
 [[package]]
 name = "octa-plugin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "octa-plugin-manager"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "interprocess",
  "nix 0.26.4",
@@ -1142,7 +1142,7 @@ dependencies = [
 
 [[package]]
 name = "octa_plugin_shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1161,7 +1161,7 @@ dependencies = [
 
 [[package]]
 name = "octa_plugin_tpl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
