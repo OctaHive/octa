@@ -20,7 +20,7 @@ pub enum OctaCommand {
   Hello(Version),
   Schema,
   Execute {
-    command: String,
+    params: String,
     args: Vec<String>,
     dir: PathBuf,
     envs: HashMap<String, String>,

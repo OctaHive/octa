@@ -105,7 +105,7 @@ Plugin Start response:
 Example:
 ```json
 {
-  "type":"StdOut",
+  "type":"Start",
   "payload":{
     "id": "test-execution-id"
   }

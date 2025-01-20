@@ -223,7 +223,7 @@ impl PluginClient {
   #[allow(clippy::too_many_arguments)]
   pub async fn execute(
     &mut self,
-    command: String,
+    params: String,
     dry: bool,
     args: Vec<String>,
     dir: PathBuf,
@@ -232,7 +232,7 @@ impl PluginClient {
     cancel_token: CancellationToken,
   ) -> Result<String, PluginClientError> {
     let cmd = OctaCommand::Execute {
-      command,
+      params,
       args,
       dir,
       envs,

@@ -113,7 +113,7 @@ where
 {
   match command {
     OctaCommand::Execute {
-      command,
+      params,
       args,
       dir,
       envs,
@@ -122,7 +122,7 @@ where
     } => {
       let id = Uuid::new_v4().to_string();
 
-      logger.log(&format!("Received execute command {:?}", command))?;
+      logger.log(&format!("Received execute command {:?}", params))?;
 
       {
         // Send started response
@@ -144,7 +144,7 @@ where
           .execute_command(
             command_id.clone(),
             dry,
-            command,
+            params,
             args,
             dir,
             vars,
@@ -621,7 +621,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
-      command: "test".to_string(),
+      params: "test".to_string(),
       args: vec!["arg1".to_string(), "arg2".to_string()],
       dir: PathBuf::from("/test/dir"),
       envs: {
@@ -717,7 +717,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
-      command: "failing_command".to_string(),
+      params: "failing_command".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -767,7 +767,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
-      command: "long_running".to_string(),
+      params: "long_running".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -821,7 +821,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
-      command: "to_be_cancelled".to_string(),
+      params: "to_be_cancelled".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -921,7 +921,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
-      command: "empty_output".to_string(),
+      params: "empty_output".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -974,7 +974,7 @@ mod tests {
     envs.insert("TEST_VAR2".to_string(), "value2".to_string());
 
     let command = OctaCommand::Execute {
-      command: "env_test".to_string(),
+      params: "env_test".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
       envs,
@@ -1023,7 +1023,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
-      command: "test".to_string(),
+      params: "test".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -1087,7 +1087,7 @@ mod tests {
     let mut handles = vec![];
     for i in 0..3 {
       let command = OctaCommand::Execute {
-        command: format!("cmd{}", i),
+        params: format!("cmd{}", i),
         args: vec![],
         dir: PathBuf::from("."),
         envs: HashMap::new(),
@@ -1209,7 +1209,7 @@ mod tests {
     writer.flush().await.unwrap();
 
     let cmd_command = OctaCommand::Execute {
-      command: "".to_owned(),
+      params: "".to_owned(),
       args: vec!["arg1".to_string(), "arg2".to_string()],
       dir: PathBuf::from("/test/dir"),
       envs: HashMap::new(),
