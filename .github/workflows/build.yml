@@ -109,7 +109,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           draft: true
-          files: "octa*"
+          files: "octa-*"
           token: ${{ github.token }}
           body_path: Changelog.md
         if: startsWith( github.ref, 'refs/tags/v' )
