@@ -1,15 +1,18 @@
-use std::{fs::File, io::Write};
+use std::{env, fs::File, io::Write};
 
 use assert_cmd::Command;
-use predicates::prelude::predicate;
+use predicates::prelude::{predicate, PredicateBooleanExt};
+use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
 #[test]
 fn test_no_octafile_file_discovered() {
   let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
   let mut cmd = Command::cargo_bin("octa").unwrap();
   cmd.current_dir(tmp_dir.path());
   cmd.arg("echo");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
   cmd.assert().failure().stderr(predicate::str::contains(
     "Octafile not found traversing to root directory",
   ));
@@ -18,13 +21,14 @@ fn test_no_octafile_file_discovered() {
 #[test]
 fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
   let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
   file.write_all(
     r#"
     version: 1
     tasks:
       hello:
-        cmd: echo "hello world"
+        shell: echo "hello world"
     "#
     .as_bytes(),
   )?;
@@ -32,6 +36,7 @@ fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
   let mut cmd = Command::cargo_bin("octa")?;
   cmd.current_dir(tmp_dir.path());
   cmd.arg("hello");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
   cmd.assert().success().stdout(predicate::str::contains("hello world"));
 
   Ok(())
@@ -40,13 +45,14 @@ fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_task_args() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
   let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
   file.write_all(
     r#"
       version: 1
       tasks:
         hello:
-          cmd: echo {{ COMMAND_ARGS }}
+          shell: echo {{ COMMAND_ARGS }}
     "#
     .as_bytes(),
   )?;
@@ -54,6 +60,7 @@ fn test_task_args() -> Result<(), Box<dyn std::error::Error>> {
   let mut cmd = Command::cargo_bin("octa")?;
   cmd.current_dir(tmp_dir.path());
   cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
   cmd.arg("hello");
   cmd.arg("--");
   cmd.arg("arg1");
@@ -80,6 +87,7 @@ fn test_task_args() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_file_option() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
   let mut file = File::create(tmp_dir.path().join("sample.octafile.yml"))?;
   file.write_all(
     r#"
@@ -87,7 +95,7 @@ fn test_file_option() -> Result<(), Box<dyn std::error::Error>> {
 
     tasks:
       hello:
-        cmd: echo Test
+        shell: echo Test
     "#
     .as_bytes(),
   )?;
@@ -95,7 +103,8 @@ fn test_file_option() -> Result<(), Box<dyn std::error::Error>> {
   let mut cmd = Command::cargo_bin("octa")?;
   cmd.current_dir(tmp_dir.path());
   cmd.env("OCTA_TESTS", "");
-  cmd.args(["-c=sample.octafile.yml", "hello"]);
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.args(["-o=sample.octafile.yml", "hello"]);
 
   let output = cmd.output().expect("Failed to execute command");
   assert!(output.status.success());
@@ -108,6 +117,7 @@ fn test_file_option() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_run_os_task() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
   let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
   file.write_all(
     r#"
@@ -122,15 +132,15 @@ fn test_run_os_task() -> Result<(), Box<dyn std::error::Error>> {
 
       hello_windows:
         platforms: ['windows']
-        cmd: echo hello windows
+        shell: echo hello windows
 
       hello_linux:
         platforms: ['linux']
-        cmd: echo hello linux
+        shell: echo hello linux
 
       hello_macos:
         platforms: ['macos']
-        cmd: echo hello macos
+        shell: echo hello macos
     "#
     .as_bytes(),
   )?;
@@ -146,8 +156,16 @@ fn test_run_os_task() -> Result<(), Box<dyn std::error::Error>> {
   let mut cmd = Command::cargo_bin("octa")?;
   cmd.current_dir(tmp_dir.path());
   cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
   cmd.arg("hello");
-  cmd.assert().success().stdout(predicate::str::contains(expected));
+  let output = cmd.output().expect("Failed to execute command");
+  let stdout = String::from_utf8(output.stdout).expect("Invalid UTF-8 in stdout");
+  assert!(
+    stdout.contains(expected),
+    "Missing found '{}' in stdout. Stdout: {}",
+    expected,
+    stdout
+  );
 
   Ok(())
 }
@@ -172,18 +190,20 @@ fn test_set_env() -> Result<(), Box<dyn std::error::Error>> {
 
         hello_windows:
           platforms: ['windows']
-          cmd: echo %greeting%
+          shell: echo %greeting%
 
         hello_linux_macos:
           platforms: ['macos', 'linux']
-          cmd: "echo $greeting"
+          shell: "echo $greeting"
     "#
     .as_bytes(),
   )?;
 
+  let package_root = env!("CARGO_MANIFEST_DIR");
   let mut cmd = Command::cargo_bin("octa")?;
   cmd.current_dir(tmp_dir.path());
   cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", format!("{}/../../plugins", package_root));
   cmd.arg("hello");
 
   cmd.assert().success().stdout(predicate::str::contains("hello world"));
@@ -194,6 +214,7 @@ fn test_set_env() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_env_file() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
   let mut env_file = File::create(tmp_dir.path().join(".env"))?;
   env_file
     .write_all(
@@ -217,11 +238,11 @@ fn test_env_file() -> Result<(), Box<dyn std::error::Error>> {
 
         test_windows:
           platforms: ['windows']
-          cmd: "echo %VAR1%"
+          shell: "echo %VAR1%"
 
         test_linux_macos:
           platforms: ['macos', 'linux']
-          cmd: "echo $VAR1"
+          shell: "echo $VAR1"
     "#
     .as_bytes(),
   )?;
@@ -229,6 +250,7 @@ fn test_env_file() -> Result<(), Box<dyn std::error::Error>> {
   let mut cmd = Command::cargo_bin("octa")?;
   cmd.current_dir(tmp_dir.path());
   cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
   cmd.arg("test");
   cmd.assert().success().stdout(predicate::str::contains("VAL1"));
 
@@ -236,8 +258,40 @@ fn test_env_file() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_dry_run() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
+  let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
+  file.write_all(
+    r#"
+      version: 1
+      tasks:
+        test:
+          shell: touch test.txt
+    "#
+    .as_bytes(),
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.args(["--dry", "test"]);
+
+  cmd.assert().success();
+
+  assert!(
+    !tmp_dir.path().join("test.txt").exists(),
+    "File should not be created in dry run mode"
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_task_run_mode() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
   let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
   file.write_all(
     r#"
@@ -245,11 +299,11 @@ fn test_task_run_mode() -> Result<(), Box<dyn std::error::Error>> {
     tasks:
       long:
         run: once
-        cmd: sleep 1
+        shell: sleep 1
 
       task:
         run: changed
-        cmd: echo {{ CONTENT }}
+        shell: echo {{ CONTENT }}
         deps:
           - long
 
@@ -271,6 +325,7 @@ fn test_task_run_mode() -> Result<(), Box<dyn std::error::Error>> {
   let mut cmd = Command::cargo_bin("octa")?;
   cmd.current_dir(tmp_dir.path());
   cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
   cmd.arg("test");
 
   let output = cmd.output().expect("Failed to execute command");
@@ -295,8 +350,169 @@ fn test_task_run_mode() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_parallel_execution() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
+  let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
+  file.write_all(
+    r#"
+      version: 1
+      tasks:
+        parallel_test:
+          cmds:
+            - task: task1
+            - task: task2
+            - task: task3
+
+        task1:
+          shell: echo "task1"
+
+        task2:
+          shell: echo "task2"
+
+        task3:
+          shell: echo "task3"
+    "#
+    .as_bytes(),
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.args(["--parallel", "parallel_test"]);
+
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("task1"))
+    .stdout(predicate::str::contains("task2"))
+    .stdout(predicate::str::contains("task3"));
+
+  Ok(())
+}
+
+#[test]
+fn test_list_tasks() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
+  let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
+  file.write_all(
+    r#"
+      version: 1
+      tasks:
+        task1:
+          desc: "First task"
+          shell: echo "task1"
+
+        task2:
+          desc: "Second task"
+          shell: echo "task2"
+
+        _internal:
+          internal: true
+          shell: echo "internal"
+    "#
+    .as_bytes(),
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.arg("--list-tasks");
+
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("task1: First task"))
+    .stdout(predicate::str::contains("task2: Second task"))
+    .stdout(predicate::str::contains("_internal").not());
+
+  Ok(())
+}
+
+#[test]
+fn test_clean_cache() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
+  let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
+  file.write_all(
+    r#"
+      version: 1
+      tasks:
+        test:
+          run: changed
+          shell: echo "test"
+    "#
+    .as_bytes(),
+  )?;
+
+  // Run task first time
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.arg("test");
+  cmd.assert().success();
+
+  // Clean cache
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.arg("--clean-cache");
+  cmd.assert().success();
+
+  // Run task again - should execute because cache was cleaned
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.arg("test");
+  cmd.assert().success().stdout(predicate::str::contains("test"));
+
+  Ok(())
+}
+
+#[test]
+fn test_force_execution() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
+  let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
+  file.write_all(
+    r#"
+      version: 1
+      tasks:
+        test:
+          run: changed
+          shell: echo "forced"
+    "#
+    .as_bytes(),
+  )?;
+
+  // Run task first time
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.arg("test");
+  cmd.assert().success();
+
+  // Run task with force flag
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.args(["--force", "test"]);
+  cmd.assert().success().stdout(predicate::str::contains("forced"));
+
+  Ok(())
+}
+
+#[test]
 fn test_comple_executor_plan() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
   let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
   file.write_all(
     r#"
@@ -322,17 +538,17 @@ fn test_comple_executor_plan() -> Result<(), Box<dyn std::error::Error>> {
           - echo {{ CONTENT }}
 
       content:
-        cmd: echo {{ CONTENT }}
+        shell: echo {{ CONTENT }}
 
       yyy:
         vars:
           CONTENT: YYY
-        cmd: echo {{ CONTENT }}
+        shell: echo {{ CONTENT }}
         deps:
           - nnn
 
       nnn:
-        cmd: echo NNN
+        shell: echo NNN
     "#
     .as_bytes(),
   )?;
@@ -340,10 +556,15 @@ fn test_comple_executor_plan() -> Result<(), Box<dyn std::error::Error>> {
   let mut cmd = Command::cargo_bin("octa")?;
   cmd.current_dir(tmp_dir.path());
   cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
   cmd.arg("zzz");
 
   let output = cmd.output().expect("Failed to execute command");
-  assert!(output.status.success());
+
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  assert_eq!(stderr, "");
+
+  assert_eq!(output.status.success(), true);
 
   let stdout = String::from_utf8(output.stdout).expect("Invalid UTF-8 in stdout");
   let lines: Vec<&str> = stdout.lines().collect();

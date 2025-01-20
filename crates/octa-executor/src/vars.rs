@@ -194,7 +194,7 @@ impl Vars {
     TEMPLATE_REGEX.is_match(value)
   }
 
-  fn to_hashmap(&self) -> HashMap<String, Value> {
+  pub fn to_hashmap(&self) -> HashMap<String, Value> {
     self
       .context
       .clone()

@@ -1,0 +1,29 @@
+[package]
+name = "octa_plugin_tpl"
+description = "Plugin for run template commands"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+include = ["src/"]
+
+[[bin]]
+name = "octa_plugin_tpl"
+bench = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+octa-plugin = { version = "0.1.0", path = "../octa-plugin" }
+shellexpand = "3.1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tera = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.2"

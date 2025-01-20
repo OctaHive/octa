@@ -190,14 +190,19 @@ impl OctaFinder {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::path::PathBuf;
+  use serde_yml::Value;
+  use std::{collections::HashMap, path::PathBuf};
   use tempfile::TempDir;
   use test_log::test;
   use tracing_test::traced_test;
 
   fn create_test_task(name: &str) -> Task {
+    let mut extra = HashMap::new();
+    let cmd_value = Value::String(format!("echo {}", name));
+    extra.insert("cmd".to_owned(), cmd_value);
+
     Task {
-      cmd: Some(format!("echo {}", name).into()),
+      extra,
       ..Task::default()
     }
   }
@@ -219,7 +224,8 @@ mod tests {
       content.push_str("tasks:\n");
       for (task_name, task) in &tasks {
         content.push_str(&format!("  {}:\n", task_name));
-        if let Some(ref cmd) = task.cmd {
+        if let Some(cmd) = task.extra.get("cmd") {
+          let cmd = serde_yml::to_string(&cmd).unwrap();
           content.push_str(&format!("    cmd: {}\n", cmd));
         }
       }
@@ -236,7 +242,7 @@ mod tests {
     let finder = OctaFinder::new();
     let (_temp_dir, file_path) = create_gen_test_yaml(vec![("test", create_test_task("test"))]);
 
-    let octafile = Octafile::load(Some(file_path), false).unwrap();
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
     let results = finder.find_by_path(octafile, "test");
 
     assert_eq!(results.len(), 1);
@@ -270,7 +276,7 @@ mod tests {
     let root_path = temp_dir.path().join("Octafile.yml");
     std::fs::write(&root_path, root_content).unwrap();
 
-    let root = Octafile::load(Some(root_path), false).unwrap();
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
     let results = finder.find_by_path(root, "child:child_task");
 
     assert_eq!(results.len(), 1);
@@ -313,7 +319,7 @@ mod tests {
     let root_path = temp_dir.path().join("Octafile.yml");
     std::fs::write(&root_path, root_content).unwrap();
 
-    let root = Octafile::load(Some(root_path), false).unwrap();
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
     let results = finder.find_by_path(root, "*:task");
 
     assert_eq!(results.len(), 2);
@@ -413,7 +419,7 @@ mod tests {
     );
     let root_path = create_test_yaml(&temp_dir, "", &root_content);
 
-    let root = Octafile::load(Some(root_path), false).unwrap();
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
 
     // Test recursive search for all task1
     let results = finder.find_by_path(root.clone(), "**:task1");
@@ -475,7 +481,7 @@ mod tests {
     );
     let root_path = create_test_yaml(&temp_dir, "", &root_content);
 
-    let root = Octafile::load(Some(root_path), false).unwrap();
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
     let results = finder.find_by_path(root, "**:task1");
 
     assert_eq!(results.len(), 2); // Should find both task1 instances
@@ -498,7 +504,7 @@ mod tests {
     "#;
     let root_path = create_test_yaml(&temp_dir, "", root_content);
 
-    let root = Octafile::load(Some(root_path), false).unwrap();
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
     let results = finder.find_by_path(root, "**:task1");
 
     assert_eq!(results.len(), 1);
@@ -540,7 +546,7 @@ mod tests {
     );
     let root_path = create_test_yaml(&temp_dir, "", &root_content);
 
-    let root = Octafile::load(Some(root_path), false).unwrap();
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
 
     // Test recursive search for all tasks
     let results = finder.find_by_path(root, "**");

@@ -2,10 +2,10 @@ version: 1
 
 tasks:
   prev:
-    cmd: echo Start
+    shell: echo Start
 
   next:
-    cmd: echo Finish
+    shell: echo Finish
 
   run:
     cmds:

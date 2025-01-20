@@ -1,11 +1,13 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use serde::{
-  de::{MapAccess, Visitor},
+  de::{DeserializeSeed, MapAccess, Visitor},
   Deserialize, Deserializer, Serialize,
 };
 
-use crate::{octafile::Envs, Cmds, Vars};
+use serde_yml::Value;
+
+use crate::{octafile::Envs, Vars};
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -81,15 +83,18 @@ impl From<String> for Deps {
   }
 }
 
-#[derive(Serialize, Debug, Clone, Default)]
+#[derive(Debug)]
+pub struct Context {
+  pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct Task {
   pub env: Option<Envs>,                         // Task environment variables
   pub dir: Option<PathBuf>,                      // Working directory for the task
   pub desc: Option<String>,                      // Task description
   pub vars: Option<Vars>,                        // Task-specific variables
-  pub tpl: Option<String>,                       // Task template
-  pub cmd: Option<Cmds>,                         // Command to execute
-  pub cmds: Option<Vec<Cmds>>,                   // List of commands
+  pub cmds: Option<Vec<Value>>,                  // List of commands
   pub internal: Option<bool>,                    // Show command in list of available commands
   pub platforms: Option<Vec<String>>,            // Supported platforms
   pub ignore_error: Option<bool>,                // Whether to continue on error
@@ -100,67 +105,90 @@ pub struct Task {
   pub sources: Option<Vec<String>>,              // Sources for fingerprinting
   pub source_strategy: Option<SourceStrategies>, // Strategy for compare sources
   pub preconditions: Option<Vec<String>>,        // Commands to check should run command
+  pub extra: HashMap<String, Value>,             // Captures any additional attributes
 }
 
-impl<'de> Deserialize<'de> for Task {
-  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+pub struct TaskSeed<'a> {
+  pub context: &'a Context,
+}
+
+impl<'de> DeserializeSeed<'de> for TaskSeed<'_> {
+  type Value = Task;
+
+  fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
   where
     D: Deserializer<'de>,
   {
-    struct TaskVisitor;
+    // Forward to a visitor, passing the context
+    deserializer.deserialize_map(TaskVisitor { context: self.context })
+  }
+}
 
-    impl<'de> Visitor<'de> for TaskVisitor {
-      type Value = Task;
+pub struct TaskVisitor<'a> {
+  pub context: &'a Context,
+}
 
-      fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a string or a map representing a Task")
-      }
+impl<'de> Visitor<'de> for TaskVisitor<'_> {
+  type Value = Task;
 
-      fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-      where
-        E: serde::de::Error,
-      {
-        Ok(Task {
-          cmd: Some(Cmds::Simple(value.to_string())),
-          ..Task::default()
-        })
-      }
+  fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+    formatter.write_str("a string or a map representing a Task")
+  }
 
-      fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-      where
-        M: MapAccess<'de>,
-      {
-        let mut task = Task::default();
+  fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+  where
+    E: serde::de::Error,
+  {
+    let mut extra = HashMap::new();
+    let cmd_value = Value::String(value.to_string());
+    extra.insert("shell".to_owned(), cmd_value);
 
-        while let Some(key) = map.next_key::<String>()? {
-          match key.as_str() {
-            "dir" => task.dir = map.next_value()?,
-            "desc" => task.desc = map.next_value()?,
-            "vars" => task.vars = map.next_value()?,
-            "tpl" => task.tpl = map.next_value()?,
-            "cmd" => task.cmd = map.next_value()?,
-            "cmds" => task.cmds = map.next_value()?,
-            "internal" => task.internal = map.next_value()?,
-            "platforms" => task.platforms = map.next_value()?,
-            "ignore_error" => task.ignore_error = map.next_value()?,
-            "deps" => task.deps = map.next_value()?,
-            "run" => task.run = map.next_value()?,
-            "silent" => task.silent = map.next_value()?,
-            "execute_mode" => task.execute_mode = map.next_value()?,
-            "sources" => task.sources = map.next_value()?,
-            "source_strategy" => task.source_strategy = map.next_value()?,
-            "preconditions" => task.preconditions = map.next_value()?,
-            _ => {
-              // Skip unknown fields
-              let _ = map.next_value::<serde::de::IgnoredAny>()?;
-            },
+    Ok(Task {
+      extra,
+      ..Task::default()
+    })
+  }
+
+  fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+  where
+    M: MapAccess<'de>,
+  {
+    let mut task = Task::default();
+    let mut extra = HashMap::new();
+
+    while let Some(key) = map.next_key::<String>()? {
+      match key.as_str() {
+        "dir" => task.dir = map.next_value()?,
+        "desc" => task.desc = map.next_value()?,
+        "vars" => task.vars = map.next_value()?,
+        "env" => task.env = map.next_value()?,
+        "cmds" => task.cmds = map.next_value()?,
+        "internal" => task.internal = map.next_value()?,
+        "platforms" => task.platforms = map.next_value()?,
+        "ignore_error" => task.ignore_error = map.next_value()?,
+        "deps" => task.deps = map.next_value()?,
+        "run" => task.run = map.next_value()?,
+        "silent" => task.silent = map.next_value()?,
+        "execute_mode" => task.execute_mode = map.next_value()?,
+        "sources" => task.sources = map.next_value()?,
+        "source_strategy" => task.source_strategy = map.next_value()?,
+        "preconditions" => task.preconditions = map.next_value()?,
+        key => {
+          if self.context.keys.contains(&key.to_owned()) {
+            let val = Value::String(map.next_value()?);
+            extra.insert(key.to_owned(), val);
+          } else {
+            // Skip unknown fields
+            let _ = map.next_value::<serde::de::IgnoredAny>()?;
           }
-        }
-
-        Ok(task)
+        },
       }
     }
 
-    deserializer.deserialize_any(TaskVisitor)
+    if !extra.is_empty() {
+      task.extra = extra;
+    }
+
+    Ok(task)
   }
 }

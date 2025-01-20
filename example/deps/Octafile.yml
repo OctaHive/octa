@@ -6,7 +6,7 @@ tasks:
   prepare_two: echo Prepare two
 
   complex_task:
-    cmd: echo All deps task completed
+    shell: echo All deps task completed
     deps:
       - prepare_one
       - prepare_two
@@ -16,7 +16,7 @@ tasks:
   task2: echo 2
 
   global:
-    cmd: echo {{ deps_result.task1 | int + deps_result.task2 | int }}
+    shell: echo {{ deps_result.task1 | int + deps_result.task2 | int }}
     deps:
       - task1
       - task2

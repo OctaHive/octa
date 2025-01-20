@@ -1,20 +1,21 @@
 use std::{
-  borrow::Cow,
   collections::HashMap,
   env,
   hash::{Hash, Hasher},
+  io,
   path::PathBuf,
-  process::Stdio,
   sync::Arc,
-  time::Duration,
 };
 
 use async_trait::async_trait;
+use dunce::canonicalize;
 use indexmap::IndexMap;
+use octa_plugin::protocol::PluginResponse;
+use octa_plugin_manager::plugin_manager::PluginManager;
+use serde_json::Value;
 use sled::Db;
 use tera::{Context, Tera};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::{select, sync::Mutex};
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, enabled, error, info, Level};
 
@@ -34,6 +35,7 @@ use crate::{
 pub trait Executable<T> {
   async fn execute(
     &self,
+    plugin_manager: Arc<PluginManager>,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     fingerprint: Arc<Db>,
     dry: bool,
@@ -112,8 +114,6 @@ pub struct TaskConfig {
   pub dep_name: String,
 
   // Execution configuration
-  pub cmd: Option<String>, // Command to execute
-  pub tpl: Option<String>, // Template to render
   pub dir: PathBuf,        // Working directory
   pub ignore_errors: bool, // Whether to continue on error
   pub silent: bool,        // Should task print to stdout or stderr
@@ -128,6 +128,8 @@ pub struct TaskConfig {
 
   // State management
   cmd_type: CmdType, // Type of task for internal use
+
+  extra: HashMap<String, Value>,
 }
 
 impl TaskConfig {
@@ -142,8 +144,6 @@ pub struct TaskConfigBuilder {
   name: Option<String>,
   dep_name: Option<String>,
 
-  pub cmd: Option<String>,
-  pub tpl: Option<String>,
   pub dir: Option<PathBuf>,
   pub ignore_errors: Option<bool>,
   pub silent: Option<bool>,
@@ -156,6 +156,8 @@ pub struct TaskConfigBuilder {
   pub preconditions: Option<Vec<String>>,
 
   pub cmd_type: Option<CmdType>,
+
+  pub extra: HashMap<String, Value>,
 }
 
 impl TaskConfigBuilder {
@@ -171,16 +173,6 @@ impl TaskConfigBuilder {
 
   pub fn id(mut self, id: impl Into<String>) -> Self {
     self.id = Some(id.into());
-    self
-  }
-
-  pub fn cmd(mut self, cmd: Option<impl Into<String>>) -> Self {
-    self.cmd = cmd.map(Into::into);
-    self
-  }
-
-  pub fn tpl(mut self, tpl: Option<String>) -> Self {
-    self.tpl = tpl;
     self
   }
 
@@ -206,6 +198,11 @@ impl TaskConfigBuilder {
 
   pub fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
     self.dir = Some(dir.into());
+    self
+  }
+
+  pub fn extra(mut self, extra: HashMap<String, Value>) -> Self {
+    self.extra = extra;
     self
   }
 
@@ -245,8 +242,6 @@ impl TaskConfigBuilder {
       id: self.id.ok_or("Missing mandatory field: id")?,
       name: self.name.ok_or("Missing mandatory field: name")?,
       dep_name: self.dep_name.ok_or("Missing mandatory field: dep_name")?,
-      cmd: self.cmd,
-      tpl: self.tpl,
       dir: dir.ok_or("Missing mandatory field: dir")?,
       ignore_errors: self.ignore_errors.unwrap_or(false),
       silent: self.silent.unwrap_or(false),
@@ -257,6 +252,7 @@ impl TaskConfigBuilder {
       preconditions: self.preconditions,
       source_strategy: self.source_strategy.unwrap_or(SourceMethod::Hash),
       cmd_type: self.cmd_type.unwrap_or(CmdType::Normal),
+      extra: self.extra,
     })
   }
 }
@@ -270,8 +266,6 @@ pub struct TaskNode {
   pub dep_name: String, // Name of task in deps
 
   // Execution configuration
-  pub cmd: Option<String>, // Command to execute
-  pub tpl: Option<String>, // Template to render
   pub dir: PathBuf,        // Working directory
   pub ignore_errors: bool, // Whether to continue on error
   pub silent: bool,        // Should task print to stdout or stderr
@@ -287,6 +281,8 @@ pub struct TaskNode {
   // State management
   pub deps_res: Arc<Mutex<HashMap<String, String>>>, // Dependencies results
   cmd_type: CmdType,                                 // Type of task for internal use
+
+  extra: HashMap<String, Value>,
 }
 
 // Implement equality based on task ID
@@ -311,8 +307,6 @@ impl TaskNode {
       id: config.id,
       name: config.name,
       dep_name: config.dep_name,
-      cmd: config.cmd,
-      tpl: config.tpl,
       run_mode: config.run_mode,
       sources: config.sources,
       source_strategy: config.source_strategy,
@@ -324,186 +318,99 @@ impl TaskNode {
       deps_res: Arc::new(Mutex::new(HashMap::default())),
       cmd_type: config.cmd_type,
       preconditions: config.preconditions,
+      extra: config.extra,
     }
   }
 
-  /// Executes a shell command and returns its output
-  async fn execute_command(&self, cmd: &str, dry: bool, cancel_token: CancellationToken) -> ExecutorResult<String> {
-    let rendered_cmd = self.render_template(cmd, None, dry).await?;
-    debug!("Execute command: {}", rendered_cmd);
-
-    if dry {
-      info!("Execute command in dry mode: {}", rendered_cmd);
-
-      return Ok("".to_owned());
-    }
-
-    let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
-
-    // Platform specific command setup
-    #[cfg(windows)]
-    let command = self.setup_windows_command(&rendered_cmd, &dir);
-
-    #[cfg(not(windows))]
-    let command = self.setup_unix_command(&rendered_cmd, &dir);
-
-    self.run_command(command, cancel_token).await
-  }
-
-  /// Renders the command template with variables and dependency results
-  async fn render_template(
+  #[allow(clippy::too_many_arguments)]
+  async fn execute_plugin_command(
     &self,
-    template: &str,
-    cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
+    plugin_manager: Arc<PluginManager>,
+    plugin_name: &str,
     dry: bool,
-  ) -> ExecutorResult<String> {
-    // Interpolate vars
-    let mut vars = self.vars.clone();
-    vars.expand(dry).await?;
+    command: String,
+    args: Vec<String>,
+    dir: PathBuf,
+    vars: HashMap<String, Value>,
+    envs: HashMap<String, String>,
+    silent: bool,
+    cancel_token: CancellationToken,
+  ) -> io::Result<(i32, String, String)> {
+    // Changed return type
+    let mut output = String::new();
+    let mut errors = String::new();
+    let mut exit_code = None;
 
-    let mut envs = self.envs.clone();
-    envs.expand().await?;
+    let client = plugin_manager.get_client(plugin_name).await.unwrap();
+    let mut client_guard = client.lock().await;
+    let client = client_guard.as_mut().unwrap();
 
-    let get_env = |name: &str| match envs.get(name) {
-      Some(val) => Some(Cow::Borrowed(val.as_str())),
-      None => match env::var(name) {
-        Ok(val) => Some(Cow::Owned(val)),
-        Err(_) => None,
-      },
-    };
+    // Use a cleanup flag to track if we need to shut down
+    let mut needs_cleanup = false;
+    let result = async {
+      // Start command execution with cancellation support
+      let command_id = client
+        .execute(command.clone(), dry, args, dir, vars, envs, cancel_token.clone())
+        .await
+        .map_err(io::Error::from)?;
 
-    let val = shellexpand::env_with_context_no_errors(&template, get_env);
+      // Process output until command completes
+      loop {
+        match client.receive_output(&cancel_token).await {
+          Ok(Some(response)) => match response {
+            PluginResponse::Stdout { id, line } if id == command_id => {
+              if !silent {
+                println!("{}", line.trim());
+              }
+              output.push_str(line.trim());
+              output.push('\n');
+            },
+            PluginResponse::Stderr { id, line } if id == command_id => {
+              if !silent {
+                eprintln!("{}", line.trim());
+              }
+              errors.push_str(line.trim());
+              errors.push('\n');
+            },
+            PluginResponse::ExitStatus { id, code } if id == command_id => {
+              exit_code = Some(code);
+              break;
+            },
+            PluginResponse::Error { id, message } if id == command_id => {
+              return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("Plugin error: {}", message),
+              ));
+            },
+            _ => {},
+          },
+          Ok(None) => {
+            return Err(io::Error::new(
+              io::ErrorKind::ConnectionAborted,
+              "Plugin connection closed unexpectedly",
+            ));
+          },
+          Err(e) => {
+            if cancel_token.is_cancelled() {
+              return Err(io::Error::new(io::ErrorKind::Interrupted, "Command cancelled"));
+            }
 
-    let mut tera = Tera::default();
-    let template_name = format!("task_{}", self.name);
+            needs_cleanup = true;
+            return Err(io::Error::from(e));
+          },
+        }
+      }
 
-    tera.add_raw_template(&template_name, val.as_ref()).map_err(|e| {
-      ExecutorError::TemplateParseFailed(format!("Failed to parse template for task {}: {:?}", self.name, e))
-    })?;
+      Ok((exit_code.unwrap_or(-1), output, errors))
+    }
+    .await;
 
-    let mut context: Context = vars.clone().into();
-    // Add dependency results to template context
-    let deps_res = self.deps_res.lock().await;
-    context.insert("deps_result", &*deps_res);
-
-    let result = tera.render(&template_name, &context).map_err(|e| {
-      ExecutorError::TemplateRenderError(format!("Failed to render template for task {}: {:?}", self.name, e))
-    })?;
-
-    if let Some(ref cache) = cache {
-      self.update_cache(&result, vars, cache).await?;
+    // Perform cleanup if needed
+    if needs_cleanup {
+      let _ = client.shutdown().await;
     }
 
-    Ok(result)
-  }
-
-  /// Execute command with cancellation support
-  async fn run_command(
-    &self,
-    mut command: tokio::process::Command,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
-    let mut child = command.spawn()?;
-    let mut output = Vec::new();
-    let mut errors = Vec::new();
-
-    // Handle stdout
-    let stdout_handle = if let Some(stdout) = child.stdout.take() {
-      let reader = BufReader::new(stdout);
-      let mut lines = reader.lines();
-      let is_silent = self.silent;
-      Some(tokio::spawn(async move {
-        let mut captured = Vec::new();
-        while let Some(line) = lines.next_line().await.unwrap_or(None) {
-          if !line.is_empty() {
-            captured.push(line.clone());
-            if !is_silent {
-              println!("{}", line);
-            }
-          }
-        }
-        captured
-      }))
-    } else {
-      None
-    };
-
-    // Handle stderr
-    let stderr_handle = if let Some(stderr) = child.stderr.take() {
-      let reader = BufReader::new(stderr);
-      let mut lines = reader.lines();
-      let is_silent = self.silent;
-      Some(tokio::spawn(async move {
-        let mut captured = Vec::new();
-        while let Some(line) = lines.next_line().await.unwrap_or(None) {
-          if !line.is_empty() {
-            captured.push(line.clone());
-            if !is_silent {
-              eprintln!("{}", line);
-            }
-          }
-        }
-        captured
-      }))
-    } else {
-      None
-    };
-
-    let result = select! {
-      _ = cancel_token.cancelled() => {
-        self.handle_cancellation(&mut child).await?
-      }
-      result = async {
-        // Wait for process completion and stream processing
-        let status = child.wait().await?;
-
-        // Collect stdout if available
-        if let Some(handle) = stdout_handle {
-          if let Ok(lines) = handle.await {
-            output.extend(lines);
-          }
-        }
-
-        // Collect stderr if available
-        if let Some(handle) = stderr_handle {
-          if let Ok(lines) = handle.await {
-            errors.extend(lines);
-          }
-        }
-
-        // Create synthetic Output struct
-        Ok::<std::process::Output, std::io::Error>(std::process::Output {
-          status,
-          stdout: output.join("\n").into_bytes(),
-          stderr: errors.join("\n").into_bytes(),
-        })
-      } => result?
-    };
-
-    self.process_command_output(result, cancel_token).await
-  }
-
-  /// Handle task cancellation
-  async fn handle_cancellation(&self, child: &mut tokio::process::Child) -> ExecutorResult<std::process::Output> {
-    self.log_info(format!("Shutting down task {}", self.name));
-
-    // Platform-specific process termination
-    #[cfg(windows)]
-    self.terminate_windows_process(child);
-
-    #[cfg(unix)]
-    self.terminate_unix_process(child);
-
-    // Give the process time to clean up
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Force kill if still running
-    child.kill().await?;
-
-    // Create a new command to get the output
-    let _output = child.wait().await?;
-
-    Err(ExecutorError::TaskCancelled(self.name.clone()))
+    result
   }
 
   async fn interpolate_dir(&self, dir: PathBuf, dry: bool) -> ExecutorResult<PathBuf> {
@@ -529,28 +436,6 @@ impl TaskNode {
       debug!("Expanded path: {}", rendered);
 
       Ok(PathBuf::from(rendered.trim_matches('"'))) // Remove extra quotes from result
-    }
-  }
-
-  async fn execute_cmd(
-    &self,
-    cmd: String,
-    cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    dry: bool,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
-    let mut vars = self.vars.clone();
-    vars.expand(dry).await?;
-
-    match self.execute_command(&cmd, dry, cancel_token).await {
-      Ok(result) => {
-        self.update_cache(&result, vars, &cache).await?;
-        debug!("Completed task {}", self.name);
-
-        Ok(result)
-      },
-      Err(ExecutorError::TaskCancelled(e)) => Err(ExecutorError::TaskCancelled(e)),
-      Err(e) => self.handle_execution_error(e),
     }
   }
 
@@ -597,25 +482,6 @@ impl TaskNode {
     Ok(result)
   }
 
-  /// Process command output and handle errors
-  async fn process_command_output(
-    &self,
-    output: std::process::Output,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
-    if !output.status.success() && !cancel_token.is_cancelled() {
-      let error = String::from_utf8_lossy(&output.stderr);
-      return Err(ExecutorError::CommandFailed(format!(
-        "Task {} failed: {}",
-        self.name, error
-      )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    Ok(stdout.trim().to_string())
-  }
-
   /// Check if result is cached
   async fn check_cache(
     &self,
@@ -653,71 +519,6 @@ impl TaskNode {
     Ok(())
   }
 
-  /// Platform-specific command setup for Windows
-  #[cfg(windows)]
-  fn setup_windows_command(&self, cmd: &str, dir: &PathBuf) -> tokio::process::Command {
-    #[allow(unused_imports)]
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-    let mut command = tokio::process::Command::new("cmd");
-    command
-      .current_dir(dir)
-      .args(["/C", cmd])
-      .envs(self.envs.clone())
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .kill_on_drop(true)
-      .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    command
-  }
-
-  #[cfg(windows)]
-  fn terminate_windows_process(&self, child: &mut tokio::process::Child) {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-    if let Some(pid) = child.id() {
-      unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-        if handle as HANDLE != INVALID_HANDLE_VALUE {
-          let handle_ptr = handle as HANDLE;
-          TerminateProcess(handle_ptr, 1);
-          CloseHandle(handle_ptr);
-        }
-      }
-    }
-  }
-
-  /// Platform-specific command setup for Unix
-  #[cfg(not(windows))]
-  fn setup_unix_command(&self, cmd: &str, dir: &PathBuf) -> tokio::process::Command {
-    let mut command = tokio::process::Command::new("sh");
-    command
-      .current_dir(dir)
-      .arg("-c")
-      .arg(cmd)
-      .envs(self.envs.clone())
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .kill_on_drop(true)
-      .process_group(0);
-    command
-  }
-
-  #[cfg(unix)]
-  fn terminate_unix_process(&self, child: &mut tokio::process::Child) {
-    use nix::sys::signal::{kill, Signal};
-    use nix::unistd::Pid;
-
-    if let Some(pid) = child.id() {
-      self.log_info(format!("Kill task with pid {}", pid));
-      let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
-    }
-  }
-
   async fn debug_log_dependencies(&self) {
     if enabled!(Level::DEBUG) {
       let deps = self.deps_res.lock().await;
@@ -728,7 +529,7 @@ impl TaskNode {
   }
 
   /// Handle execution errors
-  fn handle_execution_error(&self, error: ExecutorError) -> ExecutorResult<String> {
+  fn handle_execution_error(&self, error: io::Error) -> ExecutorResult<String> {
     if self.ignore_errors {
       error!("Task {} failed but errors ignored. Error: {}", self.name, error);
       Ok("".to_string())
@@ -755,6 +556,7 @@ impl Executable<TaskNode> for TaskNode {
   /// Executes the task and returns the result
   async fn execute(
     &self,
+    plugin_manager: Arc<PluginManager>,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
     fingerprint: Arc<Db>,
     dry: bool,
@@ -789,19 +591,73 @@ impl Executable<TaskNode> for TaskNode {
     // Debug information about dependency results
     self.debug_log_dependencies().await;
 
-    match (&self.cmd, &self.tpl) {
-      // This variant should validate on load octafile stage
-      (Some(_), Some(_)) => {
-        unreachable!("Both cmd and tpl cannot be Some - should be validated during octafile loading")
-      },
-      (Some(cmd), None) => self.execute_cmd(cmd.clone(), cache, dry, cancel_token.clone()).await,
-      (None, Some(tpl)) => {
-        let rendered_cmd = self.render_template(tpl, Some(cache), dry).await?;
+    let plugins_key = plugin_manager.get_schema_keys().await;
 
-        Ok(rendered_cmd)
+    let mut result: Vec<(String, Value)> = vec![];
+    for (key, value) in &self.extra {
+      if let Some(plugin_name) = plugins_key.get(key) {
+        result.push((plugin_name.clone(), value.clone()));
+      }
+    }
+
+    if result.is_empty() {
+      return Ok("".to_string());
+    }
+
+    if result.len() > 1 {
+      panic!("Several plugin keys provide in task");
+    }
+
+    // Interpolate vars
+    let mut vars = self.vars.clone();
+    vars.expand(dry).await?;
+
+    // Interpolate environment variables
+    let mut envs = self.envs.clone();
+    envs.expand().await?;
+
+    // Add dependency results to template context
+    let mut vars_with_deps_results = vars.clone();
+    let deps_res = self.deps_res.lock().await;
+    vars_with_deps_results.insert("deps_result", &*deps_res);
+
+    let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
+    let dir = canonicalize(dir)?;
+
+    match self
+      .execute_plugin_command(
+        plugin_manager,
+        &result[0].0,
+        dry,
+        result[0].1.to_string().trim_matches('"').to_owned(),
+        vec![],
+        dir,
+        vars_with_deps_results.to_hashmap(),
+        self.envs.clone().into(),
+        self.silent,
+        cancel_token.clone(),
+      )
+      .await
+    {
+      Ok((code, stdout, stderr)) => {
+        if code != 0 && !cancel_token.is_cancelled() {
+          if self.ignore_errors {
+            error!("Task {} failed but errors ignored. Error code: {}", self.name, code);
+            Ok("".to_string())
+          } else {
+            Err(ExecutorError::TaskFailed(format!(
+              "Task {} failed: {}",
+              self.name, stderr
+            )))
+          }
+        } else {
+          self.update_cache(stdout.trim(), vars, &cache).await?;
+
+          Ok(stdout.trim().to_string())
+        }
       },
-      // This variant just if we want only run deps
-      (None, None) => Ok("".to_string()),
+      Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
+      Err(e) => self.handle_execution_error(e),
     }
   }
 }
@@ -835,11 +691,21 @@ impl TaskItem for TaskNode {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::fs;
+  use std::{fs, time::Duration};
   use tempfile::TempDir;
 
   // Helper function to create a test TaskNode
   fn create_test_task(name: &str, cmd: Option<&str>, tpl: Option<String>, run_mode: Option<RunMode>) -> TaskNode {
+    let mut extra = HashMap::new();
+    if let Some(tpl) = tpl {
+      let tpl_value = Value::String(tpl);
+      extra.insert("tpl".to_owned(), tpl_value);
+    }
+    if let Some(cmd) = cmd {
+      let cmd_value = Value::String(cmd.to_owned());
+      extra.insert("shell".to_owned(), cmd_value);
+    }
+
     let task_config = TaskConfig::builder()
       .id(name.to_string())
       .name(name.to_string())
@@ -847,8 +713,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .tpl(tpl)
-      .cmd(cmd)
+      .extra(extra)
       .run_mode(Some(run_mode.unwrap_or(RunMode::Always)))
       .build()
       .unwrap();
@@ -867,12 +732,33 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
-      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .execute(
+        plugin_manager.clone(),
+        cache,
+        fingerprint,
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result.trim(), "hello world");
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -885,6 +771,10 @@ mod tests {
     let mut vars = Vars::new();
     vars.insert(&"name", &"world");
 
+    let mut extra = HashMap::new();
+    let tpl_value = Value::String("Hello {{ name }}!".into());
+    extra.insert("tpl".to_owned(), tpl_value);
+
     let task_config = TaskConfig::builder()
       .id("template_task".to_string())
       .name("template_task".to_string())
@@ -892,7 +782,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(vars)
       .envs(Envs::new())
-      .tpl(Some("Hello {{ name }}!".to_owned()))
+      .extra(extra)
       .build()
       .unwrap();
 
@@ -900,12 +790,27 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
-      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .execute(
+        plugin_manager.clone(),
+        cache,
+        fingerprint,
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result, "Hello world!");
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -918,10 +823,24 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // First execution
     let result1 = task
       .execute(
+        plugin_manager.clone(),
         cache.clone(),
         fingerprint.clone(),
         false,
@@ -935,6 +854,7 @@ mod tests {
     // Second execution should return cached result
     let result2 = task
       .execute(
+        plugin_manager.clone(),
         cache.clone(),
         fingerprint.clone(),
         false,
@@ -944,6 +864,7 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(result1, result2);
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -957,6 +878,10 @@ mod tests {
     let test_file = temp_dir.path().join("test.txt");
     fs::write(&test_file, "initial content").unwrap();
 
+    let mut extra = HashMap::new();
+    let cmd_value = Value::String("echo 'test'".to_string());
+    extra.insert("shell".to_owned(), cmd_value);
+
     let task_config = TaskConfig::builder()
       .id("source_task".to_string())
       .name("source_task".to_string())
@@ -964,11 +889,10 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .cmd(Some("echo 'test'".to_string()))
+      .extra(extra)
       .run_mode(Some(AllowedRun::Changed))
       .sources(Some(vec![test_file.to_str().unwrap().to_string()]))
       .source_strategy(Some(SourceStrategies::Hash))
-      .tpl(None)
       .build()
       .unwrap();
 
@@ -976,10 +900,24 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // First execution
     let result1 = task
       .execute(
+        plugin_manager.clone(),
         cache.clone(),
         fingerprint.clone(),
         false,
@@ -995,6 +933,7 @@ mod tests {
     // Second execution should run again due to source changes
     let result2 = task
       .execute(
+        plugin_manager.clone(),
         cache.clone(),
         fingerprint.clone(),
         false,
@@ -1004,6 +943,7 @@ mod tests {
       .await
       .unwrap();
     assert_eq!(result1, result2);
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -1017,11 +957,32 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
-      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .execute(
+        plugin_manager.clone(),
+        cache,
+        fingerprint,
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await;
     assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -1032,6 +993,10 @@ mod tests {
       .expect("Failed to open in-memory Sled database");
 
     let cancel_token = CancellationToken::new();
+    let mut extra = HashMap::new();
+    let cmd_value = Value::String("sleep 5".to_string());
+    extra.insert("shell".to_owned(), cmd_value);
+
     let task_config = TaskConfig::builder()
       .id("long_task".to_string())
       .name("long_task".to_string())
@@ -1039,7 +1004,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .cmd(Some("sleep 5".to_string()))
+      .extra(extra)
       .build()
       .unwrap();
 
@@ -1047,6 +1012,19 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // Cancel the task after a short delay
     let cancel_handle = tokio::spawn({
@@ -1057,10 +1035,13 @@ mod tests {
       }
     });
 
-    let result = task.execute(cache, fingerprint, false, false, cancel_token).await;
+    let result = task
+      .execute(plugin_manager.clone(), cache, fingerprint, false, false, cancel_token)
+      .await;
     assert!(matches!(result, Err(ExecutorError::TaskCancelled(_))));
 
     cancel_handle.await.unwrap();
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -1070,6 +1051,10 @@ mod tests {
       .open()
       .expect("Failed to open in-memory Sled database");
 
+    let mut extra = HashMap::new();
+    let cmd_value = Value::String("nonexistent_command".to_string());
+    extra.insert("shell".to_owned(), cmd_value);
+
     let task_config = TaskConfig::builder()
       .id("ignore_error_task".to_string())
       .name("ignore_error_task".to_string())
@@ -1077,7 +1062,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .cmd(Some("nonexistent_command".to_string()))
+      .extra(extra)
       .ignore_errors(Some(true))
       .build()
       .unwrap();
@@ -1086,12 +1071,33 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
-      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .execute(
+        plugin_manager.clone(),
+        cache,
+        fingerprint,
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap(), "");
+    plugin_manager.shutdown_all().await;
   }
 
   #[tokio::test]
@@ -1112,11 +1118,32 @@ mod tests {
 
     let cache = Arc::new(Mutex::new(IndexMap::new()));
     let fingerprint = Arc::new(db);
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_tpl";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_tpl.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     let result = task
-      .execute(cache, fingerprint, false, false, CancellationToken::new())
+      .execute(
+        plugin_manager.clone(),
+        cache,
+        fingerprint,
+        false,
+        false,
+        CancellationToken::new(),
+      )
       .await
       .unwrap();
     assert_eq!(result, "Result: dep_output");
+    plugin_manager.shutdown_all().await;
   }
 }

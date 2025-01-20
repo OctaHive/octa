@@ -16,11 +16,17 @@ pub enum ExecutorError {
   #[error("Task {0} cancelled")]
   TaskCancelled(String),
 
+  #[error("Missing plugin keys in task")]
+  TaskParsedError,
+
   #[error("Cycle detected in task dependencies")]
   CycleDetected,
 
   #[error("Command not found: {0}")]
   CommandNotFound(String),
+
+  #[error("Failed to parse YAML Value: {0}")]
+  DeserializeError(#[from] serde_yml::Error),
 
   #[error("Task not found: {0}")]
   TaskNotFound(String),
@@ -60,6 +66,9 @@ pub enum ExecutorError {
 
   #[error("IO error: {0}")]
   IoError(#[from] std::io::Error),
+
+  #[error("Failed to convert {0} yaml Value to json Value: {1}")]
+  ExtraValueConvertError(String, String),
 
   #[error("Task join error: {0}")]
   JoinError(#[from] task::JoinError),

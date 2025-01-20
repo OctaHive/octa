@@ -25,6 +25,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Build plugin
+        run: |
+          cargo build -p octa_plugin_shell
+          cp target/debug/octa_plugin_shell plugins
+          cargo build -p octa_plugin_tpl
+          cp target/debug/octa_plugin_tpl plugins
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate code coverage

@@ -81,10 +81,20 @@ jobs:
         shell: bash
         run: |
           cd target/${{ matrix.platform.target }}/release
+          mkdir ./release
+          mkdir ./release/plugins
           if [[ "${{ matrix.platform.os }}" == "windows-latest" ]]; then
-            7z a ../../../${{ matrix.platform.name }} ${{ matrix.platform.bin }}
+            cp ./octa_plugin_shell.exe ./release/plugins
+            cp ./octa_plugin_tpl.exe ./release/plugins
+            cp octa.exe ./release
+
+            7z a ../../../${{ matrix.platform.name }} ./release/*
           else
-            tar czvf ../../../${{ matrix.platform.name }} ${{ matrix.platform.bin }}
+            cp ./octa_plugin_shell ./release/plugins
+            cp ./octa_plugin_tpl ./release/plugins
+            cp octa ./release
+
+            tar czvf ../../../${{ matrix.platform.name }} -C ./release .
           fi
           cd -
 

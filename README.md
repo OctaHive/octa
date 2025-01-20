@@ -7,6 +7,7 @@ This project was inspired by the go-task build project. However, when we rewriti
 functionality missing, so I decided to create my own builder. 
 
 # The differences from go-task
+* Support for a plugin system to extend the builder’s functionality
 * Support run tasks using wildcards, for example `*:docker` run all first child docker tasks, or you can run `**:docker` and run all nested docker task
 * Support returning dependency task results. This is useful, for example, when you need to process the result of a task in its parent task.
 * Support rendering templates and return result of rendering as task result
@@ -81,7 +82,7 @@ file, or reaches the root directory with no further folders to check.
 To run a task from your global Octafile located in your home directory, use the --global or -g flag. This is ideal for managing 
 personal tasks that aren’t tied to a specific project.
 
-You can also run tasks from a specific file by simply passing it with the `--config` or `-c` flag, e.g., `octa -c project_tasks.yml build`.
+You can also run tasks from a specific file by simply passing it with the `--octafile` or `-o` flag, e.g., `octa -o project_tasks.yml build`.
 
 # Including task files
 If you have a large project with deep nesting structure, keeping all tasks in a single file can be inconvenient. Additionally, different 
@@ -167,7 +168,7 @@ version: 1
 
 tasks:
   web:
-    cmd: echo {{ COMMAND_ARGS }}
+    shell: echo {{ COMMAND_ARGS }}
 ```
 
 ```console
@@ -251,16 +252,16 @@ vars:
   
 tasks:
   say_hi:
-    cmd: echo {{ STR }}
+    shell: echo {{ STR }}
     
   plus_one:
-    cmd: echo {{ NUM + 1 }}
+    shell: echo {{ NUM + 1 }}
     
   print_obj:
-    cmd: echo {{ OBJ.val }}
+    shell: echo {{ OBJ.val }}
 
   print_arr:
-    cmd: echo {{ ARR[0] }}
+    shell: echo {{ ARR[0] }}
 ```
 
 You can use different data types as values. The following data types are supported:
@@ -342,12 +343,12 @@ task:
   simple: echo Simple Task
   
   complex:
-    cmd: echo Complex task
+    shell: echo Complex task
 ```
 
 ## Task command
 Each task can have commands that will be executed in the command line (defaults to cmd in 
-Windows and bash in Unix/Mac). There are two ways to set commands in a task: `cmd` and `cmds`. 
+Windows and bash in Unix/Mac). There are two ways to set commands in a task: `shell` and `cmds`. 
 The cmds variant allows you to set multiple commands, which will be executed in sequence.
 
 ```yaml
@@ -355,7 +356,7 @@ version: 1
   
 tasks:
   simple:
-    cmd: echo Hello World!
+    shell: echo Hello World!
     
   multiple:
     cmds:
@@ -394,7 +395,7 @@ tasks:
           - LOG_LEVEL=Debug
 
   docker-compose:
-    cmd: echo "{{ deps_result['docker-compose-service'] }}"
+    shell: echo "{{ deps_result['docker-compose-service'] }}"
     deps:
       - docker-compose-service
 ```
@@ -440,7 +441,7 @@ version: 1
 
 tasks:
   build:
-    cmd: go build main.go
+    shell: go build main.go
     dir: ./service
 ```
 
@@ -454,7 +455,7 @@ version: 1
 
 tasks:
   build:
-    cmd: go build main.go
+    shell: go build main.go
     dir: "{{ USER_WORKING_DIR }}"
 ```
 
@@ -478,10 +479,10 @@ version: 1
 
 tasks:
   prev:
-    cmd: echo Start
+    shell: echo Start
   
   next:
-    cmd: echo Finish
+    shell: echo Finish
     
   run:
     cmds:
@@ -502,11 +503,11 @@ version: 1
 tasks:
   build_win: 
     platforms: ["windows"]
-    cmd: echo Windows build
+    shell: echo Windows build
   
   build_mac: 
     platforms: ["macos/arm64"]
-    cmd: echo Mac OS build
+    shell: echo Mac OS build
     
   build:
     cmds:
@@ -536,7 +537,7 @@ tasks:
   prepare_two: echo Prepare two
   
   complex_task:
-    cmd: echo All deps task completed
+    shell: echo All deps task completed
     deps:
       - prepare_one
       - prepare_two
@@ -555,7 +556,7 @@ tasks:
   task2: echo 2
 
   global:
-    cmd: echo {{ deps_result.task1 | int + deps_result.task2 | int }}
+    shell: echo {{ deps_result.task1 | int + deps_result.task2 | int }}
     deps:
       - task1
       - task2
@@ -580,12 +581,12 @@ version: 1
 
 tasks:
   long: 
-    cmd: sleep 10
+    shell: sleep 10
     run: once
   
   task:
     run: changed
-    cmd: echo {{ CONTENT }}
+    shell: echo {{ CONTENT }}
     deps:
       - long
       
@@ -615,7 +616,7 @@ tasks:
   build:
     sources:
       - ./src/*
-    cmd: echo Run build
+    shell: echo Run build
 ```
 
 If we run this task again, the command will complete without actually executing:
@@ -656,12 +657,15 @@ version: 1
 
 tasks:
   hello:
-    cmd: echo Hello
+    shell: echo Hello
     preconditions:
       - "{{ deps_result.build == 'true' }}"
     deps:
       - build
 
   build:
-    cmd: echo true
+    shell: echo true
 ```
+
+# Plugins
+Information about plugins you can find in plugins documentation [here](https://github.com/OctaHive/octa/blob/main/docs/plugin.md)

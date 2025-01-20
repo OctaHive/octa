@@ -11,8 +11,14 @@ pub enum OctaError {
   #[error("Failed to execute task: {0}")]
   Runtime(String),
 
+  #[error("Failed to start plugin: {0}")]
+  PluginStartError(String),
+
   #[error("Failed to load .env file")]
   Dotenv(#[from] DotenvError),
+
+  #[error("Failed to load config file: {0}")]
+  ConfigLoadError(String),
 
   #[error(transparent)]
   OctafileLoad(#[from] OctafileError),

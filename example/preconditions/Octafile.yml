@@ -2,11 +2,11 @@ version: 1
 
 tasks:
   hello:
-    cmd: echo Hello
+    shell: echo Hello
     preconditions:
       - "{{ deps_result.build == 'true' }}"
     deps:
       - build
 
   build:
-    cmd: echo true
+    shell: echo true
