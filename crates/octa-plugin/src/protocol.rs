@@ -31,7 +31,7 @@ pub enum OctaCommand {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
+#[serde(tag = "type", content = "payload")]
 pub enum PluginResponse {
   Hello(Version),
   Schema(Schema),

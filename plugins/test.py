@@ -18,8 +18,10 @@ class CommandHandler:
     def handle_hello(self, cmd):
         response = {
             "type": "Hello",
-            "version": "0.2.0",
-            "features": []
+            "payload": {
+              "version": "0.2.0",
+              "features": []
+            }
         }
         return False, [response]
 
@@ -29,23 +31,29 @@ class CommandHandler:
         # Send Started
         started = {
             "type": "Started",
-            "id": "test-execution-id"
+            "payload": {
+              "id": "test-execution-id"
+            }
         }
         response.append(started)
 
         # Send stdout
         stdout = {
             "type": "Stdout",
-            "id": "test-execution-id",
-            "line": "test output"
+            "payload": {
+              "id": "test-execution-id",
+              "line": "test output"
+            }
         }
         response.append(stdout)
 
         # Send exit status
         exit_status = {
             "type": "ExitStatus",
-            "id": "test-execution-id",
-            "code": 0
+            "payload": {
+              "id": "test-execution-id",
+              "code": 0
+            }
         }
         response.append(exit_status)
 
@@ -54,14 +62,18 @@ class CommandHandler:
     def handle_schema(self, cmd):
       response = {
           "type": "Schema",
-          "key": "key",
+          "payload": {
+            "key": "key",
+          }
       }
       return False, [response]
 
     def handle_shutdown(self, cmd):
         response = {
             "type": "Shutdown",
-            "message": "Shutting down"
+            "payload": {
+              "message": "Shutting down"
+            }
         }
         return True, [response]
 
