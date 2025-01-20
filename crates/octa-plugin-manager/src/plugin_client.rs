@@ -220,6 +220,7 @@ impl PluginClient {
     });
   }
 
+  #[allow(clippy::too_many_arguments)]
   pub async fn execute(
     &mut self,
     command: String,
