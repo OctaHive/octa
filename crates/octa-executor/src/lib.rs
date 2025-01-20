@@ -117,6 +117,7 @@ impl TaskGraphBuilder {
     Ok(dag)
   }
 
+  #[allow(clippy::too_many_arguments)]
   async fn process_command(
     &self,
     dag: &mut DagNode,
@@ -246,7 +247,7 @@ impl TaskGraphBuilder {
                     }
 
                     let (key, value) = plugin_key.unwrap();
-                    let simple = self.create_simple_command(&key, command, &to_string(value).unwrap());
+                    let simple = self.create_simple_command(key, command, &to_string(value).unwrap());
 
                     // Fix command name
                     let task = self.create_task_node(
@@ -305,6 +306,7 @@ impl TaskGraphBuilder {
     }
   }
 
+  #[allow(clippy::too_many_arguments)]
   async fn process_deps_command(
     &self,
     dag: &mut DagNode,
@@ -429,7 +431,7 @@ impl TaskGraphBuilder {
 
                     let (key, value) = plugin_key.unwrap();
 
-                    let simple = self.create_simple_command(&key, command, &to_string(value).unwrap());
+                    let simple = self.create_simple_command(key, command, &to_string(value).unwrap());
 
                     let task = self.create_task_node(
                       dag,
