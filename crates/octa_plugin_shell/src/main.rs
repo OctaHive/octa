@@ -96,6 +96,7 @@ impl Plugin for ShellPlugin {
   async fn execute_command(
     &self,
     id: String,
+    dry: bool,
     command: String,
     _args: Vec<String>,
     dir: PathBuf,
@@ -128,24 +129,7 @@ impl Plugin for ShellPlugin {
       .render(&template_name, &context)
       .context(format!("Failed to render template: {:?}", context))?;
 
-    #[cfg(windows)]
-    let mut command = setup_windows_command(&result, &dir, envs);
-
-    #[cfg(not(windows))]
-    let mut command = setup_unix_command(&result, &dir, envs);
-
-    let mut child = command.spawn()?;
-
-    let stdout = child.stdout.take().context("Failed to capture stdout")?;
-    let stderr = child.stderr.take().context("Failed to capture stderr")?;
-
     let (tx, mut rx): (mpsc::Sender<String>, mpsc::Receiver<String>) = mpsc::channel(100);
-    let tx_stdout = tx.clone();
-    let tx_stderr = tx.clone();
-
-    let (tx_done, mut rx_done) = mpsc::channel::<()>(2);
-    let tx_done_stdout = tx_done.clone();
-    let tx_done_stderr = tx_done.clone();
 
     let writer_handle = tokio::spawn({
       let writer = Arc::clone(&writer);
@@ -157,6 +141,37 @@ impl Plugin for ShellPlugin {
         }
       }
     });
+
+    if dry {
+      logger.log(&format!("Run command in dry mode: {}", result))?;
+
+      let response = PluginResponse::ExitStatus {
+        id: id.clone(),
+        code: 0,
+      };
+      let response_json = serde_json::to_string(&response).unwrap() + "\n";
+      let _ = tx.send(response_json.clone()).await;
+
+      return Ok(());
+    }
+
+    #[cfg(windows)]
+    let mut command = setup_windows_command(&result, &dir, envs);
+
+    #[cfg(not(windows))]
+    let mut command = setup_unix_command(&result, &dir, envs);
+
+    let mut child = command.spawn()?;
+
+    let stdout = child.stdout.take().context("Failed to capture stdout")?;
+    let stderr = child.stderr.take().context("Failed to capture stderr")?;
+
+    let tx_stdout = tx.clone();
+    let tx_stderr = tx.clone();
+
+    let (tx_done, mut rx_done) = mpsc::channel::<()>(2);
+    let tx_done_stdout = tx_done.clone();
+    let tx_done_stderr = tx_done.clone();
 
     let stdout_handle = {
       let id = id.clone();
@@ -374,6 +389,7 @@ mod tests {
     let result = plugin
       .execute_command(
         "test-id".to_string(),
+        false,
         format!("echo {}", test_string),
         vec![],
         dir,
@@ -438,6 +454,7 @@ mod tests {
     let result = plugin
       .execute_command(
         "test-id".to_string(),
+        false,
         command.to_string(),
         vec![],
         dir,

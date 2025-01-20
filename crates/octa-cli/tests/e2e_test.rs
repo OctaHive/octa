@@ -1,7 +1,7 @@
 use std::{env, fs::File, io::Write};
 
 use assert_cmd::Command;
-use predicates::prelude::predicate;
+use predicates::prelude::{predicate, PredicateBooleanExt};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -258,6 +258,37 @@ fn test_env_file() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_dry_run() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
+  let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
+  file.write_all(
+    r#"
+      version: 1
+      tasks:
+        test:
+          shell: touch test.txt
+    "#
+    .as_bytes(),
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.args(["--dry", "test"]);
+
+  cmd.assert().success();
+
+  assert!(
+    !tmp_dir.path().join("test.txt").exists(),
+    "File should not be created in dry run mode"
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_task_run_mode() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");
@@ -314,6 +345,166 @@ fn test_task_run_mode() -> Result<(), Box<dyn std::error::Error>> {
   ];
 
   assert_eq!(lines, expected_lines);
+
+  Ok(())
+}
+
+#[test]
+fn test_parallel_execution() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
+  let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
+  file.write_all(
+    r#"
+      version: 1
+      tasks:
+        parallel_test:
+          cmds:
+            - task: task1
+            - task: task2
+            - task: task3
+
+        task1:
+          shell: echo "task1"
+
+        task2:
+          shell: echo "task2"
+
+        task3:
+          shell: echo "task3"
+    "#
+    .as_bytes(),
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.args(["--parallel", "parallel_test"]);
+
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("task1"))
+    .stdout(predicate::str::contains("task2"))
+    .stdout(predicate::str::contains("task3"));
+
+  Ok(())
+}
+
+#[test]
+fn test_list_tasks() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
+  let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
+  file.write_all(
+    r#"
+      version: 1
+      tasks:
+        task1:
+          desc: "First task"
+          shell: echo "task1"
+
+        task2:
+          desc: "Second task"
+          shell: echo "task2"
+
+        _internal:
+          internal: true
+          shell: echo "internal"
+    "#
+    .as_bytes(),
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.arg("--list-tasks");
+
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("task1: First task"))
+    .stdout(predicate::str::contains("task2: Second task"))
+    .stdout(predicate::str::contains("_internal").not());
+
+  Ok(())
+}
+
+#[test]
+fn test_clean_cache() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
+  let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
+  file.write_all(
+    r#"
+      version: 1
+      tasks:
+        test:
+          run: changed
+          shell: echo "test"
+    "#
+    .as_bytes(),
+  )?;
+
+  // Run task first time
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.arg("test");
+  cmd.assert().success();
+
+  // Clean cache
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.arg("--clean-cache");
+  cmd.assert().success();
+
+  // Run task again - should execute because cache was cleaned
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.arg("test");
+  cmd.assert().success().stdout(predicate::str::contains("test"));
+
+  Ok(())
+}
+
+#[test]
+fn test_force_execution() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new().unwrap();
+  let package_root = env::current_dir().unwrap().join("../../plugins");
+  let mut file = File::create(tmp_dir.path().join("octafile.yml"))?;
+  file.write_all(
+    r#"
+      version: 1
+      tasks:
+        test:
+          run: changed
+          shell: echo "forced"
+    "#
+    .as_bytes(),
+  )?;
+
+  // Run task first time
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.arg("test");
+  cmd.assert().success();
+
+  // Run task with force flag
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.args(["--force", "test"]);
+  cmd.assert().success().stdout(predicate::str::contains("forced"));
 
   Ok(())
 }

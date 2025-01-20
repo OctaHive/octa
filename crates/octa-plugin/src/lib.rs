@@ -53,6 +53,7 @@ pub trait Plugin: Send + Sync + 'static {
   async fn execute_command(
     &self,
     id: String,
+    dry: bool,
     command: String,
     args: Vec<String>,
     dir: PathBuf,
@@ -117,6 +118,7 @@ where
       dir,
       envs,
       vars,
+      dry,
     } => {
       let id = Uuid::new_v4().to_string();
 
@@ -141,6 +143,7 @@ where
         if let Err(e) = plugin
           .execute_command(
             command_id.clone(),
+            dry,
             command,
             args,
             dir,
@@ -542,6 +545,7 @@ mod tests {
     async fn execute_command(
       &self,
       id: String,
+      _dry: bool,
       command: String,
       args: Vec<String>,
       _dir: PathBuf,
@@ -626,6 +630,7 @@ mod tests {
         map
       },
       vars: HashMap::new(),
+      dry: false,
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -717,6 +722,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      dry: false,
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -766,6 +772,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      dry: false,
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -819,6 +826,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      dry: false,
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -918,6 +926,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      dry: false,
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -970,6 +979,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs,
       vars: HashMap::new(),
+      dry: false,
     };
 
     let response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -1018,6 +1028,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      dry: false,
     };
 
     let _response_handle = tokio::spawn(async move { read_responses(reader).await });
@@ -1081,6 +1092,7 @@ mod tests {
         dir: PathBuf::from("."),
         envs: HashMap::new(),
         vars: HashMap::new(),
+        dry: false,
       };
 
       let writer_clone = writer.clone();
@@ -1202,6 +1214,7 @@ mod tests {
       dir: PathBuf::from("/test/dir"),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      dry: false,
     };
     let cmd_json = serde_json::to_string(&cmd_command).unwrap() + "\n";
     writer.write_all(cmd_json.as_bytes()).await.unwrap();

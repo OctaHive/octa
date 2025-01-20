@@ -448,6 +448,7 @@ mod tests {
     let execution_id = client
       .execute(
         "test".to_string(),
+        false,
         vec![],
         PathBuf::from("."),
         HashMap::new(),

@@ -327,6 +327,7 @@ impl TaskNode {
     &self,
     plugin_manager: Arc<PluginManager>,
     plugin_name: &str,
+    dry: bool,
     command: String,
     args: Vec<String>,
     dir: PathBuf,
@@ -349,7 +350,7 @@ impl TaskNode {
     let result = async {
       // Start command execution with cancellation support
       let command_id = client
-        .execute(command.clone(), args, dir, vars, envs, cancel_token.clone())
+        .execute(command.clone(), dry, args, dir, vars, envs, cancel_token.clone())
         .await
         .map_err(io::Error::from)?;
 
@@ -627,6 +628,7 @@ impl Executable<TaskNode> for TaskNode {
       .execute_plugin_command(
         plugin_manager,
         &result[0].0,
+        dry,
         result[0].1.to_string().trim_matches('"').to_owned(),
         vec![],
         dir,

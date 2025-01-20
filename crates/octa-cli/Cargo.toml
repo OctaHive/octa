@@ -19,6 +19,7 @@ octa-finder = { version = "0.1.0", path = "../octa-finder" }
 octa-octafile = { version = "0.1.0", path = "../octa-octafile" }
 octa-executor = { version = "0.1.0", path = "../octa-executor" }
 octa-plugin-manager = { version = "0.1.0", path = "../octa-plugin-manager" }
+octa-plugin = { version = "0.1.0", path = "../octa-plugin" }
 clap_complete = "4"
 clap = { version = "4.5", features = ["derive", "env"] }
 chrono = "0.4.39"

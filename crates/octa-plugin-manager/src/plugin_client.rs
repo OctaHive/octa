@@ -223,6 +223,7 @@ impl PluginClient {
   pub async fn execute(
     &mut self,
     command: String,
+    dry: bool,
     args: Vec<String>,
     dir: PathBuf,
     vars: HashMap<String, Value>,
@@ -235,6 +236,7 @@ impl PluginClient {
       dir,
       envs,
       vars,
+      dry,
     };
 
     let cmd_json = serde_json::to_string(&cmd)? + "\n";
@@ -559,6 +561,7 @@ mod tests {
       TIMEOUT,
       client.execute(
         "test".to_string(),
+        false,
         vec![],
         PathBuf::from("."),
         HashMap::new(),
@@ -635,6 +638,7 @@ mod tests {
     let result = client
       .execute(
         "test".to_string(),
+        false,
         vec![],
         PathBuf::from("."),
         HashMap::new(),
@@ -683,6 +687,7 @@ mod tests {
           client
             .execute(
               format!("test{}", i),
+              false,
               vec![],
               PathBuf::from("."),
               HashMap::new(),
@@ -824,6 +829,7 @@ mod tests {
       let result = client
         .execute(
           format!("test{}", i),
+          false,
           vec![],
           PathBuf::from("."),
           HashMap::new(),

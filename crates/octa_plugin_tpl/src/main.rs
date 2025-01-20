@@ -24,6 +24,7 @@ impl Plugin for TemplatePlugin {
   async fn execute_command(
     &self,
     id: String,
+    _dry: bool,
     command: String,
     _args: Vec<String>,
     _dir: PathBuf,
@@ -161,6 +162,7 @@ mod tests {
     let result = plugin
       .execute_command(
         "test-id".to_string(),
+        false,
         "{{ name }}".to_owned(),
         vec![],
         dir,

@@ -25,6 +25,7 @@ pub enum OctaCommand {
     dir: PathBuf,
     envs: HashMap<String, String>,
     vars: HashMap<String, Value>,
+    dry: bool,
   },
   Shutdown,
 }

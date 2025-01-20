@@ -11,9 +11,11 @@ use clap::{CommandFactory, Parser};
 use clap_complete::aot::{generate, Generator, Shell};
 use lazy_static::lazy_static;
 use logger::{ChronoLocal, OctaFormatter};
+use octa_plugin::protocol::Schema;
 use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Deserialize;
 use tokio::signal;
+use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::{
@@ -31,6 +33,7 @@ mod error;
 mod logger;
 
 const DEFAULT_PLUGINS: [&str; 2] = ["shell", "tpl"];
+const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 struct PluginConfig {
@@ -105,6 +108,154 @@ struct ExecuteItem {
   command: String,
 }
 
+/// Sets up signal handling for graceful shutdown
+async fn setup_signal_handling(cancel_token: CancellationToken) {
+  tokio::spawn(async move {
+    let ctrl_c = async {
+      signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+      signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("failed to install signal handler")
+        .recv()
+        .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received Ctrl-C, shutting down...");
+            cancel_token.cancel()
+        },
+        _ = terminate => {
+            info!("Received terminate, shutting down...");
+            cancel_token.cancel()
+        },
+    }
+  });
+}
+
+/// Sets up logging based on verbosity and test environment
+fn setup_logging(verbose: bool) -> OctaResult<()> {
+  let filter_layer = EnvFilter::try_from_default_env()
+    .or_else(|_| {
+      if verbose {
+        EnvFilter::try_new("debug")
+      } else {
+        EnvFilter::try_new("info")
+      }
+    })
+    .unwrap();
+
+  let pretty_print = env::var("OCTA_TESTS").is_err();
+  if pretty_print {
+    let fmt_layer = fmt::layer()
+      .compact()
+      .with_timer(ChronoLocal)
+      .with_file(false)
+      .with_line_number(false)
+      .with_span_events(FmtSpan::CLOSE)
+      .event_format(OctaFormatter);
+
+    tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
+  } else {
+    let fmt_layer = fmt::layer()
+      .compact()
+      .with_file(false)
+      .with_level(false)
+      .without_time()
+      .with_target(false)
+      .with_line_number(false)
+      .with_span_events(FmtSpan::CLOSE);
+
+    tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
+  }
+  Ok(())
+}
+
+/// Initializes plugin manager and loads plugins
+async fn initialize_plugins(
+  plugin_manager: Arc<PluginManager>,
+  config_plugins: Vec<String>,
+) -> OctaResult<(Arc<PluginManager>, HashMap<String, Schema>)> {
+  let mut plugin_futures = Vec::new();
+  let plugins = [config_plugins, DEFAULT_PLUGINS.iter().map(|s| s.to_string()).collect()].concat();
+
+  // Start all plugins in parallel
+  for plugin in plugins {
+    #[cfg(not(windows))]
+    let plugin_name = format!("octa_plugin_{}", plugin);
+    #[cfg(windows)]
+    let plugin_name = format!("octa_plugin_{}.exe", plugin);
+
+    let plugin_manager = plugin_manager.clone();
+    let plugin_key = plugin.clone();
+
+    let future = tokio::spawn(async move {
+      match timeout(PLUGIN_TIMEOUT, plugin_manager.start_plugin(&plugin_name)).await {
+        Ok(Ok(schema)) => Ok((plugin_key, schema)),
+        Ok(Err(e)) => Err(OctaError::PluginStartError(format!("Plugin error: {}", e))),
+        Err(_) => Err(OctaError::PluginStartError(format!("Plugin timeout: {}", plugin_name))),
+      }
+    });
+
+    plugin_futures.push(future);
+  }
+
+  // Collect results
+  let mut plugin_keys = HashMap::new();
+  for future in plugin_futures {
+    match future.await {
+      Ok(Ok((plugin, schema))) => {
+        plugin_keys.insert(plugin, schema);
+      },
+      Ok(Err(e)) => return Err(e),
+      Err(e) => return Err(OctaError::Runtime(e.to_string())),
+    }
+  }
+
+  Ok((plugin_manager, plugin_keys))
+}
+
+/// Executes tasks either in parallel or sequentially
+async fn execute_tasks(tasks: Vec<ExecuteItem>, parallel: bool, cancel_token: CancellationToken) -> OctaResult<()> {
+  if parallel {
+    let mut handles = Vec::with_capacity(tasks.len());
+    let mut results = Vec::with_capacity(tasks.len());
+
+    // Spawn all tasks
+    for task in tasks {
+      let cancel_token = cancel_token.clone();
+      let handle = tokio::spawn(async move { task.executor.execute(cancel_token, &task.command).await });
+      handles.push(handle);
+    }
+
+    // Wait for all tasks to complete
+    for handle in handles {
+      match handle.await {
+        Ok(result) => results.push(result),
+        Err(e) => return Err(error::OctaError::Runtime(e.to_string())),
+      }
+    }
+
+    // Check if any task failed
+    for result in results {
+      if let Err(e) = result {
+        return Err(OctaError::ExecutionError(e));
+      }
+    }
+  } else {
+    for task in tasks {
+      task.executor.execute(cancel_token.clone(), &task.command).await?;
+    }
+  }
+  Ok(())
+}
+
 pub async fn run() -> OctaResult<()> {
   // Parse command line arguments
   let args = Cli::parse();
@@ -117,71 +268,17 @@ pub async fn run() -> OctaResult<()> {
 
   // Load environments
   let _ = dotenvy::dotenv();
-
-  // Configure the subscriber with a custom format layer
-  let filter_layer = EnvFilter::try_from_default_env()
-    .or_else(|_| {
-      if args.verbose {
-        EnvFilter::try_new("debug")
-      } else {
-        EnvFilter::try_new("info")
-      }
-    })
-    .unwrap();
-
-  let pretty_print = env::var("OCTA_TESTS").is_err();
-
-  if pretty_print {
-    // Create formatting layer
-    let fmt_layer = fmt::layer()
-      .compact()
-      .with_timer(ChronoLocal)
-      .with_file(false)
-      .with_line_number(false)
-      .with_span_events(FmtSpan::CLOSE)
-      .event_format(OctaFormatter);
-
-    // Combine layers and set as global default
-    tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
-  } else {
-    // Create formatting layer
-    let fmt_layer = fmt::layer()
-      .compact()
-      .with_file(false)
-      .with_level(false)
-      .without_time()
-      .with_target(false)
-      .with_line_number(false)
-      .with_span_events(FmtSpan::CLOSE);
-
-    tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
-  }
+  setup_logging(args.verbose)?;
 
   let plugins_dir = std::env::var("OCTA_PLUGINS_DIR").unwrap_or_else(|_| "plugins".to_string());
-  let plugin_manager = PluginManager::new(plugins_dir);
+  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
 
   let config_plugins = match args.config {
-    Some(config) => {
-      let config = load_config(config)?;
-      Ok::<Vec<String>, OctaError>(config.plugins)
-    },
-    None => Ok(vec![]),
-  }?;
+    Some(config) => load_config(config)?.plugins,
+    None => vec![],
+  };
 
-  let mut plugin_keys = HashMap::new();
-  let plugins = [config_plugins, DEFAULT_PLUGINS.iter().map(|s| s.to_string()).collect()].concat();
-  for plugin in plugins {
-    // Shell plugin loaded always
-    #[cfg(not(windows))]
-    let plugin_name = format!("octa_plugin_{}", plugin);
-    #[cfg(windows)]
-    let plugin_name = format!("octa_plugin_{}.exe", plugin);
-
-    let schema = plugin_manager.start_plugin(&plugin_name).await.unwrap();
-    plugin_keys.insert(plugin, schema);
-  }
-
-  let plugin_manager = Arc::new(plugin_manager);
+  let (plugin_manager, plugin_keys) = initialize_plugins(plugin_manager.clone(), config_plugins).await?;
 
   // Load octafile
   let octafile = Octafile::load(args.octafile, args.global, plugin_keys.keys().cloned().collect())?;
@@ -191,37 +288,7 @@ pub async fn run() -> OctaResult<()> {
   }
 
   let cancel_token = CancellationToken::new();
-  // Start task for catching interrupt
-  tokio::spawn({
-    let cancel_token = cancel_token.clone();
-    async move {
-      let ctrl_c = async {
-        signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
-      };
-
-      #[cfg(unix)]
-      let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-          .expect("failed to install signal handler")
-          .recv()
-          .await;
-      };
-
-      #[cfg(not(unix))]
-      let terminate = std::future::pending::<()>();
-
-      tokio::select! {
-        _ = ctrl_c => {
-          info!("Received Ctrl-C, shutting down...");
-          cancel_token.cancel()
-        },
-        _ = terminate => {
-          info!("Received terminate, shutting down...");
-          cancel_token.cancel()
-        },
-      }
-    }
-  });
+  setup_signal_handling(cancel_token.clone()).await;
 
   if args.list_tasks {
     let finder = OctaFinder::new();
@@ -280,36 +347,7 @@ pub async fn run() -> OctaResult<()> {
     });
   }
 
-  if args.parallel {
-    let mut handles = Vec::with_capacity(tasks.len());
-    let mut results = Vec::with_capacity(tasks.len());
-
-    // Spawn all tasks
-    for task in tasks {
-      let cancel_token = cancel_token.clone();
-      let handle = tokio::spawn(async move { task.executor.execute(cancel_token, &task.command).await });
-      handles.push(handle);
-    }
-
-    // Wait for all tasks to complete
-    for handle in handles {
-      match handle.await {
-        Ok(result) => results.push(result),
-        Err(e) => return Err(error::OctaError::Runtime(e.to_string())),
-      }
-    }
-
-    // Check if any task failed
-    for result in results {
-      if let Err(e) = result {
-        return Err(OctaError::ExecutionError(e));
-      }
-    }
-  } else {
-    for task in tasks {
-      task.executor.execute(cancel_token.clone(), &task.command).await?;
-    }
-  }
+  execute_tasks(tasks, args.parallel, cancel_token).await?;
 
   if args.summary {
     summary.print().await;

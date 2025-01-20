@@ -1001,6 +1001,7 @@ dependencies = [
  "octa-executor",
  "octa-finder",
  "octa-octafile",
+ "octa-plugin",
  "octa-plugin-manager",
  "predicates",
  "pretty_assertions",
