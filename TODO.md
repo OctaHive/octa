@@ -7,3 +7,6 @@
 - Add option to provide template like file on disk
 - Add better output for cli
 - Add default for default task if no task is specified
+- Add search for printing list of available commands
+- Add posibility to set shell for command
+- Rewrite to yaml-rust for parsing yaml with support of task annotations
