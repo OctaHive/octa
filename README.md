@@ -668,4 +668,4 @@ tasks:
 ```
 
 # Plugins
-Information about plugins you can find in plugins documentation [here](https://github.com/OctaHive/octa/blob/main/docs/plugin.md)
+Information about plugins you can find in plugins documentation [here](https://github.com/OctaHive/octa/blob/main/docs/plugins.md)
