@@ -1,7 +1,7 @@
 [package]
 name = "octa-plugin"
 description = "Plugin common"
-version = "0.2.0"
+version = "0.2.1"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -14,8 +14,8 @@ include = ["src/"]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = "0.4"
-clap = { version = "4.2", features = ["derive"] }
-ctrlc = "3.4.5"
+clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4.6"
 interprocess = { git = "https://github.com/federico-terzi/interprocess", features = [
   "tokio",
 ] }
@@ -28,5 +28,5 @@ tokio-util = { version = "0.7", features = ["codec"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.14"
-regex = "1.5"
+tempfile = "3.19"
+regex = "1.11"

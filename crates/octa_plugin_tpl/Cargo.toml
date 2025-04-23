@@ -1,7 +1,7 @@
 [package]
 name = "octa_plugin_tpl"
 description = "Plugin for run template commands"
-version = "0.2.0"
+version = "0.2.1"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -17,8 +17,8 @@ bench = false
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-octa-plugin = { version = "0.2.0", path = "../octa-plugin" }
-shellexpand = "3.1.0"
+octa-plugin = { version = "0.2.1", path = "../octa-plugin" }
+shellexpand = "3.1.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tera = { workspace = true }
@@ -26,4 +26,4 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.2"
+tempfile = "3.19"
