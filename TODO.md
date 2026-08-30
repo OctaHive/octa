@@ -1,4 +1,3 @@
 - Add support architecture to platform specific task
 - Add run options to octafile level
 - Add better output for cli
-- Add default for default task if no task is specified

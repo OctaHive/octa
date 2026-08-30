@@ -59,6 +59,9 @@ tasks:
 After creating a Octafile, you can run a tasks by calling `octa` and provide the names of the task to run. Provided tasks will 
 be executed sequentially.
 
+When no task name is provided, Octa runs the task named `default`. If the Octafile does not define
+that task, Octa prints its command-line help instead.
+
 # Task files
 The tasks are defined using the YAML format. So to start create your build tasks you need create task config file. 
 The system currently supports configuration files in the following name variants:

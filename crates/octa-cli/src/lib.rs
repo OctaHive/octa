@@ -33,6 +33,7 @@ mod error;
 mod logger;
 
 const DEFAULT_PLUGINS: [&str; 2] = ["shell", "tpl"];
+const DEFAULT_TASK: &str = "default";
 const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
@@ -353,7 +354,11 @@ pub async fn run() -> OctaResult<()> {
     return Ok(());
   }
 
-  if args.commands.is_none() {
+  if args.commands.is_none()
+    && OctaFinder::new()
+      .find_by_path(Arc::clone(&octafile), DEFAULT_TASK)
+      .is_empty()
+  {
     Cli::command().print_help().unwrap();
     println!();
 
@@ -362,7 +367,8 @@ pub async fn run() -> OctaResult<()> {
 
   let summary = Arc::new(Summary::new());
   let mut tasks = vec![];
-  for command in args.commands.as_ref().unwrap() {
+  let commands = args.commands.unwrap_or_else(|| vec![DEFAULT_TASK.to_string()]);
+  for command in &commands {
     // Create DAG
     let builder = TaskGraphBuilder::new(plugin_manager.clone())?;
     let dag = builder

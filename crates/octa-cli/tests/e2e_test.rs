@@ -70,6 +70,52 @@ fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_run_default_task_when_task_is_not_specified() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+tasks:
+  default:
+    shell: echo "default task"
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success().stdout(predicate::str::contains("default task"));
+
+  Ok(())
+}
+
+#[test]
+fn test_missing_default_task_prints_help() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+tasks:
+  build:
+    shell: echo build
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Usage: octa"))
+    .stderr(predicate::str::contains("Command not found: default").not());
+
+  Ok(())
+}
+
+#[test]
 fn test_run_annotated_plugin_task() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   let package_root = env::current_dir()?.join("../../plugins").canonicalize()?;
