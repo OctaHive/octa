@@ -11,15 +11,25 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
 fn validation_plugins_dir() -> PathBuf {
-  env::var_os("OCTA_E2E_PLUGINS_DIR")
-    .map(PathBuf::from)
-    .unwrap_or_else(|| {
-      env::current_dir()
-        .unwrap()
-        .join("../../plugins")
-        .canonicalize()
-        .unwrap()
-    })
+  if let Some(path) = env::var_os("OCTA_E2E_PLUGINS_DIR") {
+    return PathBuf::from(path);
+  }
+
+  let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
+  #[cfg(windows)]
+  let plugin_names = ["octa_plugin_shell.exe", "octa_plugin_tpl.exe"];
+  #[cfg(not(windows))]
+  let plugin_names = ["octa_plugin_shell", "octa_plugin_tpl"];
+
+  if plugin_names.iter().all(|name| target_dir.join(name).is_file()) {
+    target_dir
+  } else {
+    env::current_dir()
+      .unwrap()
+      .join("../../plugins")
+      .canonicalize()
+      .unwrap()
+  }
 }
 
 #[test]
@@ -580,6 +590,29 @@ fn test_list_tasks() -> Result<(), Box<dyn std::error::Error>> {
     .success()
     .stdout(predicate::str::contains("task1: First task"))
     .stdout(predicate::str::contains("task2: Second task"))
+    .stdout(predicate::str::contains("_internal").not());
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.args(["--search", "SECOND"]);
+
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("task2: Second task"))
+    .stdout(predicate::str::contains("task1").not())
+    .stdout(predicate::str::contains("_internal").not());
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_TESTS", "");
+  cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
+  cmd.args(["--search", "internal"]);
+  cmd
+    .assert()
+    .success()
     .stdout(predicate::str::contains("_internal").not());
 
   Ok(())

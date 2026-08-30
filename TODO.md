@@ -5,4 +5,3 @@
 - Add option to provide template like file on disk
 - Add better output for cli
 - Add default for default task if no task is specified
-- Add search for printing list of available commands

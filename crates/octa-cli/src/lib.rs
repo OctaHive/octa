@@ -75,6 +75,10 @@ pub(crate) struct Cli {
   #[arg(short, long, default_value_t = false)]
   pub list_tasks: bool,
 
+  /// Search available tasks by qualified name or description
+  #[arg(long, value_name = "QUERY", conflicts_with = "commands")]
+  pub search: Option<String>,
+
   #[arg(short, long, default_value_t = false)]
   pub dry: bool,
 
@@ -303,9 +307,12 @@ pub async fn run() -> OctaResult<()> {
   let cancel_token = CancellationToken::new();
   setup_signal_handling(cancel_token.clone()).await;
 
-  if args.list_tasks {
+  if args.list_tasks || args.search.is_some() {
     let finder = OctaFinder::new();
-    let commands = finder.find_by_path(Arc::clone(&octafile), "**");
+    let commands = match args.search.as_deref() {
+      Some(query) => finder.search(Arc::clone(&octafile), query),
+      None => finder.find_by_path(Arc::clone(&octafile), "**"),
+    };
     let filtered = commands.into_iter().filter(|cmd| !cmd.task.internal.unwrap_or(false));
     let found_commands: Vec<(String, Option<String>)> = filtered.map(|c| (c.name.clone(), c.task.desc)).collect();
 
@@ -452,5 +459,13 @@ mod tests {
   fn test_cli_global() {
     let cli = Cli::parse_from(["octa", "--global", "build"]);
     assert!(cli.global);
+  }
+
+  #[test]
+  fn test_cli_search() {
+    let cli = Cli::parse_from(["octa", "--search", "build"]);
+
+    assert_eq!(cli.search.as_deref(), Some("build"));
+    assert!(cli.commands.is_none());
   }
 }

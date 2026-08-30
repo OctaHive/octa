@@ -84,6 +84,21 @@ personal tasks that aren’t tied to a specific project.
 
 You can also run tasks from a specific file by simply passing it with the `--octafile` or `-o` flag, e.g., `octa -o project_tasks.yml build`.
 
+## Listing and searching tasks
+
+Use `--list-tasks` to print every available task. Internal tasks are omitted from the output.
+
+```console
+octa --list-tasks
+```
+
+Use `--search` to filter the list by a task's qualified name or description. Search is
+case-insensitive and includes names from nested Octafiles, such as `backend:build`.
+
+```console
+octa --search build
+```
+
 # Including task files
 If you have a large project with deep nesting structure, keeping all tasks in a single file can be inconvenient. Additionally, different 
 teams may be responsible for building different parts of the project. To address this, you can split your tasks across multiple files and 

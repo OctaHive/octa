@@ -62,6 +62,24 @@ impl OctaFinder {
     results
   }
 
+  /// Finds tasks whose qualified name or description contains the query.
+  pub fn search(&self, octafile: Arc<Octafile>, query: &str) -> Vec<FindResult> {
+    let query = query.to_lowercase();
+
+    self
+      .find_by_path(octafile, "**")
+      .into_iter()
+      .filter(|result| {
+        result.name.to_lowercase().contains(&query)
+          || result
+            .task
+            .desc
+            .as_ref()
+            .is_some_and(|description| description.to_lowercase().contains(&query))
+      })
+      .collect()
+  }
+
   /// Recursively searches for tasks matching the path pattern
   fn search_recursive(
     &self,
@@ -557,5 +575,44 @@ mod tests {
     assert!(task_names.contains(&"task3".to_string()));
     assert!(task_names.contains(&"level1:task1".to_string()));
     assert!(task_names.contains(&"level1:task2".to_string()));
+  }
+
+  #[test]
+  fn test_search_tasks_by_qualified_name_and_description() {
+    let temp_dir = TempDir::new().unwrap();
+    let child_content = r#"
+      version: 1
+      tasks:
+        deploy:
+          desc: Publish service
+          shell: echo deploy
+    "#;
+    let child_path = create_test_yaml(&temp_dir, "backend", child_content);
+    let root_content = format!(
+      r#"
+      version: 1
+      includes:
+        backend:
+          octafile: {}
+      tasks:
+        build:
+          desc: Compile application
+          shell: echo build
+      "#,
+      child_path.display()
+    );
+    let root_path = create_test_yaml(&temp_dir, "", &root_content);
+    let root = Octafile::load(Some(root_path), false, vec![]).unwrap();
+    let finder = OctaFinder::new();
+
+    let by_name = finder.search(Arc::clone(&root), "BACKEND:DEP");
+    assert_eq!(by_name.len(), 1);
+    assert_eq!(by_name[0].name, "backend:deploy");
+
+    let by_description = finder.search(Arc::clone(&root), "compile");
+    assert_eq!(by_description.len(), 1);
+    assert_eq!(by_description[0].name, "build");
+
+    assert!(finder.search(root, "missing").is_empty());
   }
 }
