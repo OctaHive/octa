@@ -41,6 +41,13 @@ fn normalize_platform(value: &str) -> String {
     .collect()
 }
 
+fn normalize_os(value: &str) -> String {
+  match normalize_platform(value).as_str() {
+    "darwin" | "osx" => "macos".to_string(),
+    os => os.to_string(),
+  }
+}
+
 fn normalize_architecture(value: &str) -> String {
   match normalize_platform(value).as_str() {
     "amd64" | "x64" | "x86-64" => "x86_64".to_string(),
@@ -51,11 +58,10 @@ fn normalize_architecture(value: &str) -> String {
 
 fn matches_platform(selector: &str, os_type: &str, os_arch: &str) -> bool {
   if let Some((platform, architecture)) = selector.split_once('/') {
-    return normalize_platform(platform) == os_type && normalize_architecture(architecture) == os_arch;
+    return normalize_os(platform) == os_type && normalize_architecture(architecture) == os_arch;
   }
 
-  let selector = normalize_platform(selector);
-  selector == os_type || normalize_architecture(&selector) == os_arch
+  normalize_os(selector) == os_type || normalize_architecture(selector) == os_arch
 }
 
 pub struct TaskGraphBuilder {
@@ -79,7 +85,7 @@ impl TaskGraphBuilder {
   /// Creates a new TaskGraphBuilder instance
   pub fn new(plugin_manager: Arc<PluginManager>) -> ExecutorResult<Self> {
     let current_dir = env::current_dir()?;
-    let os_type = normalize_platform(&whoami::platform().to_string());
+    let os_type = normalize_os(&whoami::platform().to_string());
     let os_arch = normalize_architecture(&whoami::cpu_arch().to_string());
 
     Ok(Self {
@@ -116,9 +122,10 @@ impl TaskGraphBuilder {
 
     let mut commands = self.find_and_filter_commands(&octafile, command)?;
     commands = self.filter_command_by_platform(commands);
+    let platform_skipped = commands.is_empty();
     commands = self.filter_internal_task(commands);
 
-    if commands.is_empty() {
+    if commands.is_empty() && !platform_skipped {
       return Err(ExecutorError::CommandNotFound(command.to_string()));
     }
 
@@ -137,6 +144,10 @@ impl TaskGraphBuilder {
           Some(run_parallel),
         )
         .await?;
+    }
+
+    if dag.node_count() == 0 {
+      self.create_group_node(&mut dag, Some(AllowedRun::Always), format!("Skipped command {command}"))?;
     }
 
     self.validate_dag(&dag, command)?;
@@ -188,7 +199,11 @@ impl TaskGraphBuilder {
         let mut index = 0;
 
         for cmd in cmds {
-          match cmd {
+          if !self.matches_platforms(cmd.platforms.as_deref()) {
+            continue;
+          }
+
+          match &cmd.value {
             serde_yml::Value::String(s) => {
               let simple = self.create_simple_command("shell", command, s);
 
@@ -366,7 +381,11 @@ impl TaskGraphBuilder {
         let run_parallel = matches!(&command.task.execute_mode, Some(ExecuteMode::Parallel));
 
         for cmd in cmds {
-          match cmd {
+          if !self.matches_platforms(cmd.platforms.as_deref()) {
+            continue;
+          }
+
+          match &cmd.value {
             serde_yml::Value::String(s) => {
               let simple = self.create_simple_command("shell", command, s);
 
@@ -926,16 +945,16 @@ impl TaskGraphBuilder {
   fn filter_command_by_platform(&self, commands: Vec<FindResult>) -> Vec<FindResult> {
     commands
       .into_iter()
-      .filter(|cmd| {
-        if let Some(platforms) = &cmd.task.platforms {
-          return platforms
-            .iter()
-            .any(|platform| matches_platform(platform, &self.os_type, &self.os_arch));
-        }
-
-        true
-      })
+      .filter(|cmd| self.matches_platforms(cmd.task.platforms.as_deref()))
       .collect()
+  }
+
+  fn matches_platforms(&self, platforms: Option<&[String]>) -> bool {
+    platforms.is_none_or(|platforms| {
+      platforms
+        .iter()
+        .any(|platform| matches_platform(platform, &self.os_type, &self.os_arch))
+    })
   }
 
   fn validate_dag(&self, dag: &DagNode, command: &str) -> ExecutorResult<()> {
@@ -955,6 +974,7 @@ impl TaskGraphBuilder {
 mod tests {
   use super::*;
 
+  use octa_dag::Identifiable;
   use octa_octafile::Octafile;
   use std::fs;
   use tempfile::TempDir;
@@ -984,6 +1004,7 @@ mod tests {
     }
 
     assert!(matches_platform(" macOS / AARCH64 ", "macos", "arm64"));
+    assert!(matches_platform("darwin/amd64", "macos", "x86_64"));
   }
 
   #[tokio::test]
@@ -1166,6 +1187,30 @@ mod tests {
 
     // The number of nodes will depend on the current platform
     assert!(!dag.has_cycle()?);
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_platform_mismatch_creates_skipped_plan() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      tasks:
+        test:
+          platforms: [unsupported]
+          shell: echo test
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
+    let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+    let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+    let builder = TaskGraphBuilder::new(plugin_manager)?;
+    let dag = builder.build(octafile, "test", true, vec![]).await?;
+
+    assert_eq!(dag.node_count(), 1);
+    assert!(dag.nodes().iter().all(|task| task.is_internal()));
     Ok(())
   }
 

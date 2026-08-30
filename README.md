@@ -563,15 +563,16 @@ tasks:
       - task: next
 ```
 
-# Platform specific tasks
-If you want to create different tasks for different operating systems and architectures, you can use the `platforms` parameter in a task.
-Tasks that are not valid for the current architecture or operating system will be skipped during execution. Additionally, the current 
-operating system type will be available through the `OCTA_OS` variable, and the current architecture will be  available through the 
-`OCTA_ARCH` variable. You can specify multiple operating system and/or architecture types for a task.
+# Platform specific tasks and commands
+
+If you want to restrict tasks or individual commands to particular operating systems and architectures,
+use the `platforms` parameter. Tasks and commands that do not match the current platform are skipped.
+The current operating system is available through the `OCTA_OS` variable, and the current architecture is
+available through `OCTA_ARCH`. You can specify multiple operating system and/or architecture selectors.
 
 Each value can select an operating system (`linux`, `windows`, `macos`), an architecture (`x86_64`, `arm64`),
 or an exact pair such as `linux/x86_64`. The aliases `amd64` and `x64` match `x86_64`; `aarch64` matches
-`arm64`. Matching is case-insensitive and ignores whitespace.
+`arm64`; `darwin` and `osx` match `macos`. Matching is case-insensitive and ignores whitespace.
 
 ```yaml
 version: 1
@@ -594,6 +595,26 @@ tasks:
       - task: build_win
       - task: build_mac
       - task: build_linux
+```
+
+The same restriction can be applied to plugin commands and task references inside `cmds`. Commands without
+`platforms` continue to run on every platform:
+
+```yaml
+version: 1
+
+tasks:
+  build:
+    cmds:
+      - shell: build.cmd
+        platforms: [windows]
+      - shell: ./build.sh
+        platforms: [linux, darwin]
+      - tpl: templates/config.tpl
+        platforms: [linux/arm64]
+      - task: package
+        platforms: [linux, darwin]
+      - echo "Runs on every platform"
 ```
 
 # Task dependencies

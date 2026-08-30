@@ -1229,13 +1229,59 @@ mod tests {
           cmds:
             - docker:
                 image: busybox
+              platforms: [linux/amd64]
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "valid_plugin_schema");
 
     let octafile = Octafile::load_with_schemas(Some(file_path), false, docker_schemas()).unwrap();
 
     assert!(octafile.tasks["deploy"].extra.contains_key("docker"));
-    assert!(octafile.tasks["pipeline"].cmds.is_some());
+    let command = &octafile.tasks["pipeline"].cmds.as_ref().unwrap()[0];
+    assert_eq!(command.platforms, Some(vec!["linux/amd64".to_string()]));
+    assert!(!command.value.as_mapping().unwrap().contains_key("platforms"));
+  }
+
+  #[test]
+  fn parses_platforms_on_task_reference_commands() {
+    let content = r#"
+      version: 1
+      tasks:
+        pipeline:
+          cmds:
+            - task: build
+              vars:
+                profile: release
+              platforms: [darwin, linux/arm64]
+        build:
+          shell: echo build
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "command_platforms");
+
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+    let command = &octafile.tasks["pipeline"].cmds.as_ref().unwrap()[0];
+
+    assert_eq!(
+      command.platforms,
+      Some(vec!["darwin".to_string(), "linux/arm64".to_string()])
+    );
+    assert!(!command.value.as_mapping().unwrap().contains_key("platforms"));
+  }
+
+  #[test]
+  fn rejects_invalid_command_platforms() {
+    let content = r#"
+      version: 1
+      tasks:
+        build:
+          cmds:
+            - shell: echo build
+              platforms: linux
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_command_platforms");
+
+    let error = Octafile::load(Some(file_path), false, vec![]).unwrap_err();
+
+    assert!(error.to_string().contains("invalid command platforms"));
   }
 
   #[test]

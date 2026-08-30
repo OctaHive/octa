@@ -86,6 +86,16 @@ impl From<String> for Deps {
   }
 }
 
+/// A command payload with metadata handled by Octa rather than a plugin.
+#[derive(Debug, Clone)]
+pub struct TaskCommand {
+  /// Shell command, task reference, or plugin-specific command value.
+  pub value: Value,
+
+  /// Platforms on which this command is included in the execution plan.
+  pub platforms: Option<Vec<String>>,
+}
+
 pub struct Context {
   validators: HashMap<String, Option<jsonschema::Validator>>,
 }
@@ -141,32 +151,47 @@ impl Context {
     }
   }
 
-  fn validate_commands(&self, commands: &[Value]) -> Result<(), String> {
-    for command in commands {
-      match command {
-        Value::String(_) => self.validate("shell", command)?,
-        Value::Mapping(mapping) => {
-          if mapping.contains_key("task") {
-            serde_yml::from_value::<ComplexDep>(command.clone())
-              .map_err(|error| format!("invalid task command: {error}"))?;
-            continue;
-          }
+  fn parse_commands(&self, commands: Vec<Value>) -> Result<Vec<TaskCommand>, String> {
+    commands
+      .into_iter()
+      .map(|command| self.parse_command(command))
+      .collect()
+  }
 
-          if mapping.len() != 1 {
-            return Err("a plugin command must contain exactly one plugin task type".to_string());
-          }
+  fn parse_command(&self, command: Value) -> Result<TaskCommand, String> {
+    let (value, platforms) = match command {
+      Value::String(value) => (Value::String(value), None),
+      Value::Mapping(mut mapping) => {
+        let platforms = mapping
+          .remove("platforms")
+          .map(serde_yml::from_value::<Vec<String>>)
+          .transpose()
+          .map_err(|error| format!("invalid command platforms: {error}"))?;
+        (Value::Mapping(mapping), platforms)
+      },
+      _ => return Err("commands must be strings, task references, or plugin commands".to_string()),
+    };
 
-          let (key, value) = mapping.iter().next().unwrap();
-          if !self.contains(key) {
-            return Err(format!("unknown plugin command type '{key}'"));
-          }
-          self.validate(key, value)?;
-        },
-        _ => return Err("commands must be strings, task references, or plugin commands".to_string()),
-      }
+    match &value {
+      Value::String(_) => self.validate("shell", &value)?,
+      Value::Mapping(mapping) if mapping.contains_key("task") => {
+        serde_yml::from_value::<ComplexDep>(value.clone()).map_err(|error| format!("invalid task command: {error}"))?;
+      },
+      Value::Mapping(mapping) => {
+        if mapping.len() != 1 {
+          return Err("a plugin command must contain exactly one plugin task type".to_string());
+        }
+
+        let (key, value) = mapping.iter().next().unwrap();
+        if !self.contains(key) {
+          return Err(format!("unknown plugin command type '{key}'"));
+        }
+        self.validate(key, value)?;
+      },
+      _ => unreachable!("command value was normalized above"),
     }
 
-    Ok(())
+    Ok(TaskCommand { value, platforms })
   }
 }
 
@@ -182,7 +207,7 @@ pub struct Task {
   pub dir: Option<PathBuf>,                      // Working directory for the task
   pub desc: Option<String>,                      // Task description
   pub vars: Option<Vars>,                        // Task-specific variables
-  pub cmds: Option<Vec<Value>>,                  // List of commands
+  pub cmds: Option<Vec<TaskCommand>>,            // List of commands
   pub internal: Option<bool>,                    // Show command in list of available commands
   pub platforms: Option<Vec<String>>,            // Supported platforms
   pub ignore_error: Option<bool>,                // Whether to continue on error
@@ -255,13 +280,10 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "env" => task.env = map.next_value()?,
         "cmds" => {
           let commands: Option<Vec<Value>> = map.next_value()?;
-          if let Some(commands) = &commands {
-            self
-              .context
-              .validate_commands(commands)
-              .map_err(serde::de::Error::custom)?;
-          }
-          task.cmds = commands;
+          task.cmds = commands
+            .map(|commands| self.context.parse_commands(commands))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
         },
         "internal" => task.internal = map.next_value()?,
         "platforms" => task.platforms = map.next_value()?,

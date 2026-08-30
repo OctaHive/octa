@@ -460,6 +460,70 @@ fn test_run_os_task() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_platform_specific_commands() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let platform = if cfg!(target_os = "windows") {
+    "windows"
+  } else if cfg!(target_os = "macos") {
+    "darwin"
+  } else {
+    "linux"
+  };
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    format!(
+      r#"
+version: 1
+
+tasks:
+  build:
+    cmds:
+      - shell: echo plugin > plugin.txt
+        platforms: [{platform}]
+      - shell: echo skipped > skipped-plugin.txt
+        platforms: [unsupported]
+      - task: package
+        platforms: [{platform}]
+      - task: skipped
+        platforms: [unsupported]
+
+  package:
+    shell: echo task > task.txt
+
+  skipped:
+    shell: echo skipped > skipped-task.txt
+
+  skipped_all:
+    cmds:
+      - shell: echo skipped > skipped-all.txt
+        platforms: [unsupported]
+"#,
+    ),
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("build");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success();
+
+  assert!(tmp_dir.path().join("plugin.txt").is_file());
+  assert!(tmp_dir.path().join("task.txt").is_file());
+  assert!(!tmp_dir.path().join("skipped-plugin.txt").exists());
+  assert!(!tmp_dir.path().join("skipped-task.txt").exists());
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("skipped_all");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success();
+
+  assert!(!tmp_dir.path().join("skipped-all.txt").exists());
+
+  Ok(())
+}
+
+#[test]
 #[ignore]
 fn test_set_env() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();

@@ -18,3 +18,13 @@ tasks:
       - task: build_win
       - task: build_mac
       - task: build_arm
+
+  build_commands:
+    cmds:
+      - shell: echo Windows command
+        platforms: [windows]
+      - shell: echo Unix command
+        platforms: [linux, darwin]
+      - task: build_arm
+        platforms: [arm64]
+      - echo Cross-platform command
