@@ -267,7 +267,7 @@ impl Octafile {
       },
       None => {
         if global {
-          let home = dirs::home_dir().ok_or(OctafileError::NotSearchedError)?;
+          let home = home_dir().ok_or(OctafileError::NotSearchedError)?;
           Octafile::find_octafile(Some(home))
         } else {
           match search_dir {
@@ -611,6 +611,18 @@ impl Octafile {
       }
     }
   }
+}
+
+fn home_dir() -> Option<PathBuf> {
+  #[cfg(windows)]
+  let home = env::var_os("USERPROFILE");
+  #[cfg(not(windows))]
+  let home = env::var_os("HOME");
+
+  home
+    .filter(|path| !path.is_empty())
+    .map(PathBuf::from)
+    .or_else(dirs::home_dir)
 }
 
 impl<'de> Deserialize<'de> for Octafile {
