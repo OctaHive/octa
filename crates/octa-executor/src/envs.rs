@@ -7,17 +7,19 @@ use std::{
   sync::Arc,
 };
 
+use octa_octafile::EnvValue;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tera::{Context, Tera};
 use tracing::debug;
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
-  function::{format_tera_error, register_shell_function},
+  function::{format_tera_error, register_shell, ExecuteShell},
   vars::Vars,
 };
 
-type EnvContext = HashMap<String, String>;
+type EnvContext = HashMap<String, EnvValue>;
+type ResolvedEnvContext = HashMap<String, String>;
 
 #[derive(Clone, Debug, Default)]
 pub struct Envs {
@@ -54,13 +56,13 @@ impl Envs {
     }
   }
 
-  pub fn with_value(value: EnvContext) -> Self {
+  pub fn with_value<V: Into<EnvValue>>(value: HashMap<String, V>) -> Self {
     let mut envs = Self::default();
     envs.set_value(value);
     envs
   }
 
-  pub fn with_value_and_parent(value: EnvContext, parent: Envs) -> Self {
+  pub fn with_value_and_parent<V: Into<EnvValue>>(value: HashMap<String, V>, parent: Envs) -> Self {
     let mut envs = Self::with_parent(parent);
     envs.set_value(value);
     envs
@@ -77,24 +79,29 @@ impl Envs {
     self.expanded = false;
   }
 
-  pub fn set_value(&mut self, value: EnvContext) {
-    self.context = value;
+  pub fn set_value<V: Into<EnvValue>>(&mut self, value: HashMap<String, V>) {
+    self.context = value.into_iter().map(|(key, value)| (key, value.into())).collect();
     self.expanded = false;
   }
 
   pub fn get(&self, key: &str) -> Option<&String> {
-    self.context.get(key)
+    match self.context.get(key) {
+      Some(EnvValue::String(value)) => Some(value),
+      _ => None,
+    }
   }
 
   pub fn insert<T: AsRef<str>>(&mut self, key: &T, value: &T) {
     self
       .context
-      .insert(key.as_ref().to_string(), value.as_ref().to_string());
+      .insert(key.as_ref().to_string(), EnvValue::String(value.as_ref().to_string()));
     self.expanded = false;
   }
 
-  pub fn extend(&mut self, source: EnvContext) {
-    self.context.extend(source);
+  pub fn extend<V: Into<EnvValue>>(&mut self, source: HashMap<String, V>) {
+    self
+      .context
+      .extend(source.into_iter().map(|(key, value)| (key, value.into())));
     self.expanded = false;
   }
 
@@ -162,22 +169,25 @@ impl Envs {
     dry: bool,
   ) -> ExecutorResult<EnvContext> {
     let mut processed = EnvContext::new();
+    let parent = resolved_environment(parent);
 
     // Resolve literal values first so templates and shell commands can consume dotenv and
     // ordinary environment values declared at the same level without depending on map order.
     for (key, value) in &context {
-      if !is_template(value) {
-        processed.insert(key.clone(), expand_environment_value(value, parent));
+      if let EnvValue::String(value) = value {
+        if !is_template(value) {
+          processed.insert(key.clone(), EnvValue::String(expand_environment_value(value, &parent)));
+        }
       }
     }
 
     let mut available = parent.clone();
-    available.extend(processed.clone());
+    available.extend(resolved_environment(&processed));
 
     // Template values receive inherited values and same-layer literals. Other same-layer
     // templates are deliberately excluded because HashMap declaration order is not stable.
     let mut tera = Tera::default();
-    register_shell_function(&mut tera, current_dir, available.clone(), dry);
+    let shell = register_shell(&mut tera, current_dir, available.clone(), dry);
     let mut template_context: Context = vars.clone().into();
     template_context.extend(
       Context::from_serialize(&available)
@@ -185,9 +195,18 @@ impl Envs {
     );
 
     for (key, value) in context {
-      if is_template(&value) {
-        let processed_value = self.process_template_value(&key, &value, &available, &mut tera, &template_context)?;
-        processed.insert(key, processed_value);
+      let processed_value = match value {
+        EnvValue::String(value) if is_template(&value) => {
+          Some(self.process_template_value(&key, &value, &available, &mut tera, &template_context)?)
+        },
+        EnvValue::Shell(shell_value) => {
+          Some(self.process_shell_value(&key, &shell_value.sh, &available, &mut tera, &template_context, &shell)?)
+        },
+        EnvValue::String(_) => None,
+      };
+
+      if let Some(value) = processed_value {
+        processed.insert(key, EnvValue::String(value));
       }
     }
 
@@ -198,7 +217,7 @@ impl Envs {
     &self,
     key: &str,
     value: &str,
-    context: &EnvContext,
+    context: &ResolvedEnvContext,
     tera: &mut Tera,
     template_context: &Context,
   ) -> ExecutorResult<String> {
@@ -211,13 +230,40 @@ impl Envs {
     debug!("Processing environment '{}' with value: '{}'", key, val);
     Ok(expand_environment_value(&val, context))
   }
+
+  fn process_shell_value(
+    &self,
+    key: &str,
+    command: &str,
+    context: &ResolvedEnvContext,
+    tera: &mut Tera,
+    template_context: &Context,
+    shell: &ExecuteShell,
+  ) -> ExecutorResult<String> {
+    let command = tera
+      .render_str(command, template_context)
+      .map_err(|error| ExecutorError::ValueExpandError(command.to_owned(), format_tera_error(&error)))?;
+    debug!("Processing shell-backed environment '{}': '{}'", key, command);
+
+    let value = shell
+      .execute(&command)
+      .map_err(|error| ExecutorError::ValueExpandError(command, format_tera_error(&error)))?;
+    Ok(expand_environment_value(&value, context))
+  }
 }
 
 fn is_template(value: &str) -> bool {
   value.contains("{{") && value.contains("}}")
 }
 
-fn expand_environment_value(value: &str, context: &EnvContext) -> String {
+fn resolved_environment(context: &EnvContext) -> ResolvedEnvContext {
+  context
+    .iter()
+    .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_owned())))
+    .collect()
+}
+
+fn expand_environment_value(value: &str, context: &ResolvedEnvContext) -> String {
   let get_env = |name: &str| match context.get(name) {
     Some(value) => Some(Cow::Borrowed(value.as_str())),
     None => env::var(name).map(Cow::Owned).ok(),
@@ -250,9 +296,15 @@ impl From<EnvContext> for Envs {
   }
 }
 
-impl From<Envs> for EnvContext {
+impl From<ResolvedEnvContext> for Envs {
+  fn from(context: ResolvedEnvContext) -> Self {
+    Self::with_value(context)
+  }
+}
+
+impl From<Envs> for ResolvedEnvContext {
   fn from(envs: Envs) -> Self {
-    envs.context
+    resolved_environment(&envs.context)
   }
 }
 
@@ -277,13 +329,14 @@ impl<'de> Deserialize<'de> for Envs {
 }
 
 pub struct EnvsIter {
-  map: EnvContext,
+  map: ResolvedEnvContext,
   keys: Vec<String>,
   position: usize,
 }
 
 impl EnvsIter {
   fn new(map: EnvContext) -> Self {
+    let map = resolved_environment(&map);
     let keys: Vec<String> = map.keys().cloned().collect();
     Self { map, keys, position: 0 }
   }
@@ -345,7 +398,7 @@ mod tests {
 
   #[test]
   fn test_with_value() {
-    let mut map = EnvContext::new();
+    let mut map = ResolvedEnvContext::new();
     map.insert("key".to_owned(), "value".to_owned());
 
     let envs = Envs::with_value(map);
@@ -355,10 +408,10 @@ mod tests {
 
   #[test]
   fn test_with_value_and_parent() {
-    let mut parent_map = EnvContext::new();
+    let mut parent_map = ResolvedEnvContext::new();
     parent_map.insert("parent_key".to_owned(), "parent_value".to_owned());
 
-    let mut map = EnvContext::new();
+    let mut map = ResolvedEnvContext::new();
     map.insert("child_key".to_owned(), "child_value".to_owned());
 
     let parent = Envs::with_value(parent_map);
@@ -378,7 +431,7 @@ mod tests {
   #[test]
   fn test_extend() {
     let mut envs = Envs::new();
-    let mut context = EnvContext::new();
+    let mut context = ResolvedEnvContext::new();
     context.insert("key".to_string(), "value".to_string());
     envs.extend(context);
 
@@ -387,7 +440,7 @@ mod tests {
 
   #[test]
   fn test_envs_iterator() {
-    let mut map = EnvContext::new();
+    let mut map = ResolvedEnvContext::new();
     map.insert("key1".to_owned(), "value1".to_owned());
     map.insert("key2".to_owned(), "value2".to_owned());
 
@@ -401,7 +454,7 @@ mod tests {
 
   #[test]
   fn test_serialize_deserialize() {
-    let mut map = EnvContext::new();
+    let mut map = ResolvedEnvContext::new();
     map.insert("key".to_owned(), "value".to_owned());
 
     let original = Envs::with_value(map);
@@ -414,7 +467,7 @@ mod tests {
 
   #[test]
   fn test_display() {
-    let mut map = EnvContext::new();
+    let mut map = ResolvedEnvContext::new();
     map.insert("key".to_owned(), "value".to_owned());
 
     let envs = Envs::with_value(map);
@@ -426,7 +479,7 @@ mod tests {
 
   #[test]
   fn test_context_conversion() {
-    let mut context = EnvContext::new();
+    let mut context = ResolvedEnvContext::new();
     context.insert("key".to_owned(), "value".to_owned());
 
     // Test From<Context> for Envs
@@ -434,13 +487,13 @@ mod tests {
     assert_eq!(envs.get("key").unwrap(), &"value".to_string());
 
     // Test From<Envs> for Context
-    let context_back: EnvContext = envs.into();
+    let context_back: ResolvedEnvContext = envs.into();
     assert_eq!(context_back.get("key").unwrap(), &"value".to_string());
   }
 
   #[tokio::test]
   async fn test_expand_simple() {
-    let mut context = EnvContext::new();
+    let mut context = ResolvedEnvContext::new();
     context.insert("name".to_owned(), "John".to_owned());
     context.insert("key".to_owned(), "$name".to_owned());
 
@@ -453,9 +506,9 @@ mod tests {
 
   #[tokio::test]
   async fn test_expand_with_parent() {
-    let mut parent_context = EnvContext::new();
+    let mut parent_context = ResolvedEnvContext::new();
     parent_context.insert("first".to_owned(), "John".to_owned());
-    let mut context = EnvContext::new();
+    let mut context = ResolvedEnvContext::new();
     context.insert("full".to_owned(), "$first Doe".to_owned());
 
     let parent = Envs::with_value(parent_context);
@@ -468,7 +521,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_expand_from_process_environment() {
-    let mut context = EnvContext::new();
+    let mut context = ResolvedEnvContext::new();
     context.insert("path".to_owned(), "$PATH".to_owned());
     let mut envs = Envs::with_value(context);
 
@@ -491,15 +544,21 @@ mod tests {
     let env_command = "echo $DOTENV_VALUE";
 
     let mut envs = Envs::with_value(HashMap::from([
-      ("DOTENV_VALUE".to_owned(), "available".to_owned()),
-      ("FROM_VAR".to_owned(), "{{ VERSION }}".to_owned()),
+      ("DOTENV_VALUE".to_owned(), EnvValue::from("available")),
+      ("FROM_VAR".to_owned(), EnvValue::from("{{ VERSION }}")),
       (
         "FROM_SHELL".to_owned(),
-        format!("{{{{ shell(command=\"{command}\") }}}}"),
+        EnvValue::from(format!("{{{{ shell(command=\"{command}\") }}}}")),
       ),
       (
         "FROM_DOTENV".to_owned(),
-        format!("{{{{ shell(command=\"{env_command}\") }}}}"),
+        EnvValue::Shell(octa_octafile::ShellValue {
+          sh: env_command.to_owned(),
+        }),
+      ),
+      (
+        "FROM_FILTER".to_owned(),
+        EnvValue::from(format!("prefix-{{{{ \"{command}\" | shell }}}}")),
       ),
     ]));
     envs.set_dir(temp_dir.path());
@@ -510,6 +569,7 @@ mod tests {
     assert_eq!(envs.get("FROM_VAR"), Some(&"1.2.3".to_owned()));
     assert_eq!(envs.get("FROM_SHELL"), Some(&"from-shell".to_owned()));
     assert_eq!(envs.get("FROM_DOTENV"), Some(&"available".to_owned()));
+    assert_eq!(envs.get("FROM_FILTER"), Some(&"prefix-from-shell".to_owned()));
   }
 
   #[test]
@@ -522,7 +582,7 @@ mod tests {
     let command = "touch marker.txt";
     let mut envs = Envs::with_value(HashMap::from([(
       "VALUE".to_owned(),
-      format!("{{{{ shell(command=\"{command}\") }}}}"),
+      EnvValue::Shell(octa_octafile::ShellValue { sh: command.to_owned() }),
     )]));
     envs.set_dir(temp_dir.path());
 
@@ -540,7 +600,7 @@ mod tests {
     let command = "echo failed >&2; exit 7";
     let mut envs = Envs::with_value(HashMap::from([(
       "VALUE".to_owned(),
-      format!("{{{{ shell(command=\"{command}\") }}}}"),
+      EnvValue::Shell(octa_octafile::ShellValue { sh: command.to_owned() }),
     )]));
     envs.set_dir(temp_dir.path());
 

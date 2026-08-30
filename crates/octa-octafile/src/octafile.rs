@@ -35,7 +35,42 @@ const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
 ];
 
 pub type Vars = HashMap<String, Value>;
-pub type Envs = HashMap<String, String>;
+pub type Envs = HashMap<String, EnvValue>;
+
+/// A literal environment value or a command that produces it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum EnvValue {
+  String(String),
+  Shell(ShellValue),
+}
+
+impl EnvValue {
+  pub fn as_str(&self) -> Option<&str> {
+    match self {
+      Self::String(value) => Some(value),
+      Self::Shell(_) => None,
+    }
+  }
+}
+
+impl From<String> for EnvValue {
+  fn from(value: String) -> Self {
+    Self::String(value)
+  }
+}
+
+impl From<&str> for EnvValue {
+  fn from(value: &str) -> Self {
+    Self::String(value.to_owned())
+  }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellValue {
+  pub sh: String,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WatchInterval(Duration);
@@ -1165,6 +1200,54 @@ mod tests {
       Some(vec![".env.local".to_string(), "config/base.env".to_string()])
     );
     assert_eq!(octafile.tasks["test"].dotenv, Some(vec![".env.test".to_string()]));
+  }
+
+  #[test]
+  fn parses_shell_backed_environment_values() {
+    let content = r#"
+      version: 1
+      env:
+        STATIC: value
+        DYNAMIC:
+          sh: echo dynamic
+      tasks:
+        test:
+          env:
+            TASK_DYNAMIC:
+              sh: echo task
+          shell: echo test
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "shell_env");
+
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+
+    assert_eq!(octafile.env.as_ref().unwrap()["STATIC"], EnvValue::from("value"));
+    assert_eq!(
+      octafile.env.as_ref().unwrap()["DYNAMIC"],
+      EnvValue::Shell(ShellValue {
+        sh: "echo dynamic".to_owned()
+      })
+    );
+    assert!(matches!(
+      octafile.tasks["test"].env.as_ref().unwrap()["TASK_DYNAMIC"],
+      EnvValue::Shell(_)
+    ));
+  }
+
+  #[test]
+  fn rejects_invalid_shell_backed_environment_values() {
+    let content = r#"
+      version: 1
+      env:
+        INVALID:
+          sh: echo invalid
+          extra: value
+      tasks:
+        test: echo test
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_shell_env");
+
+    assert!(Octafile::load(Some(file_path), false, vec![]).is_err());
   }
 
   #[test]

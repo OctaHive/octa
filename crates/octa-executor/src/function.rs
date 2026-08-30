@@ -8,10 +8,11 @@ use std::{
 #[cfg(windows)]
 #[allow(unused_imports)]
 use std::os::windows::process::CommandExt;
-use tera::{Function, Result, Value};
+use tera::{Filter, Function, Result, Value};
 use tracing::{debug, info};
 
-/// Tera function that evaluates a command in the directory and environment of its value layer.
+/// Tera function and filter that evaluate a command in the context of their value layer.
+#[derive(Clone)]
 pub struct ExecuteShell {
   current_dir: PathBuf,
   environment: HashMap<String, String>,
@@ -26,22 +27,15 @@ impl ExecuteShell {
       dry,
     }
   }
-}
 
-impl Function for ExecuteShell {
-  fn call(&self, args: &HashMap<String, Value>) -> Result<Value> {
-    let sh = args
-      .get("command")
-      .ok_or_else(|| tera::Error::msg("Missing 'command' argument"))?;
-    let command_text = sh.as_str().ok_or_else(|| tera::Error::msg("Wrong command format"))?;
-
+  pub(crate) fn execute(&self, command_text: &str) -> Result<String> {
     if self.dry {
       info!(
         "Execute command in directory {}: {}",
         self.current_dir.display(),
         command_text
       );
-      return Ok(Value::Null);
+      return Ok(String::new());
     }
 
     debug!(
@@ -81,7 +75,7 @@ impl Function for ExecuteShell {
 
     let output = command
       .output()
-      .map_err(|e| tera::Error::msg(format!("Failed to execute command {} for arg: {}", sh, e)))?;
+      .map_err(|error| tera::Error::msg(format!("Failed to execute command '{command_text}': {error}")))?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -94,22 +88,48 @@ impl Function for ExecuteShell {
       )));
     }
 
-    let res = Value::String(String::from_utf8_lossy(output.stdout.trim_ascii_end()).to_string());
+    let result = String::from_utf8_lossy(output.stdout.trim_ascii_end()).to_string();
+    debug!("Command output result: {:?}", result);
 
-    debug!("Command output result: {:?}", res);
-
-    Ok(res)
+    Ok(result)
   }
 }
 
-/// Registers the shell function with the execution context for the current vars or env layer.
-pub fn register_shell_function(
+impl Function for ExecuteShell {
+  fn call(&self, args: &HashMap<String, Value>) -> Result<Value> {
+    let sh = args
+      .get("command")
+      .ok_or_else(|| tera::Error::msg("Missing 'command' argument"))?;
+    let command_text = sh.as_str().ok_or_else(|| tera::Error::msg("Wrong command format"))?;
+
+    self.execute(command_text).map(Value::String)
+  }
+}
+
+impl Filter for ExecuteShell {
+  fn filter(&self, value: &Value, args: &HashMap<String, Value>) -> Result<Value> {
+    if !args.is_empty() {
+      return Err(tera::Error::msg("The 'shell' filter does not accept arguments"));
+    }
+
+    let command_text = value
+      .as_str()
+      .ok_or_else(|| tera::Error::msg("The 'shell' filter expects a string"))?;
+    self.execute(command_text).map(Value::String)
+  }
+}
+
+/// Registers both shell template forms and returns the same runner for structured `sh` values.
+pub fn register_shell(
   tera: &mut tera::Tera,
   current_dir: &Path,
   environment: HashMap<String, String>,
   dry: bool,
-) {
-  tera.register_function("shell", ExecuteShell::new(current_dir.to_path_buf(), environment, dry));
+) -> ExecuteShell {
+  let shell = ExecuteShell::new(current_dir.to_path_buf(), environment, dry);
+  tera.register_function("shell", shell.clone());
+  tera.register_filter("shell", shell.clone());
+  shell
 }
 
 /// Includes nested function errors that Tera omits from its top-level display message.
@@ -155,6 +175,19 @@ mod tests {
       },
       _ => panic!("Expected string output"),
     }
+  }
+
+  #[test]
+  fn test_execute_shell_filter() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut tera = tera::Tera::default();
+    register_shell(&mut tera, temp_dir.path(), HashMap::new(), false);
+
+    let result = tera
+      .render_str(r#"{{ "echo filtered" | shell }}"#, &tera::Context::new())
+      .unwrap();
+
+    assert_eq!(result.trim(), "filtered");
   }
 
   #[test]
@@ -208,7 +241,7 @@ mod tests {
     let execute_shell_dry = ExecuteShell::new(temp_dir.path(), HashMap::new(), true);
 
     let result = execute_shell_dry.call(&args).unwrap();
-    assert!(matches!(result, Value::Null));
+    assert_eq!(result, Value::String(String::new()));
   }
 
   #[test]

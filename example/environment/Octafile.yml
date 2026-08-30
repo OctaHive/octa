@@ -27,8 +27,10 @@ tasks:
 
   print-dynamic-env:
     vars:
-      COMMIT: '{{ shell(command="git rev-parse --short HEAD") }}'
+      COMMIT:
+        sh: git rev-parse --short HEAD
     env:
       EXPORTED_COMMIT: "{{ COMMIT }}"
-      CURRENT_BRANCH: '{{ shell(command="git branch --show-current") }}'
-    shell: echo ${EXPORTED_COMMIT} ${CURRENT_BRANCH}
+      CURRENT_BRANCH: '{{ "git branch --show-current" | shell }}'
+      DESCRIBE: '{{ shell(command="git describe --tags --always") }}'
+    shell: echo ${EXPORTED_COMMIT} ${CURRENT_BRANCH} ${DESCRIBE}

@@ -34,7 +34,7 @@ use executor::DeferredAction;
 pub use executor::{ExecutionPlan, Executor};
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
-use octa_octafile::{AllowedRun, Deps, ExecuteMode, Octafile, Task, TaskCommand};
+use octa_octafile::{AllowedRun, Deps, EnvValue, ExecuteMode, Octafile, Task, TaskCommand};
 pub use task::TaskNode;
 use task::{CmdType, TaskConfig};
 use vars::Vars;
@@ -1133,13 +1133,18 @@ impl TaskGraphBuilder {
     let mut envs = Envs::new();
     let root = cmd.octafile.root();
     envs.set_dir(root.dir.clone());
-    let mut values = dotenv::load(root.dotenv.as_deref(), &root.dir, vars, template_environment)?;
+    let mut values = Self::dotenv_values(dotenv::load(
+      root.dotenv.as_deref(),
+      &root.dir,
+      vars,
+      template_environment,
+    )?);
 
     // Explicit Octafile values take precedence over values loaded from dotenv files.
     if let Some(env) = &root.env {
       values.extend(env.clone());
     }
-    template_environment.extend(values.clone());
+    Self::extend_template_environment(template_environment, &values);
     envs.set_value(values);
 
     Ok(envs)
@@ -1167,18 +1172,18 @@ impl TaskGraphBuilder {
           let mut new_envs = Envs::new();
           new_envs.set_parent(Some(envs.clone()));
           new_envs.set_dir(nested_octafile.dir.clone());
-          let mut values = dotenv::load(
+          let mut values = Self::dotenv_values(dotenv::load(
             nested_octafile.dotenv.as_deref(),
             &nested_octafile.dir,
             vars,
             template_environment,
-          )?;
+          )?);
           // Each included Octafile overrides its dotenv values explicitly and then overrides
           // all environment values inherited from its parent.
           if let Some(env) = &nested_octafile.env {
             values.extend(env.clone());
           }
-          template_environment.extend(values.clone());
+          Self::extend_template_environment(template_environment, &values);
           new_envs.set_value(values);
 
           *envs = new_envs;
@@ -1206,15 +1211,37 @@ impl TaskGraphBuilder {
     new_envs.set_parent(Some(envs));
 
     let task_dir = self.task_working_dir(cmd);
-    let mut values = dotenv::load(cmd.task.dotenv.as_deref(), &task_dir, vars, template_environment)?;
+    let mut values = Self::dotenv_values(dotenv::load(
+      cmd.task.dotenv.as_deref(),
+      &task_dir,
+      vars,
+      template_environment,
+    )?);
     // Task values are the most specific layer and therefore override task dotenv values.
     if let Some(task_envs) = &cmd.task.env {
       values.extend(task_envs.clone());
     }
-    template_environment.extend(values.clone());
+    Self::extend_template_environment(template_environment, &values);
     new_envs.set_value(values);
 
     Ok(new_envs)
+  }
+
+  fn dotenv_values(values: HashMap<String, String>) -> octa_octafile::Envs {
+    values
+      .into_iter()
+      .map(|(key, value)| (key, EnvValue::String(value)))
+      .collect()
+  }
+
+  fn extend_template_environment(target: &mut HashMap<String, String>, values: &octa_octafile::Envs) {
+    // Dynamic values are evaluated only when the task runs and therefore cannot select a
+    // dotenv file while the execution graph is being built.
+    target.extend(
+      values
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_owned()))),
+    );
   }
 
   fn task_working_dir(&self, cmd: &FindResult) -> PathBuf {

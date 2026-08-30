@@ -14,7 +14,7 @@ use tracing::debug;
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
-  function::{format_tera_error, register_shell_function},
+  function::{format_tera_error, register_shell, ExecuteShell},
 };
 
 lazy_static! {
@@ -153,8 +153,8 @@ impl Vars {
         None => env::current_dir()?,
       };
       let environment = context_as_environment(&accumulated);
-      register_shell_function(tera, &current_dir, environment, dry);
-      let processed = self.process_single_context(context, &accumulated, tera).await?;
+      let shell = register_shell(tera, &current_dir, environment, dry);
+      let processed = self.process_single_context(context, &accumulated, tera, &shell).await?;
       accumulated.extend(processed);
     }
 
@@ -166,6 +166,7 @@ impl Vars {
     context: Context,
     parent: &Context,
     tera: &mut Tera,
+    shell: &ExecuteShell,
   ) -> ExecutorResult<Context> {
     let mut processed = Context::new();
     let vars = Vars {
@@ -176,7 +177,7 @@ impl Vars {
     };
 
     for (key, value) in vars.iter() {
-      let processed_value = self.process_template_value(&key, &value, parent, tera).await?;
+      let processed_value = self.process_template_value(&key, &value, parent, tera, shell).await?;
       processed.insert(&key, &processed_value);
     }
 
@@ -189,7 +190,19 @@ impl Vars {
     value: &Value,
     context: &Context,
     tera: &mut Tera,
+    shell: &ExecuteShell,
   ) -> ExecutorResult<Value> {
+    if let Some(command) = shell_command(value) {
+      let command = tera
+        .render_str(command, context)
+        .map_err(|error| ExecutorError::VariableExpandError(command.to_owned(), format_tera_error(&error)))?;
+      debug!("Processing shell-backed variable '{}': '{}'", key, command);
+      return shell
+        .execute(&command)
+        .map(Value::String)
+        .map_err(|error| ExecutorError::VariableExpandError(command, format_tera_error(&error)));
+    }
+
     let val = match value {
       Value::String(value) => value.trim().to_owned(),
       value => value.to_string().trim().to_owned(),
@@ -239,6 +252,11 @@ impl Vars {
 
     result
   }
+}
+
+fn shell_command(value: &Value) -> Option<&str> {
+  let object = value.as_object()?;
+  (object.len() == 1).then(|| object.get("sh")?.as_str()).flatten()
 }
 
 fn context_as_environment(context: &Context) -> HashMap<String, String> {
@@ -334,8 +352,11 @@ impl Iterator for VarsIter {
 
 #[cfg(test)]
 mod tests {
+  use std::fs;
+
   use super::*;
   use serde_json::json;
+  use tempfile::TempDir;
 
   #[test]
   fn test_new_vars() {
@@ -494,5 +515,25 @@ mod tests {
 
     vars.expand(true).await.unwrap();
     assert_eq!(vars.get("full").unwrap(), &Value::String("John Doe".to_string()));
+  }
+
+  #[tokio::test]
+  async fn expands_structured_shell_values_and_shell_filters() {
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(temp_dir.path().join("value.txt"), "dynamic").unwrap();
+    #[cfg(windows)]
+    let command = "type value.txt";
+    #[cfg(not(windows))]
+    let command = "cat value.txt";
+    let mut vars = Vars::with_value(json!({
+      "STRUCTURED": { "sh": command },
+      "FILTERED": format!("prefix-{{{{ \"{command}\" | shell }}}}"),
+    }));
+    vars.set_dir(temp_dir.path());
+
+    vars.expand(false).await.unwrap();
+
+    assert_eq!(vars.get("STRUCTURED"), Some(&Value::String("dynamic".to_owned())));
+    assert_eq!(vars.get("FILTERED"), Some(&Value::String("prefix-dynamic".to_owned())));
   }
 }

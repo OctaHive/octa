@@ -308,12 +308,19 @@ version: 1
 tasks:
   build:
     vars:
-      VERSION: '{{ shell(command="git describe --tags --always") }}'
+      VERSION:
+        sh: git describe --tags --always
     env:
       BUILD_VERSION: "{{ VERSION }}"
-      COMMIT: '{{ shell(command="git rev-parse --short HEAD") }}'
+      COMMIT:
+        sh: git rev-parse --short HEAD
+      RELEASE: 'release-{{ "git describe --tags --always" | shell }}'
     shell: ./build.sh
 ```
+
+Use `sh:` when the command produces the complete value. The `shell` Tera filter is useful when the
+output is embedded in a larger template. The existing
+`{{ shell(command="git describe --tags") }}` function form remains supported.
 
 Shell-backed values run once for each task execution and are evaluated again when watch mode reruns
 the task. Octafile-level values run from their Octafile directory, while task-level environment
@@ -409,7 +416,8 @@ tasks:
     cmds:
       - go build -ldflags="-X main.Version={{VERSION}}" main.go      
     vars:
-      VERSION: '{{ shell(command="git describe --tags --abbrev=0") }}'
+      VERSION:
+        sh: git describe --tags --abbrev=0
 ```
 
 # Dry mode

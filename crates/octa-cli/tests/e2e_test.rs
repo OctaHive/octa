@@ -855,11 +855,14 @@ tasks:
     dotenv:
       - .env.runtime
     vars:
-      VERSION: '{{{{ shell(command="{read_command}") }}}}'
+      VERSION:
+        sh: "{read_command}"
     env:
       FROM_VAR: "{{{{ VERSION }}}}"
-      FROM_SHELL: '{{{{ shell(command="{env_command}") }}}}'
-    tpl: "$FROM_VAR|$FROM_SHELL"
+      FROM_SHELL:
+        sh: "{env_command}"
+      FROM_FILTER: '{{{{ "{read_command}" | shell }}}}'
+    tpl: "$FROM_VAR|$FROM_SHELL|$FROM_FILTER"
 "#
   );
   fs::write(tmp_dir.path().join("octafile.yml"), octafile)?;
@@ -871,7 +874,7 @@ tasks:
   cmd
     .assert()
     .success()
-    .stdout(predicate::str::contains("dynamic|from-dotenv"));
+    .stdout(predicate::str::contains("dynamic|from-dotenv|dynamic"));
 
   Ok(())
 }
@@ -896,7 +899,8 @@ tasks:
     dir: nested
     if: "{condition}"
     env:
-      VALUE: '{{{{ shell(command="{env_command}") }}}}'
+      VALUE:
+        sh: "{env_command}"
     tpl: "$VALUE"
 "#
   );
