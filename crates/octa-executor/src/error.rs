@@ -55,6 +55,9 @@ pub enum ExecutorError {
   #[error("Failed to extend source path")]
   GlobError(#[from] GlobError),
 
+  #[error("Failed to load .octaignore: {0}")]
+  OctaignoreError(#[from] ignore::Error),
+
   #[error("Failed to add graph dependency")]
   AddDependencyError(#[from] DAGError),
 

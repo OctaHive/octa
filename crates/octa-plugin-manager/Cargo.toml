@@ -15,16 +15,16 @@ interprocess = { git = "https://github.com/federico-terzi/interprocess", feature
   "tokio",
 ] }
 octa-plugin = { version = "0.2.1", path = "../octa-plugin" }
-semver = "1.0.26"
+semver = "1.0.28"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util = { workspace = true }
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 [target.'cfg(unix)'.dependencies]
-nix = "0.29"
+nix = "0.31"
 
 [dev-dependencies]
-tempfile = "3.19"
+tempfile = "3.27"

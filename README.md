@@ -638,6 +638,23 @@ $ ./octa build
 
 You can use glob patterns when specify source targets.
 
+To exclude files or directories matched by `sources`, create `.octaignore` files anywhere under the root
+`Octafile` directory. Each file uses `.gitignore` syntax, applies to its directory and descendants, and works with
+both the `hash` and `timestamp` source strategies:
+
+```gitignore
+# Ignore generated files and directories
+*.generated.rs
+src/generated/
+
+# Keep one generated file tracked
+!src/generated/schema.generated.rs
+```
+
+Patterns in nested `.octaignore` files override matching rules inherited from parent directories. As with
+`.gitignore`, a file cannot be re-included if one of its parent directories is still ignored. Sources outside the
+root `Octafile` directory are not filtered by `.octaignore`.
+
 By default, Octa calculates file checksums, but you can switch it to track file modification 
 timestamps by setting the `source_strategy` parameter to `timestamp`.
 

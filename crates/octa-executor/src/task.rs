@@ -48,7 +48,7 @@ pub trait Executable<T> {
 
 #[async_trait]
 pub trait SourceStrategy: Send {
-  async fn is_changed(&self, sources: Vec<String>) -> ExecutorResult<bool>;
+  async fn is_changed(&self, sources: Vec<PathBuf>) -> ExecutorResult<bool>;
 }
 
 pub trait TaskItem {
@@ -123,6 +123,7 @@ pub struct TaskConfig {
   pub vars: Vars,                         // Task variables
   pub envs: Envs,                         // Task environments
   pub sources: Option<Vec<String>>,       // Sources for fingerprinting
+  pub octafile_root: PathBuf,             // Directory containing the root Octafile
   pub source_strategy: SourceMethod,      // Source validation strategy
   pub preconditions: Option<Vec<String>>, // Task preconditions
 
@@ -152,6 +153,7 @@ pub struct TaskConfigBuilder {
   pub vars: Option<Vars>,
   pub envs: Option<Envs>,
   pub sources: Option<Vec<String>>,
+  pub octafile_root: Option<PathBuf>,
   pub source_strategy: Option<SourceMethod>,
   pub preconditions: Option<Vec<String>>,
 
@@ -178,6 +180,11 @@ impl TaskConfigBuilder {
 
   pub fn sources(mut self, sources: Option<Vec<String>>) -> Self {
     self.sources = sources;
+    self
+  }
+
+  pub fn octafile_root(mut self, octafile_root: impl Into<PathBuf>) -> Self {
+    self.octafile_root = Some(octafile_root.into());
     self
   }
 
@@ -238,17 +245,21 @@ impl TaskConfigBuilder {
       None => self.dir,
     };
 
+    let dir = dir.ok_or("Missing mandatory field: dir")?;
+    let octafile_root = self.octafile_root.unwrap_or_else(|| dir.clone());
+
     Ok(TaskConfig {
       id: self.id.ok_or("Missing mandatory field: id")?,
       name: self.name.ok_or("Missing mandatory field: name")?,
       dep_name: self.dep_name.ok_or("Missing mandatory field: dep_name")?,
-      dir: dir.ok_or("Missing mandatory field: dir")?,
+      dir,
       ignore_errors: self.ignore_errors.unwrap_or(false),
       silent: self.silent.unwrap_or(false),
       run_mode: self.run_mode.unwrap_or(RunMode::Always),
       vars: self.vars.unwrap_or_default(),
       envs: self.envs.unwrap_or_default(),
       sources: self.sources,
+      octafile_root,
       preconditions: self.preconditions,
       source_strategy: self.source_strategy.unwrap_or(SourceMethod::Hash),
       cmd_type: self.cmd_type.unwrap_or(CmdType::Normal),
@@ -275,6 +286,7 @@ pub struct TaskNode {
   pub vars: Vars,                         // Task variables
   pub envs: Envs,                         // Task environments
   pub sources: Option<Vec<String>>,       // Sources for fingerprinting
+  pub octafile_root: PathBuf,             // Directory containing the root Octafile
   pub source_strategy: SourceMethod,      // Source validation strategy
   pub preconditions: Option<Vec<String>>, // Task run preconditions
 
@@ -309,6 +321,7 @@ impl TaskNode {
       dep_name: config.dep_name,
       run_mode: config.run_mode,
       sources: config.sources,
+      octafile_root: config.octafile_root,
       source_strategy: config.source_strategy,
       vars: config.vars,
       envs: config.envs,
@@ -447,11 +460,12 @@ impl TaskNode {
 
   async fn check_sources(&self, fingerprint: Arc<Db>) -> ExecutorResult<bool> {
     if let Some(sources) = &self.sources {
+      let sources = crate::source::collect(sources, &self.octafile_root)?;
       let strategy: Box<dyn SourceStrategy + Send> = match self.source_strategy {
         SourceMethod::Hash => Box::new(HashSource::new(fingerprint.clone())),
         SourceMethod::Timestamp => Box::new(TimestampSource::new(fingerprint.clone())),
       };
-      strategy.is_changed(sources.clone()).await
+      strategy.is_changed(sources).await
     } else {
       Ok(true)
     }

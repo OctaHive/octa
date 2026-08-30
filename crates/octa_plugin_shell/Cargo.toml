@@ -18,17 +18,17 @@ bench = false
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 octa-plugin = { version = "0.2.1", path = "../octa-plugin" }
-futures-util = "0.3.31"
+futures-util = "0.3.34"
 serde = { workspace = true }
 serde_json = { workspace = true }
-shellexpand = "3.1.1"
+shellexpand = "3.1.2"
 tera = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util = { workspace = true }
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 [target.'cfg(unix)'.dependencies]
-nix = "0.29"
+nix = "0.31"
 
 [dev-dependencies]
-tempfile = "3.19"
+tempfile = "3.27"

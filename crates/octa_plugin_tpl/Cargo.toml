@@ -18,7 +18,7 @@ bench = false
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 octa-plugin = { version = "0.2.1", path = "../octa-plugin" }
-shellexpand = "3.1.1"
+shellexpand = "3.1.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tera = { workspace = true }
@@ -26,4 +26,4 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.19"
+tempfile = "3.27"

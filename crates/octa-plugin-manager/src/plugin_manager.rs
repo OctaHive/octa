@@ -688,7 +688,7 @@ time.sleep(10)  # Simulate a hanging plugin
     .await
     .unwrap();
 
-    let setup = TestSetup::new(temp_dir.into_path(), "hanging.py").await;
+    let setup = TestSetup::new(temp_dir.keep(), "hanging.py").await;
 
     // Try to start the hanging plugin
     let result = tokio::time::timeout(
@@ -809,7 +809,7 @@ sys.exit(1)  # Crash immediately
         .unwrap();
     }
 
-    let setup = TestSetup::new(temp_dir.into_path(), "crash.py").await;
+    let setup = TestSetup::new(temp_dir.keep(), "crash.py").await;
 
     let result = setup
       .plugin_manager

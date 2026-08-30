@@ -4,6 +4,7 @@ pub mod error;
 pub mod executor;
 mod function;
 mod hash_source;
+mod source;
 pub mod summary;
 pub mod task;
 mod timestamp_source;
@@ -53,7 +54,7 @@ impl TaskGraphBuilder {
   pub fn new(plugin_manager: Arc<PluginManager>) -> ExecutorResult<Self> {
     let current_dir = env::current_dir()?;
     let os_type = whoami::platform().to_string().replace(" ", "").to_lowercase();
-    let os_arch = whoami::arch().to_string().replace(" ", "").to_lowercase();
+    let os_arch = whoami::cpu_arch().to_string().replace(" ", "").to_lowercase();
 
     Ok(Self {
       plugin_manager,
@@ -538,6 +539,7 @@ impl TaskGraphBuilder {
       .envs(envs)
       .preconditions(cmd.task.preconditions.clone())
       .sources(cmd.task.sources.clone())
+      .octafile_root(cmd.octafile.root().dir.clone())
       .silent(cmd.task.silent)
       .source_strategy(cmd.task.source_strategy.clone())
       .ignore_errors(cmd.task.ignore_error)
@@ -754,7 +756,7 @@ impl TaskGraphBuilder {
   fn initialize_global_vars(&self, cmd: &FindResult) -> Vars {
     let mut vars = Vars::new();
     let os_type = whoami::platform();
-    let os_arch = whoami::arch();
+    let os_arch = whoami::cpu_arch();
     let root = cmd.octafile.root();
 
     vars.set_value(root.vars.clone());

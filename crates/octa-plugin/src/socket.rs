@@ -22,7 +22,7 @@ pub fn make_local_socket_name(unique_id: &str) -> OsString {
 
 /// Interpret a local socket name for use with `interprocess`.
 #[cfg(unix)]
-pub fn interpret_local_socket_name(name: &OsStr) -> Result<interprocess::local_socket::Name, std::io::Error> {
+pub fn interpret_local_socket_name(name: &OsStr) -> Result<interprocess::local_socket::Name<'_>, std::io::Error> {
   use interprocess::local_socket::{GenericFilePath, ToFsName};
 
   name.to_fs_name::<GenericFilePath>()
@@ -40,7 +40,7 @@ pub fn make_local_socket_name(unique_id: &str) -> OsString {
 
 /// Interpret a local socket name for use with `interprocess`.
 #[cfg(windows)]
-pub fn interpret_local_socket_name(name: &OsStr) -> Result<interprocess::local_socket::Name, std::io::Error> {
+pub fn interpret_local_socket_name(name: &OsStr) -> Result<interprocess::local_socket::Name<'_>, std::io::Error> {
   use interprocess::local_socket::{GenericNamespaced, ToNsName};
 
   name.to_ns_name::<GenericNamespaced>()

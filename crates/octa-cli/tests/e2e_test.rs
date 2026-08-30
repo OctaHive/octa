@@ -1,4 +1,8 @@
-use std::{env, fs::File, io::Write};
+use std::{
+  env,
+  fs::{self, File},
+  io::Write,
+};
 
 use assert_cmd::Command;
 use predicates::prelude::{predicate, PredicateBooleanExt};
@@ -38,6 +42,53 @@ fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
   cmd.arg("hello");
   cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
   cmd.assert().success().stdout(predicate::str::contains("hello world"));
+
+  Ok(())
+}
+
+#[test]
+fn test_octaignore_excludes_sources() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let package_root = env::current_dir()?.join("../../plugins").canonicalize()?;
+  let src_dir = tmp_dir.path().join("src");
+  let runs_file = tmp_dir.path().join("runs.txt");
+  fs::create_dir(&src_dir)?;
+  fs::write(src_dir.join("tracked.txt"), "tracked")?;
+  fs::write(src_dir.join("ignored.txt"), "ignored")?;
+  fs::write(src_dir.join(".octaignore"), "ignored.txt\n")?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  build:
+    sources:
+      - ./src/*.txt
+    shell: echo run >> runs.txt
+"#,
+  )?;
+
+  let run = || -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = Command::cargo_bin("octa")?;
+    cmd.current_dir(tmp_dir.path());
+    cmd.env("OCTA_TESTS", "");
+    cmd.env("OCTA_PLUGINS_DIR", &package_root);
+    cmd.arg("build");
+    cmd.assert().success();
+    Ok(())
+  };
+
+  run()?;
+  assert_eq!(fs::read_to_string(&runs_file)?.lines().count(), 1);
+
+  fs::write(src_dir.join("ignored.txt"), "ignored change")?;
+  run()?;
+  assert_eq!(fs::read_to_string(&runs_file)?.lines().count(), 1);
+
+  fs::write(src_dir.join("tracked.txt"), "tracked change")?;
+  run()?;
+  assert_eq!(fs::read_to_string(&runs_file)?.lines().count(), 2);
 
   Ok(())
 }

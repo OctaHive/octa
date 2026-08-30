@@ -123,7 +123,7 @@ impl Plugin for ShellPlugin {
       .add_raw_template(&template_name, val.as_ref())
       .context("Failed to parse template")?;
 
-    let context = TeraContext::from_serialize(vars).context("Failed to serialize variables to context")?;
+    let context = TeraContext::from_serialize(&vars).context("Failed to serialize variables to context")?;
 
     let result = tera
       .render(&template_name, &context)
@@ -370,7 +370,7 @@ mod tests {
     let writer = Arc::new(Mutex::new(TestWriter::new()));
     let logger = Arc::new(MockLogger::new());
     let temp_dir = tempdir().unwrap();
-    (writer, logger, temp_dir.into_path())
+    (writer, logger, temp_dir.keep())
   }
 
   #[tokio::test]

@@ -21,11 +21,11 @@ octa-executor = { version = "0.2.1", path = "../octa-executor" }
 octa-plugin-manager = { version = "0.2.1", path = "../octa-plugin-manager" }
 octa-plugin = { version = "0.2.1", path = "../octa-plugin" }
 clap_complete = "4"
-clap = { version = "4.5", features = ["derive", "env"] }
-chrono = "0.4.40"
-colored = "3.0"
+clap = { version = "4.6", features = ["derive", "env"] }
+chrono = "0.4.45"
+colored = "3.1"
 dotenvy = "0.15.7"
-nu-ansi-term = "0.50.1"
+nu-ansi-term = "0.50.3"
 lazy_static = { workspace = true }
 serde = { workspace = true }
 serde_yml = { workspace = true }
@@ -37,7 +37,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3.19"
+tempfile = "3.27"
 pretty_assertions = "1.4"
-assert_cmd = "2.0.17"
-predicates = "3.1.3"
+assert_cmd = "2.2.2"
+predicates = "3.1.4"

@@ -166,11 +166,6 @@ impl Octafile {
         let mut octafile = Octafile::default();
 
         for (key, value) in map {
-          let key = match key {
-            Value::String(s) => s,
-            _ => return Err("Expected string key".to_string()),
-          };
-
           match key.as_str() {
             "version" => {
               octafile.version = match value {
@@ -191,11 +186,6 @@ impl Octafile {
               if let Value::Mapping(tasks_map) = value {
                 let mut tasks = HashMap::new();
                 for (task_key, task_value) in tasks_map {
-                  let task_name = match task_key {
-                    Value::String(s) => s,
-                    _ => return Err("Expected string key for tasks".to_string()),
-                  };
-
                   let task = match task_value {
                     Value::String(s) => {
                       let task_visitor = crate::task::TaskVisitor { context };
@@ -203,15 +193,14 @@ impl Octafile {
                         .visit_str::<serde_yml::Error>(&s)
                         .map_err(|e| e.to_string())?
                     },
-                    _ => {
+                    task_value => {
                       let task_seed = TaskSeed { context };
-                      let task_str = serde_yml::to_string(&task_value).map_err(|e| e.to_string())?;
-                      let deserializer = serde_yml::Deserializer::from_str(&task_str);
+                      let deserializer = serde_yml::Deserializer::new(&task_value);
                       task_seed.deserialize(deserializer).map_err(|e| e.to_string())?
                     },
                   };
 
-                  tasks.insert(task_name, task);
+                  tasks.insert(task_key, task);
                 }
                 octafile.tasks = tasks;
               } else {
@@ -489,11 +478,6 @@ impl<'de> Visitor<'de> for OctafileVisitor {
           if let Value::Mapping(tasks_map) = map.next_value::<Value>()? {
             let mut tasks = HashMap::new();
             for (task_key, task_value) in tasks_map {
-              let task_name = match task_key {
-                Value::String(s) => s,
-                _ => return Err(serde::de::Error::custom("Expected string key for tasks")),
-              };
-
               let task = match task_value {
                 Value::String(s) => {
                   let task_visitor = crate::task::TaskVisitor { context: &self.context };
@@ -501,15 +485,14 @@ impl<'de> Visitor<'de> for OctafileVisitor {
                     .visit_str::<A::Error>(&s)
                     .map_err(serde::de::Error::custom)?
                 },
-                _ => {
+                task_value => {
                   let task_seed = TaskSeed { context: &self.context };
-                  let task_str = serde_yml::to_string(&task_value).map_err(serde::de::Error::custom)?;
-                  let deserializer = serde_yml::Deserializer::from_str(&task_str);
+                  let deserializer = serde_yml::Deserializer::new(&task_value);
                   task_seed.deserialize(deserializer).map_err(serde::de::Error::custom)?
                 },
               };
 
-              tasks.insert(task_name, task);
+              tasks.insert(task_key, task);
             }
             octafile.tasks = tasks;
           }

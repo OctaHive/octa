@@ -64,7 +64,7 @@ impl Vars {
   }
 
   pub fn set_value<T: Serialize>(&mut self, value: T) {
-    self.context = Context::from_serialize(value).unwrap_or_default();
+    self.context = Context::from_serialize(&value).unwrap_or_default();
     self.expanded = false;
   }
 
@@ -250,7 +250,7 @@ impl<'de> Deserialize<'de> for Vars {
   {
     let map = HashMap::<String, Value>::deserialize(deserializer)?;
     let mut vars = Vars::new();
-    vars.context = Context::from_serialize(map).unwrap_or_default();
+    vars.context = Context::from_serialize(&map).unwrap_or_default();
     Ok(vars)
   }
 }
