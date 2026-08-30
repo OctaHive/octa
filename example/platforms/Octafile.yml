@@ -9,7 +9,12 @@ tasks:
     platforms: ["macos/amd64"]
     shell: echo Mac OS build
 
+  build_arm:
+    platforms: ["arm64"]
+    shell: echo ARM64 build
+
   build:
     cmds:
       - task: build_win
       - task: build_mac
+      - task: build_arm

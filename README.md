@@ -564,10 +564,14 @@ tasks:
 ```
 
 # Platform specific tasks
-If you want to create different tasks for different operating systems and architectures, you can use the `platform` parameter in a task.
+If you want to create different tasks for different operating systems and architectures, you can use the `platforms` parameter in a task.
 Tasks that are not valid for the current architecture or operating system will be skipped during execution. Additionally, the current 
 operating system type will be available through the `OCTA_OS` variable, and the current architecture will be  available through the 
 `OCTA_ARCH` variable. You can specify multiple operating system and/or architecture types for a task.
+
+Each value can select an operating system (`linux`, `windows`, `macos`), an architecture (`x86_64`, `arm64`),
+or an exact pair such as `linux/x86_64`. The aliases `amd64` and `x64` match `x86_64`; `aarch64` matches
+`arm64`. Matching is case-insensitive and ignores whitespace.
 
 ```yaml
 version: 1
@@ -580,11 +584,16 @@ tasks:
   build_mac: 
     platforms: ["macos/arm64"]
     shell: echo Mac OS build
+
+  build_linux:
+    platforms: ["linux/amd64"]
+    shell: echo Linux x86-64 build
     
   build:
     cmds:
       - task: build_win
       - task: build_mac
+      - task: build_linux
 ```
 
 # Task dependencies

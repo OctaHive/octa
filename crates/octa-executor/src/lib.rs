@@ -32,6 +32,31 @@ use vars::Vars;
 type DagNode = DAG<TaskNode>;
 type ArcNode = Arc<TaskNode>;
 
+fn normalize_platform(value: &str) -> String {
+  value
+    .chars()
+    .filter(|character| !character.is_whitespace())
+    .flat_map(char::to_lowercase)
+    .collect()
+}
+
+fn normalize_architecture(value: &str) -> String {
+  match normalize_platform(value).as_str() {
+    "amd64" | "x64" | "x86-64" => "x86_64".to_string(),
+    "aarch64" => "arm64".to_string(),
+    architecture => architecture.to_string(),
+  }
+}
+
+fn matches_platform(selector: &str, os_type: &str, os_arch: &str) -> bool {
+  if let Some((platform, architecture)) = selector.split_once('/') {
+    return normalize_platform(platform) == os_type && normalize_architecture(architecture) == os_arch;
+  }
+
+  let selector = normalize_platform(selector);
+  selector == os_type || normalize_architecture(&selector) == os_arch
+}
+
 pub struct TaskGraphBuilder {
   plugin_manager: Arc<PluginManager>, // Plugin manager for check plugin commands
   finder: Arc<OctaFinder>,            // Finder for search task in octafile
@@ -53,8 +78,8 @@ impl TaskGraphBuilder {
   /// Creates a new TaskGraphBuilder instance
   pub fn new(plugin_manager: Arc<PluginManager>) -> ExecutorResult<Self> {
     let current_dir = env::current_dir()?;
-    let os_type = whoami::platform().to_string().replace(" ", "").to_lowercase();
-    let os_arch = whoami::cpu_arch().to_string().replace(" ", "").to_lowercase();
+    let os_type = normalize_platform(&whoami::platform().to_string());
+    let os_arch = normalize_architecture(&whoami::cpu_arch().to_string());
 
     Ok(Self {
       plugin_manager,
@@ -897,9 +922,9 @@ impl TaskGraphBuilder {
       .into_iter()
       .filter(|cmd| {
         if let Some(platforms) = &cmd.task.platforms {
-          return platforms.contains(&self.os_type)
-            || platforms.contains(&self.os_arch)
-            || platforms.contains(&format!("{}/{}", self.os_type, self.os_arch));
+          return platforms
+            .iter()
+            .any(|platform| matches_platform(platform, &self.os_type, &self.os_arch));
         }
 
         true
@@ -937,6 +962,22 @@ mod tests {
       extra,
       ..Task::default()
     }
+  }
+
+  #[test]
+  fn test_matches_platform_and_architecture() {
+    for selector in ["linux", "x86_64", "amd64", "x64", "linux/x86_64", "linux/amd64"] {
+      assert!(matches_platform(selector, "linux", "x86_64"), "{selector} must match");
+    }
+
+    for selector in ["windows", "arm64", "linux/arm64", "windows/amd64"] {
+      assert!(
+        !matches_platform(selector, "linux", "x86_64"),
+        "{selector} must not match"
+      );
+    }
+
+    assert!(matches_platform(" macOS / AARCH64 ", "macos", "arm64"));
   }
 
   #[tokio::test]
