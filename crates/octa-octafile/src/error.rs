@@ -10,6 +10,9 @@ pub enum OctafileError {
   #[error("Octafile not found in path {0}")]
   NotFoundError(String),
 
+  #[error("Failed to render included Octafile path '{0}': {1}")]
+  IncludeTemplateError(String, String),
+
   #[error("Octafile {0} parsing error: {1}")]
   ParseError(String, String),
 

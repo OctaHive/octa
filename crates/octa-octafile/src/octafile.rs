@@ -14,6 +14,7 @@ use serde::{
   Deserialize, Deserializer, Serialize,
 };
 use serde_yml::Value;
+use tera::{Context as TeraContext, Tera};
 use tracing::{debug, info};
 
 use crate::{
@@ -464,27 +465,23 @@ impl Octafile {
     };
 
     for (name, include) in includes {
-      let path = match include {
-        IncludeInfo::Simple(path) => match octafile.dir.join(path).canonicalize() {
-          Ok(path) => {
-            Octafile::find_octafile(Some(path.clone()))?.ok_or(OctafileError::NotFoundError(path.display().to_string()))
-          },
-          Err(_) => Err(OctafileError::NotFoundError(path.clone())),
-        }?,
-        IncludeInfo::Complex(complex) => match octafile.dir.join(&complex.octafile).canonicalize() {
-          Ok(path) => {
-            Octafile::find_octafile(Some(path))?.ok_or(OctafileError::NotFoundError(complex.octafile.clone()))?
-          },
-          Err(_) => {
-            if let Some(optional) = complex.optional {
-              if optional {
-                continue;
-              }
-            }
-
-            return Err(OctafileError::NotFoundError(complex.octafile.clone()));
-          },
+      let (path_template, optional) = match include {
+        IncludeInfo::Simple(path) => (path.as_str(), false),
+        IncludeInfo::Complex(complex) => (complex.octafile.as_str(), complex.optional.unwrap_or(false)),
+      };
+      let rendered_path = Self::render_include_path(&octafile, path_template)?;
+      let unresolved_path = octafile.dir.join(&rendered_path);
+      let path = match unresolved_path.canonicalize() {
+        Ok(path) => Octafile::find_octafile(Some(path))?
+          .ok_or_else(|| OctafileError::NotFoundError(unresolved_path.display().to_string()))?,
+        Err(_) if optional => {
+          info!(
+            "Skipping optional {} octafile. Reason:: not found",
+            unresolved_path.display()
+          );
+          continue;
         },
+        Err(_) => return Err(OctafileError::NotFoundError(unresolved_path.display().to_string())),
       };
 
       debug!("Loading included octafile: {}", path.display());
@@ -537,6 +534,20 @@ impl Octafile {
     }
 
     Ok(())
+  }
+
+  /// Resolves an include template before filesystem lookup using Go-compatible platform names.
+  fn render_include_path(octafile: &Octafile, path: &str) -> OctafileResult<String> {
+    let mut template_context = match &octafile.vars {
+      Some(vars) => TeraContext::from_serialize(vars),
+      None => Ok(TeraContext::new()),
+    }
+    .map_err(|error| OctafileError::IncludeTemplateError(path.to_owned(), error.to_string()))?;
+    template_context.insert("OS", go_os());
+    template_context.insert("ARCH", go_arch());
+
+    Tera::one_off(path, &template_context, false)
+      .map_err(|error| OctafileError::IncludeTemplateError(path.to_owned(), error.to_string()))
   }
 
   /// Sets common attributes for an Octafile, including merging from parent if present
@@ -625,6 +636,36 @@ fn home_dir() -> Option<PathBuf> {
     .or_else(dirs::home_dir)
 }
 
+fn go_os() -> &'static str {
+  go_os_name(env::consts::OS)
+}
+
+fn go_os_name(os: &str) -> &str {
+  match os {
+    "macos" => "darwin",
+    os => os,
+  }
+}
+
+fn go_arch() -> &'static str {
+  go_arch_name(env::consts::ARCH, cfg!(target_endian = "little"))
+}
+
+fn go_arch_name(arch: &str, little_endian: bool) -> &str {
+  match arch {
+    "x86" => "386",
+    "x86_64" => "amd64",
+    "aarch64" => "arm64",
+    "loongarch64" => "loong64",
+    "mips" if little_endian => "mipsle",
+    "mips64" if little_endian => "mips64le",
+    "powerpc64" if little_endian => "ppc64le",
+    "powerpc64" => "ppc64",
+    "wasm32" => "wasm",
+    arch => arch,
+  }
+}
+
 impl<'de> Deserialize<'de> for Octafile {
   fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
   where
@@ -710,7 +751,7 @@ impl<'de> Visitor<'de> for OctafileVisitor {
 
 #[cfg(test)]
 mod tests {
-  use super::OCTAFILE_DEFAULT_NAMES;
+  use super::{go_arch, go_arch_name, go_os, go_os_name, OCTAFILE_DEFAULT_NAMES};
   use crate::*;
   use octafile::Version;
   use pretty_assertions::assert_eq;
@@ -862,6 +903,79 @@ mod tests {
 
     // Test hierarchy
     assert_eq!(child.hierarchy_path(), vec!["child".to_string()]);
+  }
+
+  #[test]
+  fn interpolates_platform_and_octafile_vars_in_include_paths() {
+    let temp_dir = TempDir::new().unwrap();
+    let root_path = temp_dir.path().join("Octafile.yml");
+    let included_path = temp_dir
+      .path()
+      .join(format!("Taskfile_{}_{}_debug.yml", go_os(), go_arch()));
+    fs::write(
+      &root_path,
+      r#"
+version: 1
+vars:
+  PROFILE: debug
+includes:
+  platform: Taskfile_{{OS}}_{{ARCH}}_{{PROFILE}}.yml
+tasks: {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+      included_path,
+      r#"
+version: 1
+tasks:
+  build: echo platform
+"#,
+    )
+    .unwrap();
+
+    let octafile = Octafile::load(Some(root_path), false, vec![]).unwrap();
+    let included = octafile.get_included("platform").unwrap().unwrap();
+
+    assert!(included.tasks.contains_key("build"));
+  }
+
+  #[test]
+  fn uses_go_platform_names_in_include_templates() {
+    assert_eq!(go_os_name("macos"), "darwin");
+    assert_eq!(go_os_name("linux"), "linux");
+
+    for (architecture, expected) in [
+      ("x86", "386"),
+      ("x86_64", "amd64"),
+      ("aarch64", "arm64"),
+      ("loongarch64", "loong64"),
+      ("wasm32", "wasm"),
+    ] {
+      assert_eq!(go_arch_name(architecture, false), expected);
+    }
+    assert_eq!(go_arch_name("mips", true), "mipsle");
+    assert_eq!(go_arch_name("mips", false), "mips");
+    assert_eq!(go_arch_name("mips64", true), "mips64le");
+    assert_eq!(go_arch_name("mips64", false), "mips64");
+    assert_eq!(go_arch_name("powerpc64", true), "ppc64le");
+    assert_eq!(go_arch_name("powerpc64", false), "ppc64");
+    assert_eq!(go_arch_name("riscv64", true), "riscv64");
+  }
+
+  #[test]
+  fn reports_invalid_include_path_templates() {
+    let content = r#"
+      version: 1
+      includes:
+        platform: Taskfile_{{MISSING}}.yml
+      tasks: {}
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_include_template");
+
+    let error = Octafile::load(Some(file_path), false, vec![]).unwrap_err();
+
+    assert!(matches!(error, OctafileError::IncludeTemplateError(_, _)));
   }
 
   #[test]

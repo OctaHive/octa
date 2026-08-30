@@ -134,6 +134,21 @@ includes:
 All imported tasks will be accessible through a namespace based on the key name in the imports section. So, you'd call task `web:serve` to 
 run the serve task from web/Octafile.yml or task `backend:build` to run the build task from the ./backend/Octafile.yml file.
 
+Include paths are Tera templates. The built-in `OS` and `ARCH` variables use Go-compatible values such
+as `linux`, `darwin`, `windows`, `amd64`, and `arm64`. Variables declared in the current Octafile are
+also available:
+
+```yaml
+version: 1
+
+vars:
+  PROFILE: development
+
+includes:
+  platform: ./Taskfile_{{OS}}.yml
+  profile: ./profiles/Octafile_{{PROFILE}}.yml
+```
+
 ## Advanced including options
 If you are using the extended task file import option, you can use the following settings:
 

@@ -1,5 +1,8 @@
 version: 1
 
+includes:
+  platform: ./Taskfile_{{OS}}.yml
+
 tasks:
   build_win:
     platforms: ["windows"]
@@ -28,3 +31,7 @@ tasks:
       - task: build_arm
         platforms: [arm64]
       - echo Cross-platform command
+
+  platform_info:
+    cmds:
+      - task: platform:info
