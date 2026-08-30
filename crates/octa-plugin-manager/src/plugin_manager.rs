@@ -1,24 +1,22 @@
 use octa_plugin::protocol::Schema;
 use octa_plugin::socket::{interpret_local_socket_name, make_local_socket_name};
 use std::ffi::OsString;
-use std::{
-  collections::HashMap,
-  hash::{Hash, Hasher},
-  path::PathBuf,
-  process::Stdio,
-  sync::Arc,
-  time::SystemTime,
-};
+use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
 use thiserror::Error;
 use tokio::io::{self, AsyncReadExt};
 use tokio::process::Command;
 use tokio::{
   process::Child,
   sync::Mutex,
+  task::JoinHandle,
   time::{timeout, Duration},
 };
+use uuid::Uuid;
 
-use crate::plugin_client::{PluginClient, PluginClientError};
+use crate::plugin_client::PluginClient;
+
+const PLUGIN_START_TIMEOUT: Duration = Duration::from_secs(5);
+const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Error, Debug)]
 pub enum PluginManagerError {
@@ -74,13 +72,8 @@ impl PluginManager {
   }
 
   /// Generate a unique socket path for a plugin
-  fn generate_socket_path(&self, plugin_name: &str) -> OsString {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    plugin_name.hash(&mut hasher);
-    SystemTime::now().hash(&mut hasher);
-    let unique_id = format!("{:016x}", hasher.finish());
-
-    make_local_socket_name(&unique_id)
+  fn generate_socket_path(&self) -> OsString {
+    make_local_socket_name(&Uuid::new_v4().simple().to_string())
   }
 
   async fn read_stream_to_string<R>(mut stream: R) -> io::Result<String>
@@ -90,6 +83,38 @@ impl PluginManager {
     let mut buffer = String::new();
     stream.read_to_string(&mut buffer).await?;
     Ok(buffer)
+  }
+
+  async fn collect_startup_output(handle: JoinHandle<io::Result<String>>) -> String {
+    match timeout(PROCESS_STOP_TIMEOUT, handle).await {
+      Ok(Ok(Ok(output))) => output,
+      Ok(Ok(Err(error))) => format!("failed to read plugin output: {error}"),
+      Ok(Err(error)) => format!("failed to join plugin output task: {error}"),
+      Err(_) => "timed out while reading plugin output".to_string(),
+    }
+  }
+
+  async fn cleanup_failed_start(
+    process: &mut Child,
+    socket_path: &OsString,
+    stdout_handle: JoinHandle<io::Result<String>>,
+    stderr_handle: JoinHandle<io::Result<String>>,
+  ) {
+    let _ = process.start_kill();
+    let _ = timeout(PROCESS_STOP_TIMEOUT, process.wait()).await;
+    let _ = tokio::fs::remove_file(socket_path).await;
+
+    let (stdout, stderr) = tokio::join!(
+      Self::collect_startup_output(stdout_handle),
+      Self::collect_startup_output(stderr_handle)
+    );
+
+    if !stdout.is_empty() {
+      println!("Plugin stdout: {stdout}");
+    }
+    if !stderr.is_empty() {
+      println!("Plugin stderr: {stderr}");
+    }
   }
 
   /// Start a plugin and establish connection
@@ -107,13 +132,16 @@ impl PluginManager {
       return Err(PluginManagerError::PluginAlreadyRunning(plugin_name.to_string()));
     }
 
-    let socket_path = self.generate_socket_path(plugin_path);
+    let socket_path = self.generate_socket_path();
 
     if !plugin_full_path.exists() {
       return Err(PluginManagerError::PluginNotFound(
         plugin_full_path.to_string_lossy().to_string(),
       ));
     }
+
+    let socket_name =
+      interpret_local_socket_name(&socket_path).map_err(|e| PluginManagerError::SocketPath(e.to_string()))?;
 
     let mut command = self.setup_command(plugin_full_path.clone(), socket_path.clone());
     let mut process = command.spawn()?;
@@ -132,39 +160,35 @@ impl PluginManager {
     let stdout_handle = tokio::spawn(Self::read_stream_to_string(stdout));
     let stderr_handle = tokio::spawn(Self::read_stream_to_string(stderr));
 
-    // Convert socket path to proper format for connection
-    let socket_name =
-      interpret_local_socket_name(&socket_path).map_err(|e| PluginManagerError::SocketPath(e.to_string()))?;
+    let startup = timeout(PLUGIN_START_TIMEOUT, async {
+      let mut client = PluginClient::connect(&socket_name)
+        .await
+        .map_err(|error| PluginManagerError::ConnectionError(error.to_string()))?;
+      client
+        .handshake()
+        .await
+        .map_err(|error| PluginManagerError::StartError(error.to_string()))?;
+      let schema = client
+        .get_schema()
+        .await
+        .map_err(|error| PluginManagerError::StartError(error.to_string()))?;
 
-    // Try to connect with timeout
-    let client = match timeout(Duration::from_secs(5), async {
-      loop {
-        match PluginClient::connect(&socket_name).await {
-          Ok(client) => return Ok::<_, PluginClientError>(client),
-          Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-      }
+      Ok::<_, PluginManagerError>((client, schema))
     })
-    .await
-    {
-      Ok(Ok(client)) => client,
-      Err(_) => {
-        let stdout_content = stdout_handle
-          .await
-          .map_err(|e| PluginManagerError::StartError(e.to_string()))?
-          .map_err(|e| PluginManagerError::StartError(e.to_string()))?;
+    .await;
 
-        let stderr_content = stderr_handle
-          .await
-          .map_err(|e| PluginManagerError::StartError(e.to_string()))?
-          .map_err(|e| PluginManagerError::StartError(e.to_string()))?;
-
-        println!("Plugin stdout: {}", stdout_content);
-        println!("Plugin stderr: {}", stderr_content);
-
-        return Err(PluginManagerError::ConnectionError("Connection timeout".to_string()));
+    let (client, schema) = match startup {
+      Ok(Ok(result)) => result,
+      Ok(Err(error)) => {
+        Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
+        return Err(error);
       },
-      Ok(Err(e)) => return Err(PluginManagerError::ConnectionError(e.to_string())),
+      Err(_) => {
+        Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
+        return Err(PluginManagerError::ConnectionError(
+          "Plugin startup timeout".to_string(),
+        ));
+      },
     };
 
     let client = Arc::new(Mutex::new(Some(client)));
@@ -178,26 +202,12 @@ impl PluginManager {
       },
     );
 
-    let schema = {
-      let mut client_guard = client.lock().await;
-      if let Some(ref mut client) = *client_guard {
-        client
-          .handshake()
-          .await
-          .map_err(|e| PluginManagerError::StartError(e.to_string()))?;
-        client
-          .get_schema()
-          .await
-          .map_err(|e| PluginManagerError::StartError(e.to_string()))?
-      } else {
-        return Err(PluginManagerError::StartError("Client not available".to_string()));
-      }
-    };
-
     {
       let mut schemas = self.plugins_schema.lock().await;
       schemas.insert(plugin_name, schema.clone());
     }
+
+    drop(active_plugins);
 
     Ok(schema)
   }
@@ -271,19 +281,15 @@ impl PluginManager {
 
   /// Shutdown a specific plugin
   pub async fn shutdown_plugin(&self, plugin_name: &str) -> Result<()> {
-    // Delete schema
-    {
-      let mut schemas = self.plugins_schema.lock().await;
-      schemas.remove(plugin_name);
-    }
+    let mut active_plugins = self.active_plugins.lock().await;
+    let mut instance = active_plugins
+      .remove(plugin_name)
+      .ok_or_else(|| PluginManagerError::PluginNotFound(plugin_name.to_string()))?;
 
-    // First get the instance
-    let mut instance = {
-      let mut active_plugins = self.active_plugins.lock().await;
-      active_plugins
-        .remove(plugin_name)
-        .ok_or_else(|| PluginManagerError::PluginNotFound(plugin_name.to_string()))?
-    };
+    let mut schemas = self.plugins_schema.lock().await;
+    schemas.remove(plugin_name);
+    drop(schemas);
+    drop(active_plugins);
 
     // Handle the client shutdown
     let shutdown_result = {
@@ -381,6 +387,8 @@ impl Drop for PluginManager {
 
 #[cfg(test)]
 mod tests {
+  use std::collections::HashSet;
+
   use super::*;
   use octa_plugin::protocol::PluginResponse;
   use tempfile::TempDir;
@@ -408,6 +416,44 @@ mod tests {
 
     fn plugin_name(&self) -> &str {
       self.plugin_path.file_name().unwrap().to_str().unwrap()
+    }
+  }
+
+  #[test]
+  fn test_socket_paths_are_unique() {
+    let manager = PluginManager::new(".");
+    let paths = (0..1_000)
+      .map(|_| manager.generate_socket_path())
+      .collect::<HashSet<_>>();
+
+    assert_eq!(paths.len(), 1_000);
+  }
+
+  #[tokio::test]
+  async fn test_parallel_managers_start_same_plugin() {
+    let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
+    let managers = [
+      PluginManager::new(plugins_dir.clone()),
+      PluginManager::new(plugins_dir.clone()),
+      PluginManager::new(plugins_dir),
+    ];
+
+    let starts = tokio::time::timeout(Duration::from_secs(10), async {
+      tokio::join!(
+        managers[0].start_plugin("test.py"),
+        managers[1].start_plugin("test.py"),
+        managers[2].start_plugin("test.py")
+      )
+    })
+    .await
+    .expect("parallel plugin startup timed out");
+
+    assert!(starts.0.is_ok());
+    assert!(starts.1.is_ok());
+    assert!(starts.2.is_ok());
+
+    for manager in &managers {
+      assert!(manager.shutdown_all().await.iter().all(Result::is_ok));
     }
   }
 
@@ -692,14 +738,15 @@ time.sleep(10)  # Simulate a hanging plugin
 
     // Try to start the hanging plugin
     let result = tokio::time::timeout(
-      Duration::from_secs(2),
+      Duration::from_secs(10),
       setup
         .plugin_manager
         .start_plugin(hanging_plugin.file_name().unwrap().to_str().unwrap()),
     )
-    .await;
+    .await
+    .expect("plugin startup exceeded its internal timeout");
 
-    assert!(result.is_err() || result.unwrap().is_err());
+    assert!(matches!(result, Err(PluginManagerError::ConnectionError(_))));
   }
 
   #[tokio::test]

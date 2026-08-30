@@ -21,6 +21,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util = { workspace = true }
+uuid = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 [target.'cfg(unix)'.dependencies]
