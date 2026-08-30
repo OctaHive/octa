@@ -627,13 +627,13 @@ fn test_task_run_mode() -> Result<(), Box<dyn std::error::Error>> {
   file.write_all(
     r#"
     version: 1
+    run: changed
     tasks:
       long:
         run: once
         shell: sleep 1
 
       task:
-        run: changed
         shell: echo {{ CONTENT }}
         deps:
           - long
@@ -660,7 +660,12 @@ fn test_task_run_mode() -> Result<(), Box<dyn std::error::Error>> {
   cmd.arg("test");
 
   let output = cmd.output().expect("Failed to execute command");
-  assert!(output.status.success());
+  assert!(
+    output.status.success(),
+    "stdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
 
   let stdout = String::from_utf8(output.stdout).expect("Invalid UTF-8 in stdout");
   let lines: Vec<&str> = stdout.lines().collect();

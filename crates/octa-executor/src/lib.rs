@@ -568,7 +568,7 @@ impl TaskGraphBuilder {
       .silent(cmd.task.silent)
       .source_strategy(cmd.task.source_strategy.clone())
       .ignore_errors(cmd.task.ignore_error)
-      .run_mode(cmd.task.run.clone())
+      .run_mode(self.task_run_mode(cmd))
       .extra(extra);
 
     let task = TaskNode::new(task_config.build().unwrap());
@@ -610,7 +610,7 @@ impl TaskGraphBuilder {
     // видна в результатах выполнения плана задач.
     let group = self.create_group_node(
       dag,
-      cmd.task.run.clone(),
+      self.task_run_mode(cmd),
       format!("Group deps task for command {}", cmd.name),
     )?;
 
@@ -686,6 +686,10 @@ impl TaskGraphBuilder {
       .into_iter()
       .filter(|t| !t.task.internal.unwrap_or(false))
       .collect()
+  }
+
+  fn task_run_mode(&self, cmd: &FindResult) -> Option<AllowedRun> {
+    cmd.task.run.clone().or_else(|| cmd.octafile.run.clone())
   }
 
   /// Build a map tracking frequency of each dependency
@@ -1013,6 +1017,52 @@ mod tests {
     let tasks: Vec<String> = dag.nodes().iter().map(|n| n.name.clone()).collect();
 
     assert!(tasks.contains(&"test".to_owned()));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_octafile_run_mode_is_inherited_and_can_be_overridden() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      run: once
+      includes:
+        child: child.yml
+      tasks:
+        inherited:
+          shell: echo inherited
+        overridden:
+          run: changed
+          shell: echo overridden
+    "#;
+    let child_content = r#"
+      version: 1
+      run: changed
+      tasks:
+        child_inherited:
+          shell: echo child
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+    fs::write(temp_dir.path().join("child.yml"), child_content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
+    let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+    let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+    let builder = TaskGraphBuilder::new(plugin_manager)?;
+    let dag = builder.build(octafile, "**", true, vec![]).await?;
+
+    let inherited = dag.nodes().iter().find(|task| task.name == "inherited").unwrap();
+    let overridden = dag.nodes().iter().find(|task| task.name == "overridden").unwrap();
+    let child = dag
+      .nodes()
+      .iter()
+      .find(|task| task.name == "child:child_inherited")
+      .unwrap();
+    assert_eq!(inherited.run_mode, task::RunMode::Once);
+    assert_eq!(overridden.run_mode, task::RunMode::Changed);
+    assert_eq!(child.run_mode, task::RunMode::Changed);
+
     Ok(())
   }
 

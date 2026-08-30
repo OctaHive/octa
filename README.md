@@ -684,6 +684,22 @@ tasks:
           CONTENT: 2
 ```
 
+You can also set `run` at the Octafile level. It becomes the default for tasks declared in that file;
+a task-level value takes precedence. Included Octafiles use their own `run` setting.
+
+```yaml
+version: 1
+run: changed
+
+tasks:
+  build:
+    shell: cargo build
+
+  publish:
+    run: always
+    shell: cargo publish
+```
+
 # Prevent run task
 Often, if your source files have not changed, there is no need to run the task. To handle this, you can specify 
 the `sources` parameter for the task, where you can list the files whose changes need to be tracked. When the 

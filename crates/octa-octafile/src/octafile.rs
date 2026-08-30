@@ -18,7 +18,7 @@ use crate::{
   error::{OctafileError, OctafileResult},
   include::IncludeInfo,
   parser::{self, location_error, Node},
-  task::{Context, PluginSchemas, Task, TaskSeed},
+  task::{AllowedRun, Context, PluginSchemas, Task, TaskSeed},
 };
 
 const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
@@ -86,6 +86,9 @@ pub struct Octafile {
   // Octafile global environment variables
   pub env: Option<Envs>,
 
+  // Default task run mode
+  pub run: Option<AllowedRun>,
+
   // list of included octafiles
   pub includes: Option<HashMap<String, IncludeInfo>>,
 
@@ -120,6 +123,7 @@ impl fmt::Debug for Octafile {
     f.debug_struct("Octafile")
       .field("version", &self.version)
       .field("name", &self._name)
+      .field("run", &self.run)
       .field("includes", &self.includes)
       .field("tasks", &self.tasks)
       .field("dir", &self.dir)
@@ -197,6 +201,9 @@ impl Octafile {
         },
         "env" => {
           octafile.env = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "run" => {
+          octafile.run = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
         },
         "includes" => {
           octafile.includes = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
@@ -516,6 +523,9 @@ impl<'de> Visitor<'de> for OctafileVisitor {
         "env" => {
           octafile.env = map.next_value()?;
         },
+        "run" => {
+          octafile.run = map.next_value()?;
+        },
         "includes" => {
           octafile.includes = map.next_value()?;
         },
@@ -581,6 +591,7 @@ mod tests {
   fn test_load_basic_octafile() {
     let content = r#"
       version: 1
+      run: changed
       tasks:
         test:
           shell: echo "hello"
@@ -589,7 +600,20 @@ mod tests {
 
     let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
     assert_eq!(octafile.version, 1);
+    assert_eq!(octafile.run, Some(AllowedRun::Changed));
     assert!(octafile.tasks.contains_key("test"));
+  }
+
+  #[test]
+  fn test_invalid_octafile_run_mode() {
+    let content = r#"
+      version: 1
+      run: invalid
+      tasks: {}
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_octafile_run_mode");
+
+    assert!(Octafile::load(Some(file_path), false, vec![]).is_err());
   }
 
   #[test]
