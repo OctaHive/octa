@@ -501,7 +501,9 @@ it from appearing in the list of available tasks when using the `--list-tasks` c
 
 ## Task directory
 By default, tasks are executed in the directory where the Octafile is located. However, you can easily 
-change the working directory for a task by specifying the `dir` parameter.
+change the working directory for a task by specifying the `dir` parameter. If that directory does not
+exist, Octa creates it together with any missing parent directories before executing the task. A dry run
+resolves the path without creating it.
 
 ```yaml
 version: 1

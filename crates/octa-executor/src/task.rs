@@ -449,6 +449,27 @@ impl TaskNode {
     }
   }
 
+  async fn prepare_dir(&self, dry: bool) -> ExecutorResult<PathBuf> {
+    let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
+
+    if dry {
+      return match canonicalize(&dir) {
+        Ok(dir) => Ok(dir),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+          if dir.is_absolute() {
+            Ok(dir)
+          } else {
+            Ok(env::current_dir()?.join(dir))
+          }
+        },
+        Err(error) => Err(error.into()),
+      };
+    }
+
+    tokio::fs::create_dir_all(&dir).await?;
+    Ok(canonicalize(dir)?)
+  }
+
   fn log_info(&self, message: String) {
     if self.cmd_type != CmdType::Internal {
       info!("{}", message);
@@ -632,8 +653,7 @@ impl Executable<TaskNode> for TaskNode {
     let deps_res = self.deps_res.lock().await;
     vars_with_deps_results.insert("deps_result", &*deps_res);
 
-    let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
-    let dir = canonicalize(dir)?;
+    let dir = self.prepare_dir(dry).await?;
 
     match self
       .execute_plugin_command(

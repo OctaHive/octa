@@ -538,6 +538,42 @@ fn test_dry_run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_create_task_directory() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let task_dir = tmp_dir.path().join("build").join("generated");
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+tasks:
+  build:
+    vars:
+      OUTPUT_DIR: build/generated
+    dir: "{{ OUTPUT_DIR }}"
+    shell: echo created > result.txt
+"#,
+  )?;
+
+  let plugins_dir = validation_plugins_dir();
+  let mut dry_run = Command::cargo_bin("octa")?;
+  dry_run.current_dir(tmp_dir.path());
+  dry_run.env("OCTA_PLUGINS_DIR", &plugins_dir);
+  dry_run.args(["--dry", "build"]);
+  dry_run.assert().success();
+  assert!(!task_dir.exists());
+
+  let mut run = Command::cargo_bin("octa")?;
+  run.current_dir(tmp_dir.path());
+  run.env("OCTA_PLUGINS_DIR", plugins_dir);
+  run.arg("build");
+  run.assert().success();
+
+  assert!(task_dir.join("result.txt").is_file());
+
+  Ok(())
+}
+
+#[test]
 fn test_task_run_mode() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");

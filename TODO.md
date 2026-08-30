@@ -1,4 +1,3 @@
-- Create task directory if it not exist
 - Add support architecture to platform specific task
 - Add run options to octafile level
 - Add better output for cli
