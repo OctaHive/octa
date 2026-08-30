@@ -66,6 +66,9 @@ pub(crate) struct Cli {
   #[arg(short, long)]
   pub config: Option<PathBuf>,
 
+  #[arg(short = 'e', long = "env-file", value_name = "PATH")]
+  pub env_files: Vec<PathBuf>,
+
   #[arg(short, long, default_value_t = false)]
   pub parallel: bool,
 
@@ -105,6 +108,22 @@ pub(crate) struct Cli {
 fn generate_completions<G: Generator>(gen: G, cmd: &mut clap::Command) {
   let bin_name = cmd.get_name().to_string();
   generate(gen, cmd, bin_name, &mut io::stdout());
+}
+
+fn load_env_files(paths: &[PathBuf]) -> OctaResult<()> {
+  if paths.is_empty() {
+    let _ = dotenvy::dotenv();
+    return Ok(());
+  }
+
+  for path in paths.iter().rev() {
+    dotenvy::from_path(path).map_err(|source| OctaError::Dotenv {
+      path: path.display().to_string(),
+      source,
+    })?;
+  }
+
+  Ok(())
 }
 
 struct ExecuteItem {
@@ -270,8 +289,7 @@ pub async fn run() -> OctaResult<()> {
     return Ok(());
   }
 
-  // Load environments
-  let _ = dotenvy::dotenv();
+  load_env_files(&args.env_files)?;
   setup_logging(args.verbose)?;
 
   let plugins_dir = std::env::var("OCTA_PLUGINS_DIR").unwrap_or_else(|_| "plugins".to_string());
@@ -398,6 +416,16 @@ mod tests {
     let cli = Cli::parse_from(["octa", "--parallel", "build"]);
     assert!(cli.parallel);
     assert_eq!(cli.commands, Some(vec!["build".to_string()]));
+  }
+
+  #[test]
+  fn test_cli_env_files() {
+    let cli = Cli::parse_from(["octa", "--env-file", ".env.local", "-e", "config/test.env", "build"]);
+
+    assert_eq!(
+      cli.env_files,
+      vec![PathBuf::from(".env.local"), PathBuf::from("config/test.env")]
+    );
   }
 
   #[test]

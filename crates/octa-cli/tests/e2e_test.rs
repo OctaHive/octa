@@ -450,6 +450,63 @@ fn test_env_file() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_explicit_env_files() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let env_dir = tmp_dir.path().join("config");
+  fs::create_dir(&env_dir)?;
+  fs::write(tmp_dir.path().join(".env"), "OCTA_E2E_DOTENV_SHARED=default\n")?;
+  fs::write(
+    env_dir.join("first.env"),
+    "OCTA_E2E_DOTENV_FIRST=first\nOCTA_E2E_DOTENV_SHARED=first\n",
+  )?;
+  fs::write(
+    env_dir.join("second.env"),
+    "OCTA_E2E_DOTENV_SECOND=second\nOCTA_E2E_DOTENV_SHARED=second\nOCTA_E2E_DOTENV_PROCESS=file\n",
+  )?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+tasks:
+  show:
+    tpl: "$OCTA_E2E_DOTENV_FIRST|$OCTA_E2E_DOTENV_SECOND|$OCTA_E2E_DOTENV_SHARED|$OCTA_E2E_DOTENV_PROCESS"
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.args([
+    "--env-file",
+    "config/first.env",
+    "--env-file",
+    "config/second.env",
+    "show",
+  ]);
+  cmd.env("OCTA_E2E_DOTENV_PROCESS", "process");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("first|second|second|process"));
+
+  Ok(())
+}
+
+#[test]
+fn test_missing_explicit_env_file() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.args(["--env-file", "config/missing.env", "--list-tasks"]);
+  cmd
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("config/missing.env"));
+
+  Ok(())
+}
+
+#[test]
 fn test_dry_run() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");

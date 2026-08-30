@@ -14,8 +14,12 @@ pub enum OctaError {
   #[error("Failed to start plugin: {0}")]
   PluginStartError(String),
 
-  #[error("Failed to load .env file")]
-  Dotenv(#[from] DotenvError),
+  #[error("Failed to load environment file '{path}': {source}")]
+  Dotenv {
+    path: String,
+    #[source]
+    source: DotenvError,
+  },
 
   #[error("Failed to load config file: {0}")]
   ConfigLoadError(String),

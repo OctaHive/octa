@@ -246,7 +246,19 @@ Karol
 2024-12-17 11:23:51 [octa] ==================================================
 ```
 
-Octa also supports loading variables from `.env` files. The files are searched recursively, starting from the current directory.
+Octa also supports loading variables from `.env` files. By default, `.env` is searched for from
+the current directory upward through its parents.
+
+Use `-e` or `--env-file` to load one or more files from explicit paths:
+
+```console
+octa --env-file config/base.env --env-file config/development.env print-file-env
+```
+
+Relative paths are resolved from the current directory. When multiple files define the same
+variable, the last file wins. Variables already present in the process environment take precedence
+over all files. Supplying `--env-file` disables the automatic `.env` search, and every specified
+file must exist and contain valid dotenv syntax.
 
 # Variables
 The vars property is used to define variables that will be available to all tasks in the file. This behaves like the env property, but the 
