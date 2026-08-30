@@ -139,7 +139,11 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::sync::Arc;
+  use std::{
+    future::Future,
+    sync::Arc,
+    task::{Context, Poll, Waker},
+  };
   use test_log::test;
   use tracing_test::traced_test;
 
@@ -179,10 +183,36 @@ mod tests {
 
   #[test]
   fn test_new_dag() {
-    let dag: DAG<TestNode> = DAG::new();
+    let dag: DAG<TestNode> = DAG::default();
     assert_eq!(dag.node_count(), 0);
     assert!(dag.edges().is_empty());
     assert!(dag.nodes().is_empty());
+  }
+
+  #[traced_test]
+  #[test]
+  fn test_graph_handles_missing_adjacency_entry() {
+    let mut dag = DAG::new();
+    let node = TestNode::new("A");
+    dag.add_node(node.clone());
+    dag.edges.remove(&node.id());
+
+    dag.print_graph();
+
+    assert!(!dag.has_cycle().unwrap());
+    assert!(logs_contain("A -> (no dependencies)"));
+  }
+
+  #[test]
+  fn test_identifiable_values() {
+    let node = TestNode::new("A");
+
+    assert_eq!(node.name(), "A");
+    assert!(!node.is_internal());
+
+    let mut future = Box::pin(node.get_deps_result());
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(result) if result.is_empty()));
   }
 
   #[test]

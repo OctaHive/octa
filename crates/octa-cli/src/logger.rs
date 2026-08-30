@@ -128,3 +128,74 @@ where
     writeln!(writer)
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use std::{
+    io,
+    sync::{Arc, Mutex},
+  };
+
+  use tracing::Level;
+  use tracing_subscriber::fmt::MakeWriter;
+
+  use super::*;
+
+  #[derive(Clone, Default)]
+  struct Output(Arc<Mutex<Vec<u8>>>);
+
+  struct OutputWriter(Arc<Mutex<Vec<u8>>>);
+
+  impl io::Write for OutputWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+      self.0.lock().unwrap().extend_from_slice(buffer);
+      Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+      Ok(())
+    }
+  }
+
+  impl<'a> MakeWriter<'a> for Output {
+    type Writer = OutputWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+      OutputWriter(Arc::clone(&self.0))
+    }
+  }
+
+  #[test]
+  fn formats_all_levels_and_field_types() {
+    let output = Output::default();
+    let subscriber = tracing_subscriber::fmt()
+      .with_max_level(Level::TRACE)
+      .event_format(OctaFormatter)
+      .with_writer(output.clone())
+      .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+      tracing::error!(message = "error", detail = "fatal");
+      tracing::warn!(message = "warn");
+      tracing::info!(message = "info");
+      tracing::debug!(message = "debug");
+      tracing::trace!(message = "trace");
+      tracing::info!(answer = 42, "formatted {}", "message");
+    });
+
+    let output = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    for expected in [
+      "[octa]",
+      "error",
+      "fatal",
+      "warn",
+      "info",
+      "debug",
+      "trace",
+      "formatted message",
+      "42",
+    ] {
+      assert!(output.contains(expected), "missing {expected:?} in {output:?}");
+    }
+  }
+}

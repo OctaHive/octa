@@ -753,6 +753,98 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn test_prepare_dir_creates_interpolated_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    let target = temp_dir.path().join("build").join("generated");
+    let mut task = create_test_task("create_dir", None, None, None);
+    let mut vars = Vars::new();
+    vars.insert("OUTPUT_DIR", &target.to_string_lossy().to_string());
+    task.vars = vars;
+    task.dir = PathBuf::from("{{ OUTPUT_DIR }}");
+
+    let prepared = task.prepare_dir(false).await.unwrap();
+
+    assert!(target.is_dir());
+    assert_eq!(prepared, canonicalize(target).unwrap());
+  }
+
+  #[tokio::test]
+  async fn test_prepare_dir_dry_run_with_existing_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    let mut task = create_test_task("existing_dir", None, None, None);
+    task.dir = temp_dir.path().to_path_buf();
+
+    let prepared = task.prepare_dir(true).await.unwrap();
+
+    assert_eq!(prepared, canonicalize(temp_dir.path()).unwrap());
+  }
+
+  #[tokio::test]
+  async fn test_prepare_dir_dry_run_with_missing_absolute_directory() {
+    let temp_dir = TempDir::new().unwrap();
+    let target = temp_dir.path().join("missing");
+    let mut task = create_test_task("missing_absolute_dir", None, None, None);
+    task.dir = target.clone();
+
+    let prepared = task.prepare_dir(true).await.unwrap();
+
+    assert_eq!(prepared, target);
+    assert!(!prepared.exists());
+  }
+
+  #[tokio::test]
+  async fn test_prepare_dir_dry_run_with_missing_relative_directory() {
+    let current_dir = env::current_dir().unwrap();
+    let temp_dir = TempDir::new_in(&current_dir).unwrap();
+    let relative = temp_dir.path().strip_prefix(&current_dir).unwrap().join("missing");
+    let mut task = create_test_task("missing_relative_dir", None, None, None);
+    task.dir = relative.clone();
+
+    let prepared = task.prepare_dir(true).await.unwrap();
+
+    assert_eq!(prepared, current_dir.join(relative));
+    assert!(!prepared.exists());
+  }
+
+  #[tokio::test]
+  async fn test_prepare_dir_rejects_file_path() {
+    let temp_file = tempfile::NamedTempFile::new().unwrap();
+    let mut task = create_test_task("file_path", None, None, None);
+    task.dir = temp_file.path().to_path_buf();
+
+    assert!(matches!(task.prepare_dir(false).await, Err(ExecutorError::IoError(_))));
+  }
+
+  #[tokio::test]
+  async fn test_prepare_dir_propagates_interpolation_error() {
+    let mut task = create_test_task("invalid_interpolation", None, None, None);
+    task.dir = PathBuf::from("{{ invalid + }}");
+
+    assert!(matches!(
+      task.prepare_dir(false).await,
+      Err(ExecutorError::ValueExpandError(_, _))
+    ));
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn test_prepare_dir_dry_run_propagates_canonicalize_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = TempDir::new().unwrap();
+    let locked = temp_dir.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut task = create_test_task("unreadable_dir", None, None, None);
+    task.dir = locked.join("child");
+    let result = task.prepare_dir(true).await;
+
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(result, Err(ExecutorError::IoError(_))));
+  }
+
+  #[tokio::test]
   async fn test_basic_command_execution() {
     let db = sled::Config::new()
       .temporary(true)

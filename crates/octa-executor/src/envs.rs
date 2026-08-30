@@ -372,6 +372,7 @@ mod tests {
     let mut envs = Envs::with_value(context);
 
     envs.expand().await.unwrap();
+    envs.expand().await.unwrap();
     assert_eq!(envs.get("name").unwrap(), &"John".to_string());
   }
 
@@ -388,5 +389,29 @@ mod tests {
 
     envs.expand().await.unwrap();
     assert_eq!(envs.get("full").unwrap(), &"John Doe".to_string());
+  }
+
+  #[tokio::test]
+  async fn test_expand_from_process_environment() {
+    let mut context = EnvContext::new();
+    context.insert("path".to_owned(), "$PATH".to_owned());
+    let mut envs = Envs::with_value(context);
+
+    envs.expand().await.unwrap();
+
+    assert_eq!(envs.get("path"), Some(&env::var("PATH").unwrap()));
+  }
+
+  #[test]
+  fn test_iteration_and_multiline_display() {
+    let context = HashMap::from([
+      ("first".to_owned(), "one".to_owned()),
+      ("second".to_owned(), "two".to_owned()),
+    ]);
+    let envs = Envs::with_value(context.clone());
+
+    assert_eq!(envs.clone().into_iter().collect::<HashMap<_, _>>(), context);
+    assert_eq!((&envs).into_iter().collect::<HashMap<_, _>>(), context);
+    assert!(envs.to_string().contains(",\n"));
   }
 }

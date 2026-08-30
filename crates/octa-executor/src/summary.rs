@@ -55,7 +55,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_new() {
-    let summary = Summary::new();
+    let summary = Summary::default();
     let tasks = summary.tasks.lock().await;
     assert!(tasks.is_empty());
   }
