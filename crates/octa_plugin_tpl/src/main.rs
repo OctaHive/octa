@@ -1,7 +1,14 @@
-use std::{borrow::Cow, collections::HashMap, env, path::PathBuf, sync::Arc};
+use std::{
+  borrow::Cow,
+  collections::HashMap,
+  env,
+  path::{Path, PathBuf},
+  sync::Arc,
+};
 
 use anyhow::Context;
 use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::Value;
 
 use octa_plugin::{logger::Logger, protocol::PluginResponse, serve_plugin, Plugin, PluginSchema};
@@ -14,11 +21,45 @@ use tokio_util::sync::CancellationToken;
 
 struct TemplatePlugin {}
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TemplateFile {
+  file: PathBuf,
+}
+
 fn plugin_schema() -> PluginSchema {
   PluginSchema {
     key: "tpl".to_owned(),
-    validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+    validation_schema: serde_json::json!({
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "properties": {
+            "file": { "type": "string", "minLength": 1 }
+          },
+          "required": ["file"],
+          "additionalProperties": false
+        }
+      ]
+    })
+    .as_object()
+    .cloned(),
   }
+}
+
+async fn load_template(command: String, dir: &Path) -> anyhow::Result<String> {
+  let Ok(Value::Object(params)) = serde_json::from_str::<Value>(&command) else {
+    return Ok(command);
+  };
+
+  let template_file = serde_json::from_value::<TemplateFile>(Value::Object(params))
+    .context("Failed to parse template file parameters")?;
+  let path = dir.join(template_file.file);
+
+  tokio::fs::read_to_string(&path)
+    .await
+    .with_context(|| format!("Failed to read template file '{}'", path.display()))
 }
 
 #[async_trait]
@@ -34,7 +75,7 @@ impl Plugin for TemplatePlugin {
     _dry: bool,
     command: String,
     _args: Vec<String>,
-    _dir: PathBuf,
+    dir: PathBuf,
     vars: HashMap<String, Value>,
     envs: HashMap<String, String>,
     writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
@@ -45,6 +86,7 @@ impl Plugin for TemplatePlugin {
 
     let mut tera = Tera::default();
     let template_name = format!("template_{}", id);
+    let template = load_template(command, &dir).await?;
 
     let get_env = |name: &str| match envs.get(name) {
       Some(val) => Some(Cow::Borrowed(val.as_str())),
@@ -54,7 +96,7 @@ impl Plugin for TemplatePlugin {
       },
     };
 
-    let val = shellexpand::env_with_context_no_errors(&command, get_env);
+    let val = shellexpand::env_with_context_no_errors(&template, get_env);
 
     tera
       .add_raw_template(&template_name, val.as_ref())
@@ -163,10 +205,7 @@ mod tests {
     let schema = plugin_schema();
 
     assert_eq!(schema.key, "tpl");
-    assert_eq!(
-      schema.validation_schema.unwrap().get("type"),
-      Some(&Value::String("string".to_owned()))
-    );
+    assert_eq!(schema.validation_schema.unwrap()["oneOf"].as_array().unwrap().len(), 2);
   }
 
   #[tokio::test]
@@ -219,5 +258,64 @@ mod tests {
     let log_messages = mock_logger.get_messages().await;
     assert!(!log_messages.is_empty());
     assert!(log_messages.iter().any(|msg| msg.contains("Stdout")));
+  }
+
+  #[tokio::test]
+  async fn test_file_template() {
+    let (writer, logger, dir) = setup_test().await;
+    tokio::fs::write(dir.join("greeting.tpl"), "Hello, {{ name }}!")
+      .await
+      .unwrap();
+
+    TemplatePlugin {}
+      .execute_command(
+        "test-id".to_string(),
+        false,
+        serde_json::json!({ "file": "greeting.tpl" }).to_string(),
+        vec![],
+        dir,
+        HashMap::from([("name".to_owned(), Value::String("World".to_owned()))]),
+        HashMap::new(),
+        writer.clone(),
+        logger,
+        CancellationToken::new(),
+      )
+      .await
+      .unwrap();
+
+    let output = writer.lock().await.get_output();
+    let stdout = output
+      .lines()
+      .find(|line| line.contains("\"type\":\"Stdout\""))
+      .unwrap();
+    let response: PluginResponse = serde_json::from_str(stdout).unwrap();
+
+    assert!(matches!(
+      response,
+      PluginResponse::Stdout { line, .. } if line == "Hello, World!"
+    ));
+  }
+
+  #[tokio::test]
+  async fn test_missing_template_file() {
+    let (writer, logger, dir) = setup_test().await;
+
+    let error = TemplatePlugin {}
+      .execute_command(
+        "test-id".to_string(),
+        false,
+        serde_json::json!({ "file": "missing.tpl" }).to_string(),
+        vec![],
+        dir,
+        HashMap::new(),
+        HashMap::new(),
+        writer,
+        logger,
+        CancellationToken::new(),
+      )
+      .await
+      .unwrap_err();
+
+    assert!(error.to_string().contains("Failed to read template file"));
   }
 }

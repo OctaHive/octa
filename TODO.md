@@ -2,6 +2,5 @@
 - Create task directory if it not exist
 - Add support architecture to platform specific task
 - Add run options to octafile level
-- Add option to provide template like file on disk
 - Add better output for cli
 - Add default for default task if no task is specified

@@ -20,6 +20,15 @@ tasks:
         environment:
           - LOG_LEVEL=Debug
 
+  docker-compose-service-file:
+    vars:
+      SERVICE: service
+      PROJECT: octa
+      DOCKER_REPO: docker.octa.com
+      VERSION: 1.0.0
+    tpl:
+      file: service.yml.tpl
+
   docker-compose:
     shell: echo "{{ deps_result['docker-compose-service'] }}"
     deps:

@@ -410,6 +410,9 @@ current one. To do this, you can specify a `tpl` for the task, and when the task
 the result will be templated using the specified variables and returned as the result of the task. 
 This allows you to generate configurations, such as generating a docker-compose file for your project.
 
+The template can be defined inline or loaded from a UTF-8 file. Relative file paths are resolved
+from the task working directory.
+
 ```yaml
 version: 1
 
@@ -437,6 +440,19 @@ tasks:
     shell: echo "{{ deps_result['docker-compose-service'] }}"
     deps:
       - docker-compose-service
+```
+
+To load the same template from disk, use the object form:
+
+```yaml
+tasks:
+  docker-compose-service:
+    vars:
+      SERVICE: service
+      PROJECT: octa
+      VERSION: 1.0.0
+    tpl:
+      file: templates/service.yml.tpl
 ```
 
 If we run task `docker-compose` we see next output:

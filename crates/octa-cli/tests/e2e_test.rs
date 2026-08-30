@@ -119,6 +119,35 @@ tasks:
 }
 
 #[test]
+fn test_run_template_plugin_file() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join("greeting.tpl"), "Hello from {{ source }}!")?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+tasks:
+  hello:
+    vars:
+      source: file
+    tpl:
+      file: greeting.tpl
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("hello");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Hello from file!"));
+
+  Ok(())
+}
+
+#[test]
 fn test_builtin_plugin_schemas_reject_invalid_values() -> Result<(), Box<dyn std::error::Error>> {
   let cases = [
     (
