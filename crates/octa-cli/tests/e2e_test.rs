@@ -123,6 +123,7 @@ tasks:
 #[test]
 fn test_deferred_commands() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
+  // Keep redirection adjacent to the echoed value because cmd.exe preserves a space before `>` in the output.
   fs::write(
     tmp_dir.path().join("octafile.yml"),
     r#"
@@ -131,70 +132,70 @@ version: 1
 tasks:
   success:
     cmds:
-      - defer: echo first >> success.txt
+      - defer: echo first>>success.txt
       - defer:
-          shell: echo second >> success.txt
-      - defer: echo skipped >> success.txt
+          shell: echo second>>success.txt
+      - defer: echo skipped>>success.txt
         platforms: [unsupported]
-      - shell: echo work >> success.txt
+      - shell: echo work>>success.txt
 
   failure:
     cmds:
       - defer:
           task: cleanup
-      - shell: echo work >> failure.txt
+      - shell: echo work>>failure.txt
       - shell: exit 1
 
   cleanup:
-    shell: echo cleanup >> failure.txt
+    shell: echo cleanup>>failure.txt
 
   late_defer:
     cmds:
       - shell: exit 1
-      - defer: echo late > late.txt
+      - defer: echo late>late.txt
 
   cleanup_failure:
     cmds:
       - defer: exit 1
-      - shell: echo success > cleanup-failure.txt
+      - shell: echo success>cleanup-failure.txt
 
   nested:
     cmds:
-      - defer: echo inner-cleanup >> nested.txt
-      - shell: echo inner-work >> nested.txt
+      - defer: echo inner-cleanup>>nested.txt
+      - shell: echo inner-work>>nested.txt
 
   outer:
     cmds:
-      - defer: echo outer-cleanup >> nested.txt
+      - defer: echo outer-cleanup>>nested.txt
       - task: nested
-      - shell: echo outer-work >> nested.txt
+      - shell: echo outer-work>>nested.txt
 
   dependency:
     cmds:
-      - defer: echo dependency-cleanup >> dependency.txt
-      - shell: echo dependency-work >> dependency.txt
+      - defer: echo dependency-cleanup>>dependency.txt
+      - shell: echo dependency-work>>dependency.txt
 
   with_dependency:
     deps: [dependency]
-    shell: echo parent-work >> dependency.txt
+    shell: echo parent-work>>dependency.txt
 
   only_defer:
     deps: [prepare]
     cmds:
-      - defer: echo cleanup >> only-defer.txt
+      - defer: echo cleanup>>only-defer.txt
 
   prepare:
-    shell: echo prepare >> only-defer.txt
+    shell: echo prepare>>only-defer.txt
 
   failing_dependency:
     cmds:
-      - defer: echo dependency-cleanup > failed-dependency.txt
+      - defer: echo dependency-cleanup>failed-dependency.txt
       - shell: exit 1
 
   with_failing_dependency:
     deps: [failing_dependency]
     cmds:
-      - defer: echo parent-cleanup > failed-parent.txt
+      - defer: echo parent-cleanup>failed-parent.txt
       - shell: echo parent
 "#,
   )?;
