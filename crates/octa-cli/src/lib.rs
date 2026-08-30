@@ -70,6 +70,10 @@ pub(crate) struct Cli {
   #[arg(short, long)]
   pub octafile: Option<PathBuf>,
 
+  /// Start Octafile discovery from this directory
+  #[arg(long, value_name = "PATH", conflicts_with = "global")]
+  pub dir: Option<PathBuf>,
+
   #[arg(short, long)]
   pub config: Option<PathBuf>,
 
@@ -442,7 +446,7 @@ pub async fn run() -> OctaResult<()> {
   }
 
   // Load octafile
-  let octafile = Octafile::load_with_schemas(args.octafile, args.global, validation_schemas)?;
+  let octafile = Octafile::load_with_schemas_from(args.octafile, args.global, args.dir, validation_schemas)?;
 
   if args.dry {
     warn!("Octa run in dry mode");
@@ -827,6 +831,12 @@ tasks:
   fn test_cli_global() {
     let cli = Cli::parse_from(["octa", "--global", "build"]);
     assert!(cli.global);
+  }
+
+  #[test]
+  fn test_cli_dir() {
+    let cli = Cli::parse_from(["octa", "--dir", "backend", "build"]);
+    assert_eq!(cli.dir, Some(PathBuf::from("backend")));
   }
 
   #[test]

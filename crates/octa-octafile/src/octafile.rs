@@ -227,28 +227,53 @@ impl fmt::Debug for Octafile {
 
 impl Octafile {
   pub fn load(path: Option<PathBuf>, global: bool, plugin_keys: Vec<String>) -> OctafileResult<Arc<Self>> {
-    Self::load_with_context(path, global, Context::from_keys(plugin_keys))
+    Self::load_with_context(path, global, None, Context::from_keys(plugin_keys))
   }
 
   pub fn load_with_schemas(path: Option<PathBuf>, global: bool, schemas: PluginSchemas) -> OctafileResult<Arc<Self>> {
-    let context = Context::from_schemas(schemas).map_err(OctafileError::PluginSchemaError)?;
-    Self::load_with_context(path, global, context)
+    Self::load_with_schemas_from(path, global, None, schemas)
   }
 
-  fn load_with_context(path: Option<PathBuf>, global: bool, context: Context) -> OctafileResult<Arc<Self>> {
+  /// Loads an Octafile, starting automatic discovery from `search_dir` when provided.
+  pub fn load_with_schemas_from(
+    path: Option<PathBuf>,
+    global: bool,
+    search_dir: Option<PathBuf>,
+    schemas: PluginSchemas,
+  ) -> OctafileResult<Arc<Self>> {
+    let context = Context::from_schemas(schemas).map_err(OctafileError::PluginSchemaError)?;
+    Self::load_with_context(path, global, search_dir, context)
+  }
+
+  fn load_with_context(
+    path: Option<PathBuf>,
+    global: bool,
+    search_dir: Option<PathBuf>,
+    context: Context,
+  ) -> OctafileResult<Arc<Self>> {
+    let search_dir = match search_dir {
+      Some(path) if path.is_absolute() => Some(path),
+      Some(path) => Some(env::current_dir()?.join(path)),
+      None => None,
+    };
+
     let path = match path {
-      Some(path) => Octafile::find_octafile(Some(path)),
+      Some(path) => {
+        let path = match &search_dir {
+          Some(search_dir) if path.is_relative() => search_dir.join(path),
+          _ => path,
+        };
+        Octafile::find_octafile(Some(path))
+      },
       None => {
         if global {
-          let home = dirs::home_dir();
-
-          if let Some(home) = home {
-            Ok(Some(home))
-          } else {
-            return Err(OctafileError::NotSearchedError);
-          }
+          let home = dirs::home_dir().ok_or(OctafileError::NotSearchedError)?;
+          Octafile::find_octafile(Some(home))
         } else {
-          Octafile::find_octafile(None)
+          match search_dir {
+            Some(search_dir) => Octafile::find_octafile_from(search_dir),
+            None => Octafile::find_octafile(None),
+          }
         }
       },
     }?
@@ -554,7 +579,7 @@ impl Octafile {
       if path.is_dir() {
         for taskfile_name in OCTAFILE_DEFAULT_NAMES {
           let potential_path = path.join(taskfile_name);
-          if potential_path.exists() {
+          if potential_path.is_file() {
             return Ok(Some(potential_path));
           }
         }
@@ -562,24 +587,29 @@ impl Octafile {
         return Ok(Some(path));
       }
     } else {
-      let mut current_dir = env::current_dir()?;
-      loop {
-        for taskfile_name in OCTAFILE_DEFAULT_NAMES {
-          let potential_path = current_dir.join(taskfile_name);
-          if potential_path.exists() {
-            return Ok(Some(potential_path));
-          }
-        }
-
-        if let Some(parent) = current_dir.parent() {
-          current_dir = parent.to_path_buf();
-        } else {
-          break;
-        }
-      }
+      return Self::find_octafile_from(env::current_dir()?);
     }
 
     Ok(None)
+  }
+
+  fn find_octafile_from(mut current_dir: PathBuf) -> OctafileResult<Option<PathBuf>> {
+    if !current_dir.is_dir() {
+      return Ok(None);
+    }
+
+    loop {
+      for taskfile_name in OCTAFILE_DEFAULT_NAMES {
+        let potential_path = current_dir.join(taskfile_name);
+        if potential_path.is_file() {
+          return Ok(Some(potential_path));
+        }
+      }
+
+      if !current_dir.pop() {
+        return Ok(None);
+      }
+    }
   }
 }
 
@@ -965,6 +995,13 @@ mod tests {
     // Create nested directory structure
     let nested_dir = temp_dir.path().join("nested").join("deeply");
     fs::create_dir_all(&nested_dir).unwrap();
+
+    let found = Octafile::find_octafile_from(nested_dir.clone()).unwrap();
+    assert_eq!(
+      found.unwrap().canonicalize().unwrap(),
+      octafile_path.canonicalize().unwrap()
+    );
+    assert!(Octafile::find_octafile_from(octafile_path.clone()).unwrap().is_none());
 
     // Change to nested directory and try to find Octafile
     let original_dir = env::current_dir().unwrap();

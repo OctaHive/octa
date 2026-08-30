@@ -46,6 +46,90 @@ fn test_no_octafile_file_discovered() {
 }
 
 #[test]
+fn test_global_octafile() -> Result<(), Box<dyn std::error::Error>> {
+  let home_dir = TempDir::new()?;
+  let working_dir = TempDir::new()?;
+  fs::write(
+    home_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+tasks:
+  global-task:
+    shell: echo global-task
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd
+    .current_dir(working_dir.path())
+    .args(["--global", "global-task"])
+    .env("HOME", home_dir.path())
+    .env("USERPROFILE", home_dir.path())
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success().stdout(predicate::str::contains("global-task"));
+
+  Ok(())
+}
+
+#[test]
+fn test_dir_option_searches_upward() -> Result<(), Box<dyn std::error::Error>> {
+  let project_dir = TempDir::new()?;
+  let working_dir = TempDir::new()?;
+  let nested_dir = project_dir.path().join("backend").join("nested");
+  fs::create_dir_all(&nested_dir)?;
+  fs::write(
+    project_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+tasks:
+  from-dir:
+    shell: echo from-dir
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd
+    .current_dir(working_dir.path())
+    .args(["--dir", nested_dir.to_str().unwrap(), "from-dir"])
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success().stdout(predicate::str::contains("from-dir"));
+
+  Ok(())
+}
+
+#[test]
+fn test_dir_option_resolves_relative_octafile() -> Result<(), Box<dyn std::error::Error>> {
+  let project_dir = TempDir::new()?;
+  let working_dir = TempDir::new()?;
+  let config_dir = project_dir.path().join("config");
+  fs::create_dir(&config_dir)?;
+  fs::write(
+    config_dir.join("custom.yml"),
+    r#"
+version: 1
+tasks:
+  relative-file:
+    shell: echo relative-file
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd
+    .current_dir(working_dir.path())
+    .args([
+      "--dir",
+      project_dir.path().to_str().unwrap(),
+      "--octafile",
+      "config/custom.yml",
+      "relative-file",
+    ])
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success().stdout(predicate::str::contains("relative-file"));
+
+  Ok(())
+}
+
+#[test]
 fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");

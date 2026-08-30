@@ -87,6 +87,15 @@ personal tasks that aren’t tied to a specific project.
 
 You can also run tasks from a specific file by simply passing it with the `--octafile` or `-o` flag, e.g., `octa -o project_tasks.yml build`.
 
+Use `--dir` to start Octafile discovery from another directory. Octa searches that directory and
+then its parents, just as it does for the current working directory. When combined with a relative
+`--octafile` path, the path is resolved relative to `--dir`.
+
+```console
+octa --dir ./backend build
+octa --dir ./backend --octafile config/Octafile.yml build
+```
+
 ## Listing and searching tasks
 
 Use `--list-tasks` to print every available task. Internal tasks are omitted from the output.
