@@ -1,6 +1,8 @@
 use std::{
-  collections::HashMap,
+  cmp::Reverse,
+  collections::{HashMap, HashSet},
   hash::Hash,
+  ops::Deref,
   sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
@@ -31,6 +33,60 @@ use crate::{
 // Add shutdown timeout constant
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A task graph together with cleanup actions managed by the executor.
+///
+/// Deferred actions are intentionally kept outside `TaskNode`: task nodes describe work,
+/// while the execution plan describes when additional work must run.
+#[derive(Clone)]
+pub struct ExecutionPlan<T: Eq + Hash + Identifiable> {
+  /// Main task graph. Deferred actions are represented here only by internal barrier nodes.
+  dag: DAG<T>,
+
+  /// Cleanup actions indexed by the ID of their corresponding barrier node.
+  deferred: HashMap<String, Arc<DeferredAction<T>>>,
+}
+
+/// A cleanup action attached to an internal barrier in the main task graph.
+#[derive(Clone)]
+pub(crate) struct DeferredAction<T: Eq + Hash + Identifiable> {
+  /// Name used in executor logs for the nested cleanup plan.
+  pub(crate) command: String,
+
+  /// Nested plan that executes the shell, task reference, or plugin command.
+  pub(crate) plan: ExecutionPlan<T>,
+
+  /// Declaration order used to run unfinished cleanup actions in LIFO order.
+  pub(crate) order: usize,
+
+  /// Tasks that must finish before this cleanup action is considered registered.
+  pub(crate) registered_after: Vec<String>,
+}
+
+impl<T: Eq + Hash + Identifiable> ExecutionPlan<T> {
+  pub(crate) fn new(dag: DAG<T>, deferred: HashMap<String, Arc<DeferredAction<T>>>) -> Self {
+    Self { dag, deferred }
+  }
+}
+
+impl<T: Eq + Hash + Identifiable> From<DAG<T>> for ExecutionPlan<T> {
+  /// Keeps plain DAG execution available for callers that do not use deferred actions.
+  fn from(dag: DAG<T>) -> Self {
+    Self {
+      dag,
+      deferred: HashMap::new(),
+    }
+  }
+}
+
+impl<T: Eq + Hash + Identifiable> Deref for ExecutionPlan<T> {
+  type Target = DAG<T>;
+
+  fn deref(&self) -> &Self::Target {
+    // Graph inspection remains transparent for existing builder consumers.
+    &self.dag
+  }
+}
+
 /// Configuration for the Executor
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -54,11 +110,14 @@ struct ExecutionState<T: Hash + Identifiable + Eq + TaskItem> {
   fingerprint: Arc<Db>,                           // Fingerprint db
   dry: bool,                                      // Dry mode
   force: bool,
+  // Successful nodes determine which deferred actions were registered before an interruption.
+  completed_tasks: Arc<Mutex<HashSet<String>>>,
 }
 
 /// Executor manages the execution of tasks in a directed acyclic graph (DAG)
 pub struct Executor<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clone + 'static> {
   state: ExecutionState<T>,
+  deferred: Arc<HashMap<String, Arc<DeferredAction<T>>>>,
   config: ExecutorConfig,
   finished: CancellationToken,
   plugin_manager: Arc<PluginManager>,
@@ -69,7 +128,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
   /// Creates a new Executor instance with the given DAG
   pub fn new(
     plugin_manager: Arc<PluginManager>,
-    dag: DAG<T>,
+    plan: impl Into<ExecutionPlan<T>>,
     config: ExecutorConfig,
     cache: Option<Arc<Mutex<IndexMap<String, CacheItem>>>>,
     fingerprint: Arc<Db>,
@@ -77,6 +136,8 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     force: bool,
     summary: Option<Arc<Summary>>,
   ) -> ExecutorResult<Self> {
+    let plan = plan.into();
+    let dag = plan.dag;
     let in_degree = dag.nodes().iter().map(|n| (n.id().clone(), 0)).collect();
 
     let cache = match cache {
@@ -94,11 +155,13 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       cache,
       dry,
       force,
+      completed_tasks: Arc::new(Mutex::new(HashSet::new())),
       fingerprint,
     };
 
     Ok(Self {
       state,
+      deferred: Arc::new(plan.deferred),
       config,
       finished: CancellationToken::new(),
       plugin_manager,
@@ -115,10 +178,13 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
 
     self.schedule_initial_tasks(&tx).await?;
 
-    match self.process_tasks(cancel_token.clone(), rx, &tx, &mut handles).await {
+    let result = match self.process_tasks(cancel_token.clone(), rx, &tx, &mut handles).await {
       Ok(_) => self.handle_completion(cancel_token, handles).await,
       Err(e) => self.handle_error(e, cancel_token).await,
-    }
+    };
+
+    self.run_deferred().await;
+    result
   }
 
   async fn initialize_execution(&self) -> ExecutorResult<()> {
@@ -127,6 +193,45 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
 
   fn create_task_channel(&self) -> (mpsc::Sender<Arc<T>>, mpsc::Receiver<Arc<T>>) {
     mpsc::channel(self.state.dag.node_count())
+  }
+
+  async fn run_deferred(&self) {
+    let completed_tasks = self.state.completed_tasks.lock().await.clone();
+    let mut deferred = self
+      .deferred
+      .iter()
+      .map(|(id, action)| (id, action.clone()))
+      .collect::<Vec<_>>();
+    deferred.sort_by_key(|(_, action)| Reverse(action.order));
+
+    for (id, action) in deferred {
+      // A completed barrier means the action already ran during normal DAG execution.
+      if completed_tasks.contains(id) {
+        continue;
+      }
+
+      // An action declared after the failed node was never reached and must not run.
+      if !action
+        .registered_after
+        .iter()
+        .all(|task_id| completed_tasks.contains(task_id))
+      {
+        continue;
+      }
+
+      if let Err(error) = execute_deferred_action(
+        action,
+        self.plugin_manager.clone(),
+        self.state.cache.clone(),
+        self.state.fingerprint.clone(),
+        self.state.dry,
+        self.state.force,
+      )
+      .await
+      {
+        error!("Deferred command failed: {}", error);
+      }
+    }
   }
 
   async fn handle_completion(
@@ -193,6 +298,8 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       fingerprint: self.state.fingerprint.clone(),
       dry: self.state.dry,
       force: self.state.force,
+      completed_tasks: self.state.completed_tasks.clone(),
+      deferred: self.deferred.clone(),
     };
 
     let plugin_manager = Arc::clone(&self.plugin_manager);
@@ -207,11 +314,17 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
   /// Schedules tasks with no dependencies
   async fn schedule_initial_tasks(&self, tx: &mpsc::Sender<Arc<T>>) -> ExecutorResult<()> {
     let degrees = self.state.in_degree.lock().await;
+    let mut scheduled = 0;
     for node in self.state.dag.nodes() {
-      if degrees[&node.id()] == 0 {
+      // Deferred barriers are released only by their predecessors, never as graph roots.
+      if !self.deferred.contains_key(&node.id()) && degrees[&node.id()] == 0 {
         self.state.active_tasks.fetch_add(1, Ordering::SeqCst);
         tx.send(node.clone()).await.map_err(|_| ExecutorError::ChannelError)?;
+        scheduled += 1;
       }
+    }
+    if scheduled == 0 {
+      self.finished.cancel();
     }
     Ok(())
   }
@@ -284,9 +397,11 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   fingerprint: Arc<Db>,
   dry: bool,
   force: bool,
+  completed_tasks: Arc<Mutex<HashSet<String>>>,
+  deferred: Arc<HashMap<String, Arc<DeferredAction<T>>>>,
 }
 
-struct TaskExecutor<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> {
+struct TaskExecutor<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clone + 'static> {
   context: ExecutorContext<T>,
   task: Arc<T>,
   tx: mpsc::Sender<Arc<T>>,
@@ -294,7 +409,7 @@ struct TaskExecutor<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clo
   plugin_manager: Arc<PluginManager>,
 }
 
-impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> TaskExecutor<T> {
+impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> {
   fn new(
     context: ExecutorContext<T>,
     task: Arc<T>,
@@ -316,20 +431,39 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
     debug!("Executing task: {}", task_name);
 
     let start_time = SystemTime::now();
-    let result = self
-      .task
-      .execute(
+    let deferred = self.context.deferred.get(&task_name).cloned();
+    let result = if let Some(action) = deferred.as_ref() {
+      // The graph node is only an ordering barrier; its actual work lives in the nested plan.
+      execute_deferred_action(
+        action.clone(),
         self.plugin_manager.clone(),
         self.context.cache.clone(),
         self.context.fingerprint.clone(),
         self.context.dry,
         self.context.force,
-        self.cancel_token.clone(),
       )
-      .await;
+      .await
+    } else {
+      self
+        .task
+        .execute(
+          self.plugin_manager.clone(),
+          self.context.cache.clone(),
+          self.context.fingerprint.clone(),
+          self.context.dry,
+          self.context.force,
+          self.cancel_token.clone(),
+        )
+        .await
+    };
 
     match result {
       Ok(output) => self.handle_success(output, start_time).await,
+      Err(error) if deferred.is_some() => {
+        // Cleanup failures are reported without replacing the main task result.
+        error!("Deferred command failed: {}", error);
+        self.handle_success(String::new(), start_time).await
+      },
       Err(e) => self.handle_error(e).await,
     }
   }
@@ -352,6 +486,9 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
           .await;
       }
     }
+
+    // This also marks deferred barriers as already handled by the normal execution path.
+    self.context.completed_tasks.lock().await.insert(self.task.id());
 
     self.process_task_success(output).await
   }
@@ -397,4 +534,31 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Clone + 'static> T
 
     Ok(output)
   }
+}
+
+async fn execute_deferred_action<
+  T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clone + 'static,
+>(
+  action: Arc<DeferredAction<T>>,
+  plugin_manager: Arc<PluginManager>,
+  cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
+  fingerprint: Arc<Db>,
+  dry: bool,
+  force: bool,
+) -> ExecutorResult<String> {
+  // A fresh token lets cleanup continue even when cancellation stopped the main plan.
+  let executor = Executor::new(
+    plugin_manager,
+    action.plan.clone(),
+    ExecutorConfig { silent: true },
+    Some(cache),
+    fingerprint,
+    dry,
+    force,
+    None,
+  )?;
+
+  Box::pin(executor.execute(CancellationToken::new(), &action.command))
+    .await
+    .map(|results| results.join("\n"))
 }

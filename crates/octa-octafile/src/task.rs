@@ -94,6 +94,9 @@ pub struct TaskCommand {
 
   /// Platforms on which this command is included in the execution plan.
   pub platforms: Option<Vec<String>>,
+
+  /// Whether the command must run after the main execution plan finishes.
+  pub deferred: bool,
 }
 
 pub struct Context {
@@ -159,19 +162,31 @@ impl Context {
   }
 
   fn parse_command(&self, command: Value) -> Result<TaskCommand, String> {
-    let (value, platforms) = match command {
-      Value::String(value) => (Value::String(value), None),
+    let (value, platforms, deferred) = match command {
+      Value::String(value) => (Value::String(value), None, false),
       Value::Mapping(mut mapping) => {
+        // Command metadata belongs to the wrapper and must not be passed to a plugin schema.
         let platforms = mapping
           .remove("platforms")
           .map(serde_yml::from_value::<Vec<String>>)
           .transpose()
           .map_err(|error| format!("invalid command platforms: {error}"))?;
-        (Value::Mapping(mapping), platforms)
+        if let Some(value) = mapping.remove("defer") {
+          // `defer` wraps exactly one ordinary command. Sibling command fields would make the
+          // command type ambiguous, while metadata such as `platforms` was removed above.
+          if !mapping.is_empty() {
+            return Err("a deferred command cannot contain sibling command fields".to_string());
+          }
+          (value, platforms, true)
+        } else {
+          (Value::Mapping(mapping), platforms, false)
+        }
       },
       _ => return Err("commands must be strings, task references, or plugin commands".to_string()),
     };
 
+    // Validate the unwrapped value exactly like a regular command. This also delegates plugin
+    // parameters to the validation schema supplied by that plugin.
     match &value {
       Value::String(_) => self.validate("shell", &value)?,
       Value::Mapping(mapping) if mapping.contains_key("task") => {
@@ -188,10 +203,14 @@ impl Context {
         }
         self.validate(key, value)?;
       },
-      _ => unreachable!("command value was normalized above"),
+      _ => return Err("commands must be strings, task references, or plugin commands".to_string()),
     }
 
-    Ok(TaskCommand { value, platforms })
+    Ok(TaskCommand {
+      value,
+      platforms,
+      deferred,
+    })
   }
 }
 

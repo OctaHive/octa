@@ -1230,6 +1230,9 @@ mod tests {
             - docker:
                 image: busybox
               platforms: [linux/amd64]
+            - defer:
+                docker:
+                  image: alpine
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "valid_plugin_schema");
 
@@ -1239,6 +1242,7 @@ mod tests {
     let command = &octafile.tasks["pipeline"].cmds.as_ref().unwrap()[0];
     assert_eq!(command.platforms, Some(vec!["linux/amd64".to_string()]));
     assert!(!command.value.as_mapping().unwrap().contains_key("platforms"));
+    assert!(octafile.tasks["pipeline"].cmds.as_ref().unwrap()[1].deferred);
   }
 
   #[test]
@@ -1282,6 +1286,52 @@ mod tests {
     let error = Octafile::load(Some(file_path), false, vec![]).unwrap_err();
 
     assert!(error.to_string().contains("invalid command platforms"));
+  }
+
+  #[test]
+  fn parses_deferred_commands() {
+    let content = r#"
+      version: 1
+      tasks:
+        pipeline:
+          cmds:
+            - defer: echo cleanup
+            - defer:
+                task: cleanup
+              platforms: [linux]
+        cleanup:
+          shell: echo cleanup task
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "deferred_commands");
+
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+    let commands = octafile.tasks["pipeline"].cmds.as_ref().unwrap();
+
+    assert!(commands[0].deferred);
+    assert_eq!(commands[0].value, Value::String("echo cleanup".to_string()));
+    assert!(commands[1].deferred);
+    assert_eq!(commands[1].platforms, Some(vec!["linux".to_string()]));
+    assert_eq!(
+      commands[1].value.as_mapping().unwrap()["task"].as_str(),
+      Some("cleanup")
+    );
+  }
+
+  #[test]
+  fn rejects_deferred_command_with_sibling_command() {
+    let content = r#"
+      version: 1
+      tasks:
+        pipeline:
+          cmds:
+            - defer: echo cleanup
+              shell: echo work
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_deferred_command");
+
+    let error = Octafile::load(Some(file_path), false, vec![]).unwrap_err();
+
+    assert!(error.to_string().contains("deferred command cannot contain sibling"));
   }
 
   #[test]

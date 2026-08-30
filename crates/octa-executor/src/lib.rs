@@ -11,7 +11,15 @@ mod timestamp_source;
 pub mod vars;
 pub mod watcher;
 
-use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
+use std::{
+  collections::{HashMap, HashSet},
+  env,
+  path::PathBuf,
+  sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+  },
+};
 
 use envs::Envs;
 use octa_plugin_manager::plugin_manager::PluginManager;
@@ -21,10 +29,11 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 use error::{ExecutorError, ExecutorResult};
-pub use executor::Executor;
+use executor::DeferredAction;
+pub use executor::{ExecutionPlan, Executor};
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
-use octa_octafile::{AllowedRun, Deps, ExecuteMode, Octafile, Task};
+use octa_octafile::{AllowedRun, Deps, ExecuteMode, Octafile, Task, TaskCommand};
 pub use task::TaskNode;
 use task::{CmdType, TaskConfig};
 use vars::Vars;
@@ -71,6 +80,9 @@ pub struct TaskGraphBuilder {
   command_args: Vec<String>,          // Additional task arguments from cli
   os_arch: String,                    // Operating system architecture
   os_type: String,                    // Operating system type
+  defer_order: AtomicUsize,           // Declaration order for deferred commands
+  // Deferred actions are collected separately and attached to the DAG when the plan is complete.
+  deferred: Mutex<HashMap<String, Arc<DeferredAction<TaskNode>>>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -95,6 +107,8 @@ impl TaskGraphBuilder {
       command_args: vec![],
       os_arch,
       os_type,
+      defer_order: AtomicUsize::new(0),
+      deferred: Mutex::new(HashMap::new()),
     })
   }
 
@@ -111,7 +125,7 @@ impl TaskGraphBuilder {
     command: &str,
     run_parallel: bool,
     command_args: Vec<String>,
-  ) -> ExecutorResult<DAG<TaskNode>> {
+  ) -> ExecutorResult<ExecutionPlan<TaskNode>> {
     info!(
       "Building DAG for command {} with provided args {:?}",
       command, command_args
@@ -152,7 +166,7 @@ impl TaskGraphBuilder {
 
     self.validate_dag(&dag, command)?;
 
-    Ok(dag)
+    Ok(ExecutionPlan::new(dag, self.deferred.into_inner().unwrap()))
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -197,9 +211,33 @@ impl TaskGraphBuilder {
     match &command.task.cmds {
       Some(cmds) => {
         let mut index = 0;
+        let existing_nodes = dag.nodes().iter().map(|task| task.id.clone()).collect::<HashSet<_>>();
+        let mut deferred_nodes = Vec::new();
 
         for cmd in cmds {
           if !self.matches_platforms(cmd.platforms.as_deref()) {
+            continue;
+          }
+
+          if cmd.deferred {
+            // Registration dependencies capture the point reached in the surrounding command list.
+            let deferred = self
+              .create_deferred_node(
+                dag,
+                dep_name.clone(),
+                command,
+                cmd,
+                execute_vars.clone(),
+                execute_envs.clone(),
+                prev
+                  .as_ref()
+                  .into_iter()
+                  .chain(parent.as_ref())
+                  .map(|task| task.id.clone())
+                  .collect(),
+              )
+              .await?;
+            deferred_nodes.push(deferred);
             continue;
           }
 
@@ -325,6 +363,10 @@ impl TaskGraphBuilder {
           }
         }
 
+        // Cleanup barriers close this command scope after all of its regular work.
+        let registration_nodes = prev.as_ref().into_iter().chain(parent.as_ref()).cloned().collect();
+        self.attach_deferred_nodes(dag, &existing_nodes, deferred_nodes, registration_nodes, prev)?;
+
         Ok(index)
       },
       None => {
@@ -379,9 +421,33 @@ impl TaskGraphBuilder {
       Some(cmds) => {
         // Зависимости по умолчанию выполняются паралелльно
         let run_parallel = matches!(&command.task.execute_mode, Some(ExecuteMode::Parallel));
+        let existing_nodes = dag.nodes().iter().map(|task| task.id.clone()).collect::<HashSet<_>>();
+        let mut deferred_nodes = Vec::new();
 
         for cmd in cmds {
           if !self.matches_platforms(cmd.platforms.as_deref()) {
+            continue;
+          }
+
+          if cmd.deferred {
+            // Dependency scopes also include their parent gates in registration requirements.
+            let deferred = self
+              .create_deferred_node(
+                dag,
+                dep_name.clone(),
+                command,
+                cmd,
+                execute_vars.clone(),
+                execute_envs.clone(),
+                prev
+                  .as_ref()
+                  .into_iter()
+                  .chain(parents.iter().flatten())
+                  .map(|task| task.id.clone())
+                  .collect(),
+              )
+              .await?;
+            deferred_nodes.push(deferred);
             continue;
           }
 
@@ -519,6 +585,20 @@ impl TaskGraphBuilder {
             },
           }
         }
+
+        let has_deferred = !deferred_nodes.is_empty();
+        let registration_nodes = prev
+          .as_ref()
+          .into_iter()
+          .chain(parents.iter().flatten())
+          .cloned()
+          .collect();
+        self.attach_deferred_nodes(dag, &existing_nodes, deferred_nodes, registration_nodes, prev)?;
+        if has_deferred {
+          if let Some(finalizer) = prev.as_ref() {
+            dag.add_dependency(finalizer, &group)?;
+          }
+        }
       },
       None => {
         // Зависимости по умолчанию выполняются паралелльно
@@ -551,6 +631,156 @@ impl TaskGraphBuilder {
         }
       },
     }
+
+    Ok(())
+  }
+
+  /// Compiles a deferred command into a nested execution plan.
+  #[allow(clippy::too_many_arguments)]
+  async fn create_deferred_node(
+    &self,
+    dag: &mut DagNode,
+    dep_name: String,
+    command: &FindResult,
+    deferred: &TaskCommand,
+    execute_vars: Option<octa_octafile::Vars>,
+    execute_envs: Option<octa_octafile::Envs>,
+    registered_after: Vec<String>,
+  ) -> ExecutorResult<ArcNode> {
+    let order = self.defer_order.fetch_add(1, Ordering::SeqCst);
+    let name = format!("Deferred command {order} for {}", command.name);
+
+    // Normalize `defer` into an ordinary one-command task so shell commands, task references,
+    // and plugin commands all use the existing graph-building path.
+    let deferred_command = FindResult {
+      name: name.clone(),
+      octafile: command.octafile.clone(),
+      task: Task {
+        cmds: Some(vec![TaskCommand {
+          value: deferred.value.clone(),
+          platforms: None,
+          deferred: false,
+        }]),
+        deps: None,
+        platforms: None,
+        condition: None,
+        preconditions: None,
+        sources: None,
+        run: Some(AllowedRun::Always),
+        extra: HashMap::new(),
+        ..command.task.clone()
+      },
+    };
+
+    // Each deferred action owns its nested cleanup scope, including defers declared by a
+    // referenced task. This keeps nested cleanup ordering local to that task invocation.
+    let nested_builder = self.nested_builder();
+    let mut deferred_dag = DAG::new();
+    nested_builder
+      .process_command(
+        &mut deferred_dag,
+        dep_name,
+        &deferred_command,
+        None,
+        &mut None,
+        execute_vars,
+        execute_envs,
+        Some(false),
+      )
+      .await?;
+
+    if deferred_dag.node_count() == 0 {
+      nested_builder.create_group_node(&mut deferred_dag, Some(AllowedRun::Always), format!("Skipped {name}"))?;
+    }
+
+    let plan = ExecutionPlan::new(deferred_dag, nested_builder.deferred.into_inner().unwrap());
+
+    // The internal node preserves ordering in the main DAG. Its executable payload is stored
+    // in `DeferredAction`, not in `TaskNode`.
+    let task = TaskConfig::builder()
+      .id(Uuid::new_v4())
+      .name(name.clone())
+      .dep_name(name.clone())
+      .cmd_type(Some(CmdType::Internal))
+      .build()
+      .unwrap();
+    let task = Arc::new(TaskNode::new(task));
+    dag.add_node(task.clone());
+    self.deferred.lock().unwrap().insert(
+      task.id.clone(),
+      Arc::new(DeferredAction {
+        command: name,
+        plan,
+        order,
+        registered_after,
+      }),
+    );
+
+    Ok(task)
+  }
+
+  fn nested_builder(&self) -> Self {
+    // Runtime context is inherited, while cleanup order and collected actions belong to
+    // the nested plan and therefore start from an empty state.
+    Self {
+      plugin_manager: self.plugin_manager.clone(),
+      finder: self.finder.clone(),
+      dir: self.dir.clone(),
+      command_args: self.command_args.clone(),
+      os_arch: self.os_arch.clone(),
+      os_type: self.os_type.clone(),
+      defer_order: AtomicUsize::new(0),
+      deferred: Mutex::new(HashMap::new()),
+    }
+  }
+
+  /// Connects cleanup barriers after every node created by the current command scope.
+  /// The barriers are reversed to preserve LIFO order without putting cleanup data in `TaskNode`.
+  fn attach_deferred_nodes(
+    &self,
+    dag: &mut DagNode,
+    existing_nodes: &HashSet<String>,
+    mut deferred_nodes: Vec<ArcNode>,
+    registration_nodes: Vec<ArcNode>,
+    prev: &mut Option<ArcNode>,
+  ) -> ExecutorResult<()> {
+    if deferred_nodes.is_empty() {
+      return Ok(());
+    }
+
+    // All nodes added within this command scope must finish before cleanup starts. Connecting
+    // them directly avoids inferring terminal nodes from the shape of the graph.
+    let mut predecessors = dag
+      .nodes()
+      .iter()
+      .filter(|task| !existing_nodes.contains(&task.id))
+      .filter(|task| !deferred_nodes.iter().any(|deferred| deferred.id == task.id))
+      .cloned()
+      .collect::<Vec<_>>();
+
+    if predecessors.is_empty() {
+      // A task containing only `defer` starts cleanup after its dependency gates. At the root,
+      // a no-op node records that execution reached the declaration.
+      if registration_nodes.is_empty() {
+        predecessors.push(self.create_group_node(
+          dag,
+          Some(AllowedRun::Always),
+          "Register deferred commands".to_string(),
+        )?);
+      } else {
+        predecessors = registration_nodes;
+      }
+    }
+
+    // Reversing declaration order produces defer-N -> ... -> defer-1 (LIFO).
+    deferred_nodes.reverse();
+    for deferred in deferred_nodes {
+      for predecessor in &predecessors {
+        dag.add_dependency(predecessor, &deferred)?;
+      }
+      predecessors = vec![deferred];
+    }
+    *prev = predecessors.pop();
 
     Ok(())
   }

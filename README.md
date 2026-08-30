@@ -563,6 +563,44 @@ tasks:
       - task: next
 ```
 
+# Deferred commands
+
+Use `defer` to schedule cleanup after the current task finishes. Deferred commands run after successful
+execution, after a failure, and during cancellation. Multiple deferred commands run in reverse declaration
+order. A deferred command is registered only after execution reaches its position in `cmds`.
+
+```yaml
+version: 1
+
+tasks:
+  build:
+    cmds:
+      - shell: mkdir -p build/tmp
+      - defer: rm -rf build/tmp
+      - defer:
+          task: report
+      - shell: ./build.sh
+
+  report:
+    shell: echo "Build finished"
+```
+
+`defer` supports shell commands, task references, and every plugin command. Command metadata such as
+`platforms` can be placed next to `defer`:
+
+```yaml
+tasks:
+  cleanup:
+    cmds:
+      - defer:
+          shell: ./cleanup.sh
+        platforms: [linux, darwin]
+      - shell: ./run.sh
+```
+
+Deferred command failures are logged but do not replace the result of the main task. If the main task fails,
+it remains failed after cleanup finishes.
+
 # Platform specific tasks and commands
 
 If you want to restrict tasks or individual commands to particular operating systems and architectures,

@@ -1,0 +1,12 @@
+version: 1
+
+tasks:
+  default:
+    cmds:
+      - defer: echo First cleanup
+      - defer:
+          task: cleanup
+      - shell: echo Work
+
+  cleanup:
+    shell: echo Second cleanup

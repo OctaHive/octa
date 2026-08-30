@@ -121,6 +121,146 @@ tasks:
 }
 
 #[test]
+fn test_deferred_commands() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  success:
+    cmds:
+      - defer: echo first >> success.txt
+      - defer:
+          shell: echo second >> success.txt
+      - defer: echo skipped >> success.txt
+        platforms: [unsupported]
+      - shell: echo work >> success.txt
+
+  failure:
+    cmds:
+      - defer:
+          task: cleanup
+      - shell: echo work >> failure.txt
+      - shell: exit 1
+
+  cleanup:
+    shell: echo cleanup >> failure.txt
+
+  late_defer:
+    cmds:
+      - shell: exit 1
+      - defer: echo late > late.txt
+
+  cleanup_failure:
+    cmds:
+      - defer: exit 1
+      - shell: echo success > cleanup-failure.txt
+
+  nested:
+    cmds:
+      - defer: echo inner-cleanup >> nested.txt
+      - shell: echo inner-work >> nested.txt
+
+  outer:
+    cmds:
+      - defer: echo outer-cleanup >> nested.txt
+      - task: nested
+      - shell: echo outer-work >> nested.txt
+
+  dependency:
+    cmds:
+      - defer: echo dependency-cleanup >> dependency.txt
+      - shell: echo dependency-work >> dependency.txt
+
+  with_dependency:
+    deps: [dependency]
+    shell: echo parent-work >> dependency.txt
+
+  only_defer:
+    deps: [prepare]
+    cmds:
+      - defer: echo cleanup >> only-defer.txt
+
+  prepare:
+    shell: echo prepare >> only-defer.txt
+
+  failing_dependency:
+    cmds:
+      - defer: echo dependency-cleanup > failed-dependency.txt
+      - shell: exit 1
+
+  with_failing_dependency:
+    deps: [failing_dependency]
+    cmds:
+      - defer: echo parent-cleanup > failed-parent.txt
+      - shell: echo parent
+"#,
+  )?;
+
+  let run = |task: &str| -> Result<Command, Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command.current_dir(tmp_dir.path());
+    command.arg(task);
+    command.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+    Ok(command)
+  };
+
+  run("success")?.assert().success();
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("success.txt"))?
+      .lines()
+      .collect::<Vec<_>>(),
+    vec!["work", "second", "first"]
+  );
+
+  run("failure")?.assert().failure();
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("failure.txt"))?
+      .lines()
+      .collect::<Vec<_>>(),
+    vec!["work", "cleanup"]
+  );
+
+  run("late_defer")?.assert().failure();
+  assert!(!tmp_dir.path().join("late.txt").exists());
+
+  run("cleanup_failure")?.assert().success();
+  assert!(tmp_dir.path().join("cleanup-failure.txt").is_file());
+
+  run("outer")?.assert().success();
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("nested.txt"))?
+      .lines()
+      .collect::<Vec<_>>(),
+    vec!["inner-work", "inner-cleanup", "outer-work", "outer-cleanup"]
+  );
+
+  run("with_dependency")?.assert().success();
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("dependency.txt"))?
+      .lines()
+      .collect::<Vec<_>>(),
+    vec!["dependency-work", "dependency-cleanup", "parent-work"]
+  );
+
+  run("only_defer")?.assert().success();
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("only-defer.txt"))?
+      .lines()
+      .collect::<Vec<_>>(),
+    vec!["prepare", "cleanup"]
+  );
+
+  run("with_failing_dependency")?.assert().failure();
+  assert!(tmp_dir.path().join("failed-dependency.txt").is_file());
+  assert!(!tmp_dir.path().join("failed-parent.txt").exists());
+
+  Ok(())
+}
+
+#[test]
 fn test_run_default_task_when_task_is_not_specified() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   fs::write(
