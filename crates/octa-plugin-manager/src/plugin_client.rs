@@ -26,9 +26,9 @@ impl From<PluginClientError> for io::Error {
     match err {
       PluginClientError::Io(e) => e,
       PluginClientError::SerdeJson(e) => io::Error::new(io::ErrorKind::InvalidData, e),
-      PluginClientError::Protocol(msg) => io::Error::new(io::ErrorKind::Other, msg),
+      PluginClientError::Protocol(msg) => io::Error::other(msg),
       PluginClientError::ConnectionClosed => io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed"),
-      PluginClientError::VersionMismatch => io::Error::new(io::ErrorKind::Other, "Version mismatch"),
+      PluginClientError::VersionMismatch => io::Error::other("Version mismatch"),
       PluginClientError::WriterClosed => io::Error::new(io::ErrorKind::ConnectionAborted, "Writer closed"),
     }
   }
@@ -433,7 +433,7 @@ mod tests {
           let mut buffer = String::new();
 
           // Read Hello handshake
-          if let Ok(_) = reader.read_line(&mut buffer).await {
+          if reader.read_line(&mut buffer).await.is_ok() {
             messages.push(buffer.clone());
 
             // Send Hello response
@@ -448,7 +448,7 @@ mod tests {
 
             // Wait for next client message and respond with invalid JSON
             buffer.clear();
-            if let Ok(_) = reader.read_line(&mut buffer).await {
+            if reader.read_line(&mut buffer).await.is_ok() {
               messages.push(buffer);
               writer.write_all(b"invalid json\n").await.unwrap();
               writer.flush().await.unwrap();
@@ -727,7 +727,7 @@ mod tests {
         let mut buffer = String::new();
 
         // Handle handshake
-        if let Ok(_) = reader.read_line(&mut buffer).await {
+        if reader.read_line(&mut buffer).await.is_ok() {
           messages.push(buffer.clone());
           let response = PluginResponse::Hello(Version {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -739,7 +739,7 @@ mod tests {
 
           // Wait for Schema command
           buffer.clear();
-          if let Ok(_) = reader.read_line(&mut buffer).await {
+          if reader.read_line(&mut buffer).await.is_ok() {
             messages.push(buffer.clone());
 
             let response = PluginResponse::Schema(Schema { key: "key".to_owned() });
@@ -750,7 +750,7 @@ mod tests {
 
           // Wait for shutdown command but don't respond
           buffer.clear();
-          if let Ok(_) = reader.read_line(&mut buffer).await {
+          if reader.read_line(&mut buffer).await.is_ok() {
             messages.push(buffer);
             // Just wait without responding
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -786,7 +786,7 @@ mod tests {
         let mut buffer = String::new();
 
         // Handle handshake
-        if let Ok(_) = reader.read_line(&mut buffer).await {
+        if reader.read_line(&mut buffer).await.is_ok() {
           messages.push(buffer.clone());
           let response = PluginResponse::Hello(Version {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -865,7 +865,7 @@ mod tests {
         let mut buffer = String::new();
 
         // Handle handshake
-        if let Ok(_) = reader.read_line(&mut buffer).await {
+        if reader.read_line(&mut buffer).await.is_ok() {
           messages.push(buffer.clone());
           let response = PluginResponse::Hello(Version {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -877,7 +877,7 @@ mod tests {
 
           // Wait for shutdown command and respond with error
           buffer.clear();
-          if let Ok(_) = reader.read_line(&mut buffer).await {
+          if reader.read_line(&mut buffer).await.is_ok() {
             messages.push(buffer);
             let error_response = PluginResponse::Error {
               id: "shutdown_error".to_string(),

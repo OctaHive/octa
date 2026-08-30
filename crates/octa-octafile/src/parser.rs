@@ -1,0 +1,308 @@
+use std::collections::HashMap;
+
+use serde_yml::{Mapping, Number, Tag as ValueTag, TaggedValue, Value};
+use yaml_rust2::{
+  parser::{Event, MarkedEventReceiver, Parser, Tag},
+  scanner::{Marker, TScalarStyle},
+  Yaml,
+};
+
+#[derive(Clone, Debug)]
+/// YAML node that keeps the source marker and tag discarded by the regular yaml-rust2 DOM loader.
+pub(crate) struct Node {
+  value: NodeValue,
+  tag: Option<Tag>,
+  marker: Marker,
+}
+
+#[derive(Clone, Debug)]
+enum NodeValue {
+  Scalar(Value),
+  Sequence(Vec<Node>),
+  Mapping(Vec<(Node, Node)>),
+}
+
+impl Node {
+  pub(crate) fn marker(&self) -> Marker {
+    self.marker
+  }
+
+  pub(crate) fn annotation(&self) -> Option<&str> {
+    // Only local tags such as `!shell` are task annotations. Resolved standard
+    // YAML tags use the `tag:yaml.org,2002:` handle and retain normal YAML semantics.
+    self
+      .tag
+      .as_ref()
+      .filter(|tag| tag.handle == "!")
+      .map(|tag| tag.suffix.as_str())
+  }
+
+  pub(crate) fn into_mapping(self) -> Option<Vec<(Node, Node)>> {
+    match self.value {
+      NodeValue::Mapping(entries) => Some(entries),
+      _ => None,
+    }
+  }
+
+  pub(crate) fn as_str(&self) -> Option<&str> {
+    match &self.value {
+      NodeValue::Scalar(Value::String(value)) => Some(value),
+      _ => None,
+    }
+  }
+
+  pub(crate) fn into_value(self) -> Result<Value, String> {
+    self.convert(true)
+  }
+
+  pub(crate) fn into_untagged_value(self) -> Result<Value, String> {
+    // The outer tag selects a task plugin and must not be forwarded as part of
+    // the plugin parameters. Tags nested inside the payload are still preserved.
+    self.convert(false)
+  }
+
+  fn convert(self, preserve_tag: bool) -> Result<Value, String> {
+    let value = match self.value {
+      NodeValue::Scalar(value) => value,
+      NodeValue::Sequence(nodes) => {
+        Value::Sequence(nodes.into_iter().map(Node::into_value).collect::<Result<Vec<_>, _>>()?)
+      },
+      NodeValue::Mapping(entries) => {
+        let mut mapping = Mapping::new();
+
+        for (key, value) in entries {
+          let marker = key.marker;
+          let key = key
+            .into_value()?
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| location_error(marker, "mapping keys must be strings"))?;
+
+          if mapping.insert(key.clone(), value.into_value()?).is_some() {
+            return Err(location_error(marker, &format!("duplicated key '{key}'")));
+          }
+        }
+
+        Value::Mapping(mapping)
+      },
+    };
+
+    if preserve_tag {
+      if let Some(tag) = self.tag.filter(|tag| !is_standard_tag(tag)) {
+        return Ok(Value::Tagged(Box::new(TaggedValue::new(
+          ValueTag::new(format!("{}{}", tag.handle, tag.suffix)),
+          value,
+        ))));
+      }
+    }
+
+    Ok(value)
+  }
+}
+
+enum ContainerValue {
+  Sequence(Vec<Node>),
+  Mapping {
+    entries: Vec<(Node, Node)>,
+    // yaml-rust2 emits mapping keys and values as consecutive events. A pending
+    // key is stored here until the next complete node arrives.
+    key: Option<Node>,
+  },
+}
+
+struct Container {
+  value: ContainerValue,
+  anchor: usize,
+  tag: Option<Tag>,
+  marker: Marker,
+}
+
+#[derive(Default)]
+struct Loader {
+  documents: Vec<Node>,
+  // Open sequences and mappings. Completed child nodes are attached to the
+  // container at the top of the stack.
+  stack: Vec<Container>,
+  // Anchors point to already completed nodes so aliases can clone the same tree.
+  anchors: HashMap<usize, Node>,
+  // MarkedEventReceiver cannot return errors, so structural errors are retained
+  // here and returned after yaml-rust2 finishes emitting events.
+  error: Option<String>,
+}
+
+impl Loader {
+  fn push_node(&mut self, node: Node, anchor: usize) {
+    if self.error.is_some() {
+      return;
+    }
+
+    if anchor > 0 {
+      // yaml-rust2 uses zero to mean that the node has no anchor.
+      self.anchors.insert(anchor, node.clone());
+    }
+
+    let Some(container) = self.stack.last_mut() else {
+      self.documents.push(node);
+      return;
+    };
+
+    match &mut container.value {
+      ContainerValue::Sequence(nodes) => nodes.push(node),
+      ContainerValue::Mapping { entries, key } => {
+        if let Some(key) = key.take() {
+          entries.push((key, node));
+        } else {
+          *key = Some(node);
+        }
+      },
+    }
+  }
+
+  fn close_container(&mut self, sequence: bool, marker: Marker) {
+    // Collection tags and markers arrive on the start event, so they are kept
+    // in Container until the matching end event produces a complete Node.
+    let Some(container) = self.stack.pop() else {
+      self.error = Some(location_error(marker, "unexpected collection end"));
+      return;
+    };
+
+    let value = match container.value {
+      ContainerValue::Sequence(nodes) if sequence => NodeValue::Sequence(nodes),
+      ContainerValue::Mapping { entries, key: None } if !sequence => NodeValue::Mapping(entries),
+      ContainerValue::Mapping { key: Some(_), .. } => {
+        self.error = Some(location_error(marker, "mapping value is missing"));
+        return;
+      },
+      _ => {
+        self.error = Some(location_error(marker, "unexpected collection end"));
+        return;
+      },
+    };
+
+    self.push_node(
+      Node {
+        value,
+        tag: container.tag,
+        marker: container.marker,
+      },
+      container.anchor,
+    );
+  }
+}
+
+impl MarkedEventReceiver for Loader {
+  fn on_event(&mut self, event: Event, marker: Marker) {
+    if self.error.is_some() {
+      return;
+    }
+
+    match event {
+      // Document boundaries do not affect the node stack; root nodes are added
+      // directly to `documents` by push_node.
+      Event::StreamStart | Event::StreamEnd | Event::DocumentStart | Event::DocumentEnd | Event::Nothing => {},
+      Event::Scalar(value, style, anchor, tag) => {
+        let scalar = scalar_value(&value, style, tag.as_ref());
+        self.push_node(
+          Node {
+            value: NodeValue::Scalar(scalar),
+            tag,
+            marker,
+          },
+          anchor,
+        );
+      },
+      Event::SequenceStart(anchor, tag) => self.stack.push(Container {
+        value: ContainerValue::Sequence(Vec::new()),
+        anchor,
+        tag,
+        marker,
+      }),
+      Event::SequenceEnd => self.close_container(true, marker),
+      Event::MappingStart(anchor, tag) => self.stack.push(Container {
+        value: ContainerValue::Mapping {
+          entries: Vec::new(),
+          key: None,
+        },
+        anchor,
+        tag,
+        marker,
+      }),
+      Event::MappingEnd => self.close_container(false, marker),
+      Event::Alias(anchor) => match self.anchors.get(&anchor).cloned() {
+        Some(node) => self.push_node(node, 0),
+        None => self.error = Some(location_error(marker, "unknown YAML alias")),
+      },
+    }
+  }
+}
+
+pub(crate) fn parse(content: &str) -> Result<Node, String> {
+  let mut loader = Loader::default();
+  Parser::new_from_str(content)
+    .load(&mut loader, true)
+    .map_err(|error| error.to_string())?;
+
+  if let Some(error) = loader.error {
+    return Err(error);
+  }
+
+  match loader.documents.len() {
+    1 => Ok(loader.documents.pop().unwrap()),
+    0 => Err("empty YAML document".to_string()),
+    _ => Err("Octafile must contain a single YAML document".to_string()),
+  }
+}
+
+fn scalar_value(value: &str, style: TScalarStyle, tag: Option<&Tag>) -> Value {
+  // Quoted and block scalars are always strings, regardless of their contents.
+  if style != TScalarStyle::Plain {
+    return Value::String(value.to_owned());
+  }
+
+  if let Some(tag) = tag.filter(|tag| is_standard_tag(tag)) {
+    // Explicit standard tags take precedence over implicit scalar inference.
+    return match tag.suffix.as_str() {
+      "bool" => match value {
+        "true" | "True" | "TRUE" => Value::Bool(true),
+        "false" | "False" | "FALSE" => Value::Bool(false),
+        _ => Value::String(value.to_owned()),
+      },
+      "int" => value
+        .parse::<i64>()
+        .map(|value| Value::Number(value.into()))
+        .unwrap_or_else(|_| Value::String(value.to_owned())),
+      "float" => value
+        .parse::<f64>()
+        .map(|value| Value::Number(Number::from(value)))
+        .unwrap_or_else(|_| Value::String(value.to_owned())),
+      "null" if matches!(value, "~" | "null" | "Null" | "NULL") => Value::Null,
+      _ => Value::String(value.to_owned()),
+    };
+  }
+
+  // Let yaml-rust2 apply its YAML scalar rules to untagged and locally tagged
+  // plain values before converting them to the Value type used by Octafile.
+  yaml_value(Yaml::from_str(value))
+}
+
+fn yaml_value(value: Yaml) -> Value {
+  match value {
+    Yaml::Integer(value) => Value::Number(value.into()),
+    Yaml::Real(value) => value
+      .parse::<f64>()
+      .map(|value| Value::Number(Number::from(value)))
+      .unwrap_or_else(|_| Value::String(value)),
+    Yaml::Boolean(value) => Value::Bool(value),
+    Yaml::Null | Yaml::BadValue => Value::Null,
+    Yaml::String(value) => Value::String(value),
+    _ => unreachable!("scalar parsing cannot produce a collection or alias"),
+  }
+}
+
+fn is_standard_tag(tag: &Tag) -> bool {
+  tag.handle == "tag:yaml.org,2002:"
+}
+
+pub(crate) fn location_error(marker: Marker, message: &str) -> String {
+  format!("{message} at line {}, column {}", marker.line(), marker.col() + 1)
+}

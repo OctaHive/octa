@@ -899,7 +899,7 @@ impl TaskGraphBuilder {
         if let Some(platforms) = &cmd.task.platforms {
           return platforms.contains(&self.os_type)
             || platforms.contains(&self.os_arch)
-            || platforms.contains(&format!("{}/{}", &self.os_type, &self.os_arch).to_string());
+            || platforms.contains(&format!("{}/{}", self.os_type, self.os_arch));
         }
 
         true

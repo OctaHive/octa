@@ -119,8 +119,7 @@ mod tests {
     ) -> std::task::Poll<Result<usize, io::Error>> {
       let this = self.get_mut();
       // Use explicit Write trait implementation
-      std::io::Write::write_all(&mut this.buffer, buf)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+      std::io::Write::write_all(&mut this.buffer, buf).map_err(std::io::Error::other)?;
       std::task::Poll::Ready(Ok(buf.len()))
     }
 

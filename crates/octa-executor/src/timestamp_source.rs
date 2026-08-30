@@ -159,7 +159,7 @@ mod tests {
 
     let is_changed = timestamp_source.is_changed(vec![temp_file_path.clone()]).await.unwrap();
 
-    assert!(is_changed == false);
+    assert!(!is_changed);
 
     // Wait before change
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;

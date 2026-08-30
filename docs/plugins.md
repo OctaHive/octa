@@ -67,6 +67,28 @@ Example:
 
 This concludes the first stage of interaction with the plugin.
 
+The schema key also defines the YAML annotation for tasks handled by the plugin. For example, a
+plugin that returns the `shell` key can be selected with `!shell`:
+
+```yaml
+tasks:
+  build: !shell cargo build
+```
+
+The tagged value is passed to the selected plugin. An annotation can also contain a structured
+payload for plugins that accept configuration; structured values are serialized as JSON when sent
+through the current string-based Execute protocol.
+
+```yaml
+tasks:
+  deploy: !docker
+    image: app:latest
+    command: ./deploy
+```
+
+Octa rejects an annotation when no loaded plugin exposes the corresponding schema key. The existing
+task attribute form, such as `shell: cargo build`, remains supported.
+
 Next, Octa can send an arbitrary number of Execute commands, which the plugin processes and executes. Here is what the Execute commands look like:
 
 Octa Execute request:

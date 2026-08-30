@@ -165,7 +165,7 @@ mod tests {
 
     let is_changed = timestamp_source.is_changed(vec![temp_file_path.clone()]).await.unwrap();
 
-    assert!(is_changed == false);
+    assert!(!is_changed);
 
     // Modify the test file and check if it is detected as a change
     std::fs::write(&temp_file_path, "modified content").unwrap();

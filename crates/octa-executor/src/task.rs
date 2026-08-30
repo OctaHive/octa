@@ -390,10 +390,7 @@ impl TaskNode {
               break;
             },
             PluginResponse::Error { id, message } if id == command_id => {
-              return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("Plugin error: {}", message),
-              ));
+              return Err(io::Error::other(format!("Plugin error: {}", message)));
             },
             _ => {},
           },
@@ -783,7 +780,7 @@ mod tests {
       .expect("Failed to open in-memory Sled database");
 
     let mut vars = Vars::new();
-    vars.insert(&"name", &"world");
+    vars.insert("name", &"world");
 
     let mut extra = HashMap::new();
     let tpl_value = Value::String("Hello {{ name }}!".into());

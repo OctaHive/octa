@@ -148,7 +148,7 @@ impl LoggerSystem {
     self
       .writer_handle
       .join()
-      .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to join logger thread: {:?}", e)))?;
+      .map_err(|e| io::Error::other(format!("Failed to join logger thread: {:?}", e)))?;
 
     Ok(())
   }

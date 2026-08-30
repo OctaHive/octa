@@ -296,11 +296,11 @@ pub async fn run() -> OctaResult<()> {
     let filtered = commands.into_iter().filter(|cmd| !cmd.task.internal.unwrap_or(false));
     let found_commands: Vec<(String, Option<String>)> = filtered.map(|c| (c.name.clone(), c.task.desc)).collect();
 
-    for cmd in found_commands.into_iter().rev() {
-      if cmd.1.is_none() {
-        println!("{}", cmd.0);
+    for (name, description) in found_commands.into_iter().rev() {
+      if let Some(description) = description {
+        println!("{}: {}", name, description);
       } else {
-        println!("{}: {}", cmd.0, cmd.1.unwrap());
+        println!("{}", name);
       }
     }
 
@@ -375,7 +375,7 @@ mod tests {
 
   #[test]
   fn test_cli_parse() {
-    let cli = Cli::parse_from(&["octa", "--parallel", "build"]);
+    let cli = Cli::parse_from(["octa", "--parallel", "build"]);
     assert!(cli.parallel);
     assert_eq!(cli.commands, Some(vec!["build".to_string()]));
   }
@@ -407,37 +407,37 @@ mod tests {
 
   #[test]
   fn test_cli_task_args() {
-    let cli = Cli::parse_from(&["octa", "build", "--", "--release"]);
+    let cli = Cli::parse_from(["octa", "build", "--", "--release"]);
     assert_eq!(cli.task_args, vec!["--release"]);
   }
 
   #[test]
   fn test_cli_multiple_commands() {
-    let cli = Cli::parse_from(&["octa", "test", "build"]);
+    let cli = Cli::parse_from(["octa", "test", "build"]);
     assert_eq!(cli.commands, Some(vec!["test".to_string(), "build".to_string()]));
   }
 
   #[test]
   fn test_cli_dry_run() {
-    let cli = Cli::parse_from(&["octa", "--dry", "build"]);
+    let cli = Cli::parse_from(["octa", "--dry", "build"]);
     assert!(cli.dry);
   }
 
   #[test]
   fn test_cli_verbose() {
-    let cli = Cli::parse_from(&["octa", "--verbose", "build"]);
+    let cli = Cli::parse_from(["octa", "--verbose", "build"]);
     assert!(cli.verbose);
   }
 
   #[test]
   fn test_cli_completions() {
-    let cli = Cli::parse_from(&["octa", "--completions", "bash"]);
+    let cli = Cli::parse_from(["octa", "--completions", "bash"]);
     assert_eq!(cli.completions, Some(Shell::Bash));
   }
 
   #[test]
   fn test_cli_global() {
-    let cli = Cli::parse_from(&["octa", "--global", "build"]);
+    let cli = Cli::parse_from(["octa", "--global", "build"]);
     assert!(cli.global);
   }
 }

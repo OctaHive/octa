@@ -314,8 +314,8 @@ mod tests {
 
   #[test]
   fn test_with_value_and_parent() {
-    let parent = Vars::with_value(&json!({"parent_key": "parent_value"}));
-    let vars = Vars::with_value_and_parent(&json!({"child_key": "child_value"}), parent);
+    let parent = Vars::with_value(json!({"parent_key": "parent_value"}));
+    let vars = Vars::with_value_and_parent(json!({"child_key": "child_value"}), parent);
 
     assert!(vars.parent.is_some());
     assert_eq!(
@@ -354,7 +354,7 @@ mod tests {
 
   #[test]
   fn test_vars_iterator() {
-    let vars = Vars::with_value(&json!({
+    let vars = Vars::with_value(json!({
       "key1": "value1",
       "key2": "value2"
     }));
@@ -371,7 +371,7 @@ mod tests {
 
   #[test]
   fn test_serialize_deserialize() {
-    let original = Vars::with_value(&json!({
+    let original = Vars::with_value(json!({
       "key": "value",
       "number": 42
     }));
@@ -384,7 +384,7 @@ mod tests {
 
   #[test]
   fn test_display() {
-    let vars = Vars::with_value(&json!({
+    let vars = Vars::with_value(json!({
       "key": "value",
       "number": 42
     }));
@@ -419,7 +419,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_expand_simple() {
-    let mut vars = Vars::with_value(&json!({
+    let mut vars = Vars::with_value(json!({
       "name": "{{ 'John' }}",
     }));
 
@@ -429,11 +429,11 @@ mod tests {
 
   #[tokio::test]
   async fn test_expand_with_parent() {
-    let parent = Vars::with_value(&json!({
+    let parent = Vars::with_value(json!({
       "first": "John"
     }));
     let mut vars = Vars::with_value_and_parent(
-      &json!({
+      json!({
         "full": "{{ first }} Doe"
       }),
       parent,

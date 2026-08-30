@@ -175,7 +175,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "preconditions" => task.preconditions = map.next_value()?,
         key => {
           if self.context.keys.contains(&key.to_owned()) {
-            let val = Value::String(map.next_value()?);
+            let val = map.next_value()?;
             extra.insert(key.to_owned(), val);
           } else {
             // Skip unknown fields

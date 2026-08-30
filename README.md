@@ -365,6 +365,28 @@ tasks:
     
 ```
 
+## Plugin task annotations
+
+A plugin schema key can be used as a YAML annotation on a task. The annotation selects the plugin,
+and the tagged value is passed to that plugin as its command or parameters.
+
+```yaml
+version: 1
+
+tasks:
+  build: !shell cargo build
+  render: !tpl "Hello, {{ NAME }}!"
+```
+
+The annotation name must match the key returned by a loaded plugin. Unknown annotations are
+reported as Octafile parsing errors. The existing mapping syntax remains supported.
+
+```yaml
+tasks:
+  build:
+    shell: cargo build
+```
+
 ## Task template
 Sometimes you need to simply template text and return the result to a task that depends on the 
 current one. To do this, you can specify a `tpl` for the task, and when the task is executed, 

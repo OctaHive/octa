@@ -1,6 +1,7 @@
 mod error;
 mod include;
 mod octafile;
+mod parser;
 mod task;
 
 pub use error::{OctafileError, OctafileResult};

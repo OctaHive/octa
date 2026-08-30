@@ -1,5 +1,5 @@
 use std::{
-  collections::HashMap,
+  collections::{HashMap, HashSet},
   env, fmt,
   fs::File,
   io::Read,
@@ -17,6 +17,7 @@ use tracing::{debug, info};
 use crate::{
   error::{OctafileError, OctafileResult},
   include::IncludeInfo,
+  parser::{self, location_error, Node},
   task::{Context, Task, TaskSeed},
 };
 
@@ -160,61 +161,93 @@ impl Octafile {
     Ok(octafile)
   }
 
-  fn deserialize_with_context(value: Value, context: &Context) -> Result<Self, String> {
-    match value {
-      Value::Mapping(map) => {
-        let mut octafile = Octafile::default();
+  fn deserialize_with_context(value: Node, context: &Context) -> Result<Self, String> {
+    let map = value.into_mapping().ok_or_else(|| "Expected mapping".to_string())?;
+    let mut octafile = Octafile::default();
+    let mut fields = HashSet::new();
 
-        for (key, value) in map {
-          match key.as_str() {
-            "version" => {
-              octafile.version = match value {
-                Value::Number(n) => Version::try_from(n.as_u64().unwrap_or(0) as u8).map_err(|e| e.to_string())?,
-                _ => return Err("Version must be a number".to_string()),
-              };
-            },
-            "vars" => {
-              octafile.vars = serde_yml::from_value(value).map_err(|e| e.to_string())?;
-            },
-            "env" => {
-              octafile.env = serde_yml::from_value(value).map_err(|e| e.to_string())?;
-            },
-            "includes" => {
-              octafile.includes = serde_yml::from_value(value).map_err(|e| e.to_string())?;
-            },
-            "tasks" => {
-              if let Value::Mapping(tasks_map) = value {
-                let mut tasks = HashMap::new();
-                for (task_key, task_value) in tasks_map {
-                  let task = match task_value {
-                    Value::String(s) => {
-                      let task_visitor = crate::task::TaskVisitor { context };
-                      task_visitor
-                        .visit_str::<serde_yml::Error>(&s)
-                        .map_err(|e| e.to_string())?
-                    },
-                    task_value => {
-                      let task_seed = TaskSeed { context };
-                      let deserializer = serde_yml::Deserializer::new(&task_value);
-                      task_seed.deserialize(deserializer).map_err(|e| e.to_string())?
-                    },
-                  };
+    for (key, value) in map {
+      let key_marker = key.marker();
+      let key = key
+        .as_str()
+        .ok_or_else(|| location_error(key_marker, "Octafile keys must be strings"))?;
 
-                  tasks.insert(task_key, task);
-                }
-                octafile.tasks = tasks;
-              } else {
-                return Err("Expected mapping for tasks".to_string());
+      if !fields.insert(key.to_owned()) {
+        return Err(location_error(key_marker, &format!("duplicated key '{key}'")));
+      }
+
+      match key {
+        "version" => {
+          octafile.version = match value.into_value()? {
+            Value::Number(n) => Version::try_from(n.as_u64().unwrap_or(0) as u8).map_err(|e| e.to_string())?,
+            _ => return Err("Version must be a number".to_string()),
+          };
+        },
+        "vars" => {
+          octafile.vars = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "env" => {
+          octafile.env = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "includes" => {
+          octafile.includes = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "tasks" => {
+          let tasks_map = value
+            .into_mapping()
+            .ok_or_else(|| "Expected mapping for tasks".to_string())?;
+          let mut tasks = HashMap::new();
+
+          for (task_key, task_value) in tasks_map {
+            let task_marker = task_key.marker();
+            let task_name = task_key
+              .as_str()
+              .ok_or_else(|| location_error(task_marker, "task names must be strings"))?
+              .to_owned();
+            let annotation = task_value.annotation().map(str::to_owned);
+
+            let task = if let Some(annotation) = annotation {
+              if annotation.is_empty() || !context.keys.contains(&annotation) {
+                return Err(location_error(
+                  task_value.marker(),
+                  &format!("unknown task annotation '!{annotation}'"),
+                ));
               }
-            },
-            _ => {}, // Ignore unknown fields
-          }
-        }
 
-        Ok(octafile)
-      },
-      _ => Err("Expected mapping".to_string()),
+              let mut extra = HashMap::new();
+              extra.insert(annotation, task_value.into_untagged_value()?);
+              Task {
+                extra,
+                ..Task::default()
+              }
+            } else {
+              match task_value.into_value()? {
+                Value::String(value) => {
+                  let task_visitor = crate::task::TaskVisitor { context };
+                  task_visitor
+                    .visit_str::<serde_yml::Error>(&value)
+                    .map_err(|e| e.to_string())?
+                },
+                task_value => {
+                  let task_seed = TaskSeed { context };
+                  let deserializer = serde_yml::Deserializer::new(&task_value);
+                  task_seed.deserialize(deserializer).map_err(|e| e.to_string())?
+                },
+              }
+            };
+
+            if tasks.insert(task_name.clone(), task).is_some() {
+              return Err(location_error(task_marker, &format!("duplicated task '{task_name}'")));
+            }
+          }
+
+          octafile.tasks = tasks;
+        },
+        _ => {},
+      }
     }
+
+    Ok(octafile)
   }
 
   /// Return specified included octafile
@@ -390,8 +423,7 @@ impl Octafile {
 
     let context = Context { keys: plugin_keys };
 
-    let yaml_value: Value =
-      serde_yml::from_str(&content).map_err(|e| OctafileError::ParseError(path_str.clone(), e.to_string()))?;
+    let yaml_value = parser::parse(&content).map_err(|error| OctafileError::ParseError(path_str.clone(), error))?;
 
     Octafile::deserialize_with_context(yaml_value, &context).map_err(|e| OctafileError::ParseError(path_str, e))
   }
@@ -525,6 +557,13 @@ mod tests {
     let file_path = temp_dir.path().join("Octafile.yml");
     fs::write(&file_path, content).unwrap();
     (temp_dir, file_path)
+  }
+
+  fn task_mapping(value: &Value) -> &serde_yml::Mapping {
+    match value {
+      Value::Mapping(mapping) => mapping,
+      _ => panic!("expected a mapping"),
+    }
   }
 
   #[test]
@@ -995,6 +1034,73 @@ mod tests {
     assert!(task.extra.contains_key("plugin_key"));
     assert!(task.extra.contains_key("another_key"));
     assert_eq!(task.extra["plugin_key"], Value::String("plugin value".to_string()));
+  }
+
+  #[test]
+  fn test_task_with_plugin_annotation() {
+    let content = r#"
+      version: 1
+      tasks:
+        build: !shell cargo build
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "task_with_plugin_annotation");
+
+    let octafile = Octafile::load(Some(file_path), false, vec!["shell".to_string()]).unwrap();
+
+    let task = &octafile.tasks["build"];
+    assert_eq!(task.extra["shell"], Value::String("cargo build".to_string()));
+  }
+
+  #[test]
+  fn test_task_annotation_supports_structured_plugin_params() {
+    let content = r#"
+      version: 1
+      tasks:
+        deploy: !docker
+          image: app:latest
+          command: ./deploy
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "task_annotation_structured_params");
+
+    let octafile = Octafile::load(Some(file_path), false, vec!["docker".to_string()]).unwrap();
+
+    let params = task_mapping(&octafile.tasks["deploy"].extra["docker"]);
+    assert_eq!(params["image"], Value::String("app:latest".to_string()));
+    assert_eq!(params["command"], Value::String("./deploy".to_string()));
+  }
+
+  #[test]
+  fn test_unknown_task_annotation_is_an_error() {
+    let content = r#"
+      version: 1
+      tasks:
+        build: !missing cargo build
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "unknown_task_annotation");
+
+    let error = Octafile::load(Some(file_path), false, vec!["shell".to_string()]).unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("unknown task annotation '!missing'"));
+    assert!(message.contains("line"));
+    assert!(message.contains("column"));
+  }
+
+  #[test]
+  fn test_standard_yaml_tag_is_not_a_task_annotation() {
+    let content = r#"
+      version: 1
+      tasks:
+        build: !!str cargo build
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "standard_yaml_tag");
+
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+
+    assert_eq!(
+      octafile.tasks["build"].extra["shell"],
+      Value::String("cargo build".to_string())
+    );
   }
 
   #[test]

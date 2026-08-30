@@ -47,6 +47,31 @@ fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_run_annotated_plugin_task() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let package_root = env::current_dir()?.join("../../plugins").canonicalize()?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+tasks:
+  hello: !shell echo "hello from annotation"
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("hello");
+  cmd.env("OCTA_PLUGINS_DIR", package_root);
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("hello from annotation"));
+
+  Ok(())
+}
+
+#[test]
 fn test_octaignore_excludes_sources() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   let package_root = env::current_dir()?.join("../../plugins").canonicalize()?;

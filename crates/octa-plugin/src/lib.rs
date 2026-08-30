@@ -130,7 +130,7 @@ where
         let start_json = serde_json::to_string(&start_response)? + "\n";
         writer.lock().await.write_all(start_json.as_bytes()).await?;
 
-        logger.log(&format!("Send Start command for command id '{}'", &id))?;
+        logger.log(&format!("Send Start command for command id '{}'", id))?;
       }
 
       // Clone what we need to move into the spawn
@@ -1057,7 +1057,7 @@ mod tests {
     // Verify command handle has completed
     {
       let commands = active_commands.lock().await;
-      for (_, handle) in commands.iter() {
+      for handle in commands.values() {
         assert!(handle.is_finished());
       }
     }
