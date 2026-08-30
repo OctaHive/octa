@@ -49,6 +49,7 @@ pub fn interpret_local_socket_name(name: &OsStr) -> Result<interprocess::local_s
 #[cfg(test)]
 mod tests {
   use super::*;
+  #[cfg(unix)]
   use std::path::PathBuf;
 
   #[test]

@@ -766,6 +766,7 @@ time.sleep(10)  # Simulate a hanging plugin
     setup.plugin_manager.start_plugin(plugin_name).await.unwrap();
 
     // Get socket path before cleanup
+    #[cfg(unix)]
     let socket_path = setup
       .plugin_manager
       .get_socket_path("test")

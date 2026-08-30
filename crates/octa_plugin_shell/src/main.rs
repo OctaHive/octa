@@ -77,10 +77,9 @@ fn terminate_windows_process(child: &mut tokio::process::Child) {
   if let Some(pid) = child.id() {
     unsafe {
       let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-      if handle as HANDLE != INVALID_HANDLE_VALUE {
-        let handle_ptr = handle as HANDLE;
-        TerminateProcess(handle_ptr, 1);
-        CloseHandle(handle_ptr);
+      if !std::ptr::eq(handle, INVALID_HANDLE_VALUE) {
+        TerminateProcess(handle as HANDLE, 1);
+        CloseHandle(handle as HANDLE);
       }
     }
   }
