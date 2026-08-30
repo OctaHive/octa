@@ -795,6 +795,126 @@ tasks:
 }
 
 #[test]
+fn test_octafile_and_task_dotenv() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::create_dir(tmp_dir.path().join("nested"))?;
+  fs::write(tmp_dir.path().join(".env.test"), "ROOT_VALUE=root\n")?;
+  fs::write(tmp_dir.path().join(".env.task"), "TASK_VALUE=task\nEXPLICIT=dotenv\n")?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+vars:
+  PROFILE: test
+dotenv:
+  - .env.{{ PROFILE }}
+tasks:
+  show:
+    dir: nested
+    dotenv:
+      - .env.task
+    env:
+      EXPLICIT: task
+    tpl: "$ROOT_VALUE|$TASK_VALUE|$EXPLICIT"
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("show");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("root|task|task"));
+
+  Ok(())
+}
+
+#[test]
+fn test_shell_backed_environment_values() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let task_dir = tmp_dir.path().join("nested");
+  fs::create_dir(&task_dir)?;
+  fs::write(task_dir.join("value.txt"), "dynamic")?;
+  fs::write(task_dir.join(".env.runtime"), "PREFIX=from-dotenv\n")?;
+  #[cfg(windows)]
+  let read_command = "type value.txt";
+  #[cfg(not(windows))]
+  let read_command = "cat value.txt";
+  #[cfg(windows)]
+  let env_command = "echo %PREFIX%";
+  #[cfg(not(windows))]
+  let env_command = "echo $PREFIX";
+  let octafile = format!(
+    r#"
+version: 1
+tasks:
+  show:
+    dir: nested
+    dotenv:
+      - .env.runtime
+    vars:
+      VERSION: '{{{{ shell(command="{read_command}") }}}}'
+    env:
+      FROM_VAR: "{{{{ VERSION }}}}"
+      FROM_SHELL: '{{{{ shell(command="{env_command}") }}}}'
+    tpl: "$FROM_VAR|$FROM_SHELL"
+"#
+  );
+  fs::write(tmp_dir.path().join("octafile.yml"), octafile)?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("show");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("dynamic|from-dotenv"));
+
+  Ok(())
+}
+
+#[test]
+fn test_shell_environment_is_evaluated_once_per_execution() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::create_dir(tmp_dir.path().join("nested"))?;
+  #[cfg(windows)]
+  let env_command = "echo call>>../calls.txt & echo value";
+  #[cfg(not(windows))]
+  let env_command = "echo call >> ../calls.txt; echo value";
+  #[cfg(windows)]
+  let condition = "exit /B 0";
+  #[cfg(not(windows))]
+  let condition = "true";
+  let octafile = format!(
+    r#"
+version: 1
+tasks:
+  show:
+    dir: nested
+    if: "{condition}"
+    env:
+      VALUE: '{{{{ shell(command="{env_command}") }}}}'
+    tpl: "$VALUE"
+"#
+  );
+  fs::write(tmp_dir.path().join("octafile.yml"), octafile)?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("show");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success().stdout(predicate::str::contains("value"));
+
+  let calls = fs::read_to_string(tmp_dir.path().join("calls.txt"))?;
+  assert_eq!(calls.lines().count(), 1);
+
+  Ok(())
+}
+
+#[test]
 fn test_missing_explicit_env_file() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   let mut cmd = Command::cargo_bin("octa")?;

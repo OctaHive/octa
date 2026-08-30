@@ -263,6 +263,64 @@ variable, the last file wins. Variables already present in the process environme
 over all files. Supplying `--env-file` disables the automatic `.env` search, and every specified
 file must exist and contain valid dotenv syntax.
 
+Dotenv files can also be configured at the Octafile and task levels:
+
+```yaml
+version: 1
+
+vars:
+  PROFILE: development
+
+dotenv:
+  - .env.{{ PROFILE }}
+  - config/base.env
+
+env:
+  LOG_LEVEL: info
+
+tasks:
+  server:
+    dir: services/api
+    dotenv:
+      - .env.local
+    env:
+      LOG_LEVEL: debug
+    shell: ./server
+```
+
+A value containing only a file name, including a templated file name such as
+`.env.{{ PROFILE }}`, is searched for from the Octafile or task directory upward through its
+parents. A value containing a directory, such as `config/base.env` or `../shared.env`, is treated
+as an exact path relative to that directory and must exist. Absolute paths are also loaded
+directly. A missing file name searched upward is skipped.
+
+Files are listed from highest to lowest priority, so the first file wins when several files define
+the same variable. Task dotenv values override Octafile dotenv values, while an explicit `env`
+value at either level overrides dotenv values from the same level. Environment values supplied by
+the invoking task have the highest priority.
+
+Environment values also support Octa templates and shell-backed values. A dynamic variable can be
+exported to the process environment, or a command can produce the environment value directly:
+
+```yaml
+version: 1
+
+tasks:
+  build:
+    vars:
+      VERSION: '{{ shell(command="git describe --tags --always") }}'
+    env:
+      BUILD_VERSION: "{{ VERSION }}"
+      COMMIT: '{{ shell(command="git rev-parse --short HEAD") }}'
+    shell: ./build.sh
+```
+
+Shell-backed values run once for each task execution and are evaluated again when watch mode reruns
+the task. Octafile-level values run from their Octafile directory, while task-level environment
+values run from the effective task directory. They receive environment values and dotenv entries
+available at that level. A non-zero exit code fails expansion, trailing whitespace is removed from
+stdout, and dry mode prints the command without executing it.
+
 # Variables
 The vars property is used to define variables that will be available to all tasks in the file. This behaves like the env property, but the 
 variables are not exported to the environment, and can be more complex than strings.

@@ -137,6 +137,9 @@ pub struct Octafile {
   // Octafile global environment variables
   pub env: Option<Envs>,
 
+  // Environment files applied to tasks in this Octafile
+  pub dotenv: Option<Vec<String>>,
+
   // Default task run mode
   pub run: Option<AllowedRun>,
 
@@ -177,6 +180,7 @@ impl fmt::Debug for Octafile {
     f.debug_struct("Octafile")
       .field("version", &self.version)
       .field("name", &self._name)
+      .field("dotenv", &self.dotenv)
       .field("run", &self.run)
       .field("interval", &self.interval)
       .field("includes", &self.includes)
@@ -256,6 +260,9 @@ impl Octafile {
         },
         "env" => {
           octafile.env = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "dotenv" => {
+          octafile.dotenv = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
         },
         "run" => {
           octafile.run = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
@@ -580,6 +587,9 @@ impl<'de> Visitor<'de> for OctafileVisitor {
         },
         "env" => {
           octafile.env = map.next_value()?;
+        },
+        "dotenv" => {
+          octafile.dotenv = map.next_value()?;
         },
         "run" => {
           octafile.run = map.next_value()?;
@@ -1131,6 +1141,30 @@ mod tests {
     assert_eq!(task.ignore_error, Some(true));
     assert!(task.deps.is_some());
     assert_eq!(task.silent, Some(true));
+  }
+
+  #[test]
+  fn parses_octafile_and_task_dotenv() {
+    let content = r#"
+      version: 1
+      dotenv:
+        - .env.local
+        - config/base.env
+      tasks:
+        test:
+          dotenv:
+            - .env.test
+          shell: echo test
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "dotenv");
+
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+
+    assert_eq!(
+      octafile.dotenv,
+      Some(vec![".env.local".to_string(), "config/base.env".to_string()])
+    );
+    assert_eq!(octafile.tasks["test"].dotenv, Some(vec![".env.test".to_string()]));
   }
 
   #[test]

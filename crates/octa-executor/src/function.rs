@@ -1,6 +1,7 @@
 use std::{
   collections::HashMap,
-  env,
+  error::Error,
+  path::{Path, PathBuf},
   process::{Command, Stdio},
 };
 
@@ -10,17 +11,44 @@ use std::os::windows::process::CommandExt;
 use tera::{Function, Result, Value};
 use tracing::{debug, info};
 
-pub struct ExecuteShell;
+/// Tera function that evaluates a command in the directory and environment of its value layer.
+pub struct ExecuteShell {
+  current_dir: PathBuf,
+  environment: HashMap<String, String>,
+  dry: bool,
+}
+
+impl ExecuteShell {
+  pub fn new(current_dir: impl Into<PathBuf>, environment: HashMap<String, String>, dry: bool) -> Self {
+    Self {
+      current_dir: current_dir.into(),
+      environment,
+      dry,
+    }
+  }
+}
 
 impl Function for ExecuteShell {
   fn call(&self, args: &HashMap<String, Value>) -> Result<Value> {
     let sh = args
       .get("command")
       .ok_or_else(|| tera::Error::msg("Missing 'command' argument"))?;
-    let current_dir = env::current_dir().map_err(|_| tera::Error::msg("Can't get current directory"))?;
-    let command = sh.as_str().ok_or_else(|| tera::Error::msg("Wrong command format"))?;
+    let command_text = sh.as_str().ok_or_else(|| tera::Error::msg("Wrong command format"))?;
 
-    debug!("Execute command in directory {}: {}", current_dir.display(), command);
+    if self.dry {
+      info!(
+        "Execute command in directory {}: {}",
+        self.current_dir.display(),
+        command_text
+      );
+      return Ok(Value::Null);
+    }
+
+    debug!(
+      "Execute command in directory {}: {}",
+      self.current_dir.display(),
+      command_text
+    );
 
     #[cfg(windows)]
     let mut command = {
@@ -29,8 +57,9 @@ impl Function for ExecuteShell {
 
       let mut cmd = Command::new("cmd");
       cmd
-        .current_dir(current_dir)
-        .args(["/C", command])
+        .current_dir(&self.current_dir)
+        .args(["/C", command_text])
+        .envs(&self.environment)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
@@ -41,9 +70,10 @@ impl Function for ExecuteShell {
     let mut command = {
       let mut cmd = Command::new("sh");
       cmd
-        .current_dir(&current_dir)
+        .current_dir(&self.current_dir)
         .arg("-c")
-        .arg(command)
+        .arg(command_text)
+        .envs(&self.environment)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
       cmd
@@ -53,7 +83,18 @@ impl Function for ExecuteShell {
       .output()
       .map_err(|e| tera::Error::msg(format!("Failed to execute command {} for arg: {}", sh, e)))?;
 
-    let res = Value::String(String::from_utf8_lossy(output.stdout.trim_ascii()).to_string());
+    if !output.status.success() {
+      let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+      let status = output
+        .status
+        .code()
+        .map_or_else(|| "signal".to_string(), |code| code.to_string());
+      return Err(tera::Error::msg(format!(
+        "Shell command '{command_text}' failed with status {status}: {stderr}"
+      )));
+    }
+
+    let res = Value::String(String::from_utf8_lossy(output.stdout.trim_ascii_end()).to_string());
 
     debug!("Command output result: {:?}", res);
 
@@ -61,20 +102,27 @@ impl Function for ExecuteShell {
   }
 }
 
-pub struct ExecuteShellDry;
+/// Registers the shell function with the execution context for the current vars or env layer.
+pub fn register_shell_function(
+  tera: &mut tera::Tera,
+  current_dir: &Path,
+  environment: HashMap<String, String>,
+  dry: bool,
+) {
+  tera.register_function("shell", ExecuteShell::new(current_dir.to_path_buf(), environment, dry));
+}
 
-impl Function for ExecuteShellDry {
-  fn call(&self, args: &HashMap<String, Value>) -> Result<Value> {
-    let sh = args
-      .get("command")
-      .ok_or_else(|| tera::Error::msg("Missing 'command' argument"))?;
-    let current_dir = env::current_dir().map_err(|_| tera::Error::msg("Can;t get current directory"))?;
-    let command = sh.as_str().ok_or_else(|| tera::Error::msg("Wrong command format"))?;
+/// Includes nested function errors that Tera omits from its top-level display message.
+pub fn format_tera_error(error: &tera::Error) -> String {
+  let mut messages = vec![error.to_string()];
+  let mut source = error.source();
 
-    info!("Execute command in directory {}: {}", current_dir.display(), command);
-
-    Ok(Value::Null)
+  while let Some(error) = source {
+    messages.push(error.to_string());
+    source = error.source();
   }
+
+  messages.join(": ")
 }
 
 #[cfg(test)]
@@ -93,8 +141,8 @@ mod tests {
 
   #[test]
   fn test_execute_shell_echo() {
-    let (args, _temp_dir) = setup_test_command();
-    let execute_shell = ExecuteShell;
+    let (args, temp_dir) = setup_test_command();
+    let execute_shell = ExecuteShell::new(temp_dir.path(), HashMap::new(), false);
 
     let result = execute_shell.call(&args).unwrap();
 
@@ -111,7 +159,8 @@ mod tests {
 
   #[test]
   fn test_execute_shell_missing_command() {
-    let execute_shell = ExecuteShell;
+    let temp_dir = TempDir::new().unwrap();
+    let execute_shell = ExecuteShell::new(temp_dir.path(), HashMap::new(), false);
     let args = HashMap::new();
 
     let result = execute_shell.call(&args);
@@ -123,7 +172,8 @@ mod tests {
   fn test_execute_shell_invalid_command() {
     let mut args = HashMap::new();
     args.insert("command".to_string(), Value::Bool(true));
-    let execute_shell = ExecuteShell;
+    let temp_dir = TempDir::new().unwrap();
+    let execute_shell = ExecuteShell::new(temp_dir.path(), HashMap::new(), false);
 
     let result = execute_shell.call(&args);
     assert!(result.is_err());
@@ -144,7 +194,7 @@ mod tests {
 
     args.insert("command".to_string(), Value::String(command));
 
-    let execute_shell = ExecuteShell;
+    let execute_shell = ExecuteShell::new(temp_dir.path(), HashMap::new(), false);
     let _ = execute_shell.call(&args).unwrap();
 
     assert!(test_file_path.exists());
@@ -154,8 +204,8 @@ mod tests {
 
   #[test]
   fn test_execute_shell_dry() {
-    let (args, _temp_dir) = setup_test_command();
-    let execute_shell_dry = ExecuteShellDry;
+    let (args, temp_dir) = setup_test_command();
+    let execute_shell_dry = ExecuteShell::new(temp_dir.path(), HashMap::new(), true);
 
     let result = execute_shell_dry.call(&args).unwrap();
     assert!(matches!(result, Value::Null));
@@ -163,7 +213,8 @@ mod tests {
 
   #[test]
   fn test_execute_shell_dry_missing_command() {
-    let execute_shell_dry = ExecuteShellDry;
+    let temp_dir = TempDir::new().unwrap();
+    let execute_shell_dry = ExecuteShell::new(temp_dir.path(), HashMap::new(), true);
     let args = HashMap::new();
 
     let result = execute_shell_dry.call(&args);
@@ -175,7 +226,8 @@ mod tests {
   fn test_execute_shell_dry_invalid_command() {
     let mut args = HashMap::new();
     args.insert("command".to_string(), Value::Bool(true));
-    let execute_shell_dry = ExecuteShellDry;
+    let temp_dir = TempDir::new().unwrap();
+    let execute_shell_dry = ExecuteShell::new(temp_dir.path(), HashMap::new(), true);
 
     let result = execute_shell_dry.call(&args);
     assert!(result.is_err());

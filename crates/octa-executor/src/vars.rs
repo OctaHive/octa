@@ -1,6 +1,8 @@
 use std::{
   collections::HashMap,
+  env,
   fmt::{Display, Formatter},
+  path::PathBuf,
   sync::Arc,
 };
 
@@ -12,7 +14,7 @@ use tracing::debug;
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
-  function::{ExecuteShell, ExecuteShellDry},
+  function::{format_tera_error, register_shell_function},
 };
 
 lazy_static! {
@@ -23,7 +25,8 @@ lazy_static! {
 pub struct Vars {
   context: Context,          // Tera context for current variables
   parent: Option<Arc<Vars>>, // Link to parent variables
-  expanded: bool,            // Inindicator that the values have been expanded
+  dir: Option<PathBuf>,      // Directory used by shell-backed values in this context
+  expanded: bool,            // Indicates that all inherited values have been expanded
 }
 
 impl PartialEq for Vars {
@@ -39,6 +42,7 @@ impl Vars {
     Self {
       context: Context::default(),
       parent: None,
+      dir: None,
       expanded: false,
     }
   }
@@ -47,6 +51,7 @@ impl Vars {
     Self {
       context: Context::default(),
       parent: Some(Arc::new(parent)),
+      dir: None,
       expanded: false,
     }
   }
@@ -70,6 +75,12 @@ impl Vars {
 
   pub fn set_parent(&mut self, parent: Option<Vars>) {
     self.parent = parent.map(Arc::new);
+    self.expanded = false;
+  }
+
+  /// Sets the working directory for `shell()` calls declared in this variable layer.
+  pub fn set_dir(&mut self, dir: impl Into<PathBuf>) {
+    self.dir = Some(dir.into());
     self.expanded = false;
   }
 
@@ -101,40 +112,48 @@ impl Vars {
 
   pub async fn expand(&mut self, dry: bool) -> ExecutorResult<()> {
     let mut tera = Tera::default();
-    if dry {
-      tera.register_function("shell", ExecuteShellDry);
-    } else {
-      tera.register_function("shell", ExecuteShell);
-    }
 
     if self.expanded {
       return Ok(());
     }
 
     let contexts = self.collect_context_chain();
-    let processed_context = self.process_context_chain(contexts, &mut tera).await?;
+    let processed_context = self.process_context_chain(contexts, &mut tera, dry).await?;
     self.context = processed_context;
     self.expanded = true;
 
     Ok(())
   }
 
-  fn collect_context_chain(&self) -> Vec<Context> {
+  fn collect_context_chain(&self) -> Vec<(Context, Option<PathBuf>)> {
     let mut contexts = Vec::new();
     let mut current = Some(self);
 
     while let Some(vars) = current {
-      contexts.push(vars.context.clone());
+      contexts.push((vars.context.clone(), vars.dir.clone()));
       current = vars.parent.as_ref().map(|p| p.as_ref());
     }
 
     contexts.into_iter().rev().collect()
   }
 
-  async fn process_context_chain(&self, contexts: Vec<Context>, tera: &mut Tera) -> ExecutorResult<Context> {
+  async fn process_context_chain(
+    &self,
+    contexts: Vec<(Context, Option<PathBuf>)>,
+    tera: &mut Tera,
+    dry: bool,
+  ) -> ExecutorResult<Context> {
     let mut accumulated = Context::new();
 
-    for context in contexts {
+    // Re-register `shell()` for each layer because included Octafiles resolve commands from
+    // their own directories and can only consume variables inherited from parent layers.
+    for (context, dir) in contexts {
+      let current_dir = match dir {
+        Some(dir) => dir,
+        None => env::current_dir()?,
+      };
+      let environment = context_as_environment(&accumulated);
+      register_shell_function(tera, &current_dir, environment, dry);
       let processed = self.process_single_context(context, &accumulated, tera).await?;
       accumulated.extend(processed);
     }
@@ -152,6 +171,7 @@ impl Vars {
     let vars = Vars {
       context,
       parent: None,
+      dir: None,
       expanded: false,
     };
 
@@ -170,7 +190,10 @@ impl Vars {
     context: &Context,
     tera: &mut Tera,
   ) -> ExecutorResult<Value> {
-    let val = value.to_string().trim().to_owned();
+    let val = match value {
+      Value::String(value) => value.trim().to_owned(),
+      value => value.to_string().trim().to_owned(),
+    };
 
     if !self.is_template(&val) {
       return Ok(value.clone());
@@ -179,7 +202,7 @@ impl Vars {
     debug!("Processing template variable '{}' with value: '{}'", key, val);
     let res = tera
       .render_str(&val, context)
-      .map_err(|e| ExecutorError::VariableExpandError(val, e.to_string()))?;
+      .map_err(|error| ExecutorError::VariableExpandError(val, format_tera_error(&error)))?;
     let res = res.trim_matches('"').to_owned(); // remove extra quotes in value
 
     let val = match serde_json::from_str(&res) {
@@ -203,6 +226,35 @@ impl Vars {
       .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
       .unwrap_or_default()
   }
+
+  /// Returns the hierarchy as one map, with child values overriding parent values.
+  pub(crate) fn to_merged_hashmap(&self) -> HashMap<String, Value> {
+    let mut result = HashMap::new();
+
+    for (context, _) in self.collect_context_chain() {
+      if let Some(values) = context.into_json().as_object() {
+        result.extend(values.iter().map(|(key, value)| (key.clone(), value.clone())));
+      }
+    }
+
+    result
+  }
+}
+
+fn context_as_environment(context: &Context) -> HashMap<String, String> {
+  // Only scalar values have an unambiguous representation in a process environment.
+  context
+    .clone()
+    .into_json()
+    .as_object()
+    .into_iter()
+    .flatten()
+    .filter_map(|(key, value)| match value {
+      Value::String(value) => Some((key.clone(), value.clone())),
+      Value::Bool(_) | Value::Number(_) => Some((key.clone(), value.to_string())),
+      _ => None,
+    })
+    .collect()
 }
 
 impl Display for Vars {
@@ -223,6 +275,7 @@ impl From<Context> for Vars {
     Self {
       context,
       parent: None,
+      dir: None,
       expanded: false,
     }
   }

@@ -1,3 +1,4 @@
+mod dotenv;
 /// Module for building and managing task execution graphs
 pub mod envs;
 pub mod error;
@@ -794,8 +795,8 @@ impl TaskGraphBuilder {
     execute_vars: Option<octa_octafile::Vars>,
     execute_envs: Option<octa_octafile::Envs>,
   ) -> ExecutorResult<ArcNode> {
-    let envs = self.collect_envs(cmd, execute_envs);
     let vars = self.collect_vars(cmd, execute_vars);
+    let envs = self.collect_envs(cmd, execute_envs, &vars)?;
 
     // Because internally we work with json we convert yaml Value to json Value
     let mut extra = HashMap::new();
@@ -1040,6 +1041,7 @@ impl TaskGraphBuilder {
     let root = cmd.octafile.root();
 
     vars.set_value(root.vars.clone());
+    vars.set_dir(root.dir.clone());
 
     vars.insert("ROOT_DIR", &root.dir.display().to_string());
     vars.insert("OCTAFILE_DIR", &root.dir.display().to_string());
@@ -1067,6 +1069,7 @@ impl TaskGraphBuilder {
           let mut new_vars = Vars::new();
           new_vars.set_parent(Some(vars.clone()));
           new_vars.set_value(nested_octafile.vars.clone());
+          new_vars.set_dir(nested_octafile.dir.clone());
           new_vars.insert("TASKFILE_DIR", &current.dir.display().to_string());
 
           *vars = new_vars;
@@ -1088,12 +1091,14 @@ impl TaskGraphBuilder {
         let mut new_vars = Vars::new();
         new_vars.set_parent(Some(vars));
         new_vars.set_value(task_vars);
+        new_vars.set_dir(self.variable_working_dir(cmd));
 
         new_vars
       },
       None => {
         let mut new_vars = Vars::new();
         new_vars.set_parent(Some(vars));
+        new_vars.set_dir(self.variable_working_dir(cmd));
 
         new_vars
       },
@@ -1101,28 +1106,52 @@ impl TaskGraphBuilder {
   }
 
   /// Collects environments from global, hierarchy and task levels
-  fn collect_envs(&self, cmd: &FindResult, execute_envs: Option<octa_octafile::Envs>) -> Envs {
-    let mut envs = self.initialize_global_envs(cmd);
-    self.process_hierarchy_envs(cmd, &mut envs);
-    envs = self.add_task_envs(cmd, envs);
+  fn collect_envs(
+    &self,
+    cmd: &FindResult,
+    execute_envs: Option<octa_octafile::Envs>,
+    vars: &Vars,
+  ) -> ExecutorResult<Envs> {
+    // Dotenv path templates are resolved while the hierarchy is built, so keep a flattened
+    // view of the process environment and all environment layers processed so far.
+    let mut template_environment = env::vars().collect::<HashMap<_, _>>();
+    let mut envs = self.initialize_global_envs(cmd, vars, &mut template_environment)?;
+    self.process_hierarchy_envs(cmd, vars, &mut envs, &mut template_environment)?;
+    envs = self.add_task_envs(cmd, vars, envs, &mut template_environment)?;
     if let Some(exec_vars) = execute_envs {
       envs.extend(exec_vars.clone());
     }
-    envs
+    Ok(envs)
   }
 
-  fn initialize_global_envs(&self, cmd: &FindResult) -> Envs {
+  fn initialize_global_envs(
+    &self,
+    cmd: &FindResult,
+    vars: &Vars,
+    template_environment: &mut HashMap<String, String>,
+  ) -> ExecutorResult<Envs> {
     let mut envs = Envs::new();
     let root = cmd.octafile.root();
+    envs.set_dir(root.dir.clone());
+    let mut values = dotenv::load(root.dotenv.as_deref(), &root.dir, vars, template_environment)?;
 
+    // Explicit Octafile values take precedence over values loaded from dotenv files.
     if let Some(env) = &root.env {
-      envs.set_value(env.clone());
+      values.extend(env.clone());
     }
+    template_environment.extend(values.clone());
+    envs.set_value(values);
 
-    envs
+    Ok(envs)
   }
 
-  fn process_hierarchy_envs(&self, cmd: &FindResult, envs: &mut Envs) {
+  fn process_hierarchy_envs(
+    &self,
+    cmd: &FindResult,
+    vars: &Vars,
+    envs: &mut Envs,
+    template_environment: &mut HashMap<String, String>,
+  ) -> ExecutorResult<()> {
     let full_path = cmd.octafile.hierarchy_path();
     let mut current = Arc::clone(cmd.octafile.root());
 
@@ -1137,9 +1166,20 @@ impl TaskGraphBuilder {
         Some(nested_octafile) => {
           let mut new_envs = Envs::new();
           new_envs.set_parent(Some(envs.clone()));
+          new_envs.set_dir(nested_octafile.dir.clone());
+          let mut values = dotenv::load(
+            nested_octafile.dotenv.as_deref(),
+            &nested_octafile.dir,
+            vars,
+            template_environment,
+          )?;
+          // Each included Octafile overrides its dotenv values explicitly and then overrides
+          // all environment values inherited from its parent.
           if let Some(env) = &nested_octafile.env {
-            new_envs.set_value(env.clone());
+            values.extend(env.clone());
           }
+          template_environment.extend(values.clone());
+          new_envs.set_value(values);
 
           *envs = new_envs;
           current = Arc::clone(&nested_octafile);
@@ -1151,24 +1191,49 @@ impl TaskGraphBuilder {
         },
       }
     }
+
+    Ok(())
   }
 
-  fn add_task_envs(&self, cmd: &FindResult, envs: Envs) -> Envs {
-    // Add environments from current task
-    match cmd.task.env.clone() {
-      Some(task_envs) => {
-        let mut new_envs = Envs::new();
-        new_envs.set_parent(Some(envs));
-        new_envs.set_value(task_envs);
+  fn add_task_envs(
+    &self,
+    cmd: &FindResult,
+    vars: &Vars,
+    envs: Envs,
+    template_environment: &mut HashMap<String, String>,
+  ) -> ExecutorResult<Envs> {
+    let mut new_envs = Envs::new();
+    new_envs.set_parent(Some(envs));
 
-        new_envs
-      },
-      None => {
-        let mut new_envs = Envs::new();
-        new_envs.set_parent(Some(envs));
+    let task_dir = self.task_working_dir(cmd);
+    let mut values = dotenv::load(cmd.task.dotenv.as_deref(), &task_dir, vars, template_environment)?;
+    // Task values are the most specific layer and therefore override task dotenv values.
+    if let Some(task_envs) = &cmd.task.env {
+      values.extend(task_envs.clone());
+    }
+    template_environment.extend(values.clone());
+    new_envs.set_value(values);
 
-        new_envs
-      },
+    Ok(new_envs)
+  }
+
+  fn task_working_dir(&self, cmd: &FindResult) -> PathBuf {
+    let task_dir = cmd.task.dir.as_ref().unwrap_or(&cmd.octafile.dir);
+    if task_dir.is_absolute() {
+      task_dir.clone()
+    } else {
+      self.dir.join(task_dir)
+    }
+  }
+
+  fn variable_working_dir(&self, cmd: &FindResult) -> PathBuf {
+    let task_dir = self.task_working_dir(cmd);
+    let value = task_dir.to_string_lossy();
+    // A templated task directory cannot be resolved until variables have been expanded.
+    if value.contains("{{") && value.contains("}}") {
+      cmd.octafile.dir.clone()
+    } else {
+      task_dir
     }
   }
 
@@ -1494,6 +1559,64 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn test_dotenv_layers_and_search() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let nested_dir = temp_dir.path().join("work").join("nested");
+    fs::create_dir_all(temp_dir.path().join("config"))?;
+    fs::create_dir_all(&nested_dir)?;
+    fs::write(
+      temp_dir.path().join("Octafile.yml"),
+      r#"
+        version: 1
+        vars:
+          PROFILE: local
+        dotenv:
+          - .env.{{ PROFILE }}
+          - config/base.env
+        env:
+          EXPLICIT_ROOT: root
+        tasks:
+          test:
+            dir: work/nested
+            dotenv:
+              - .env.task
+            env:
+              TASK_VALUE: explicit
+            shell: echo test
+      "#,
+    )?;
+    fs::write(
+      temp_dir.path().join(".env.local"),
+      "ROOT_PRIORITY=first\nROOT_DOTENV=loaded\n",
+    )?;
+    fs::write(
+      temp_dir.path().join("config").join("base.env"),
+      "ROOT_PRIORITY=second\n",
+    )?;
+    fs::write(
+      temp_dir.path().join("work").join(".env.task"),
+      "TASK_DOTENV=searched\nTASK_VALUE=dotenv\n",
+    )?;
+
+    let octafile = Octafile::load(Some(temp_dir.path().join("Octafile.yml")), false, vec![])?;
+    let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+    let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+    let mut builder = TaskGraphBuilder::new(plugin_manager)?;
+    builder.dir = temp_dir.path().to_path_buf();
+    let plan = builder.build(octafile, "test", true, vec![]).await?;
+    let task = plan.nodes().iter().find(|task| task.name == "test").unwrap();
+    let mut envs = task.envs.clone();
+    envs.expand().await?;
+
+    assert_eq!(envs.get("ROOT_PRIORITY"), Some(&"first".to_string()));
+    assert_eq!(envs.get("ROOT_DOTENV"), Some(&"loaded".to_string()));
+    assert_eq!(envs.get("EXPLICIT_ROOT"), Some(&"root".to_string()));
+    assert_eq!(envs.get("TASK_DOTENV"), Some(&"searched".to_string()));
+    assert_eq!(envs.get("TASK_VALUE"), Some(&"explicit".to_string()));
+    Ok(())
+  }
+
+  #[tokio::test]
   async fn test_environment_inheritance() -> ExecutorResult<()> {
     let temp_dir = TempDir::new().unwrap();
     let content = r#"
@@ -1516,6 +1639,11 @@ mod tests {
     let dag = builder.build(octafile, "test", true, vec![]).await?;
 
     assert_eq!(dag.node_count(), 1);
+    let task = dag.nodes().iter().find(|task| task.name == "test").unwrap();
+    let mut envs = task.envs.clone();
+    envs.expand().await?;
+    assert_eq!(envs.get("GLOBAL_ENV"), Some(&"global".to_string()));
+    assert_eq!(envs.get("LOCAL_ENV"), Some(&"local".to_string()));
     Ok(())
   }
 

@@ -223,6 +223,7 @@ impl Default for Context {
 #[derive(Debug, Clone, Default)]
 pub struct Task {
   pub env: Option<Envs>,                         // Task environment variables
+  pub dotenv: Option<Vec<String>>,               // Environment files applied to this task
   pub dir: Option<PathBuf>,                      // Working directory for the task
   pub desc: Option<String>,                      // Task description
   pub vars: Option<Vars>,                        // Task-specific variables
@@ -297,6 +298,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "desc" => task.desc = map.next_value()?,
         "vars" => task.vars = map.next_value()?,
         "env" => task.env = map.next_value()?,
+        "dotenv" => task.dotenv = map.next_value()?,
         "cmds" => {
           let commands: Option<Vec<Value>> = map.next_value()?;
           task.cmds = commands

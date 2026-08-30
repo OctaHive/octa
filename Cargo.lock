@@ -1279,6 +1279,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "byteorder",
+ "dotenvy",
  "dunce",
  "futures",
  "glob",

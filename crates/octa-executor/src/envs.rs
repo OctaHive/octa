@@ -3,13 +3,19 @@ use std::{
   collections::HashMap,
   env,
   fmt::{Display, Formatter},
+  path::PathBuf,
   sync::Arc,
 };
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use tera::{Context, Tera};
 use tracing::debug;
 
-use crate::error::ExecutorResult;
+use crate::{
+  error::{ExecutorError, ExecutorResult},
+  function::{format_tera_error, register_shell_function},
+  vars::Vars,
+};
 
 type EnvContext = HashMap<String, String>;
 
@@ -17,7 +23,8 @@ type EnvContext = HashMap<String, String>;
 pub struct Envs {
   context: EnvContext,       // Current environments
   parent: Option<Arc<Envs>>, // Link to parent environments
-  expanded: bool,            // Inindicator that the values have been expanded
+  dir: Option<PathBuf>,      // Directory used by shell-backed values in this context
+  expanded: bool,            // Indicates that all inherited values have been expanded
 }
 
 impl PartialEq for Envs {
@@ -33,6 +40,7 @@ impl Envs {
     Self {
       context: HashMap::default(),
       parent: None,
+      dir: None,
       expanded: false,
     }
   }
@@ -41,6 +49,7 @@ impl Envs {
     Self {
       context: HashMap::default(),
       parent: Some(Arc::new(parent)),
+      dir: None,
       expanded: false,
     }
   }
@@ -59,6 +68,12 @@ impl Envs {
 
   pub fn set_parent(&mut self, parent: Option<Envs>) {
     self.parent = parent.map(Arc::new);
+    self.expanded = false;
+  }
+
+  /// Sets the working directory for `shell()` calls declared in this environment layer.
+  pub fn set_dir(&mut self, dir: impl Into<PathBuf>) {
+    self.dir = Some(dir.into());
     self.expanded = false;
   }
 
@@ -88,73 +103,127 @@ impl Envs {
   }
 
   pub async fn expand(&mut self) -> ExecutorResult<()> {
+    self.expand_with(&Vars::new(), false)
+  }
+
+  /// Expands the complete environment hierarchy using the resolved task variables.
+  pub fn expand_with(&mut self, vars: &Vars, dry: bool) -> ExecutorResult<()> {
     if self.expanded {
       return Ok(());
     }
 
     let contexts = self.collect_context_chain();
-    let processed_context = self.process_context_chain(contexts).await?;
+    let processed_context = self.process_context_chain(contexts, vars, dry)?;
     self.context = processed_context;
     self.expanded = true;
 
     Ok(())
   }
 
-  fn collect_context_chain(&self) -> Vec<EnvContext> {
+  fn collect_context_chain(&self) -> Vec<(EnvContext, Option<PathBuf>)> {
     let mut contexts = Vec::new();
     let mut current = Some(self);
 
     while let Some(envs) = current {
-      contexts.push(envs.context.clone());
+      contexts.push((envs.context.clone(), envs.dir.clone()));
       current = envs.parent.as_ref().map(|p| p.as_ref());
     }
 
     contexts.into_iter().rev().collect()
   }
 
-  async fn process_context_chain(&self, contexts: Vec<EnvContext>) -> ExecutorResult<EnvContext> {
+  fn process_context_chain(
+    &self,
+    contexts: Vec<(EnvContext, Option<PathBuf>)>,
+    vars: &Vars,
+    dry: bool,
+  ) -> ExecutorResult<EnvContext> {
     let mut accumulated = EnvContext::new();
 
-    for context in contexts {
-      let processed = self.process_single_context(context, &accumulated).await?;
+    // Parent layers are processed first so every child layer can override and reference them.
+    for (context, dir) in contexts {
+      let current_dir = match dir {
+        Some(dir) => dir,
+        None => env::current_dir()?,
+      };
+      let processed = self.process_single_context(context, &accumulated, vars, &current_dir, dry)?;
       accumulated.extend(processed);
     }
 
     Ok(accumulated)
   }
 
-  async fn process_single_context(&self, context: EnvContext, parent: &EnvContext) -> ExecutorResult<EnvContext> {
+  fn process_single_context(
+    &self,
+    context: EnvContext,
+    parent: &EnvContext,
+    vars: &Vars,
+    current_dir: &std::path::Path,
+    dry: bool,
+  ) -> ExecutorResult<EnvContext> {
     let mut processed = EnvContext::new();
-    let envs = Envs {
-      context,
-      parent: None,
-      expanded: false,
-    };
 
-    for (key, value) in envs.iter() {
-      let processed_value = self.process_template_value(&key, &value, parent).await?;
-      processed.insert(key, processed_value);
+    // Resolve literal values first so templates and shell commands can consume dotenv and
+    // ordinary environment values declared at the same level without depending on map order.
+    for (key, value) in &context {
+      if !is_template(value) {
+        processed.insert(key.clone(), expand_environment_value(value, parent));
+      }
+    }
+
+    let mut available = parent.clone();
+    available.extend(processed.clone());
+
+    // Template values receive inherited values and same-layer literals. Other same-layer
+    // templates are deliberately excluded because HashMap declaration order is not stable.
+    let mut tera = Tera::default();
+    register_shell_function(&mut tera, current_dir, available.clone(), dry);
+    let mut template_context: Context = vars.clone().into();
+    template_context.extend(
+      Context::from_serialize(&available)
+        .map_err(|error| ExecutorError::ValueExpandError("environment context".to_string(), error.to_string()))?,
+    );
+
+    for (key, value) in context {
+      if is_template(&value) {
+        let processed_value = self.process_template_value(&key, &value, &available, &mut tera, &template_context)?;
+        processed.insert(key, processed_value);
+      }
     }
 
     Ok(processed)
   }
 
-  async fn process_template_value(&self, key: &str, value: &str, context: &EnvContext) -> ExecutorResult<String> {
-    let val = value.trim().to_owned();
+  fn process_template_value(
+    &self,
+    key: &str,
+    value: &str,
+    context: &EnvContext,
+    tera: &mut Tera,
+    template_context: &Context,
+  ) -> ExecutorResult<String> {
+    let mut val = value.trim().to_owned();
 
-    let get_env = |name: &str| match context.get(name) {
-      Some(val) => Some(Cow::Borrowed(val.as_str())),
-      None => match env::var(name) {
-        Ok(val) => Some(Cow::Owned(val)),
-        Err(_) => None,
-      },
-    };
+    val = tera
+      .render_str(&val, template_context)
+      .map_err(|error| ExecutorError::ValueExpandError(value.to_string(), format_tera_error(&error)))?;
 
     debug!("Processing environment '{}' with value: '{}'", key, val);
-    let val = shellexpand::env_with_context_no_errors(&val, get_env);
-
-    Ok(val.to_string())
+    Ok(expand_environment_value(&val, context))
   }
+}
+
+fn is_template(value: &str) -> bool {
+  value.contains("{{") && value.contains("}}")
+}
+
+fn expand_environment_value(value: &str, context: &EnvContext) -> String {
+  let get_env = |name: &str| match context.get(name) {
+    Some(value) => Some(Cow::Borrowed(value.as_str())),
+    None => env::var(name).map(Cow::Owned).ok(),
+  };
+
+  shellexpand::env_with_context_no_errors(value.trim(), get_env).into_owned()
 }
 
 impl Display for Envs {
@@ -175,6 +244,7 @@ impl From<EnvContext> for Envs {
     Self {
       context,
       parent: None,
+      dir: None,
       expanded: false,
     }
   }
@@ -250,6 +320,11 @@ impl IntoIterator for &Envs {
 
 #[cfg(test)]
 mod tests {
+  use std::fs;
+
+  use serde_json::json;
+  use tempfile::TempDir;
+
   use super::*;
 
   #[test]
@@ -400,6 +475,79 @@ mod tests {
     envs.expand().await.unwrap();
 
     assert_eq!(envs.get("path"), Some(&env::var("PATH").unwrap()));
+  }
+
+  #[test]
+  fn expands_vars_and_shell_commands() {
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(temp_dir.path().join("value.txt"), "from-shell").unwrap();
+    #[cfg(windows)]
+    let command = "type value.txt";
+    #[cfg(not(windows))]
+    let command = "cat value.txt";
+    #[cfg(windows)]
+    let env_command = "echo %DOTENV_VALUE%";
+    #[cfg(not(windows))]
+    let env_command = "echo $DOTENV_VALUE";
+
+    let mut envs = Envs::with_value(HashMap::from([
+      ("DOTENV_VALUE".to_owned(), "available".to_owned()),
+      ("FROM_VAR".to_owned(), "{{ VERSION }}".to_owned()),
+      (
+        "FROM_SHELL".to_owned(),
+        format!("{{{{ shell(command=\"{command}\") }}}}"),
+      ),
+      (
+        "FROM_DOTENV".to_owned(),
+        format!("{{{{ shell(command=\"{env_command}\") }}}}"),
+      ),
+    ]));
+    envs.set_dir(temp_dir.path());
+    let vars = Vars::with_value(json!({ "VERSION": "1.2.3" }));
+
+    envs.expand_with(&vars, false).unwrap();
+
+    assert_eq!(envs.get("FROM_VAR"), Some(&"1.2.3".to_owned()));
+    assert_eq!(envs.get("FROM_SHELL"), Some(&"from-shell".to_owned()));
+    assert_eq!(envs.get("FROM_DOTENV"), Some(&"available".to_owned()));
+  }
+
+  #[test]
+  fn dry_mode_does_not_execute_env_shell_commands() {
+    let temp_dir = TempDir::new().unwrap();
+    let marker = temp_dir.path().join("marker.txt");
+    #[cfg(windows)]
+    let command = "echo executed>marker.txt";
+    #[cfg(not(windows))]
+    let command = "touch marker.txt";
+    let mut envs = Envs::with_value(HashMap::from([(
+      "VALUE".to_owned(),
+      format!("{{{{ shell(command=\"{command}\") }}}}"),
+    )]));
+    envs.set_dir(temp_dir.path());
+
+    envs.expand_with(&Vars::new(), true).unwrap();
+
+    assert!(!marker.exists());
+  }
+
+  #[test]
+  fn reports_failed_env_shell_commands() {
+    let temp_dir = TempDir::new().unwrap();
+    #[cfg(windows)]
+    let command = "echo failed 1>&2 & exit /B 7";
+    #[cfg(not(windows))]
+    let command = "echo failed >&2; exit 7";
+    let mut envs = Envs::with_value(HashMap::from([(
+      "VALUE".to_owned(),
+      format!("{{{{ shell(command=\"{command}\") }}}}"),
+    )]));
+    envs.set_dir(temp_dir.path());
+
+    let error = envs.expand_with(&Vars::new(), false).unwrap_err();
+
+    assert!(error.to_string().contains("status 7"));
+    assert!(error.to_string().contains("failed"));
   }
 
   #[test]

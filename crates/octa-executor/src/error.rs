@@ -58,6 +58,13 @@ pub enum ExecutorError {
   #[error("Failed to load .octaignore: {0}")]
   OctaignoreError(#[from] ignore::Error),
 
+  #[error("Failed to load environment file '{path}': {source}")]
+  DotenvError {
+    path: String,
+    #[source]
+    source: dotenvy::Error,
+  },
+
   #[error("Failed to add graph dependency")]
   AddDependencyError(#[from] DAGError),
 

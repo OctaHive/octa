@@ -3,7 +3,7 @@ use std::{
   env,
   hash::{Hash, Hasher},
   io,
-  path::PathBuf,
+  path::{Path, PathBuf},
   sync::Arc,
 };
 
@@ -433,7 +433,7 @@ impl TaskNode {
     result
   }
 
-  async fn interpolate_dir(&self, dir: PathBuf, dry: bool) -> ExecutorResult<PathBuf> {
+  async fn interpolate_dir(&self, dir: PathBuf, vars: &Vars) -> ExecutorResult<PathBuf> {
     let dir_str = dir.to_string_lossy();
 
     if !dir_str.contains("{{") || !dir_str.contains("}}") {
@@ -444,10 +444,7 @@ impl TaskNode {
       debug!("Expanding directory path: {}", dir_str);
 
       let mut tera = Tera::default();
-      let mut vars = self.vars.clone();
-      vars.expand(dry).await?;
-
-      let context: Context = vars.into();
+      let context: Context = vars.clone().into();
 
       let rendered = tera
         .render_str(&dir_str, &context)
@@ -459,9 +456,13 @@ impl TaskNode {
     }
   }
 
-  async fn prepare_dir(&self, dry: bool) -> ExecutorResult<PathBuf> {
-    let dir = self.interpolate_dir(self.dir.clone(), dry).await?;
+  async fn prepare_dir_with_vars(&self, vars: &Vars, dry: bool) -> ExecutorResult<PathBuf> {
+    let dir = self.interpolate_dir(self.dir.clone(), vars).await?;
 
+    self.ensure_dir(dir, dry).await
+  }
+
+  async fn ensure_dir(&self, dir: PathBuf, dry: bool) -> ExecutorResult<PathBuf> {
     if dry {
       return match canonicalize(&dir) {
         Ok(dir) => Ok(dir),
@@ -478,6 +479,37 @@ impl TaskNode {
 
     tokio::fs::create_dir_all(&dir).await?;
     Ok(canonicalize(dir)?)
+  }
+
+  /// Resolves the values shared by conditions, cache checks, and the task command once.
+  async fn resolve_runtime_context(&self, dry: bool) -> ExecutorResult<(Vars, Envs, PathBuf)> {
+    let dir_is_template = {
+      let value = self.dir.to_string_lossy();
+      value.contains("{{") && value.contains("}}")
+    };
+
+    // Static task directories must exist before a shell-backed value uses them as its cwd.
+    let prepared_dir = if dir_is_template {
+      None
+    } else {
+      Some(self.ensure_dir(self.dir.clone(), dry).await?)
+    };
+
+    let mut vars = self.vars.clone();
+    vars.expand(dry).await?;
+
+    // A templated directory can only be created after its variables have been expanded.
+    let dir = match prepared_dir {
+      Some(dir) => dir,
+      None => self.prepare_dir_with_vars(&vars, dry).await?,
+    };
+
+    let mut envs = self.envs.clone();
+    // Task-level shell-backed environment values must run from the final task directory.
+    envs.set_dir(dir.clone());
+    envs.expand_with(&vars, dry)?;
+
+    Ok((vars, envs, dir))
   }
 
   fn log_info(&self, message: String) {
@@ -504,6 +536,9 @@ impl TaskNode {
     plugin_manager: Arc<PluginManager>,
     dry: bool,
     cancel_token: CancellationToken,
+    vars: &Vars,
+    envs: &Envs,
+    dir: &Path,
   ) -> ExecutorResult<bool> {
     let Some(condition) = &self.condition else {
       return Ok(true);
@@ -515,17 +550,11 @@ impl TaskNode {
       .remove("shell")
       .ok_or(ExecutorError::TaskParsedError)?;
 
-    let mut vars = self.vars.clone();
-    vars.expand(dry).await?;
-
     let deps_res = self.deps_res.lock().await;
+    let mut vars = vars.clone();
     vars.insert("deps_result", &*deps_res);
     drop(deps_res);
 
-    let mut envs = self.envs.clone();
-    envs.expand().await?;
-
-    let dir = self.prepare_dir(dry).await?;
     match self
       .execute_plugin_command(
         plugin_manager,
@@ -533,9 +562,9 @@ impl TaskNode {
         dry,
         condition.clone(),
         vec![],
-        dir,
+        dir.to_path_buf(),
         vars.to_hashmap(),
-        envs.into(),
+        envs.clone().into(),
         true,
         cancel_token,
       )
@@ -547,12 +576,9 @@ impl TaskNode {
     }
   }
 
-  async fn check_preconditions(&self) -> ExecutorResult<bool> {
+  async fn check_preconditions(&self, vars: &Vars) -> ExecutorResult<bool> {
     let mut tera = Tera::default();
-    let mut vars = self.vars.clone();
-    vars.expand(false).await?;
-
-    let mut context: Context = vars.into();
+    let mut context: Context = vars.clone().into();
     // Add dependency results to template context
     let deps_res = self.deps_res.lock().await;
     context.insert("deps_result", &*deps_res);
@@ -653,8 +679,10 @@ impl Executable<TaskNode> for TaskNode {
     force: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
+    let (vars, envs, dir) = self.resolve_runtime_context(dry).await?;
+
     if !self
-      .check_condition(plugin_manager.clone(), dry, cancel_token.clone())
+      .check_condition(plugin_manager.clone(), dry, cancel_token.clone(), &vars, &envs, &dir)
       .await?
     {
       self.log_info(format!(
@@ -664,7 +692,7 @@ impl Executable<TaskNode> for TaskNode {
       return Ok("".to_string());
     }
 
-    if !force && !self.check_preconditions().await? {
+    if !force && !self.check_preconditions(&vars).await? {
       self.log_info(format!("Task '{}' preconditions failed", self.name));
 
       return Err(ExecutorError::TaskCancelled(format!(
@@ -678,10 +706,6 @@ impl Executable<TaskNode> for TaskNode {
 
       return Ok("".to_string());
     };
-
-    // Interpolate vars
-    let mut vars = self.vars.clone();
-    vars.expand(dry).await?;
 
     if let Some(cached) = self.check_cache(&vars, &cache).await? {
       return Ok(cached);
@@ -709,20 +733,10 @@ impl Executable<TaskNode> for TaskNode {
       panic!("Several plugin keys provide in task");
     }
 
-    // Interpolate vars
-    let mut vars = self.vars.clone();
-    vars.expand(dry).await?;
-
-    // Interpolate environment variables
-    let mut envs = self.envs.clone();
-    envs.expand().await?;
-
     // Add dependency results to template context
     let mut vars_with_deps_results = vars.clone();
     let deps_res = self.deps_res.lock().await;
     vars_with_deps_results.insert("deps_result", &*deps_res);
-
-    let dir = self.prepare_dir(dry).await?;
 
     match self
       .execute_plugin_command(
@@ -733,7 +747,7 @@ impl Executable<TaskNode> for TaskNode {
         vec![],
         dir,
         vars_with_deps_results.to_hashmap(),
-        self.envs.clone().into(),
+        envs.into(),
         self.silent,
         cancel_token.clone(),
       )
@@ -821,6 +835,12 @@ mod tests {
     TaskNode::new(task_config)
   }
 
+  async fn prepare_dir(task: &TaskNode, dry: bool) -> ExecutorResult<PathBuf> {
+    let mut vars = task.vars.clone();
+    vars.expand(dry).await?;
+    task.prepare_dir_with_vars(&vars, dry).await
+  }
+
   #[tokio::test]
   async fn test_prepare_dir_creates_interpolated_directory() {
     let temp_dir = TempDir::new().unwrap();
@@ -831,7 +851,7 @@ mod tests {
     task.vars = vars;
     task.dir = PathBuf::from("{{ OUTPUT_DIR }}");
 
-    let prepared = task.prepare_dir(false).await.unwrap();
+    let prepared = prepare_dir(&task, false).await.unwrap();
 
     assert!(target.is_dir());
     assert_eq!(prepared, canonicalize(target).unwrap());
@@ -843,7 +863,7 @@ mod tests {
     let mut task = create_test_task("existing_dir", None, None, None);
     task.dir = temp_dir.path().to_path_buf();
 
-    let prepared = task.prepare_dir(true).await.unwrap();
+    let prepared = prepare_dir(&task, true).await.unwrap();
 
     assert_eq!(prepared, canonicalize(temp_dir.path()).unwrap());
   }
@@ -855,7 +875,7 @@ mod tests {
     let mut task = create_test_task("missing_absolute_dir", None, None, None);
     task.dir = target.clone();
 
-    let prepared = task.prepare_dir(true).await.unwrap();
+    let prepared = prepare_dir(&task, true).await.unwrap();
 
     assert_eq!(prepared, target);
     assert!(!prepared.exists());
@@ -869,7 +889,7 @@ mod tests {
     let mut task = create_test_task("missing_relative_dir", None, None, None);
     task.dir = relative.clone();
 
-    let prepared = task.prepare_dir(true).await.unwrap();
+    let prepared = prepare_dir(&task, true).await.unwrap();
 
     assert_eq!(prepared, current_dir.join(relative));
     assert!(!prepared.exists());
@@ -881,7 +901,10 @@ mod tests {
     let mut task = create_test_task("file_path", None, None, None);
     task.dir = temp_file.path().to_path_buf();
 
-    assert!(matches!(task.prepare_dir(false).await, Err(ExecutorError::IoError(_))));
+    assert!(matches!(
+      prepare_dir(&task, false).await,
+      Err(ExecutorError::IoError(_))
+    ));
   }
 
   #[tokio::test]
@@ -890,7 +913,7 @@ mod tests {
     task.dir = PathBuf::from("{{ invalid + }}");
 
     assert!(matches!(
-      task.prepare_dir(false).await,
+      prepare_dir(&task, false).await,
       Err(ExecutorError::ValueExpandError(_, _))
     ));
   }
@@ -907,7 +930,7 @@ mod tests {
 
     let mut task = create_test_task("unreadable_dir", None, None, None);
     task.dir = locked.join("child");
-    let result = task.prepare_dir(true).await;
+    let result = prepare_dir(&task, true).await;
 
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(matches!(result, Err(ExecutorError::IoError(_))));
