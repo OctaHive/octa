@@ -956,7 +956,7 @@ mod tests {
       version: 1
       tasks:
         test:
-          cmd: echo "test"
+          shell: echo "test"
     "#;
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
@@ -982,9 +982,9 @@ mod tests {
       version: 1
       tasks:
         task1:
-          cmd: echo "task1"
+          shell: echo "task1"
         task2:
-          cmd: echo "task2"
+          shell: echo "task2"
           deps:
             - task1
     "#;
@@ -1021,7 +1021,7 @@ mod tests {
       version: 1
       tasks:
         test:
-          cmd: echo "test"
+          shell: echo "test"
     "#;
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
@@ -1043,15 +1043,15 @@ mod tests {
       version: 1
       tasks:
         test_macos:
-          cmd: echo "test"
+          shell: echo "test"
           platforms:
             - macos
         test_linux:
-          cmd: echo "test"
+          shell: echo "test"
           platforms:
             - linux
         test_windows:
-          cmd: echo "test"
+          shell: echo "test"
           platforms:
             - windows
     "#;
@@ -1083,7 +1083,7 @@ mod tests {
       version: 1
       tasks:
         test:
-          cmd: echo "{{ COMMAND_ARGS }}"
+          shell: echo "{{ COMMAND_ARGS }}"
     "#;
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
@@ -1110,7 +1110,7 @@ mod tests {
         test:
           vars:
             LOCAL: "local"
-          cmd: echo "{{ GLOBAL }} {{ LOCAL }}"
+          shell: echo "{{ GLOBAL }} {{ LOCAL }}"
     "#;
     let octafile_path = temp_dir.path().join("Octafile.yml");
     fs::write(&octafile_path, content)?;
@@ -1207,7 +1207,7 @@ mod tests {
           octafile: nested/Octafile.yml
       tasks:
         root_task:
-          cmd: echo "root"
+          shell: echo "root"
     "#;
 
     // Create nested octafile content
@@ -1220,7 +1220,7 @@ mod tests {
           octafile: deep/Octafile.yml
       tasks:
         nested_task:
-          cmd: echo "nested"
+          shell: echo "nested"
     "#;
 
     // Create deep octafile content
@@ -1230,7 +1230,7 @@ mod tests {
         DEEP_VAR: "deep_value"
       tasks:
         deep_task:
-          cmd: echo "deep"
+          shell: echo "deep"
     "#;
 
     // Create directory structure and write files

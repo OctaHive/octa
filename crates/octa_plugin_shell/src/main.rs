@@ -20,6 +20,13 @@ use tokio_util::sync::CancellationToken;
 
 struct ShellPlugin {}
 
+fn plugin_schema() -> PluginSchema {
+  PluginSchema {
+    key: "shell".to_owned(),
+    validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+  }
+}
+
 /// Platform-specific command setup for Unix
 #[cfg(not(windows))]
 fn setup_unix_command(cmd: &str, dir: &PathBuf, envs: HashMap<String, String>) -> tokio::process::Command {
@@ -306,13 +313,7 @@ impl Plugin for ShellPlugin {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  serve_plugin(
-    ShellPlugin {},
-    PluginSchema {
-      key: "shell".to_owned(),
-    },
-  )
-  .await
+  serve_plugin(ShellPlugin {}, plugin_schema()).await
 }
 
 #[cfg(test)]
@@ -375,6 +376,17 @@ mod tests {
   async fn test_shell_plugin_version() {
     let plugin = ShellPlugin {};
     assert_eq!(plugin.version(), env!("CARGO_PKG_VERSION").to_string());
+  }
+
+  #[test]
+  fn test_shell_plugin_schema() {
+    let schema = plugin_schema();
+
+    assert_eq!(schema.key, "shell");
+    assert_eq!(
+      schema.validation_schema.unwrap().get("type"),
+      Some(&Value::String("string".to_owned()))
+    );
   }
 
   #[tokio::test]

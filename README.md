@@ -379,7 +379,9 @@ tasks:
 ```
 
 The annotation name must match the key returned by a loaded plugin. Unknown annotations are
-reported as Octafile parsing errors. The existing mapping syntax remains supported.
+reported as Octafile parsing errors. Plugins can also return a JSON Schema for their task value;
+Octa applies it to annotations, mapping-style tasks, and plugin commands in `cmds` before execution.
+The existing mapping syntax remains supported.
 
 ```yaml
 tasks:

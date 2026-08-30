@@ -199,7 +199,7 @@ mod tests {
   fn create_test_task(name: &str) -> Task {
     let mut extra = HashMap::new();
     let cmd_value = Value::String(format!("echo {}", name));
-    extra.insert("cmd".to_owned(), cmd_value);
+    extra.insert("shell".to_owned(), cmd_value);
 
     Task {
       extra,
@@ -224,9 +224,9 @@ mod tests {
       content.push_str("tasks:\n");
       for (task_name, task) in &tasks {
         content.push_str(&format!("  {}:\n", task_name));
-        if let Some(cmd) = task.extra.get("cmd") {
+        if let Some(cmd) = task.extra.get("shell") {
           let cmd = serde_yml::to_string(&cmd).unwrap();
-          content.push_str(&format!("    cmd: {}\n", cmd));
+          content.push_str(&format!("    shell: {}\n", cmd));
         }
       }
       content
@@ -267,7 +267,7 @@ mod tests {
           octafile: {}
       tasks:
         root_task:
-          cmd: echo root
+          shell: echo root
       "#,
       child_path.display()
     );
@@ -309,7 +309,7 @@ mod tests {
           octafile: {}
       tasks:
         root_task:
-          cmd: echo root
+          shell: echo root
       "#,
       child1_path.display(),
       child2_path.display()
@@ -354,7 +354,7 @@ mod tests {
 
       tasks:
         task1:
-          cmd: echo level3_task
+          shell: echo level3_task
     "#;
     let level3_path = create_test_yaml(&temp_dir, "level1/level2/level3", level3_content);
 
@@ -368,7 +368,7 @@ mod tests {
             octafile: {}
         tasks:
           task1:
-            cmd: echo level2_task
+            shell: echo level2_task
         "#,
       level3_path.display()
     );
@@ -384,7 +384,7 @@ mod tests {
           octafile: {}
       tasks:
         task1:
-          cmd: echo level1_task
+          shell: echo level1_task
       "#,
       level2_path.display()
     );
@@ -396,7 +396,7 @@ mod tests {
 
       tasks:
         task1:
-          cmd: echo sibling_task
+          shell: echo sibling_task
     "#;
     let sibling_path = create_test_yaml(&temp_dir, "sibling", sibling_content);
 
@@ -412,7 +412,7 @@ mod tests {
             octafile: {}
         tasks:
           task1:
-            cmd: echo root_task
+            shell: echo root_task
         "#,
       level1_path.display(),
       sibling_path.display()
@@ -459,7 +459,7 @@ mod tests {
 
       tasks:
         task1:
-          cmd: echo level1_task
+          shell: echo level1_task
     "#;
     let level1_path = create_test_yaml(&temp_dir, "level1", level1_content);
 
@@ -475,7 +475,7 @@ mod tests {
           optional: true
       tasks:
         task1:
-          cmd: echo root_task
+          shell: echo root_task
       "#,
       level1_path.display()
     );
@@ -500,7 +500,7 @@ mod tests {
 
       tasks:
         task1:
-          cmd: echo root_task
+          shell: echo root_task
     "#;
     let root_path = create_test_yaml(&temp_dir, "", root_content);
 
@@ -522,9 +522,9 @@ mod tests {
 
       tasks:
         task1:
-          cmd: echo level1_task1
+          shell: echo level1_task1
         task2:
-          cmd: echo level1_task2
+          shell: echo level1_task2
     "#;
     let level1_path = create_test_yaml(&temp_dir, "level1", level1_content);
 
@@ -538,9 +538,9 @@ mod tests {
 
       tasks:
         task1:
-          cmd: echo root_task1
+          shell: echo root_task1
         task3:
-          cmd: echo root_task3
+          shell: echo root_task3
       "#,
       level1_path.display()
     );

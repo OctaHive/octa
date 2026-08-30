@@ -2,12 +2,25 @@ use std::{
   env,
   fs::{self, File},
   io::Write,
+  path::PathBuf,
 };
 
 use assert_cmd::Command;
 use predicates::prelude::{predicate, PredicateBooleanExt};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
+
+fn validation_plugins_dir() -> PathBuf {
+  env::var_os("OCTA_E2E_PLUGINS_DIR")
+    .map(PathBuf::from)
+    .unwrap_or_else(|| {
+      env::current_dir()
+        .unwrap()
+        .join("../../plugins")
+        .canonicalize()
+        .unwrap()
+    })
+}
 
 #[test]
 fn test_no_octafile_file_discovered() {
@@ -67,6 +80,70 @@ tasks:
     .assert()
     .success()
     .stdout(predicate::str::contains("hello from annotation"));
+
+  Ok(())
+}
+
+#[test]
+fn test_run_template_plugin_task() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+tasks:
+  hello:
+    vars:
+      name: World
+    tpl: "Hello, {{ name }}!"
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("hello");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success().stdout(predicate::str::contains("Hello, World!"));
+
+  Ok(())
+}
+
+#[test]
+fn test_builtin_plugin_schemas_reject_invalid_values() -> Result<(), Box<dyn std::error::Error>> {
+  let cases = [
+    (
+      "shell",
+      r#"
+version: 1
+tasks:
+  invalid:
+    cmds:
+      - shell:
+          command: echo invalid
+"#,
+    ),
+    (
+      "tpl",
+      r#"
+version: 1
+tasks:
+  invalid: !tpl 42
+"#,
+    ),
+  ];
+
+  for (plugin, octafile) in cases {
+    let tmp_dir = TempDir::new()?;
+    fs::write(tmp_dir.path().join("octafile.yml"), octafile)?;
+
+    let mut cmd = Command::cargo_bin("octa")?;
+    cmd.current_dir(tmp_dir.path());
+    cmd.arg("invalid");
+    cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+    cmd.assert().failure().stderr(predicate::str::contains(format!(
+      "invalid parameters for plugin '{plugin}'"
+    )));
+  }
 
   Ok(())
 }

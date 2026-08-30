@@ -14,6 +14,13 @@ use tokio_util::sync::CancellationToken;
 
 struct TemplatePlugin {}
 
+fn plugin_schema() -> PluginSchema {
+  PluginSchema {
+    key: "tpl".to_owned(),
+    validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+  }
+}
+
 #[async_trait]
 impl Plugin for TemplatePlugin {
   /// Return plugin version
@@ -86,7 +93,7 @@ impl Plugin for TemplatePlugin {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  serve_plugin(TemplatePlugin {}, PluginSchema { key: "tpl".to_owned() }).await
+  serve_plugin(TemplatePlugin {}, plugin_schema()).await
 }
 
 #[cfg(test)]
@@ -146,9 +153,20 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_shell_plugin_version() {
+  async fn test_template_plugin_version() {
     let plugin = TemplatePlugin {};
     assert_eq!(plugin.version(), env!("CARGO_PKG_VERSION").to_string());
+  }
+
+  #[test]
+  fn test_template_plugin_schema() {
+    let schema = plugin_schema();
+
+    assert_eq!(schema.key, "tpl");
+    assert_eq!(
+      schema.validation_schema.unwrap().get("type"),
+      Some(&Value::String("string".to_owned()))
+    );
   }
 
   #[tokio::test]

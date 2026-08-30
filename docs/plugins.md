@@ -46,24 +46,33 @@ Example:
 }
 ```
 
-After that, Octa sends the Schema command without any options to the plugin and waits for a Schema command in response, specifying the task attribute required by the plugin. 
+After that, Octa sends the Schema command without any options to the plugin and waits for a Schema command in response. The response specifies the task attribute required by the plugin and can include a JSON Schema for its value.
 
-Plugin Hello response:
+Plugin Schema response:
 | Field | Type | Description |
 | --- | --- | --- |
 | type | String | Plugin command type |
 | key | String | Plugin task key |
+| validation_schema | Object | Optional JSON Schema for the plugin task value |
 
 Example:
 
 ```json
 {
-  "type":"Schema"
+  "type":"Schema",
   "payload":{
-    "key": "shell"
+    "key": "shell",
+    "validation_schema": {
+      "type": "string"
+    }
   }
 }
 ```
+
+Octa compiles `validation_schema` once when loading the plugins and validates every matching task,
+annotation, and command before execution. An invalid plugin schema prevents the Octafile from being
+loaded. Omitting `validation_schema` keeps compatibility with older plugins: the task key is recognized,
+but the plugin-specific value is not validated.
 
 This concludes the first stage of interaction with the plugin.
 
@@ -87,7 +96,8 @@ tasks:
 ```
 
 Octa rejects an annotation when no loaded plugin exposes the corresponding schema key. The existing
-task attribute form, such as `shell: cargo build`, remains supported.
+task attribute form, such as `shell: cargo build`, remains supported and is validated with the same
+schema.
 
 Next, Octa can send an arbitrary number of Execute commands, which the plugin processes and executes. Here is what the Execute commands look like:
 
@@ -252,6 +262,22 @@ impl Plugin for SimplePlugin {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-  serve_plugin(SimplePlugin {}, PluginSchema { key: "key".to_owned() }).await
+  serve_plugin(
+    SimplePlugin {},
+    PluginSchema {
+      key: "key".to_owned(),
+      validation_schema: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "image": { "type": "string" }
+          },
+          "required": ["image"],
+          "additionalProperties": false
+        })
+        .as_object()
+        .cloned(),
+    },
+  )
+  .await
 }
 ```

@@ -13,6 +13,9 @@ pub enum OctafileError {
   #[error("Octafile {0} parsing error: {1}")]
   ParseError(String, String),
 
+  #[error("Plugin validation schema error: {0}")]
+  PluginSchemaError(String),
+
   #[error("IO error when opening octafile: {0}")]
   IoError(#[from] std::io::Error),
 

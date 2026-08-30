@@ -278,10 +278,23 @@ pub async fn run() -> OctaResult<()> {
     None => vec![],
   };
 
-  let (plugin_manager, plugin_keys) = initialize_plugins(plugin_manager.clone(), config_plugins).await?;
+  let (plugin_manager, plugin_schemas) = initialize_plugins(plugin_manager.clone(), config_plugins).await?;
+
+  let mut validation_schemas = HashMap::new();
+  for schema in plugin_schemas.values() {
+    if validation_schemas
+      .insert(schema.key.clone(), schema.validation_schema.clone())
+      .is_some()
+    {
+      return Err(OctaError::PluginStartError(format!(
+        "more than one plugin provides the '{}' task type",
+        schema.key
+      )));
+    }
+  }
 
   // Load octafile
-  let octafile = Octafile::load(args.octafile, args.global, plugin_keys.keys().cloned().collect())?;
+  let octafile = Octafile::load_with_schemas(args.octafile, args.global, validation_schemas)?;
 
   if args.dry {
     warn!("Octa run in dry mode");

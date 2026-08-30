@@ -18,7 +18,7 @@ use crate::{
   error::{OctafileError, OctafileResult},
   include::IncludeInfo,
   parser::{self, location_error, Node},
-  task::{Context, Task, TaskSeed},
+  task::{Context, PluginSchemas, Task, TaskSeed},
 };
 
 const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
@@ -129,6 +129,15 @@ impl fmt::Debug for Octafile {
 
 impl Octafile {
   pub fn load(path: Option<PathBuf>, global: bool, plugin_keys: Vec<String>) -> OctafileResult<Arc<Self>> {
+    Self::load_with_context(path, global, Context::from_keys(plugin_keys))
+  }
+
+  pub fn load_with_schemas(path: Option<PathBuf>, global: bool, schemas: PluginSchemas) -> OctafileResult<Arc<Self>> {
+    let context = Context::from_schemas(schemas).map_err(OctafileError::PluginSchemaError)?;
+    Self::load_with_context(path, global, context)
+  }
+
+  fn load_with_context(path: Option<PathBuf>, global: bool, context: Context) -> OctafileResult<Arc<Self>> {
     let path = match path {
       Some(path) => Octafile::find_octafile(Some(path)),
       None => {
@@ -150,13 +159,13 @@ impl Octafile {
 
     debug!("Loading octafile: {}", path.display());
 
-    let mut octafile = Self::read_octafile(&path, plugin_keys.clone())?;
+    let mut octafile = Self::read_octafile(&path, &context)?;
     octafile.set_attributes(&path)?;
     octafile._self = OnceLock::new();
 
     let octafile = Arc::new(octafile);
     let _ = octafile._self.set(Arc::clone(&octafile));
-    Self::load_includes(Arc::clone(&octafile), plugin_keys)?;
+    Self::load_includes(Arc::clone(&octafile), &context)?;
 
     Ok(octafile)
   }
@@ -207,15 +216,21 @@ impl Octafile {
             let annotation = task_value.annotation().map(str::to_owned);
 
             let task = if let Some(annotation) = annotation {
-              if annotation.is_empty() || !context.keys.contains(&annotation) {
+              if annotation.is_empty() || !context.contains(&annotation) {
                 return Err(location_error(
                   task_value.marker(),
                   &format!("unknown task annotation '!{annotation}'"),
                 ));
               }
 
+              let marker = task_value.marker();
+              let value = task_value.into_untagged_value()?;
+              context
+                .validate(&annotation, &value)
+                .map_err(|error| location_error(marker, &error))?;
+
               let mut extra = HashMap::new();
-              extra.insert(annotation, task_value.into_untagged_value()?);
+              extra.insert(annotation, value);
               Task {
                 extra,
                 ..Task::default()
@@ -243,7 +258,7 @@ impl Octafile {
 
           octafile.tasks = tasks;
         },
-        _ => {},
+        _ => return Err(location_error(key_marker, &format!("unknown Octafile field '{key}'"))),
       }
     }
 
@@ -310,7 +325,7 @@ impl Octafile {
   }
 
   /// Load including octafiles
-  fn load_includes(octafile: Arc<Octafile>, plugin_keys: Vec<String>) -> OctafileResult<()> {
+  fn load_includes(octafile: Arc<Octafile>, context: &Context) -> OctafileResult<()> {
     let includes = match &octafile.includes {
       Some(includes) => includes,
       None => return Ok(()),
@@ -341,7 +356,7 @@ impl Octafile {
       };
 
       debug!("Loading included octafile: {}", path.display());
-      let mut include_octafile = match Self::read_octafile(&path, plugin_keys.clone()) {
+      let mut include_octafile = match Self::read_octafile(&path, context) {
         Ok(mut t) => {
           t._parent = Some(Arc::clone(&octafile));
           t._name = name.clone();
@@ -379,7 +394,7 @@ impl Octafile {
 
       // Recursively process nested includes
       if include_octafile.includes.is_some() {
-        Self::load_includes(Arc::clone(&include_octafile), plugin_keys.clone())?;
+        Self::load_includes(Arc::clone(&include_octafile), context)?;
       }
 
       octafile
@@ -407,7 +422,7 @@ impl Octafile {
   }
 
   /// Reads and parses a taskfile from the given path
-  fn read_octafile<P: AsRef<Path>>(taskfile_path: P, plugin_keys: Vec<String>) -> OctafileResult<Octafile> {
+  fn read_octafile<P: AsRef<Path>>(taskfile_path: P, context: &Context) -> OctafileResult<Octafile> {
     let path = taskfile_path.as_ref();
     let path_str = path.display().to_string();
 
@@ -421,11 +436,9 @@ impl Octafile {
       .read_to_string(&mut content)
       .map_err(|_| OctafileError::ReadError(path_str.clone()))?;
 
-    let context = Context { keys: plugin_keys };
-
     let yaml_value = parser::parse(&content).map_err(|error| OctafileError::ParseError(path_str.clone(), error))?;
 
-    Octafile::deserialize_with_context(yaml_value, &context).map_err(|e| OctafileError::ParseError(path_str, e))
+    Octafile::deserialize_with_context(yaml_value, context).map_err(|e| OctafileError::ParseError(path_str, e))
   }
 
   /// Try to find octafile config traversing to root directory from current directory
@@ -469,7 +482,7 @@ impl<'de> Deserialize<'de> for Octafile {
     D: Deserializer<'de>,
   {
     // Create a default context for regular deserialization
-    let context = Context { keys: vec![] };
+    let context = Context::default();
     let visitor = OctafileVisitor { context };
     deserializer.deserialize_map(visitor)
   }
@@ -529,9 +542,7 @@ impl<'de> Visitor<'de> for OctafileVisitor {
             octafile.tasks = tasks;
           }
         },
-        _ => {
-          let _: serde::de::IgnoredAny = map.next_value()?;
-        },
+        _ => return Err(serde::de::Error::custom(format!("unknown Octafile field '{key}'"))),
       }
     }
 
@@ -1017,7 +1028,7 @@ mod tests {
   }
 
   #[test]
-  fn test_task_with_plugin_keys() {
+  fn test_rejects_multiple_plugin_task_types() {
     let content = r#"
       version: 1
       tasks:
@@ -1028,12 +1039,9 @@ mod tests {
     let (_temp_dir, file_path) = create_temp_octafile(content, "task_with_plugin_keys");
 
     let plugin_keys = vec!["plugin_key".to_string(), "another_key".to_string()];
-    let octafile = Octafile::load(Some(file_path), false, plugin_keys).unwrap();
+    let error = Octafile::load(Some(file_path), false, plugin_keys).unwrap_err();
 
-    let task = &octafile.tasks["plugin_task"];
-    assert!(task.extra.contains_key("plugin_key"));
-    assert!(task.extra.contains_key("another_key"));
-    assert_eq!(task.extra["plugin_key"], Value::String("plugin value".to_string()));
+    assert!(error.to_string().contains("more than one plugin task type"));
   }
 
   #[test]
@@ -1084,6 +1092,141 @@ mod tests {
     assert!(message.contains("unknown task annotation '!missing'"));
     assert!(message.contains("line"));
     assert!(message.contains("column"));
+  }
+
+  fn docker_schemas() -> PluginSchemas {
+    PluginSchemas::from([(
+      "docker".to_string(),
+      serde_json::json!({
+        "type": "object",
+        "properties": {
+          "image": { "type": "string" },
+          "replicas": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["image"],
+        "additionalProperties": false
+      })
+      .as_object()
+      .cloned(),
+    )])
+  }
+
+  #[test]
+  fn validates_plugin_params_in_tasks_and_commands() {
+    let content = r#"
+      version: 1
+      tasks:
+        deploy: !docker
+          image: alpine
+          replicas: 2
+        pipeline:
+          cmds:
+            - docker:
+                image: busybox
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "valid_plugin_schema");
+
+    let octafile = Octafile::load_with_schemas(Some(file_path), false, docker_schemas()).unwrap();
+
+    assert!(octafile.tasks["deploy"].extra.contains_key("docker"));
+    assert!(octafile.tasks["pipeline"].cmds.is_some());
+  }
+
+  #[test]
+  fn rejects_invalid_annotated_plugin_params() {
+    let content = r#"
+      version: 1
+      tasks:
+        deploy: !docker
+          image: 42
+          replicas: 0
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_plugin_annotation");
+
+    let error = Octafile::load_with_schemas(Some(file_path), false, docker_schemas()).unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("invalid parameters for plugin 'docker'"));
+    assert!(message.contains("line"));
+  }
+
+  #[test]
+  fn rejects_invalid_plugin_command_params() {
+    let content = r#"
+      version: 1
+      tasks:
+        deploy:
+          cmds:
+            - docker:
+                replicas: 2
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_plugin_command");
+
+    let error = Octafile::load_with_schemas(Some(file_path), false, docker_schemas()).unwrap_err();
+
+    assert!(error.to_string().contains("invalid parameters for plugin 'docker'"));
+  }
+
+  #[test]
+  fn validates_plugin_params_in_included_octafiles() {
+    let root_content = r#"
+      version: 1
+      includes:
+        child: child.yml
+    "#;
+    let child_content = r#"
+      version: 1
+      tasks:
+        deploy:
+          docker:
+            image: 42
+    "#;
+    let temp_dir = Builder::new().prefix("included_plugin_schema").tempdir().unwrap();
+    let root_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&root_path, root_content).unwrap();
+    fs::write(temp_dir.path().join("child.yml"), child_content).unwrap();
+
+    let error = Octafile::load_with_schemas(Some(root_path), false, docker_schemas()).unwrap_err();
+
+    assert!(error.to_string().contains("invalid parameters for plugin 'docker'"));
+    assert!(error.to_string().contains("child.yml"));
+  }
+
+  #[test]
+  fn rejects_invalid_plugin_validation_schema() {
+    let content = "version: 1\n";
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_plugin_schema");
+    let schemas = PluginSchemas::from([(
+      "docker".to_string(),
+      serde_json::json!({ "type": "not-a-json-schema-type" })
+        .as_object()
+        .cloned(),
+    )]);
+
+    let error = Octafile::load_with_schemas(Some(file_path), false, schemas).unwrap_err();
+
+    assert!(matches!(error, OctafileError::PluginSchemaError(_)));
+  }
+
+  #[test]
+  fn rejects_unknown_octafile_and_task_fields() {
+    let content = r#"
+      version: 1
+      taskz: {}
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "unknown_octafile_field");
+    let error = Octafile::load(Some(file_path), false, vec![]).unwrap_err();
+    assert!(error.to_string().contains("unknown Octafile field 'taskz'"));
+
+    let content = r#"
+      version: 1
+      tasks:
+        build:
+          slient: true
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "unknown_task_field");
+    let error = Octafile::load(Some(file_path), false, vec![]).unwrap_err();
+    assert!(error.to_string().contains("unknown task field 'slient'"));
   }
 
   #[test]

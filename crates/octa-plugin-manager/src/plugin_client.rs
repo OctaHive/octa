@@ -493,7 +493,10 @@ mod tests {
             features: vec![],
           }))
         } else if buffer.contains("Schema") {
-          Some(PluginResponse::Schema(Schema { key: "key".to_owned() }))
+          Some(PluginResponse::Schema(Schema {
+            key: "key".to_owned(),
+            validation_schema: None,
+          }))
         } else if buffer.contains("Execute") {
           Some(PluginResponse::Started {
             id: "test-id".to_string(),
@@ -742,7 +745,10 @@ mod tests {
           if reader.read_line(&mut buffer).await.is_ok() {
             messages.push(buffer.clone());
 
-            let response = PluginResponse::Schema(Schema { key: "key".to_owned() });
+            let response = PluginResponse::Schema(Schema {
+              key: "key".to_owned(),
+              validation_schema: None,
+            });
             let response_json = serde_json::to_string(&response).unwrap() + "\n";
             writer.write_all(response_json.as_bytes()).await.unwrap();
             writer.flush().await.unwrap();

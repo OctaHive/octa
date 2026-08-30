@@ -8,7 +8,7 @@ use interprocess::local_socket::{
   ListenerOptions,
 };
 use logger::{Logger, LoggerSystem};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use socket::interpret_local_socket_name;
 use tokio::io::{AsyncWrite, ReadHalf};
 use tokio::{
@@ -31,6 +31,7 @@ pub mod socket;
 #[derive(Clone)]
 pub struct PluginSchema {
   pub key: String,
+  pub validation_schema: Option<Map<String, Value>>,
 }
 
 #[derive(Parser, Debug)]
@@ -375,7 +376,10 @@ where
 
   match serde_json::from_str(&buffer) {
     Ok(OctaCommand::Schema) => {
-      let schema_response = PluginResponse::Schema(Schema { key: schema.key });
+      let schema_response = PluginResponse::Schema(Schema {
+        key: schema.key,
+        validation_schema: schema.validation_schema,
+      });
       let response_json = serde_json::to_string(&schema_response)? + "\n";
       writer.lock().await.write_all(response_json.as_bytes()).await?;
 
@@ -1157,7 +1161,10 @@ mod tests {
       output_lines: vec!["test".to_string()],
     });
 
-    let schema = PluginSchema { key: "key".to_owned() };
+    let schema = PluginSchema {
+      key: "key".to_owned(),
+      validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+    };
 
     // Create a listener for the socket
     let listener = ListenerOptions::new().name(socket_name_server).create_tokio().unwrap();
@@ -1241,6 +1248,10 @@ mod tests {
     match &responses[1] {
       PluginResponse::Schema(schema) => {
         assert_eq!(schema.key, "key");
+        assert_eq!(
+          schema.validation_schema,
+          serde_json::json!({ "type": "string" }).as_object().cloned()
+        );
       },
       _ => panic!("Expected Schema response"),
     }

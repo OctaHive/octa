@@ -1,5 +1,4 @@
 - Add options for dotenv to load environment from specified paths
-- Add validation to yaml file
 - Create task directory if it not exist
 - Add support architecture to platform specific task
 - Add run options to octafile level
