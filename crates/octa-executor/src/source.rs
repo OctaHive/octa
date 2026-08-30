@@ -21,12 +21,13 @@ const OCTAIGNORE_FILE: &str = ".octaignore";
 
 /// Expands source globs and removes paths excluded by applicable `.octaignore` files.
 pub(crate) fn collect(sources: &[String], root: &Path) -> ExecutorResult<Vec<PathBuf>> {
-  let current_dir = std::env::current_dir()?;
+  let current_dir = dunce::canonicalize(std::env::current_dir()?)?;
   let root = if root.is_absolute() {
     root.to_path_buf()
   } else {
     current_dir.join(root)
   };
+  let root = dunce::canonicalize(root)?;
   let mut filter = SourceFilter::new(root, current_dir);
   let mut paths = Vec::new();
 
@@ -64,6 +65,7 @@ impl SourceFilter {
     } else {
       self.current_dir.join(path)
     };
+    let absolute_path = dunce::canonicalize(absolute_path)?;
 
     // Ignore files outside the root Octafile must not affect external sources.
     let Ok(relative_path) = absolute_path.strip_prefix(&self.root) else {
@@ -256,6 +258,22 @@ mod tests {
     let paths = collect(&[glob_path(&source)], root.path()).unwrap();
 
     assert_eq!(paths, vec![source]);
+  }
+
+  #[test]
+  fn supports_canonicalized_project_root() {
+    let root = TempDir::new().unwrap();
+    let src = root.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("tracked.txt"), "tracked").unwrap();
+    fs::write(src.join("ignored.txt"), "ignored").unwrap();
+    fs::write(src.join(OCTAIGNORE_FILE), "ignored.txt\n").unwrap();
+
+    let canonical_root = fs::canonicalize(root.path()).unwrap();
+    let sources = vec![format!("{}/*.txt", glob_path(&src))];
+    let paths = collect(&sources, &canonical_root).unwrap();
+
+    assert_eq!(paths, vec![src.join("tracked.txt")]);
   }
 
   #[test]
