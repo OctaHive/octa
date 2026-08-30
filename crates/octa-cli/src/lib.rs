@@ -15,7 +15,7 @@ use octa_plugin::protocol::Schema;
 use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Deserialize;
 use tokio::signal;
-use tokio::time::{timeout, Duration};
+use tokio::time::{sleep, timeout, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::{
@@ -25,9 +25,14 @@ use tracing_subscriber::{
 };
 
 use error::{OctaError, OctaResult};
-use octa_executor::{executor::ExecutorConfig, summary::Summary, Executor, TaskGraphBuilder, TaskNode};
+use octa_executor::{
+  executor::ExecutorConfig,
+  summary::Summary,
+  watcher::{SourceWatcher, WatchTarget},
+  Executor, TaskGraphBuilder, TaskNode,
+};
 use octa_finder::OctaFinder;
-use octa_octafile::Octafile;
+use octa_octafile::{Octafile, WatchInterval};
 
 mod error;
 mod logger;
@@ -35,6 +40,7 @@ mod logger;
 const DEFAULT_PLUGINS: [&str; 2] = ["shell", "tpl"];
 const DEFAULT_TASK: &str = "default";
 const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Deserialize)]
 struct PluginConfig {
@@ -98,6 +104,14 @@ pub(crate) struct Cli {
   #[arg(short, long, default_value_t = false)]
   pub force: bool,
 
+  /// Watch source files and rerun selected tasks when they change
+  #[arg(short = 'w', long, default_value_t = false)]
+  pub watch: bool,
+
+  /// Set the watch polling interval (for example: 250ms, 2s, or 1m)
+  #[arg(long, value_name = "DURATION", value_parser = parse_watch_interval)]
+  pub interval: Option<Duration>,
+
   /// Generate shell completions
   #[arg(long)]
   completions: Option<Shell>,
@@ -109,6 +123,10 @@ pub(crate) struct Cli {
 fn generate_completions<G: Generator>(gen: G, cmd: &mut clap::Command) {
   let bin_name = cmd.get_name().to_string();
   generate(gen, cmd, bin_name, &mut io::stdout());
+}
+
+fn parse_watch_interval(value: &str) -> Result<Duration, String> {
+  value.parse::<WatchInterval>().map(WatchInterval::duration)
 }
 
 fn load_env_files(paths: &[PathBuf]) -> OctaResult<()> {
@@ -130,6 +148,21 @@ fn load_env_files(paths: &[PathBuf]) -> OctaResult<()> {
 struct ExecuteItem {
   executor: Executor<TaskNode>,
   command: String,
+}
+
+struct ExecutionOptions {
+  parallel: bool,
+  dry: bool,
+  force: bool,
+  task_args: Vec<String>,
+}
+
+#[derive(Clone)]
+struct ExecutionContext {
+  plugin_manager: Arc<PluginManager>,
+  octafile: Arc<Octafile>,
+  fingerprint: Arc<sled::Db>,
+  summary: Arc<Summary>,
 }
 
 /// Sets up signal handling for graceful shutdown
@@ -280,6 +313,98 @@ async fn execute_tasks(tasks: Vec<ExecuteItem>, parallel: bool, cancel_token: Ca
   Ok(())
 }
 
+async fn build_execute_items(
+  context: &ExecutionContext,
+  commands: &[String],
+  options: &ExecutionOptions,
+) -> OctaResult<(Vec<ExecuteItem>, Vec<WatchTarget>)> {
+  let mut tasks = Vec::with_capacity(commands.len());
+  let mut watch_targets = Vec::new();
+
+  for command in commands {
+    let builder = TaskGraphBuilder::new(context.plugin_manager.clone())?;
+    let dag = builder
+      .build(
+        Arc::clone(&context.octafile),
+        command,
+        options.parallel,
+        options.task_args.clone(),
+      )
+      .await?;
+
+    for node in dag.nodes() {
+      if let Some(sources) = &node.sources {
+        watch_targets.push(WatchTarget::new(sources.clone(), node.octafile_root.clone()));
+      }
+    }
+
+    let executor = Executor::new(
+      context.plugin_manager.clone(),
+      dag,
+      ExecutorConfig { silent: false },
+      None,
+      Arc::clone(&context.fingerprint),
+      options.dry,
+      options.force,
+      Some(context.summary.clone()),
+    )?;
+    tasks.push(ExecuteItem {
+      executor,
+      command: command.clone(),
+    });
+  }
+
+  Ok((tasks, watch_targets))
+}
+
+fn tasks_request_watch(octafile: &Arc<Octafile>, commands: &[String]) -> bool {
+  let finder = OctaFinder::new();
+  commands.iter().any(|command| {
+    finder
+      .find_by_path(Arc::clone(octafile), command)
+      .iter()
+      .any(|result| result.task.watch.unwrap_or(false))
+  })
+}
+
+async fn execute_watch(
+  context: ExecutionContext,
+  commands: &[String],
+  options: &ExecutionOptions,
+  interval: Duration,
+  cancel_token: CancellationToken,
+) -> OctaResult<()> {
+  let (tasks, targets) = build_execute_items(&context, commands, options).await?;
+
+  if targets.is_empty() {
+    return Err(OctaError::WatchSourcesMissing);
+  }
+
+  let mut watcher = SourceWatcher::new(targets)?;
+  if let Err(error) = execute_tasks(tasks, options.parallel, cancel_token.clone()).await {
+    warn!("Task execution failed; waiting for source changes: {}", error);
+  }
+
+  info!("Watching sources for changes");
+  loop {
+    tokio::select! {
+      _ = cancel_token.cancelled() => break,
+      _ = sleep(interval) => {},
+    }
+
+    if watcher.poll()? {
+      info!("Sources changed; restarting tasks");
+      let (tasks, _) = build_execute_items(&context, commands, options).await?;
+
+      if let Err(error) = execute_tasks(tasks, options.parallel, cancel_token.clone()).await {
+        warn!("Task execution failed; waiting for source changes: {}", error);
+      }
+    }
+  }
+
+  Ok(())
+}
+
 pub async fn run() -> OctaResult<()> {
   // Parse command line arguments
   let args = Cli::parse();
@@ -365,33 +490,43 @@ pub async fn run() -> OctaResult<()> {
     return Ok(());
   }
 
-  let summary = Arc::new(Summary::new());
-  let mut tasks = vec![];
   let commands = args.commands.unwrap_or_else(|| vec![DEFAULT_TASK.to_string()]);
-  for command in &commands {
-    // Create DAG
-    let builder = TaskGraphBuilder::new(plugin_manager.clone())?;
-    let dag = builder
-      .build(Arc::clone(&octafile), command, args.parallel, args.task_args.clone())
-      .await?;
+  let options = ExecutionOptions {
+    parallel: args.parallel,
+    dry: args.dry,
+    force: args.force,
+    task_args: args.task_args,
+  };
+  let summary = Arc::new(Summary::new());
+  let execution_context = ExecutionContext {
+    plugin_manager: plugin_manager.clone(),
+    octafile: Arc::clone(&octafile),
+    fingerprint: Arc::clone(&fingerprint),
+    summary: summary.clone(),
+  };
+  let watch = args.watch || tasks_request_watch(&octafile, &commands);
 
-    let executor = Executor::new(
-      plugin_manager.clone(),
-      dag,
-      ExecutorConfig { silent: false },
-      None,
-      Arc::clone(&fingerprint),
-      args.dry,
-      args.force,
-      Some(summary.clone()),
-    )?;
-    tasks.push(ExecuteItem {
-      executor,
-      command: command.to_string(),
-    });
+  if watch {
+    let interval = if let Some(interval) = args.interval {
+      interval
+    } else if let Some(interval) = octafile.interval {
+      interval.duration()
+    } else {
+      DEFAULT_WATCH_INTERVAL
+    };
+
+    execute_watch(
+      execution_context.clone(),
+      &commands,
+      &options,
+      interval,
+      cancel_token.clone(),
+    )
+    .await?;
+  } else {
+    let (tasks, _) = build_execute_items(&execution_context, &commands, &options).await?;
+    execute_tasks(tasks, options.parallel, cancel_token).await?;
   }
-
-  execute_tasks(tasks, args.parallel, cancel_token).await?;
 
   if args.summary {
     summary.print().await;
@@ -405,7 +540,7 @@ pub async fn run() -> OctaResult<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::fs::File;
+  use std::fs::{self, File};
   use std::io::Write;
   use std::path::PathBuf;
   use tempfile::TempDir;
@@ -417,11 +552,210 @@ mod tests {
     config_path
   }
 
+  fn test_plugins_dir() -> PathBuf {
+    let target_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
+    #[cfg(windows)]
+    let plugin_names = ["octa_plugin_shell.exe", "octa_plugin_tpl.exe"];
+    #[cfg(not(windows))]
+    let plugin_names = ["octa_plugin_shell", "octa_plugin_tpl"];
+
+    if plugin_names.iter().all(|name| target_dir.join(name).is_file()) {
+      target_dir
+    } else {
+      PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins")
+    }
+  }
+
+  fn glob_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+  }
+
+  async fn wait_for_lines(path: &Path, expected: usize) {
+    timeout(Duration::from_secs(5), async {
+      loop {
+        let lines = fs::read_to_string(path)
+          .map(|content| content.lines().count())
+          .unwrap_or_default();
+        if lines >= expected {
+          break;
+        }
+        sleep(Duration::from_millis(25)).await;
+      }
+    })
+    .await
+    .unwrap();
+  }
+
   #[test]
   fn test_cli_parse() {
     let cli = Cli::parse_from(["octa", "--parallel", "build"]);
     assert!(cli.parallel);
     assert_eq!(cli.commands, Some(vec!["build".to_string()]));
+  }
+
+  #[test]
+  fn test_cli_watch_options() {
+    let cli = Cli::parse_from(["octa", "--watch", "--interval", "250ms", "build"]);
+
+    assert!(cli.watch);
+    assert_eq!(cli.interval, Some(Duration::from_millis(250)));
+    assert_eq!(parse_watch_interval("2s"), Ok(Duration::from_secs(2)));
+    assert_eq!(parse_watch_interval("1m"), Ok(Duration::from_secs(60)));
+    assert!(parse_watch_interval("0ms").is_err());
+    assert!(parse_watch_interval("100").is_err());
+  }
+
+  #[test]
+  fn task_watch_only_applies_to_direct_cli_selection() {
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(
+      temp_dir.path().join("Octafile.yml"),
+      r#"
+version: 1
+
+tasks:
+  watched:
+    watch: true
+    sources:
+      - source.txt
+    shell: echo watched
+
+  dependency:
+    deps:
+      - watched
+    shell: echo dependency
+
+  command:
+    cmds:
+      - task: watched
+"#,
+    )
+    .unwrap();
+
+    let octafile = Octafile::load(
+      Some(temp_dir.path().join("Octafile.yml")),
+      false,
+      vec!["shell".to_string()],
+    )
+    .unwrap();
+
+    assert!(tasks_request_watch(&octafile, &["watched".to_string()]));
+    assert!(!tasks_request_watch(&octafile, &["dependency".to_string()]));
+    assert!(!tasks_request_watch(&octafile, &["command".to_string()]));
+  }
+
+  #[tokio::test]
+  async fn test_watch_reruns_task_after_source_change() {
+    let temp_dir = TempDir::new().unwrap();
+    let source = temp_dir.path().join("source.txt");
+    let output = temp_dir.path().join("runs.txt");
+    fs::write(&source, "initial").unwrap();
+    fs::write(
+      temp_dir.path().join("Octafile.yml"),
+      format!(
+        r#"
+version: 1
+interval: 25ms
+
+tasks:
+  build:
+    watch: true
+    sources:
+      - "{}"
+    shell: echo run >> runs.txt
+"#,
+        glob_path(&source),
+      ),
+    )
+    .unwrap();
+
+    let plugin_manager = Arc::new(PluginManager::new(test_plugins_dir()));
+    let (plugin_manager, schemas) = initialize_plugins(plugin_manager, Vec::new()).await.unwrap();
+    let octafile = Octafile::load(
+      Some(temp_dir.path().join("Octafile.yml")),
+      false,
+      schemas.values().map(|schema| schema.key.clone()).collect(),
+    )
+    .unwrap();
+    let commands = vec!["build".to_string()];
+    assert!(tasks_request_watch(&octafile, &commands));
+
+    let cancel_token = CancellationToken::new();
+    let watch_cancel_token = cancel_token.clone();
+    let watch_plugin_manager = plugin_manager.clone();
+    let fingerprint = Arc::new(sled::Config::new().temporary(true).open().unwrap());
+    let handle = tokio::spawn(async move {
+      let options = ExecutionOptions {
+        parallel: false,
+        dry: false,
+        force: false,
+        task_args: Vec::new(),
+      };
+      execute_watch(
+        ExecutionContext {
+          plugin_manager: watch_plugin_manager,
+          octafile,
+          fingerprint,
+          summary: Arc::new(Summary::new()),
+        },
+        &commands,
+        &options,
+        Duration::from_millis(25),
+        watch_cancel_token,
+      )
+      .await
+    });
+
+    wait_for_lines(&output, 1).await;
+    fs::write(&source, "changed").unwrap();
+    wait_for_lines(&output, 2).await;
+    cancel_token.cancel();
+
+    handle.await.unwrap().unwrap();
+    plugin_manager.shutdown_all().await;
+  }
+
+  #[tokio::test]
+  async fn test_watch_requires_sources() {
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(
+      temp_dir.path().join("Octafile.yml"),
+      r#"
+version: 1
+tasks:
+  build:
+    shell: echo build
+"#,
+    )
+    .unwrap();
+
+    let octafile = Octafile::load(
+      Some(temp_dir.path().join("Octafile.yml")),
+      false,
+      vec!["shell".to_string()],
+    )
+    .unwrap();
+    let options = ExecutionOptions {
+      parallel: false,
+      dry: false,
+      force: false,
+      task_args: Vec::new(),
+    };
+    let result = execute_watch(
+      ExecutionContext {
+        plugin_manager: Arc::new(PluginManager::new(temp_dir.path())),
+        octafile,
+        fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+        summary: Arc::new(Summary::new()),
+      },
+      &["build".to_string()],
+      &options,
+      Duration::from_millis(25),
+      CancellationToken::new(),
+    )
+    .await;
+
+    assert!(matches!(result, Err(OctaError::WatchSourcesMissing)));
   }
 
   #[test]

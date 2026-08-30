@@ -192,6 +192,7 @@ pub struct Task {
   pub execute_mode: Option<ExecuteMode>,         // How execute task commands
   pub sources: Option<Vec<String>>,              // Sources for fingerprinting
   pub source_strategy: Option<SourceStrategies>, // Strategy for compare sources
+  pub watch: Option<bool>,                       // Watch sources and rerun the task
   pub condition: Option<String>,                 // Shell condition for task execution
   pub preconditions: Option<Vec<String>>,        // Commands to check should run command
   pub extra: HashMap<String, Value>,             // Captures any additional attributes
@@ -271,6 +272,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "execute_mode" => task.execute_mode = map.next_value()?,
         "sources" => task.sources = map.next_value()?,
         "source_strategy" => task.source_strategy = map.next_value()?,
+        "watch" => task.watch = map.next_value()?,
         "if" => task.condition = map.next_value()?,
         "preconditions" => task.preconditions = map.next_value()?,
         key => {

@@ -4,7 +4,9 @@ use std::{
   fs::File,
   io::Read,
   path::{Path, PathBuf},
+  str::FromStr,
   sync::{Arc, Mutex, OnceLock},
+  time::Duration,
 };
 
 use serde::{
@@ -34,6 +36,55 @@ const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
 
 pub type Vars = HashMap<String, Value>;
 pub type Envs = HashMap<String, String>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WatchInterval(Duration);
+
+impl WatchInterval {
+  pub fn duration(self) -> Duration {
+    self.0
+  }
+}
+
+impl FromStr for WatchInterval {
+  type Err = String;
+
+  fn from_str(value: &str) -> Result<Self, Self::Err> {
+    let value = value.trim();
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ms") {
+      (number, 1)
+    } else if let Some(number) = value.strip_suffix('s') {
+      (number, 1_000)
+    } else if let Some(number) = value.strip_suffix('m') {
+      (number, 60_000)
+    } else {
+      return Err("expected a duration ending in ms, s, or m".to_string());
+    };
+
+    let number = number
+      .parse::<u64>()
+      .map_err(|_| "expected a positive integer duration".to_string())?;
+    let millis = number
+      .checked_mul(multiplier)
+      .ok_or_else(|| "duration is too large".to_string())?;
+    if millis == 0 {
+      return Err("duration must be greater than zero".to_string());
+    }
+
+    Ok(Self(Duration::from_millis(millis)))
+  }
+}
+
+impl<'de> Deserialize<'de> for WatchInterval {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    String::deserialize(deserializer)?
+      .parse()
+      .map_err(serde::de::Error::custom)
+  }
+}
 
 /// Enum of available file versions
 #[derive(Deserialize, Serialize, Debug, Clone, Copy, Default)]
@@ -89,6 +140,9 @@ pub struct Octafile {
   // Default task run mode
   pub run: Option<AllowedRun>,
 
+  // Watch polling interval
+  pub interval: Option<WatchInterval>,
+
   // list of included octafiles
   pub includes: Option<HashMap<String, IncludeInfo>>,
 
@@ -124,6 +178,7 @@ impl fmt::Debug for Octafile {
       .field("version", &self.version)
       .field("name", &self._name)
       .field("run", &self.run)
+      .field("interval", &self.interval)
       .field("includes", &self.includes)
       .field("tasks", &self.tasks)
       .field("dir", &self.dir)
@@ -204,6 +259,9 @@ impl Octafile {
         },
         "run" => {
           octafile.run = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "interval" => {
+          octafile.interval = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
         },
         "includes" => {
           octafile.includes = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
@@ -526,6 +584,9 @@ impl<'de> Visitor<'de> for OctafileVisitor {
         "run" => {
           octafile.run = map.next_value()?;
         },
+        "interval" => {
+          octafile.interval = map.next_value()?;
+        },
         "includes" => {
           octafile.includes = map.next_value()?;
         },
@@ -571,6 +632,7 @@ mod tests {
   use std::fs;
   use std::path::PathBuf;
   use std::sync::Arc;
+  use std::time::Duration;
   use tempfile::{Builder, TempDir};
 
   fn create_temp_octafile(content: &str, prefix: &str) -> (TempDir, PathBuf) {
@@ -592,8 +654,10 @@ mod tests {
     let content = r#"
       version: 1
       run: changed
+      interval: 250ms
       tasks:
         test:
+          watch: true
           shell: echo "hello"
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "load_basic_octafile");
@@ -601,6 +665,8 @@ mod tests {
     let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
     assert_eq!(octafile.version, 1);
     assert_eq!(octafile.run, Some(AllowedRun::Changed));
+    assert_eq!(octafile.interval.unwrap().duration(), Duration::from_millis(250));
+    assert_eq!(octafile.tasks["test"].watch, Some(true));
     assert!(octafile.tasks.contains_key("test"));
   }
 
@@ -614,6 +680,22 @@ mod tests {
     let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_octafile_run_mode");
 
     assert!(Octafile::load(Some(file_path), false, vec![]).is_err());
+  }
+
+  #[test]
+  fn test_invalid_watch_interval() {
+    for interval in ["0ms", "100", "soon"] {
+      let content = format!(
+        r#"
+        version: 1
+        interval: {interval}
+        tasks: {{}}
+      "#
+      );
+      let (_temp_dir, file_path) = create_temp_octafile(&content, "invalid_watch_interval");
+
+      assert!(Octafile::load(Some(file_path), false, vec![]).is_err());
+    }
   }
 
   #[test]
@@ -1298,6 +1380,7 @@ mod tests {
           sources:
             - "src/**/*.rs"
           source_strategy: hash
+          watch: true
           if: test -f "Cargo.toml"
           preconditions:
             - test -f "file.txt"
@@ -1320,6 +1403,7 @@ mod tests {
     assert!(task.execute_mode.is_some());
     assert!(task.sources.is_some());
     assert!(task.source_strategy.is_some());
+    assert_eq!(task.watch, Some(true));
     assert_eq!(task.condition, Some("test -f \"Cargo.toml\"".to_string()));
     assert!(task.preconditions.is_some());
   }

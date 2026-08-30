@@ -761,6 +761,37 @@ You can override this directory by setting the `OCTA_CACHE_DIR` environment vari
 If you still want the task to run even though the source files have not changed, you can use 
 the `--force` or `-f` flag.
 
+## Watch mode
+
+Use `--watch` or `-w` to run a task immediately and rerun it whenever a source file is created,
+modified, or removed. At least one task in the execution plan must define `sources`.
+
+```console
+octa --watch build
+```
+
+Watch mode applies glob expansion and `.octaignore` rules in the same way as regular source
+fingerprinting. When multiple commands are selected, a change reruns all of them. A failed run does
+not stop the watcher; Octa waits for the next source change. Press Ctrl-C to stop watching.
+
+A task can enable watch mode when it is selected directly from the command line:
+
+```yaml
+version: 1
+
+interval: 500ms
+
+tasks:
+  build:
+    watch: true
+    sources:
+      - src/**/*.rs
+    shell: cargo build
+```
+
+The default interval is `100ms`. Set `interval` at the root of the Octafile or override it from the
+command line with `--interval 1s`. Durations must be positive integers ending in `ms`, `s`, or `m`.
+
 ## Task conditions
 Use the `if` parameter to run a task only when a shell command exits successfully. A non-zero
 exit code skips the task without failing the execution plan. The condition runs after dependencies,

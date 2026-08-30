@@ -24,6 +24,9 @@ pub enum OctaError {
   #[error("Failed to load config file: {0}")]
   ConfigLoadError(String),
 
+  #[error("Watch mode requires at least one task with sources")]
+  WatchSourcesMissing,
+
   #[error(transparent)]
   OctafileLoad(#[from] OctafileError),
 

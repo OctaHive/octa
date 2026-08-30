@@ -23,3 +23,4 @@ target/
 /.vscode
 .DS_Store
 .octa
+/crates/octa-plugin-manager/test_plugin.log

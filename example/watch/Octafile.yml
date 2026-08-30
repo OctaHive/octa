@@ -1,0 +1,10 @@
+version: 1
+
+interval: 500ms
+
+tasks:
+  build:
+    watch: true
+    sources:
+      - input.txt
+    shell: echo "Input changed"

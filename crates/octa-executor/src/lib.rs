@@ -9,6 +9,7 @@ pub mod summary;
 pub mod task;
 mod timestamp_source;
 pub mod vars;
+pub mod watcher;
 
 use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
 
