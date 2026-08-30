@@ -70,6 +70,57 @@ fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_task_if_condition() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  condition:
+    tpl: exit 0
+
+  runs:
+    if: "{{ deps_result.condition }}"
+    deps:
+      - condition
+    shell: echo executed > executed.txt
+
+  skips:
+    if: exit 1
+    cmds:
+      - echo skipped > skipped.txt
+      - echo also-skipped > also-skipped.txt
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("runs");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success();
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("skips");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success();
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.args(["--force", "skips"]);
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success();
+
+  assert!(tmp_dir.path().join("executed.txt").is_file());
+  assert!(!tmp_dir.path().join("skipped.txt").exists());
+  assert!(!tmp_dir.path().join("also-skipped.txt").exists());
+
+  Ok(())
+}
+
+#[test]
 fn test_run_default_task_when_task_is_not_specified() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   fs::write(

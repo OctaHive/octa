@@ -562,6 +562,7 @@ impl TaskGraphBuilder {
       .dir(cmd.task.dir.clone().unwrap_or(cmd.octafile.dir.clone()))
       .vars(vars)
       .envs(envs)
+      .condition(cmd.task.condition.clone())
       .preconditions(cmd.task.preconditions.clone())
       .sources(cmd.task.sources.clone())
       .octafile_root(cmd.octafile.root().dir.clone())

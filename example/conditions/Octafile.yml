@@ -1,0 +1,9 @@
+version: 1
+
+vars:
+  ENVIRONMENT: development
+
+tasks:
+  deploy:
+    if: test "{{ ENVIRONMENT }}" = "production"
+    shell: echo "Deploying to production"

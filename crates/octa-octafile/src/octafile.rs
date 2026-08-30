@@ -1298,6 +1298,7 @@ mod tests {
           sources:
             - "src/**/*.rs"
           source_strategy: hash
+          if: test -f "Cargo.toml"
           preconditions:
             - test -f "file.txt"
     "#;
@@ -1319,6 +1320,7 @@ mod tests {
     assert!(task.execute_mode.is_some());
     assert!(task.sources.is_some());
     assert!(task.source_strategy.is_some());
+    assert_eq!(task.condition, Some("test -f \"Cargo.toml\"".to_string()));
     assert!(task.preconditions.is_some());
   }
 
@@ -1342,6 +1344,15 @@ mod tests {
           execute_mode: invalid_mode
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_execute_mode");
+    assert!(Octafile::load(Some(file_path), false, vec![]).is_err());
+
+    let content = r#"
+      version: 1
+      tasks:
+        invalid_task:
+          if: true
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_condition");
     assert!(Octafile::load(Some(file_path), false, vec![]).is_err());
   }
 

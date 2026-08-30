@@ -125,6 +125,7 @@ pub struct TaskConfig {
   pub sources: Option<Vec<String>>,       // Sources for fingerprinting
   pub octafile_root: PathBuf,             // Directory containing the root Octafile
   pub source_strategy: SourceMethod,      // Source validation strategy
+  pub condition: Option<String>,          // Shell condition for task execution
   pub preconditions: Option<Vec<String>>, // Task preconditions
 
   // State management
@@ -155,6 +156,7 @@ pub struct TaskConfigBuilder {
   pub sources: Option<Vec<String>>,
   pub octafile_root: Option<PathBuf>,
   pub source_strategy: Option<SourceMethod>,
+  pub condition: Option<String>,
   pub preconditions: Option<Vec<String>>,
 
   pub cmd_type: Option<CmdType>,
@@ -190,6 +192,11 @@ impl TaskConfigBuilder {
 
   pub fn preconditions(mut self, preconditions: Option<Vec<String>>) -> Self {
     self.preconditions = preconditions;
+    self
+  }
+
+  pub fn condition(mut self, condition: Option<String>) -> Self {
+    self.condition = condition;
     self
   }
 
@@ -260,6 +267,7 @@ impl TaskConfigBuilder {
       envs: self.envs.unwrap_or_default(),
       sources: self.sources,
       octafile_root,
+      condition: self.condition,
       preconditions: self.preconditions,
       source_strategy: self.source_strategy.unwrap_or(SourceMethod::Hash),
       cmd_type: self.cmd_type.unwrap_or(CmdType::Normal),
@@ -288,6 +296,7 @@ pub struct TaskNode {
   pub sources: Option<Vec<String>>,       // Sources for fingerprinting
   pub octafile_root: PathBuf,             // Directory containing the root Octafile
   pub source_strategy: SourceMethod,      // Source validation strategy
+  pub condition: Option<String>,          // Shell condition for task execution
   pub preconditions: Option<Vec<String>>, // Task run preconditions
 
   // State management
@@ -330,6 +339,7 @@ impl TaskNode {
       silent: config.silent,
       deps_res: Arc::new(Mutex::new(HashMap::default())),
       cmd_type: config.cmd_type,
+      condition: config.condition,
       preconditions: config.preconditions,
       extra: config.extra,
     }
@@ -489,6 +499,54 @@ impl TaskNode {
     }
   }
 
+  async fn check_condition(
+    &self,
+    plugin_manager: Arc<PluginManager>,
+    dry: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<bool> {
+    let Some(condition) = &self.condition else {
+      return Ok(true);
+    };
+
+    let plugin_name = plugin_manager
+      .get_schema_keys()
+      .await
+      .remove("shell")
+      .ok_or(ExecutorError::TaskParsedError)?;
+
+    let mut vars = self.vars.clone();
+    vars.expand(dry).await?;
+
+    let deps_res = self.deps_res.lock().await;
+    vars.insert("deps_result", &*deps_res);
+    drop(deps_res);
+
+    let mut envs = self.envs.clone();
+    envs.expand().await?;
+
+    let dir = self.prepare_dir(dry).await?;
+    match self
+      .execute_plugin_command(
+        plugin_manager,
+        &plugin_name,
+        dry,
+        condition.clone(),
+        vec![],
+        dir,
+        vars.to_hashmap(),
+        envs.into(),
+        true,
+        cancel_token,
+      )
+      .await
+    {
+      Ok((code, _, _)) => Ok(code == 0),
+      Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
+      Err(error) => Err(error.into()),
+    }
+  }
+
   async fn check_preconditions(&self) -> ExecutorResult<bool> {
     let mut tera = Tera::default();
     let mut vars = self.vars.clone();
@@ -595,6 +653,17 @@ impl Executable<TaskNode> for TaskNode {
     force: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
+    if !self
+      .check_condition(plugin_manager.clone(), dry, cancel_token.clone())
+      .await?
+    {
+      self.log_info(format!(
+        "Task '{}' skipped because its condition was not met",
+        self.name
+      ));
+      return Ok("".to_string());
+    }
+
     if !force && !self.check_preconditions().await? {
       self.log_info(format!("Task '{}' preconditions failed", self.name));
 

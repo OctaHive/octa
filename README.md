@@ -761,6 +761,26 @@ You can override this directory by setting the `OCTA_CACHE_DIR` environment vari
 If you still want the task to run even though the source files have not changed, you can use 
 the `--force` or `-f` flag.
 
+## Task conditions
+Use the `if` parameter to run a task only when a shell command exits successfully. A non-zero
+exit code skips the task without failing the execution plan. The condition runs after dependencies,
+so it can use task variables, environment variables, and `deps_result` template values.
+
+```yaml
+version: 1
+
+vars:
+  ENVIRONMENT: development
+
+tasks:
+  deploy:
+    if: test "{{ ENVIRONMENT }}" = "production"
+    shell: ./deploy.sh
+```
+
+The condition is still evaluated when `--force` is used. In dry mode, Octa prints the task commands
+without executing the condition and treats it as successful.
+
 ## Task preconditions
 Sometimes you need to check a condition before executing a task and decide whether to run it or not.
 To do this, you can specify the `preconditions` parameter for the task and list all the necessary checks there.
