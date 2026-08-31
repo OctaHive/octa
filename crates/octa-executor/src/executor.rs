@@ -17,7 +17,7 @@ use octa_plugin_manager::plugin_manager::PluginManager;
 use sled::Db;
 use tokio::{
   select,
-  sync::{mpsc, Mutex},
+  sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore},
   task::JoinHandle,
   time::timeout,
 };
@@ -104,6 +104,8 @@ pub struct ExecutorConfig {
   pub silent: bool,
   /// Cancel tasks that are already running when any task in the plan fails.
   pub failfast: bool,
+  /// Shared limiter for concurrently executing non-internal tasks.
+  pub concurrency: Option<Arc<Semaphore>>,
 }
 
 impl Default for ExecutorConfig {
@@ -111,6 +113,7 @@ impl Default for ExecutorConfig {
     Self {
       silent: true,
       failfast: false,
+      concurrency: None,
     }
   }
 }
@@ -248,6 +251,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
         self.state.fingerprint.clone(),
         self.state.dry,
         self.state.force,
+        self.config.concurrency.clone(),
       )
       .await
       {
@@ -315,6 +319,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       dry: self.state.dry,
       force: self.state.force,
       failfast: self.config.failfast,
+      concurrency: self.config.concurrency.clone(),
       completed_tasks: self.state.completed_tasks.clone(),
       deferred: self.deferred.clone(),
     };
@@ -424,6 +429,7 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   dry: bool,
   force: bool,
   failfast: bool,
+  concurrency: Option<Arc<Semaphore>>,
   completed_tasks: Arc<Mutex<HashSet<String>>>,
   deferred: Arc<HashMap<String, Arc<DeferredAction<T>>>>,
 }
@@ -457,6 +463,12 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
     let task_name = self.task.id();
     debug!("Executing task: {}", task_name);
 
+    // Internal graph barriers do not represent running user work. Deferred barriers are also
+    // internal; their nested executor acquires permits for the actual cleanup commands.
+    let _permit = match self.acquire_permit().await {
+      Ok(permit) => permit,
+      Err(error) => return self.handle_error(error).await,
+    };
     let start_time = SystemTime::now();
     let deferred = self.context.deferred.get(&task_name).cloned();
     let result = if let Some(action) = deferred.as_ref() {
@@ -468,6 +480,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
         self.context.fingerprint.clone(),
         self.context.dry,
         self.context.force,
+        self.context.concurrency.clone(),
       )
       .await
     } else {
@@ -492,6 +505,23 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
         self.handle_success(String::new(), start_time).await
       },
       Err(e) => self.handle_error(e).await,
+    }
+  }
+
+  async fn acquire_permit(&self) -> ExecutorResult<Option<OwnedSemaphorePermit>> {
+    if self.task.is_internal() {
+      return Ok(None);
+    }
+
+    let Some(concurrency) = &self.context.concurrency else {
+      return Ok(None);
+    };
+
+    select! {
+      permit = concurrency.clone().acquire_owned() => permit
+        .map(Some)
+        .map_err(|_| ExecutorError::ConcurrencyLimiterClosed),
+      _ = self.cancel_token.cancelled() => Err(ExecutorError::TaskCancelled(self.task.name())),
     }
   }
 
@@ -577,6 +607,7 @@ async fn execute_deferred_action<
   fingerprint: Arc<Db>,
   dry: bool,
   force: bool,
+  concurrency: Option<Arc<Semaphore>>,
 ) -> ExecutorResult<String> {
   // A fresh token lets cleanup continue even when cancellation stopped the main plan.
   let executor = Executor::new(
@@ -585,6 +616,7 @@ async fn execute_deferred_action<
     ExecutorConfig {
       silent: true,
       failfast: false,
+      concurrency,
     },
     Some(cache),
     fingerprint,
@@ -603,7 +635,7 @@ mod tests {
   use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
   };
 
   use async_trait::async_trait;
@@ -616,9 +648,20 @@ mod tests {
   #[derive(Clone)]
   struct TestTask {
     id: String,
+    internal: bool,
     fails: bool,
     failfast: bool,
     completed: Arc<AtomicBool>,
+    running: Option<Arc<AtomicUsize>>,
+    maximum_running: Option<Arc<AtomicUsize>>,
+  }
+
+  struct RunningTaskGuard(Arc<AtomicUsize>);
+
+  impl Drop for RunningTaskGuard {
+    fn drop(&mut self) {
+      self.0.fetch_sub(1, Ordering::SeqCst);
+    }
   }
 
   impl PartialEq for TestTask {
@@ -646,7 +689,7 @@ mod tests {
     }
 
     fn is_internal(&self) -> bool {
-      false
+      self.internal
     }
 
     async fn get_deps_result(&self) -> HashMap<String, String> {
@@ -675,6 +718,16 @@ mod tests {
       _force: bool,
       cancel_token: CancellationToken,
     ) -> ExecutorResult<String> {
+      let _running_guard = self.running.as_ref().map(|running| {
+        let running_count = running.fetch_add(1, Ordering::SeqCst) + 1;
+        self
+          .maximum_running
+          .as_ref()
+          .unwrap()
+          .fetch_max(running_count, Ordering::SeqCst);
+        RunningTaskGuard(running.clone())
+      });
+
       if self.fails {
         sleep(Duration::from_millis(20)).await;
         return Err(ExecutorError::TaskFailed(self.id.clone()));
@@ -694,40 +747,54 @@ mod tests {
     async fn bypass_result(&self, _result: HashMap<String, String>) {}
   }
 
-  async fn execute_parallel_failure(
-    executor_failfast: bool,
-    task_failfast: bool,
-  ) -> (ExecutorResult<Vec<String>>, bool) {
-    let completed = Arc::new(AtomicBool::new(false));
-    let mut dag = DAG::new();
-    dag.add_node(Arc::new(TestTask {
-      id: "failure".to_string(),
-      fails: true,
-      failfast: task_failfast,
-      completed: Arc::new(AtomicBool::new(false)),
-    }));
-    dag.add_node(Arc::new(TestTask {
-      id: "slow".to_string(),
+  fn test_task(id: impl Into<String>) -> TestTask {
+    TestTask {
+      id: id.into(),
+      internal: false,
       fails: false,
       failfast: false,
-      completed: completed.clone(),
-    }));
+      completed: Arc::new(AtomicBool::new(false)),
+      running: None,
+      maximum_running: None,
+    }
+  }
 
+  fn test_executor(dag: DAG<TestTask>, config: ExecutorConfig) -> Executor<TestTask> {
     let plugin_dir = TempDir::new().unwrap();
-    let executor = Executor::new(
+    Executor::new(
       Arc::new(PluginManager::new(plugin_dir.path())),
       dag,
-      ExecutorConfig {
-        silent: true,
-        failfast: executor_failfast,
-      },
+      config,
       None,
       Arc::new(sled::Config::new().temporary(true).open().unwrap()),
       false,
       false,
       None,
     )
-    .unwrap();
+    .unwrap()
+  }
+
+  async fn execute_parallel_failure(
+    executor_failfast: bool,
+    task_failfast: bool,
+  ) -> (ExecutorResult<Vec<String>>, bool) {
+    let completed = Arc::new(AtomicBool::new(false));
+    let mut dag = DAG::new();
+    let mut failure = test_task("failure");
+    failure.fails = true;
+    failure.failfast = task_failfast;
+    dag.add_node(Arc::new(failure));
+    let mut slow = test_task("slow");
+    slow.completed = completed.clone();
+    dag.add_node(Arc::new(slow));
+
+    let executor = test_executor(
+      dag,
+      ExecutorConfig {
+        failfast: executor_failfast,
+        ..ExecutorConfig::default()
+      },
+    );
 
     let result = executor.execute(CancellationToken::new(), "test").await;
     (result, completed.load(Ordering::SeqCst))
@@ -749,6 +816,118 @@ mod tests {
       assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
       assert!(!completed);
     }
+  }
+
+  #[tokio::test]
+  async fn limits_concurrently_running_tasks() {
+    let running = Arc::new(AtomicUsize::new(0));
+    let maximum_running = Arc::new(AtomicUsize::new(0));
+    let concurrency = Arc::new(Semaphore::new(2));
+    let build_executor = |prefix: &str| {
+      let mut dag = DAG::new();
+      for index in 0..2 {
+        let mut task = test_task(format!("{prefix}-{index}"));
+        task.running = Some(running.clone());
+        task.maximum_running = Some(maximum_running.clone());
+        dag.add_node(Arc::new(task));
+      }
+
+      test_executor(
+        dag,
+        ExecutorConfig {
+          concurrency: Some(concurrency.clone()),
+          ..ExecutorConfig::default()
+        },
+      )
+    };
+    let first = build_executor("first");
+    let second = build_executor("second");
+
+    let (first_result, second_result) = tokio::join!(
+      first.execute(CancellationToken::new(), "first"),
+      second.execute(CancellationToken::new(), "second"),
+    );
+
+    assert!(first_result.is_ok());
+    assert!(second_result.is_ok());
+    assert_eq!(maximum_running.load(Ordering::SeqCst), 2);
+  }
+
+  #[tokio::test]
+  async fn returns_error_when_concurrency_limiter_is_closed() {
+    let mut dag = DAG::new();
+    dag.add_node(Arc::new(test_task("task")));
+    let concurrency = Arc::new(Semaphore::new(1));
+    concurrency.close();
+    let executor = test_executor(
+      dag,
+      ExecutorConfig {
+        concurrency: Some(concurrency),
+        ..ExecutorConfig::default()
+      },
+    );
+
+    let result = executor.execute(CancellationToken::new(), "test").await;
+
+    assert!(matches!(result, Err(ExecutorError::ConcurrencyLimiterClosed)));
+  }
+
+  #[tokio::test]
+  async fn cancellation_interrupts_waiting_for_concurrency_permit() {
+    let completed = Arc::new(AtomicBool::new(false));
+    let mut dag = DAG::new();
+    let mut task = test_task("task");
+    task.completed = completed.clone();
+    dag.add_node(Arc::new(task));
+    let concurrency = Arc::new(Semaphore::new(1));
+    let _permit = concurrency.clone().acquire_owned().await.unwrap();
+    let executor = test_executor(
+      dag,
+      ExecutorConfig {
+        concurrency: Some(concurrency),
+        ..ExecutorConfig::default()
+      },
+    );
+    let cancel_token = CancellationToken::new();
+    let execution_token = cancel_token.clone();
+    let execution = tokio::spawn(async move { executor.execute(execution_token, "test").await });
+    tokio::task::yield_now().await;
+    cancel_token.cancel();
+
+    let result = tokio::time::timeout(Duration::from_secs(1), execution)
+      .await
+      .unwrap()
+      .unwrap();
+
+    assert!(result.is_ok());
+    assert!(!completed.load(Ordering::SeqCst));
+  }
+
+  #[tokio::test]
+  async fn internal_tasks_do_not_acquire_concurrency_permits() {
+    let completed = Arc::new(AtomicBool::new(false));
+    let mut dag = DAG::new();
+    let mut task = test_task("internal");
+    task.internal = true;
+    task.completed = completed.clone();
+    dag.add_node(Arc::new(task));
+    let executor = test_executor(
+      dag,
+      ExecutorConfig {
+        concurrency: Some(Arc::new(Semaphore::new(0))),
+        ..ExecutorConfig::default()
+      },
+    );
+
+    let result = tokio::time::timeout(
+      Duration::from_secs(1),
+      executor.execute(CancellationToken::new(), "test"),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.is_ok());
+    assert!(completed.load(Ordering::SeqCst));
   }
 
   #[test]

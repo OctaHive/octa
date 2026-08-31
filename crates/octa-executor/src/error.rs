@@ -77,6 +77,9 @@ pub enum ExecutorError {
   #[error("Channel communication error")]
   ChannelError,
 
+  #[error("Concurrency limiter was closed")]
+  ConcurrencyLimiterClosed,
+
   #[error("IO error: {0}")]
   IoError(#[from] std::io::Error),
 

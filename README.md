@@ -653,6 +653,19 @@ tasks:
       - task: next
 ```
 
+# Concurrency limit
+
+Use `--concurrency N` to limit the number of tasks running at the same time:
+
+```bash
+octa --parallel --concurrency 4 lint test build
+```
+
+The limit is shared by all selected commands and also applies to parallel task commands,
+dependencies, watch reruns, and deferred commands. Internal graph nodes do not consume a slot.
+Without this option, Octa does not impose an additional concurrency limit. The value must be
+greater than zero.
+
 # Command timeouts
 
 Use `timeout` to stop commands that run longer than expected. A task-level timeout is the default

@@ -1,0 +1,11 @@
+version: 1
+
+# Run with: octa --concurrency 2 build
+tasks:
+  build:
+    execute_mode: parallel
+    cmds:
+      - echo build frontend
+      - echo build backend
+      - echo build documentation
+      - echo build packages

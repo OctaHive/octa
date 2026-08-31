@@ -1180,7 +1180,7 @@ fn test_parallel_execution() -> Result<(), Box<dyn std::error::Error>> {
   cmd.current_dir(tmp_dir.path());
   cmd.env("OCTA_TESTS", "");
   cmd.env("OCTA_PLUGINS_DIR", package_root.canonicalize().unwrap());
-  cmd.args(["--parallel", "parallel_test"]);
+  cmd.args(["--parallel", "--concurrency", "2", "parallel_test"]);
 
   cmd
     .assert()

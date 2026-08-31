@@ -3,6 +3,7 @@ use std::{
   env,
   fs::File,
   io::{self, Read},
+  num::NonZeroUsize,
   path::{Path, PathBuf},
   sync::Arc,
 };
@@ -14,9 +15,9 @@ use logger::{ChronoLocal, OctaFormatter};
 use octa_plugin::protocol::Schema;
 use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Deserialize;
-use tokio::signal;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Duration};
+use tokio::{signal, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use tracing_subscriber::{
@@ -83,6 +84,10 @@ pub(crate) struct Cli {
 
   #[arg(short, long, default_value_t = false)]
   pub parallel: bool,
+
+  /// Maximum number of tasks that may run at the same time
+  #[arg(long, value_name = "N")]
+  pub concurrency: Option<NonZeroUsize>,
 
   #[arg(short, long, default_value_t = false)]
   pub verbose: bool,
@@ -173,6 +178,7 @@ struct ExecutionContext {
   octafile: Arc<Octafile>,
   fingerprint: Arc<sled::Db>,
   summary: Arc<Summary>,
+  concurrency: Option<Arc<Semaphore>>,
 }
 
 /// Sets up signal handling for graceful shutdown
@@ -366,6 +372,7 @@ async fn build_execute_items(
       ExecutorConfig {
         silent: false,
         failfast: options.failfast,
+        concurrency: context.concurrency.clone(),
       },
       None,
       Arc::clone(&context.fingerprint),
@@ -529,6 +536,7 @@ pub async fn run() -> OctaResult<()> {
     octafile: Arc::clone(&octafile),
     fingerprint: Arc::clone(&fingerprint),
     summary: summary.clone(),
+    concurrency: args.concurrency.map(|limit| Arc::new(Semaphore::new(limit.get()))),
   };
   let watch = args.watch || tasks_request_watch(&octafile, &commands);
 
@@ -614,10 +622,13 @@ mod tests {
 
   #[test]
   fn test_cli_parse() {
-    let cli = Cli::parse_from(["octa", "--parallel", "--failfast", "build"]);
+    let cli = Cli::parse_from(["octa", "--parallel", "--failfast", "--concurrency", "4", "build"]);
     assert!(cli.parallel);
     assert!(cli.failfast);
+    assert_eq!(cli.concurrency.map(NonZeroUsize::get), Some(4));
     assert_eq!(cli.commands, Some(vec!["build".to_string()]));
+
+    assert!(Cli::try_parse_from(["octa", "--concurrency", "0", "build"]).is_err());
   }
 
   #[test]
@@ -725,6 +736,7 @@ tasks:
           octafile,
           fingerprint,
           summary: Arc::new(Summary::new()),
+          concurrency: None,
         },
         &commands,
         &options,
@@ -776,6 +788,7 @@ tasks:
         octafile,
         fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
         summary: Arc::new(Summary::new()),
+        concurrency: None,
       },
       &["build".to_string()],
       &options,
