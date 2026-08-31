@@ -514,6 +514,7 @@ impl TaskNode {
     dir: PathBuf,
     vars: HashMap<String, Value>,
     envs: HashMap<String, String>,
+    secret_vars: Vec<String>,
     silent: bool,
     cancel_token: CancellationToken,
   ) -> io::Result<(i32, String, String)> {
@@ -531,13 +532,24 @@ impl TaskNode {
     let result = async {
       // Start command execution with cancellation support
       let command_id = client
-        .execute(command.clone(), dry, args, dir, vars, envs, cancel_token.clone())
+        .execute_with_secrets(
+          command.clone(),
+          dry,
+          args,
+          dir,
+          vars,
+          envs,
+          secret_vars,
+          cancel_token.clone(),
+        )
         .await
         .map_err(io::Error::from)?;
 
       // Process output until command completes
       loop {
         match client.receive_output(&cancel_token).await {
+          // Stdout/stderr belong to the invoked command and remain unchanged; secret metadata
+          // protects Octa and plugin diagnostics, not user-controlled command output.
           Ok(Some(response)) => match response {
             PluginResponse::Stdout { id, line } if id == command_id => {
               if !silent {
@@ -729,6 +741,7 @@ impl TaskNode {
           dir.to_path_buf(),
           vars.to_hashmap(),
           envs.clone().into(),
+          vars.secret_names(),
           true,
           cancel_token.clone(),
         )
@@ -885,6 +898,7 @@ impl TaskNode {
         dir,
         vars_with_deps_results.to_hashmap(),
         envs.into(),
+        vars_with_deps_results.secret_names(),
         self.silent,
         cancel_token.clone(),
       )

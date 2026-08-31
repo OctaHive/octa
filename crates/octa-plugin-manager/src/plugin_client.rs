@@ -221,6 +221,7 @@ impl PluginClient {
   }
 
   #[allow(clippy::too_many_arguments)]
+  /// Executes a command without secret metadata for callers using the original client API.
   pub async fn execute(
     &mut self,
     params: String,
@@ -231,12 +232,31 @@ impl PluginClient {
     envs: HashMap<String, String>,
     cancel_token: CancellationToken,
   ) -> Result<String, PluginClientError> {
+    self
+      .execute_with_secrets(params, dry, args, dir, vars, envs, Vec::new(), cancel_token)
+      .await
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  /// Executes a command and tells the plugin SDK which variable values require log redaction.
+  pub async fn execute_with_secrets(
+    &mut self,
+    params: String,
+    dry: bool,
+    args: Vec<String>,
+    dir: PathBuf,
+    vars: HashMap<String, Value>,
+    envs: HashMap<String, String>,
+    secret_vars: Vec<String>,
+    cancel_token: CancellationToken,
+  ) -> Result<String, PluginClientError> {
     let cmd = OctaCommand::Execute {
       params,
       args,
       dir,
       envs,
       vars,
+      secret_vars,
       dry,
     };
 

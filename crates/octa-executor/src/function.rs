@@ -11,11 +11,17 @@ use std::os::windows::process::CommandExt;
 use tera::{Filter, Function, Result, Value};
 use tracing::{debug, info};
 
+use octa_plugin::logger::redact;
+
 /// Tera function and filter that evaluate a command in the context of their value layer.
 #[derive(Clone)]
 pub struct ExecuteShell {
   current_dir: PathBuf,
   environment: HashMap<String, String>,
+  // Resolved secrets inherited by the command and therefore safe to replace literally.
+  redactions: Vec<String>,
+  // A secret `sh` value hides the whole producer command, not just inherited values within it.
+  redact_commands: bool,
   dry: bool,
 }
 
@@ -24,16 +30,31 @@ impl ExecuteShell {
     Self {
       current_dir: current_dir.into(),
       environment,
+      redactions: Vec::new(),
+      redact_commands: false,
       dry,
     }
   }
 
+  /// Configures diagnostic redaction without changing the command or its environment.
+  fn with_redactions(mut self, redactions: Vec<String>, redact_commands: bool) -> Self {
+    self.redactions = redactions;
+    self.redact_commands = redact_commands;
+    self
+  }
+
   pub(crate) fn execute(&self, command_text: &str) -> Result<String> {
+    // Execution receives the original command; only diagnostic text uses this sanitized copy.
+    let logged_command = if self.redact_commands {
+      "*****".to_owned()
+    } else {
+      redact(command_text, &self.redactions)
+    };
     if self.dry {
       info!(
         "Execute command in directory {}: {}",
         self.current_dir.display(),
-        command_text
+        logged_command
       );
       return Ok(String::new());
     }
@@ -41,7 +62,7 @@ impl ExecuteShell {
     debug!(
       "Execute command in directory {}: {}",
       self.current_dir.display(),
-      command_text
+      logged_command
     );
 
     #[cfg(windows)]
@@ -75,23 +96,27 @@ impl ExecuteShell {
 
     let output = command
       .output()
-      .map_err(|error| tera::Error::msg(format!("Failed to execute command '{command_text}': {error}")))?;
+      .map_err(|error| tera::Error::msg(format!("Failed to execute command '{logged_command}': {error}")))?;
 
     if !output.status.success() {
       let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+      // A failed secret producer may print the newly obtained value before Octa can collect it.
+      let logged_stderr = if self.redact_commands {
+        "*****".to_owned()
+      } else {
+        redact(&stderr, &self.redactions)
+      };
       let status = output
         .status
         .code()
         .map_or_else(|| "signal".to_string(), |code| code.to_string());
       return Err(tera::Error::msg(format!(
-        "Shell command '{command_text}' failed with status {status}: {stderr}"
+        "Shell command '{logged_command}' failed with status {status}: {}",
+        logged_stderr
       )));
     }
 
-    let result = String::from_utf8_lossy(output.stdout.trim_ascii_end()).to_string();
-    debug!("Command output result: {:?}", result);
-
-    Ok(result)
+    Ok(String::from_utf8_lossy(output.stdout.trim_ascii_end()).to_string())
   }
 }
 
@@ -126,7 +151,20 @@ pub fn register_shell(
   environment: HashMap<String, String>,
   dry: bool,
 ) -> ExecuteShell {
-  let shell = ExecuteShell::new(current_dir.to_path_buf(), environment, dry);
+  register_shell_with_redactions(tera, current_dir, environment, dry, Vec::new(), false)
+}
+
+/// Registers shell template helpers while redacting inherited secret values from diagnostics.
+pub fn register_shell_with_redactions(
+  tera: &mut tera::Tera,
+  current_dir: &Path,
+  environment: HashMap<String, String>,
+  dry: bool,
+  redactions: Vec<String>,
+  redact_commands: bool,
+) -> ExecuteShell {
+  let shell =
+    ExecuteShell::new(current_dir.to_path_buf(), environment, dry).with_redactions(redactions, redact_commands);
   tera.register_function("shell", shell.clone());
   tera.register_filter("shell", shell.clone());
   shell

@@ -7,7 +7,7 @@ use interprocess::local_socket::{
   tokio::{prelude::*, Stream},
   ListenerOptions,
 };
-use logger::{Logger, LoggerSystem};
+use logger::{collect_value_redactions, redact, Logger, LoggerSystem, RedactingLogger};
 use serde_json::{Map, Value};
 use socket::interpret_local_socket_name;
 use tokio::io::{AsyncWrite, ReadHalf};
@@ -124,11 +124,18 @@ where
       dir,
       envs,
       vars,
+      secret_vars,
       dry,
     } => {
       let id = Uuid::new_v4().to_string();
+      // Pass values rather than names to the logger because plugin diagnostics contain rendered data.
+      let mut redactions = Vec::new();
+      for value in secret_vars.iter().filter_map(|name| vars.get(name)) {
+        collect_value_redactions(value, &mut redactions);
+      }
+      let command_logger = Arc::new(RedactingLogger::new(logger.clone(), redactions.clone()));
 
-      logger.log(&format!("Received execute command {:?}", params))?;
+      command_logger.log(&format!("Received execute command {:?}", params))?;
 
       {
         // Send started response
@@ -136,13 +143,13 @@ where
         let start_json = serde_json::to_string(&start_response)? + "\n";
         writer.lock().await.write_all(start_json.as_bytes()).await?;
 
-        logger.log(&format!("Send Start command for command id '{}'", id))?;
+        command_logger.log(&format!("Send Start command for command id '{}'", id))?;
       }
 
       // Clone what we need to move into the spawn
       let writer_clone = Arc::clone(&writer);
       let command_id = id.clone();
-      let command_logger = logger.clone();
+      let command_logger = command_logger.clone();
 
       // Spawn the command execution
       // Every command gets a child token so it can be stopped without shutting down the plugin.
@@ -164,9 +171,10 @@ where
           )
           .await
         {
+          // Plugin errors bypass the logger, so sanitize the protocol response explicitly.
           let error = PluginResponse::Error {
             id: command_id,
-            message: format!("Command execution error: {}", e),
+            message: redact(&format!("Command execution error: {}", e), &redactions),
           };
           if let Ok(json) = serde_json::to_string(&error) {
             let error_json = json + "\n";
@@ -653,6 +661,7 @@ mod tests {
         map
       },
       vars: HashMap::new(),
+      secret_vars: Vec::new(),
       dry: false,
     };
 
@@ -742,6 +751,7 @@ mod tests {
         dir: PathBuf::from("."),
         envs: HashMap::new(),
         vars: HashMap::new(),
+        secret_vars: Vec::new(),
         dry: false,
       },
       writer.clone(),
@@ -790,6 +800,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      secret_vars: Vec::new(),
       dry: false,
     };
 
@@ -840,6 +851,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      secret_vars: Vec::new(),
       dry: false,
     };
 
@@ -894,6 +906,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      secret_vars: Vec::new(),
       dry: false,
     };
 
@@ -994,6 +1007,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      secret_vars: Vec::new(),
       dry: false,
     };
 
@@ -1047,6 +1061,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs,
       vars: HashMap::new(),
+      secret_vars: Vec::new(),
       dry: false,
     };
 
@@ -1096,6 +1111,7 @@ mod tests {
       dir: PathBuf::from("."),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      secret_vars: Vec::new(),
       dry: false,
     };
 
@@ -1160,6 +1176,7 @@ mod tests {
         dir: PathBuf::from("."),
         envs: HashMap::new(),
         vars: HashMap::new(),
+        secret_vars: Vec::new(),
         dry: false,
       };
 
@@ -1285,6 +1302,7 @@ mod tests {
       dir: PathBuf::from("/test/dir"),
       envs: HashMap::new(),
       vars: HashMap::new(),
+      secret_vars: Vec::new(),
       dry: false,
     };
     let cmd_json = serde_json::to_string(&cmd_command).unwrap() + "\n";

@@ -896,7 +896,7 @@ impl TaskGraphBuilder {
     self.process_hierarchy_vars(cmd, &mut vars);
     vars = self.add_task_vars(cmd, vars);
     if let Some(exec_vars) = execute_vars {
-      vars.extend_with(&Some(exec_vars));
+      vars.extend_variables(exec_vars);
     }
 
     vars.extend_with(&env_vars);
@@ -905,12 +905,11 @@ impl TaskGraphBuilder {
   }
 
   fn initialize_global_vars(&self, cmd: &FindResult) -> Vars {
-    let mut vars = Vars::new();
     let os_type = whoami::platform();
     let os_arch = whoami::cpu_arch();
     let root = cmd.octafile.root();
 
-    vars.set_value(root.vars.clone());
+    let mut vars = root.vars.clone().map(Vars::with_variables).unwrap_or_default();
     vars.set_dir(root.dir.clone());
 
     vars.insert("ROOT_DIR", &root.dir.display().to_string());
@@ -938,7 +937,9 @@ impl TaskGraphBuilder {
         Some(nested_octafile) => {
           let mut new_vars = Vars::new();
           new_vars.set_parent(Some(vars.clone()));
-          new_vars.set_value(nested_octafile.vars.clone());
+          if let Some(nested_vars) = nested_octafile.vars.clone() {
+            new_vars.set_variables(nested_vars);
+          }
           new_vars.set_dir(nested_octafile.dir.clone());
           new_vars.insert("TASKFILE_DIR", &current.dir.display().to_string());
 
@@ -958,9 +959,7 @@ impl TaskGraphBuilder {
     // Add variables from current task
     match cmd.task.vars.clone() {
       Some(task_vars) => {
-        let mut new_vars = Vars::new();
-        new_vars.set_parent(Some(vars));
-        new_vars.set_value(task_vars);
+        let mut new_vars = Vars::with_variables_and_parent(task_vars, vars);
         new_vars.set_dir(self.variable_working_dir(cmd));
 
         new_vars

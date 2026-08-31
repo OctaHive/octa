@@ -402,6 +402,8 @@ vars:
   STR: "Hello World"
   NUM: 1
   FLOAT: 1.35
+  GREETING: Hello
+  MESSAGE: "{{ GREETING }} World"
   OBJ:
     val: 1
   ARR: ["A", "B", "C"]
@@ -428,6 +430,26 @@ You can use different data types as values. The following data types are support
 * array
 * object
 
+Variables in the same `vars` mapping are expanded in declaration order, so a value can reference
+values declared before it. Forward references are rejected because the referenced value has not
+been resolved yet.
+
+Mark a literal or shell-backed variable as secret to replace its resolved value with `*****` in
+Octa diagnostics and logs produced by plugins built with the current plugin SDK:
+
+```yaml
+vars:
+  API_TOKEN:
+    value: "development-token"
+    secret: true
+  VAULT_TOKEN:
+    sh: vault read -field=token secret/application
+    secret: true
+```
+
+Secret values remain available to templates and commands. Output produced by the command itself is
+not redacted, and a variable derived from a secret must be marked as secret separately.
+
 When evaluating variables for a task, Octa will search for them along the entire execution path 
 in the following order:
 
@@ -446,13 +468,13 @@ vars:
 tasks:
   print-var:
     cmds:
-      - echo "{{.VAR}}"
+      - echo "{{ VAR }}"
     vars:
       VAR: Hello!
       
   greet:
     cmds:
-      - echo "{{.GREETING}}"
+      - echo "{{ GREETING }}"
 ```
 
 The option to pass a parameter when invoking octa:

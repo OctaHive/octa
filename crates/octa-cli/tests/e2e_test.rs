@@ -797,6 +797,41 @@ fn test_task_args() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_ordered_and_secret_variables() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+vars:
+  PREFIX: release
+  VERSION: "{{ PREFIX }}-1"
+  TOKEN:
+    value: "{{ VERSION }}-token"
+    secret: true
+
+tasks:
+  print:
+    shell: echo {{ TOKEN }}
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd
+    .current_dir(tmp_dir.path())
+    .args(["print"])
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("release-1-token"));
+
+  Ok(())
+}
+
+#[test]
 fn test_file_option() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");

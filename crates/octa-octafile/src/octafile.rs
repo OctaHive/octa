@@ -9,6 +9,7 @@ use std::{
   time::Duration,
 };
 
+use indexmap::IndexMap;
 use serde::{de::DeserializeSeed, Deserialize, Deserializer, Serialize};
 use serde_yml::Value;
 use tera::{Context as TeraContext, Tera};
@@ -19,6 +20,7 @@ use crate::{
   include::IncludeInfo,
   parser::{self, location_error, Node},
   task::{AllowedRun, Context, PluginCommand, PluginSchemas, Task, TaskSeed},
+  variable::Variable,
 };
 
 const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
@@ -32,7 +34,8 @@ const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
   "octafile.lock.yaml",
 ];
 
-pub type Vars = HashMap<String, Value>;
+/// Variables retain YAML declaration order so a value can reference variables declared before it.
+pub type Vars = IndexMap<String, Variable>;
 pub type Envs = HashMap<String, EnvValue>;
 
 /// A literal environment value or a command that produces it.
@@ -572,7 +575,15 @@ impl Octafile {
   /// Resolves an include template before filesystem lookup using Go-compatible platform names.
   fn render_include_path(octafile: &Octafile, path: &str) -> OctafileResult<String> {
     let mut template_context = match &octafile.vars {
-      Some(vars) => TeraContext::from_serialize(vars),
+      Some(vars) => {
+        // Secret values must not become filesystem paths, which are exposed by diagnostics and IO errors.
+        let values: IndexMap<_, _> = vars
+          .iter()
+          .filter(|(_, variable)| !variable.is_secret())
+          .map(|(key, variable)| (key, variable.template_value()))
+          .collect();
+        TeraContext::from_serialize(values)
+      },
       None => Ok(TeraContext::new()),
     }
     .map_err(|error| OctafileError::IncludeTemplateError(path.to_owned(), error.to_string()))?;
@@ -1029,6 +1040,27 @@ tasks:
     let error = Octafile::load(Some(file_path), false, vec!["shell".to_string()], "shell").unwrap_err();
 
     assert!(matches!(error, OctafileError::IncludeTemplateError(_, _)));
+  }
+
+  #[test]
+  fn does_not_expose_secret_variables_to_include_templates() {
+    let content = r#"
+      version: 1
+      vars:
+        TOKEN:
+          value: private-path
+          secret: true
+      includes:
+        private: Taskfile_{{TOKEN}}.yml
+      tasks: {}
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "secret_include_template");
+
+    let error = Octafile::load(Some(file_path), false, vec!["shell".to_string()], "shell").unwrap_err();
+    let message = error.to_string();
+
+    assert!(matches!(error, OctafileError::IncludeTemplateError(_, _)));
+    assert!(!message.contains("private-path"));
   }
 
   #[test]
@@ -2177,6 +2209,53 @@ tasks:
     assert!(octafile.includes.is_none());
     assert!(octafile.vars.is_none());
     assert!(octafile.env.is_none());
+  }
+
+  #[test]
+  fn parses_ordered_and_secret_variables() {
+    let vars: Vars = serde_yml::from_str(
+      r#"
+      FIRST: value
+      TOKEN:
+        value: secret-value
+        secret: true
+      DYNAMIC:
+        sh: echo dynamic
+        secret: true
+      "#,
+    )
+    .unwrap();
+
+    assert_eq!(
+      vars.keys().map(String::as_str).collect::<Vec<_>>(),
+      ["FIRST", "TOKEN", "DYNAMIC"]
+    );
+    assert!(vars["TOKEN"].is_secret());
+    assert!(!format!("{:?}", vars["TOKEN"]).contains("secret-value"));
+    assert_eq!(
+      vars["TOKEN"].clone().into_value(),
+      serde_json::Value::String("secret-value".to_owned())
+    );
+    assert!(vars["DYNAMIC"].is_secret());
+    assert_eq!(
+      vars["DYNAMIC"].clone().into_value(),
+      serde_json::json!({ "sh": "echo dynamic" })
+    );
+
+    let serialized = serde_yml::to_string(&vars).unwrap();
+    assert_eq!(serde_yml::from_str::<Vars>(&serialized).unwrap(), vars);
+  }
+
+  #[test]
+  fn rejects_invalid_secret_variables_during_parsing() {
+    for definition in [
+      "value: hidden\n    sh: echo hidden\n    secret: true",
+      "value: hidden\n    secret: yes",
+      "value: hidden\n    secret: true\n    unknown: value",
+    ] {
+      let yaml = format!("TOKEN:\n    {definition}\n");
+      assert!(serde_yml::from_str::<Vars>(&yaml).is_err(), "accepted {definition}");
+    }
   }
 
   #[test]

@@ -22,6 +22,62 @@ pub trait Logger: Send + Sync + Any + 'static {
   fn as_any(&self) -> &dyn Any;
 }
 
+/// Replaces resolved secret values before a plugin writes diagnostic messages.
+pub fn redact(message: &str, secrets: &[String]) -> String {
+  let mut secrets: Vec<&str> = secrets
+    .iter()
+    .map(String::as_str)
+    .filter(|secret| !secret.is_empty())
+    .collect();
+  // Replace longer values first so an overlapping prefix cannot leave a secret suffix behind.
+  secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+  secrets
+    .into_iter()
+    .fold(message.to_owned(), |message, secret| message.replace(secret, "*****"))
+}
+
+/// Collects scalar leaves because templates can expose individual fields of a structured secret.
+pub fn collect_value_redactions(value: &serde_json::Value, redactions: &mut Vec<String>) {
+  match value {
+    serde_json::Value::String(value) if !value.is_empty() => redactions.push(value.clone()),
+    serde_json::Value::String(_) | serde_json::Value::Null => {},
+    serde_json::Value::Bool(_) | serde_json::Value::Number(_) => redactions.push(value.to_string()),
+    serde_json::Value::Array(values) => {
+      for value in values {
+        collect_value_redactions(value, redactions);
+      }
+    },
+    serde_json::Value::Object(values) => {
+      for value in values.values() {
+        collect_value_redactions(value, redactions);
+      }
+    },
+  }
+}
+
+/// Logger adapter that removes resolved secret values before delegating a message.
+pub struct RedactingLogger<L> {
+  logger: Arc<L>,
+  secrets: Vec<String>,
+}
+
+impl<L> RedactingLogger<L> {
+  /// Wraps a logger with the scalar secret values that must be replaced.
+  pub fn new(logger: Arc<L>, secrets: Vec<String>) -> Self {
+    Self { logger, secrets }
+  }
+}
+
+impl<L: Logger> Logger for RedactingLogger<L> {
+  fn log(&self, message: &str) -> anyhow::Result<()> {
+    self.logger.log(&redact(message, &self.secrets))
+  }
+
+  fn as_any(&self) -> &dyn Any {
+    self
+  }
+}
+
 pub enum LogMessage {
   Normal { timestamp: String, message: String },
   Shutdown,
@@ -201,6 +257,40 @@ mod tests {
   use super::*;
   use std::{fs, time::Duration};
   use tempfile::tempdir;
+
+  #[test]
+  fn redacts_longest_secret_values_first() {
+    let message = redact(
+      "token-123 token",
+      &["token".to_owned(), "token-123".to_owned(), String::new()],
+    );
+
+    assert_eq!(message, "***** *****");
+  }
+
+  #[test]
+  fn collects_redactions_from_structured_values() {
+    let mut redactions = Vec::new();
+
+    collect_value_redactions(
+      &serde_json::json!({ "token": "private", "nested": [42, true, null] }),
+      &mut redactions,
+    );
+    redactions.sort();
+
+    assert_eq!(redactions, vec!["42", "private", "true"]);
+  }
+
+  #[tokio::test]
+  async fn redacting_logger_masks_messages() {
+    let logger = Arc::new(MockLogger::new());
+    let redacting = RedactingLogger::new(logger.clone(), vec!["private-value".to_owned()]);
+
+    redacting.log("using private-value").unwrap();
+    tokio::task::yield_now().await;
+
+    assert_eq!(logger.get_messages().await, vec!["using *****"]);
+  }
 
   #[test]
   fn test_logger_with_file() -> io::Result<()> {

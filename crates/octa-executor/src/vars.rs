@@ -1,37 +1,50 @@
 use std::{
-  collections::HashMap,
+  collections::{HashMap, HashSet},
   env,
-  fmt::{Display, Formatter},
+  fmt::{Debug, Display, Formatter},
   path::PathBuf,
   sync::Arc,
 };
 
+use indexmap::IndexMap;
 use lazy_static::lazy_static;
+use octa_octafile::Vars as OctafileVars;
+use octa_plugin::logger::collect_value_redactions;
 use regex::Regex;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::Serialize;
 use tera::{Context, Tera, Value};
 use tracing::debug;
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
-  function::{format_tera_error, register_shell, ExecuteShell},
+  function::{format_tera_error, register_shell_with_redactions, ExecuteShell},
 };
 
 lazy_static! {
   static ref TEMPLATE_REGEX: Regex = Regex::new(r"\{\{\s*[^{}]+\s*\}\}").unwrap();
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Vars {
-  context: Context,          // Tera context for current variables
+  // IndexMap is required because same-level references follow Octafile declaration order.
+  values: IndexMap<String, Value>,
+  // Sensitivity is runtime metadata and must stay separate from values passed to Tera/plugins.
+  secrets: HashSet<String>,
   parent: Option<Arc<Vars>>, // Link to parent variables
   dir: Option<PathBuf>,      // Directory used by shell-backed values in this context
   expanded: bool,            // Indicates that all inherited values have been expanded
 }
 
+/// One inherited variable scope together with its execution context.
+struct VariableLayer {
+  values: IndexMap<String, Value>,
+  secrets: HashSet<String>,
+  dir: Option<PathBuf>,
+}
+
 impl PartialEq for Vars {
   fn eq(&self, other: &Self) -> bool {
-    self.context == other.context
+    self.values == other.values && self.secrets == other.secrets
   }
 }
 
@@ -40,7 +53,8 @@ impl Eq for Vars {}
 impl Vars {
   pub fn new() -> Self {
     Self {
-      context: Context::default(),
+      values: IndexMap::new(),
+      secrets: HashSet::new(),
       parent: None,
       dir: None,
       expanded: false,
@@ -49,7 +63,8 @@ impl Vars {
 
   pub fn with_parent(parent: Vars) -> Self {
     Self {
-      context: Context::default(),
+      values: IndexMap::new(),
+      secrets: HashSet::new(),
       parent: Some(Arc::new(parent)),
       dir: None,
       expanded: false,
@@ -68,9 +83,29 @@ impl Vars {
     vars
   }
 
+  pub(crate) fn with_variables(value: OctafileVars) -> Self {
+    let mut vars = Self::default();
+    vars.set_variables(value);
+    vars
+  }
+
+  pub(crate) fn with_variables_and_parent(value: OctafileVars, parent: Vars) -> Self {
+    let mut vars = Self::with_parent(parent);
+    vars.set_variables(value);
+    vars
+  }
+
   pub fn set_value<T: Serialize>(&mut self, value: T) {
-    self.context = Context::from_serialize(&value).unwrap_or_default();
+    // Generic runtime values carry no sensitivity metadata and therefore replace secrets as public values.
+    self.values = serialized_values(&value);
+    self.secrets.clear();
     self.expanded = false;
+  }
+
+  pub(crate) fn set_variables(&mut self, variables: OctafileVars) {
+    self.values.clear();
+    self.secrets.clear();
+    self.extend_variables(variables);
   }
 
   pub fn set_parent(&mut self, parent: Option<Vars>) {
@@ -85,29 +120,54 @@ impl Vars {
   }
 
   pub fn insert<T: Serialize + ?Sized>(&mut self, key: &str, value: &T) {
-    self.context.insert(key, value);
+    if let Ok(value) = serde_json::to_value(value) {
+      self.values.insert(key.to_owned(), value);
+      self.secrets.remove(key);
+    }
     self.expanded = false;
   }
 
   pub fn get(&self, key: &str) -> Option<&Value> {
-    self.context.get(key)
+    self.values.get(key)
   }
 
   pub fn extend(&mut self, source: Context) {
-    self.context.extend(source);
+    // A Tera context cannot express sensitivity, so an override removes any previous secret marker.
+    if let Some(values) = source.into_json().as_object() {
+      for (key, value) in values {
+        self.values.insert(key.clone(), value.clone());
+        self.secrets.remove(key);
+      }
+    }
     self.expanded = false;
   }
 
   pub fn extend_with<T: Serialize>(&mut self, value: &T) {
-    if let Ok(context) = Context::from_serialize(value) {
-      self.extend(context);
-      self.expanded = false;
+    // Generic execution overrides are ordinary values unless they came through typed Octafile variables.
+    for (key, value) in serialized_values(value) {
+      self.values.insert(key.clone(), value);
+      self.secrets.remove(&key);
     }
+    self.expanded = false;
   }
 
-  pub fn iter(&self) -> VarsIter {
-    let map = self.to_hashmap();
-    VarsIter::new(map)
+  pub(crate) fn extend_variables(&mut self, variables: OctafileVars) {
+    // Consume the typed parser representation directly so secret metadata is not lost in Serde.
+    for (key, variable) in variables {
+      let secret = variable.is_secret();
+      let value = variable.into_value();
+      self.values.insert(key.clone(), value);
+      if secret {
+        self.secrets.insert(key);
+      } else {
+        self.secrets.remove(&key);
+      }
+    }
+    self.expanded = false;
+  }
+
+  pub fn iter(&self) -> impl Iterator<Item = (String, Value)> + '_ {
+    self.values.iter().map(|(key, value)| (key.clone(), value.clone()))
   }
 
   pub async fn expand(&mut self, dry: bool) -> ExecutorResult<()> {
@@ -118,19 +178,26 @@ impl Vars {
     }
 
     let contexts = self.collect_context_chain();
-    let processed_context = self.process_context_chain(contexts, &mut tera, dry).await?;
-    self.context = processed_context;
+    let (values, secrets) = self.process_context_chain(contexts, &mut tera, dry).await?;
+    self.values = values;
+    self.secrets = secrets;
+    // Expansion flattens the hierarchy, so retaining parents would process them a second time.
+    self.parent = None;
     self.expanded = true;
 
     Ok(())
   }
 
-  fn collect_context_chain(&self) -> Vec<(Context, Option<PathBuf>)> {
+  fn collect_context_chain(&self) -> Vec<VariableLayer> {
     let mut contexts = Vec::new();
     let mut current = Some(self);
 
     while let Some(vars) = current {
-      contexts.push((vars.context.clone(), vars.dir.clone()));
+      contexts.push(VariableLayer {
+        values: vars.values.clone(),
+        secrets: vars.secrets.clone(),
+        dir: vars.dir.clone(),
+      });
       current = vars.parent.as_ref().map(|p| p.as_ref());
     }
 
@@ -139,49 +206,49 @@ impl Vars {
 
   async fn process_context_chain(
     &self,
-    contexts: Vec<(Context, Option<PathBuf>)>,
+    contexts: Vec<VariableLayer>,
     tera: &mut Tera,
     dry: bool,
-  ) -> ExecutorResult<Context> {
-    let mut accumulated = Context::new();
+  ) -> ExecutorResult<(IndexMap<String, Value>, HashSet<String>)> {
+    let mut accumulated = IndexMap::new();
+    let mut secrets = HashSet::new();
 
-    // Re-register `shell()` for each layer because included Octafiles resolve commands from
-    // their own directories and can only consume variables inherited from parent layers.
-    for (context, dir) in contexts {
+    // Each value is added immediately after expansion. This preserves YAML declaration order
+    // and makes earlier values in the same `vars` mapping available to later ones.
+    for layer in contexts {
+      let VariableLayer {
+        values,
+        secrets: layer_secrets,
+        dir,
+      } = layer;
       let current_dir = match dir {
         Some(dir) => dir,
         None => env::current_dir()?,
       };
-      let environment = context_as_environment(&accumulated);
-      let shell = register_shell(tera, &current_dir, environment, dry);
-      let processed = self.process_single_context(context, &accumulated, tera, &shell).await?;
-      accumulated.extend(processed);
+
+      for (key, value) in values {
+        let secret = layer_secrets.contains(&key);
+        let template_context = Context::from_serialize(&accumulated).map_err(|error| {
+          ExecutorError::VariableExpandError(key.clone(), format!("failed to build template context: {error}"))
+        })?;
+        let environment = values_as_environment(&accumulated);
+        let redactions = secret_values(&accumulated, &secrets);
+        // Secret producers hide their complete command; other producers redact inherited secrets.
+        let shell = register_shell_with_redactions(tera, &current_dir, environment, dry, redactions, secret);
+        let processed = self
+          .process_template_value(&key, &value, &template_context, tera, &shell, secret)
+          .await?;
+
+        accumulated.insert(key.clone(), processed);
+        if secret {
+          secrets.insert(key);
+        } else {
+          secrets.remove(&key);
+        }
+      }
     }
 
-    Ok(accumulated)
-  }
-
-  async fn process_single_context(
-    &self,
-    context: Context,
-    parent: &Context,
-    tera: &mut Tera,
-    shell: &ExecuteShell,
-  ) -> ExecutorResult<Context> {
-    let mut processed = Context::new();
-    let vars = Vars {
-      context,
-      parent: None,
-      dir: None,
-      expanded: false,
-    };
-
-    for (key, value) in vars.iter() {
-      let processed_value = self.process_template_value(&key, &value, parent, tera, shell).await?;
-      processed.insert(&key, &processed_value);
-    }
-
-    Ok(processed)
+    Ok((accumulated, secrets))
   }
 
   async fn process_template_value(
@@ -191,16 +258,21 @@ impl Vars {
     context: &Context,
     tera: &mut Tera,
     shell: &ExecuteShell,
+    secret: bool,
   ) -> ExecutorResult<Value> {
     if let Some(command) = shell_command(value) {
       let command = tera
         .render_str(command, context)
-        .map_err(|error| ExecutorError::VariableExpandError(command.to_owned(), format_tera_error(&error)))?;
-      debug!("Processing shell-backed variable '{}': '{}'", key, command);
+        .map_err(|error| variable_error(key, format_tera_error(&error), secret))?;
+      if secret {
+        debug!("Processing secret shell-backed variable '{}'", key);
+      } else {
+        debug!("Processing shell-backed variable '{}': '{}'", key, command);
+      }
       return shell
         .execute(&command)
         .map(Value::String)
-        .map_err(|error| ExecutorError::VariableExpandError(command, format_tera_error(&error)));
+        .map_err(|error| variable_error(key, format_tera_error(&error), secret));
     }
 
     let val = match value {
@@ -212,10 +284,14 @@ impl Vars {
       return Ok(value.clone());
     }
 
-    debug!("Processing template variable '{}' with value: '{}'", key, val);
+    if secret {
+      debug!("Processing secret template variable '{}'", key);
+    } else {
+      debug!("Processing template variable '{}' with value: '{}'", key, val);
+    }
     let res = tera
       .render_str(&val, context)
-      .map_err(|error| ExecutorError::VariableExpandError(val, format_tera_error(&error)))?;
+      .map_err(|error| variable_error(key, format_tera_error(&error), secret))?;
     let res = res.trim_matches('"').to_owned(); // remove extra quotes in value
 
     let val = match serde_json::from_str(&res) {
@@ -232,25 +308,26 @@ impl Vars {
 
   pub fn to_hashmap(&self) -> HashMap<String, Value> {
     self
-      .context
-      .clone()
-      .into_json()
-      .as_object()
-      .map(|map| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-      .unwrap_or_default()
+      .values
+      .iter()
+      .map(|(key, value)| (key.clone(), value.clone()))
+      .collect()
   }
 
   /// Returns the hierarchy as one map, with child values overriding parent values.
   pub(crate) fn to_merged_hashmap(&self) -> HashMap<String, Value> {
     let mut result = HashMap::new();
 
-    for (context, _) in self.collect_context_chain() {
-      if let Some(values) = context.into_json().as_object() {
-        result.extend(values.iter().map(|(key, value)| (key.clone(), value.clone())));
-      }
+    for layer in self.collect_context_chain() {
+      result.extend(layer.values);
     }
 
     result
+  }
+
+  /// Names of values that plugins must redact from their diagnostic logs.
+  pub(crate) fn secret_names(&self) -> Vec<String> {
+    self.secrets.iter().cloned().collect()
   }
 }
 
@@ -259,20 +336,42 @@ fn shell_command(value: &Value) -> Option<&str> {
   (object.len() == 1).then(|| object.get("sh")?.as_str()).flatten()
 }
 
-fn context_as_environment(context: &Context) -> HashMap<String, String> {
+fn values_as_environment(values: &IndexMap<String, Value>) -> HashMap<String, String> {
   // Only scalar values have an unambiguous representation in a process environment.
-  context
-    .clone()
-    .into_json()
-    .as_object()
-    .into_iter()
-    .flatten()
+  values
+    .iter()
     .filter_map(|(key, value)| match value {
       Value::String(value) => Some((key.clone(), value.clone())),
       Value::Bool(_) | Value::Number(_) => Some((key.clone(), value.to_string())),
       _ => None,
     })
     .collect()
+}
+
+/// Converts arbitrary runtime mappings without a JSON text serialization round-trip.
+fn serialized_values<T: Serialize + ?Sized>(value: &T) -> IndexMap<String, Value> {
+  match serde_json::to_value(value) {
+    Ok(Value::Object(values)) => values.into_iter().collect(),
+    _ => IndexMap::new(),
+  }
+}
+
+fn variable_error(key: &str, message: String, secret: bool) -> ExecutorError {
+  if secret {
+    // Parser or shell errors may embed the literal value or producer command in their source chain.
+    ExecutorError::VariableExpandError(key.to_owned(), "failed to expand secret variable".to_owned())
+  } else {
+    ExecutorError::VariableExpandError(key.to_owned(), message)
+  }
+}
+
+/// Collects resolved values whose names are marked secret in the current flattened scope.
+fn secret_values(values: &IndexMap<String, Value>, secrets: &HashSet<String>) -> Vec<String> {
+  let mut redactions = Vec::new();
+  for value in secrets.iter().filter_map(|key| values.get(key)) {
+    collect_value_redactions(value, &mut redactions);
+  }
+  redactions
 }
 
 impl Display for Vars {
@@ -282,16 +381,51 @@ impl Display for Vars {
       if i > 0 {
         writeln!(f, ",")?;
       }
-      write!(f, "  \"{}\": {}", key, value)?;
+      if self.secrets.contains(&key) {
+        write!(f, "  \"{}\": \"*****\"", key)?;
+      } else {
+        write!(f, "  \"{}\": {}", key, value)?;
+      }
     }
     writeln!(f, "\n]")
+  }
+}
+
+// A derived implementation would recursively expose secret values from this scope and its parents.
+impl Debug for Vars {
+  fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    let values: IndexMap<_, _> = self
+      .values
+      .iter()
+      .map(|(key, value)| {
+        let value = if self.secrets.contains(key) {
+          Value::String("*****".to_owned())
+        } else {
+          value.clone()
+        };
+        (key.clone(), value)
+      })
+      .collect();
+
+    f.debug_struct("Vars")
+      .field("values", &values)
+      .field("parent", &self.parent)
+      .field("dir", &self.dir)
+      .field("expanded", &self.expanded)
+      .finish()
   }
 }
 
 impl From<Context> for Vars {
   fn from(context: Context) -> Self {
     Self {
-      context,
+      values: context
+        .into_json()
+        .as_object()
+        .map(|values| values.iter().map(|(key, value)| (key.clone(), value.clone())).collect())
+        .unwrap_or_default(),
+      // Tera Context contains values only and cannot carry secret metadata.
+      secrets: HashSet::new(),
       parent: None,
       dir: None,
       expanded: false,
@@ -301,52 +435,7 @@ impl From<Context> for Vars {
 
 impl From<Vars> for Context {
   fn from(vars: Vars) -> Self {
-    vars.context
-  }
-}
-
-impl Serialize for Vars {
-  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  where
-    S: Serializer,
-  {
-    self.context.clone().into_json().serialize(serializer)
-  }
-}
-
-impl<'de> Deserialize<'de> for Vars {
-  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: Deserializer<'de>,
-  {
-    let map = HashMap::<String, Value>::deserialize(deserializer)?;
-    let mut vars = Vars::new();
-    vars.context = Context::from_serialize(&map).unwrap_or_default();
-    Ok(vars)
-  }
-}
-
-pub struct VarsIter {
-  map: HashMap<String, Value>,
-  keys: Vec<String>,
-  position: usize,
-}
-
-impl VarsIter {
-  fn new(map: HashMap<String, Value>) -> Self {
-    let keys: Vec<String> = map.keys().cloned().collect();
-    Self { map, keys, position: 0 }
-  }
-}
-
-impl Iterator for VarsIter {
-  type Item = (String, Value);
-
-  fn next(&mut self) -> Option<Self::Item> {
-    self.keys.get(self.position).map(|key| {
-      self.position += 1;
-      (key.clone(), self.map.get(key).unwrap().clone())
-    })
+    Context::from_serialize(vars.values).unwrap_or_default()
   }
 }
 
@@ -363,7 +452,7 @@ mod tests {
     let vars = Vars::new();
     assert!(vars.parent.is_none());
     assert!(!vars.expanded);
-    assert_eq!(vars.context, Context::new());
+    assert!(vars.values.is_empty());
   }
 
   #[test]
@@ -444,19 +533,6 @@ mod tests {
   }
 
   #[test]
-  fn test_serialize_deserialize() {
-    let original = Vars::with_value(json!({
-      "key": "value",
-      "number": 42
-    }));
-
-    let serialized = serde_json::to_string(&original).unwrap();
-    let deserialized: Vars = serde_json::from_str(&serialized).unwrap();
-
-    assert_eq!(original, deserialized);
-  }
-
-  #[test]
   fn test_display() {
     let vars = Vars::with_value(json!({
       "key": "value",
@@ -515,6 +591,132 @@ mod tests {
 
     vars.expand(true).await.unwrap();
     assert_eq!(vars.get("full").unwrap(), &Value::String("John Doe".to_string()));
+  }
+
+  #[tokio::test]
+  async fn expands_variables_in_declaration_order() {
+    let values: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      GREETING: Hello
+      TARGET: World
+      MESSAGE: "{{ GREETING }} {{ TARGET }}"
+      COMPLETE: "{{ MESSAGE }}!"
+      "#,
+    )
+    .unwrap();
+    let mut vars = Vars::with_variables(values);
+
+    vars.expand(true).await.unwrap();
+
+    assert_eq!(vars.get("MESSAGE"), Some(&Value::String("Hello World".to_owned())));
+    assert_eq!(vars.get("COMPLETE"), Some(&Value::String("Hello World!".to_owned())));
+  }
+
+  #[tokio::test]
+  async fn rejects_forward_references_in_the_same_layer() {
+    let values: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      MESSAGE: "{{ TARGET }}"
+      TARGET: World
+      "#,
+    )
+    .unwrap();
+    let mut vars = Vars::with_variables(values);
+
+    assert!(vars.expand(true).await.is_err());
+  }
+
+  #[tokio::test]
+  async fn expands_and_redacts_secret_variables() {
+    let values: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      PREFIX: token
+      API_KEY:
+        value: "{{ PREFIX }}-123"
+        secret: true
+      "#,
+    )
+    .unwrap();
+    let mut vars = Vars::with_variables(values);
+
+    assert!(!format!("{vars:?}").contains("token-123"));
+
+    vars.expand(true).await.unwrap();
+
+    assert_eq!(vars.get("API_KEY"), Some(&Value::String("token-123".to_owned())));
+    assert_eq!(vars.secret_names(), vec!["API_KEY"]);
+    assert!(!format!("{vars}").contains("token-123"));
+    assert!(!format!("{vars:?}").contains("token-123"));
+    assert!(format!("{vars}").contains("*****"));
+  }
+
+  #[tokio::test]
+  async fn expands_secret_shell_variables() {
+    let temp_dir = TempDir::new().unwrap();
+    fs::write(temp_dir.path().join("token.txt"), "shell-secret").unwrap();
+    #[cfg(windows)]
+    let command = "type token.txt";
+    #[cfg(not(windows))]
+    let command = "cat token.txt";
+    let values: octa_octafile::Vars = serde_yml::from_str(&format!(
+      "TOKEN:\n  sh: {command}\n  secret: true\nDISPLAY: '{{{{ TOKEN }}}}'\n"
+    ))
+    .unwrap();
+    let mut vars = Vars::with_variables(values);
+    vars.set_dir(temp_dir.path());
+
+    vars.expand(false).await.unwrap();
+
+    assert_eq!(vars.get("TOKEN"), Some(&Value::String("shell-secret".to_owned())));
+    assert_eq!(vars.get("DISPLAY"), Some(&Value::String("shell-secret".to_owned())));
+    assert_eq!(vars.secret_names(), vec!["TOKEN"]);
+  }
+
+  #[tokio::test]
+  async fn non_secret_override_removes_secret_metadata() {
+    let parent_values: octa_octafile::Vars = serde_yml::from_str("TOKEN:\n  value: hidden\n  secret: true\n").unwrap();
+    let child_values: octa_octafile::Vars = serde_yml::from_str("TOKEN: visible\n").unwrap();
+    let parent = Vars::with_variables(parent_values);
+    let mut vars = Vars::with_variables_and_parent(child_values, parent);
+
+    vars.expand(true).await.unwrap();
+
+    assert_eq!(vars.get("TOKEN"), Some(&Value::String("visible".to_owned())));
+    assert!(vars.secret_names().is_empty());
+  }
+
+  #[tokio::test]
+  async fn secret_shell_errors_do_not_expose_commands_or_stderr() {
+    #[cfg(windows)]
+    let command = "echo literal-secret 1>&2 && exit /b 1";
+    #[cfg(not(windows))]
+    let command = "echo literal-secret >&2; exit 1";
+    let values: octa_octafile::Vars =
+      serde_yml::from_str(&format!("TOKEN:\n  sh: '{command}'\n  secret: true\n")).unwrap();
+    let mut vars = Vars::with_variables(values);
+
+    let error = vars.expand(false).await.unwrap_err().to_string();
+
+    assert!(error.contains("TOKEN"));
+    assert!(!error.contains("literal-secret"));
+  }
+
+  #[tokio::test]
+  async fn shell_errors_redact_inherited_secret_values() {
+    #[cfg(windows)]
+    let command = "echo {{ TOKEN }} 1>&2 && exit /b 1";
+    #[cfg(not(windows))]
+    let command = "echo {{ TOKEN }} >&2; exit 1";
+    let values: octa_octafile::Vars = serde_yml::from_str(&format!(
+      "TOKEN:\n  value: literal-secret\n  secret: true\nCHECK:\n  sh: '{command}'\n"
+    ))
+    .unwrap();
+    let mut vars = Vars::with_variables(values);
+
+    let error = vars.expand(false).await.unwrap_err().to_string();
+
+    assert!(error.contains("CHECK"));
+    assert!(!error.contains("literal-secret"));
   }
 
   #[tokio::test]

@@ -27,6 +27,10 @@ pub enum OctaCommand {
     dir: PathBuf,
     envs: HashMap<String, String>,
     vars: HashMap<String, Value>,
+    /// Variable names whose resolved values the plugin SDK must redact from diagnostics.
+    /// The default keeps the wire protocol compatible with runners that predate secret variables.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    secret_vars: Vec<String>,
     dry: bool,
   },
   Cancel {
@@ -50,7 +54,7 @@ pub enum PluginResponse {
 
 #[cfg(test)]
 mod tests {
-  use super::Schema;
+  use super::{OctaCommand, Schema};
 
   #[test]
   fn schema_without_validation_schema_is_backward_compatible() {
@@ -66,5 +70,18 @@ mod tests {
     let result = serde_json::from_str::<Schema>(r#"{"key":"shell","validation_schema":true}"#);
 
     assert!(result.is_err());
+  }
+
+  #[test]
+  fn execute_without_secret_vars_is_backward_compatible() {
+    let command: OctaCommand = serde_json::from_str(
+      r#"{"type":"Execute","payload":{"params":"echo","args":[],"dir":".","envs":{},"vars":{},"dry":false}}"#,
+    )
+    .unwrap();
+
+    let OctaCommand::Execute { secret_vars, .. } = command else {
+      panic!("expected execute command");
+    };
+    assert!(secret_vars.is_empty());
   }
 }

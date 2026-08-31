@@ -2,6 +2,10 @@ version: 1
 
 vars:
   PROFILE: development
+  RELEASE_CHANNEL: "{{ PROFILE }}-preview"
+  API_TOKEN:
+    value: development-token
+    secret: true
 
 dotenv:
   - .env.{{ PROFILE }}

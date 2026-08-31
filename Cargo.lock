@@ -1342,6 +1342,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "humantime",
+ "indexmap",
  "jsonschema",
  "pretty_assertions",
  "serde",
