@@ -149,6 +149,15 @@ pub struct CommandOptions {
 
   /// Maximum time allowed for this command, overriding the task default.
   pub timeout: Option<Timeout>,
+
+  /// Shell condition that must succeed before this command runs.
+  pub condition: Option<String>,
+
+  /// Whether output from this command is suppressed.
+  pub silent: Option<bool>,
+
+  /// Whether a failure from this command is ignored.
+  pub ignore_error: Option<bool>,
 }
 
 /// A typed command payload and the Octa-specific options that control its execution.
@@ -235,29 +244,44 @@ impl Context {
           .map(serde_yml::from_value::<Timeout>)
           .transpose()
           .map_err(|error| format!("invalid command timeout: {error}"))?;
+        let condition = mapping
+          .remove("if")
+          .map(serde_yml::from_value::<String>)
+          .transpose()
+          .map_err(|error| format!("invalid command condition: {error}"))?;
+        let silent = mapping
+          .remove("silent")
+          .map(serde_yml::from_value::<bool>)
+          .transpose()
+          .map_err(|error| format!("invalid command silent option: {error}"))?;
+        let ignore_error = mapping
+          .remove("ignore_error")
+          .map(serde_yml::from_value::<bool>)
+          .transpose()
+          .map_err(|error| format!("invalid command ignore_error option: {error}"))?;
+        let options = CommandOptions {
+          platforms,
+          timeout,
+          condition,
+          silent,
+          ignore_error,
+          ..CommandOptions::default()
+        };
         if let Some(value) = mapping.remove("defer") {
           // `defer` wraps exactly one ordinary command. Sibling command fields would make the
-          // command type ambiguous, while metadata such as `platforms` and `timeout` was removed above.
+          // command type ambiguous, while command metadata was removed above.
           if !mapping.is_empty() {
             return Err("a deferred command cannot contain sibling command fields".to_string());
           }
           (
             value,
             CommandOptions {
-              platforms,
               deferred: true,
-              timeout,
+              ..options
             },
           )
         } else {
-          (
-            Value::Mapping(mapping),
-            CommandOptions {
-              platforms,
-              deferred: false,
-              timeout,
-            },
-          )
+          (Value::Mapping(mapping), options)
         }
       },
       _ => return Err("commands must be strings, task references, or plugin commands".to_string()),

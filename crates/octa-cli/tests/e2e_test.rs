@@ -205,6 +205,52 @@ tasks:
 }
 
 #[test]
+fn test_command_execution_options() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  #[cfg(windows)]
+  let false_condition = "exit /B 1";
+  #[cfg(not(windows))]
+  let false_condition = "false";
+  #[cfg(windows)]
+  let failing_command = "exit /B 7";
+  #[cfg(not(windows))]
+  let failing_command = "exit 7";
+  let octafile = format!(
+    r#"
+version: 1
+
+tasks:
+  command-options:
+    env:
+      HIDDEN_VALUE: hidden-command-output
+    cmds:
+      - shell: echo skipped>skipped.txt
+        if: "{false_condition}"
+      - tpl: $HIDDEN_VALUE
+        silent: true
+      - shell: "{failing_command}"
+        ignore_error: true
+      - shell: echo continued>continued.txt
+"#
+  );
+  fs::write(tmp_dir.path().join("octafile.yml"), octafile)?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("command-options");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("hidden-command-output").not());
+
+  assert!(!tmp_dir.path().join("skipped.txt").exists());
+  assert!(tmp_dir.path().join("continued.txt").is_file());
+
+  Ok(())
+}
+
+#[test]
 fn test_deferred_commands() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   // Keep redirection adjacent to the echoed value because cmd.exe preserves a space before `>` in the output.

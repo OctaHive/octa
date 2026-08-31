@@ -34,7 +34,7 @@ pub use executor::{ExecutionPlan, Executor};
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
 use octa_octafile::{
-  AllowedRun, CommandOptions, CommandPayload, Deps, EnvValue, ExecuteMode, Octafile, Task, TaskCommand, Timeout,
+  AllowedRun, CommandOptions, CommandPayload, Deps, EnvValue, ExecuteMode, Octafile, Task, TaskCommand,
 };
 pub use task::TaskNode;
 use task::{CmdType, TaskConfig};
@@ -237,7 +237,6 @@ impl TaskGraphBuilder {
 
           match &cmd.payload {
             CommandPayload::Task(complex) => {
-              let command_timeout = cmd.options.timeout.or(command.task.timeout);
               let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
               cmds = self.filter_command_by_platform(cmds);
 
@@ -245,11 +244,11 @@ impl TaskGraphBuilder {
                 continue;
               }
 
-              for mut cmd in cmds {
-                cmd.task.timeout = command_timeout.or(cmd.task.timeout);
-                Self::inherit_failfast(command, &mut cmd);
+              for mut referenced in cmds {
+                Self::apply_command_options(&mut referenced.task, &command.task, &cmd.options);
+                Self::inherit_failfast(command, &mut referenced);
                 let mut deps = self
-                  .process_dependencies(dag, &cmd, vec![prev.as_ref().map(Arc::clone), parent.clone()])
+                  .process_dependencies(dag, &referenced, vec![prev.as_ref().map(Arc::clone), parent.clone()])
                   .await?;
 
                 // Если нам пришла зависимая задача, то привязываем наши deps
@@ -266,7 +265,7 @@ impl TaskGraphBuilder {
                   .process_command(
                     dag,
                     dep_name.clone(),
-                    &cmd,
+                    &referenced,
                     deps,
                     prev,
                     complex.vars.clone(),
@@ -279,7 +278,7 @@ impl TaskGraphBuilder {
               }
             },
             CommandPayload::Plugin { key, value } => {
-              let simple = self.create_simple_command(key, command, &to_string(value).unwrap(), cmd.options.timeout);
+              let simple = self.create_simple_command(key, command, &to_string(value).unwrap(), &cmd.options);
 
               // Fix command name
               let task = self.create_task_node(
@@ -399,7 +398,6 @@ impl TaskGraphBuilder {
 
           match &cmd.payload {
             CommandPayload::Task(complex) => {
-              let command_timeout = cmd.options.timeout.or(command.task.timeout);
               let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
               cmds = self.filter_command_by_platform(cmds);
 
@@ -407,14 +405,19 @@ impl TaskGraphBuilder {
                 continue;
               }
 
-              for mut cmd in cmds {
-                cmd.task.timeout = command_timeout.or(cmd.task.timeout);
-                Self::inherit_failfast(command, &mut cmd);
-                let task =
-                  self.create_task_node(dag, dep_name.clone(), &cmd, complex.vars.clone(), complex.envs.clone())?;
+              for mut referenced in cmds {
+                Self::apply_command_options(&mut referenced.task, &command.task, &cmd.options);
+                Self::inherit_failfast(command, &mut referenced);
+                let task = self.create_task_node(
+                  dag,
+                  dep_name.clone(),
+                  &referenced,
+                  complex.vars.clone(),
+                  complex.envs.clone(),
+                )?;
 
                 let deps = self
-                  .process_dependencies(dag, &cmd, vec![prev.as_ref().map(Arc::clone)])
+                  .process_dependencies(dag, &referenced, vec![prev.as_ref().map(Arc::clone)])
                   .await?;
                 if let Some(deps) = &deps {
                   dag.add_dependency(deps, &task)?;
@@ -439,7 +442,7 @@ impl TaskGraphBuilder {
               }
             },
             CommandPayload::Plugin { key, value } => {
-              let simple = self.create_simple_command(key, command, &to_string(value).unwrap(), cmd.options.timeout);
+              let simple = self.create_simple_command(key, command, &to_string(value).unwrap(), &cmd.options);
 
               let task = self.create_task_node(
                 dag,
@@ -549,8 +552,9 @@ impl TaskGraphBuilder {
         cmds: Some(vec![TaskCommand {
           payload: deferred.payload.clone(),
           options: CommandOptions {
-            timeout: deferred.options.timeout,
-            ..CommandOptions::default()
+            platforms: None,
+            deferred: false,
+            ..deferred.options.clone()
           },
         }]),
         deps: None,
@@ -900,23 +904,40 @@ impl TaskGraphBuilder {
     plugin_name: &str,
     command: &FindResult,
     cmd: &str,
-    timeout: Option<Timeout>,
+    options: &CommandOptions,
   ) -> FindResult {
     let mut extra = HashMap::new();
     let cmd_value = serde_yml::Value::String(cmd.to_string());
     extra.insert(plugin_name.to_owned(), cmd_value);
 
+    let mut task = Task {
+      cmds: None,
+      extra,
+      deps: None,
+      ..command.task.clone()
+    };
+    Self::apply_command_options(&mut task, &command.task, options);
+
     FindResult {
       name: cmd.to_string(),
       octafile: command.octafile.clone(),
-      task: Task {
-        cmds: None,
-        extra,
-        deps: None,
-        timeout: timeout.or(command.task.timeout),
-        ..command.task.clone()
-      },
+      task,
     }
+  }
+
+  /// Applies command metadata while retaining defaults from its containing and referenced tasks.
+  fn apply_command_options(task: &mut Task, containing_task: &Task, options: &CommandOptions) {
+    task.timeout = options.timeout.or(containing_task.timeout).or(task.timeout);
+    task.condition = options
+      .condition
+      .clone()
+      .or_else(|| containing_task.condition.clone())
+      .or_else(|| task.condition.clone());
+    task.silent = options.silent.or(containing_task.silent).or(task.silent);
+    task.ignore_error = options
+      .ignore_error
+      .or(containing_task.ignore_error)
+      .or(task.ignore_error);
   }
 
   fn create_group_node(
@@ -1323,6 +1344,60 @@ mod tests {
       overridden.timeout.unwrap().duration(),
       std::time::Duration::from_secs(2)
     );
+
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_command_options_inherit_and_override_task_defaults() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      tasks:
+        called:
+          if: referenced-condition
+          silent: true
+          ignore_error: true
+          shell: echo called
+        pipeline:
+          if: containing-condition
+          silent: true
+          ignore_error: true
+          cmds:
+            - shell: echo inherited
+            - shell: echo overridden
+              if: command-condition
+              silent: false
+              ignore_error: false
+            - task: called
+              if: reference-condition
+              silent: false
+              ignore_error: false
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
+    let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+    let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+    let dag = TaskGraphBuilder::new(plugin_manager)?
+      .build(octafile, "pipeline", false, vec![])
+      .await?;
+
+    let inherited = dag.nodes().iter().find(|task| task.name == "echo inherited").unwrap();
+    assert_eq!(inherited.condition.as_deref(), Some("containing-condition"));
+    assert!(inherited.silent);
+    assert!(inherited.ignore_errors);
+
+    let overridden = dag.nodes().iter().find(|task| task.name == "echo overridden").unwrap();
+    assert_eq!(overridden.condition.as_deref(), Some("command-condition"));
+    assert!(!overridden.silent);
+    assert!(!overridden.ignore_errors);
+
+    let referenced = dag.nodes().iter().find(|task| task.name == "called").unwrap();
+    assert_eq!(referenced.condition.as_deref(), Some("reference-condition"));
+    assert!(!referenced.silent);
+    assert!(!referenced.ignore_errors);
 
     Ok(())
   }

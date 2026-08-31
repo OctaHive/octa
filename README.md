@@ -1033,10 +1033,24 @@ tasks:
   deploy:
     if: test "{{ ENVIRONMENT }}" = "production"
     shell: ./deploy.sh
+
+  pipeline:
+    cmds:
+      - shell: ./prepare.sh
+        if: test -f config.yml
+      - shell: ./optional-check.sh
+        ignore_error: true
+      - task: deploy
+        silent: true
 ```
 
 The condition is still evaluated when `--force` is used. In dry mode, Octa prints the task commands
 without executing the condition and treats it as successful.
+
+`if`, `silent`, and `ignore_error` can also be set on an individual command or task reference. Use
+the mapping form shown above when a command needs options. Command values override task-level
+defaults; omitted values inherit them. These options are handled by Octa and work with every plugin
+command type.
 
 ## Task preconditions
 Sometimes you need to check a condition before executing a task and decide whether to run it or not.

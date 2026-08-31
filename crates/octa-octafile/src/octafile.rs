@@ -1622,6 +1622,62 @@ tasks:
   }
 
   #[test]
+  fn parses_command_execution_options() {
+    let content = r#"
+      version: 1
+      tasks:
+        pipeline:
+          cmds:
+            - shell: echo build
+              if: test -f Cargo.toml
+              silent: true
+              ignore_error: true
+            - task: cleanup
+              if: test -d target
+              silent: false
+              ignore_error: false
+        cleanup:
+          shell: echo cleanup
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "command_options");
+
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+    let commands = octafile.tasks["pipeline"].cmds.as_ref().unwrap();
+
+    assert_eq!(commands[0].options.condition.as_deref(), Some("test -f Cargo.toml"));
+    assert_eq!(commands[0].options.silent, Some(true));
+    assert_eq!(commands[0].options.ignore_error, Some(true));
+    assert_eq!(commands[1].options.condition.as_deref(), Some("test -d target"));
+    assert_eq!(commands[1].options.silent, Some(false));
+    assert_eq!(commands[1].options.ignore_error, Some(false));
+  }
+
+  #[test]
+  fn rejects_invalid_command_execution_options() {
+    for (field, value, expected) in [
+      ("if", "true", "condition"),
+      ("silent", "not-a-boolean", "silent"),
+      ("ignore_error", "not-a-boolean", "ignore_error"),
+    ] {
+      let content = format!(
+        r#"
+          version: 1
+          tasks:
+            pipeline:
+              cmds:
+                - shell: echo build
+                  {field}: {value}
+        "#
+      );
+      let (_temp_dir, file_path) = create_temp_octafile(&content, "invalid_command_options");
+
+      let error = Octafile::load(Some(file_path), false, vec![]).unwrap_err();
+
+      assert!(error.to_string().contains(expected));
+    }
+  }
+
+  #[test]
   fn rejects_invalid_and_zero_timeouts() {
     for timeout in ["later", "0s"] {
       let content = format!(
@@ -1652,6 +1708,9 @@ tasks:
             - defer:
                 task: cleanup
               platforms: [linux]
+              if: test -d target
+              silent: true
+              ignore_error: true
         cleanup:
           shell: echo cleanup task
     "#;
@@ -1668,6 +1727,9 @@ tasks:
     ));
     assert!(commands[1].options.deferred);
     assert_eq!(commands[1].options.platforms, Some(vec!["linux".to_string()]));
+    assert_eq!(commands[1].options.condition.as_deref(), Some("test -d target"));
+    assert_eq!(commands[1].options.silent, Some(true));
+    assert_eq!(commands[1].options.ignore_error, Some(true));
     assert!(matches!(
       &commands[1].payload,
       CommandPayload::Task(dependency) if dependency.task == "cleanup"

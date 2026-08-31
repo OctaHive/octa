@@ -7,3 +7,12 @@ tasks:
   deploy:
     if: test "{{ ENVIRONMENT }}" = "production"
     shell: echo "Deploying to production"
+
+  pipeline:
+    cmds:
+      - shell: echo "Preparing deployment"
+        if: test -f config.yml
+      - shell: ./optional-check.sh
+        ignore_error: true
+      - task: deploy
+        silent: true
