@@ -179,6 +179,9 @@ pub struct Octafile {
   // Default task run mode
   pub run: Option<AllowedRun>,
 
+  // Stop parallel execution after the first failure
+  pub failfast: Option<bool>,
+
   // Watch polling interval
   pub interval: Option<WatchInterval>,
 
@@ -218,6 +221,7 @@ impl fmt::Debug for Octafile {
       .field("name", &self._name)
       .field("dotenv", &self.dotenv)
       .field("run", &self.run)
+      .field("failfast", &self.failfast)
       .field("interval", &self.interval)
       .field("includes", &self.includes)
       .field("tasks", &self.tasks)
@@ -327,6 +331,9 @@ impl Octafile {
         },
         "run" => {
           octafile.run = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "failfast" => {
+          octafile.failfast = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
         },
         "interval" => {
           octafile.interval = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
@@ -712,6 +719,9 @@ impl<'de> Visitor<'de> for OctafileVisitor {
         "run" => {
           octafile.run = map.next_value()?;
         },
+        "failfast" => {
+          octafile.failfast = map.next_value()?;
+        },
         "interval" => {
           octafile.interval = map.next_value()?;
         },
@@ -751,6 +761,8 @@ impl<'de> Visitor<'de> for OctafileVisitor {
 
 #[cfg(test)]
 mod tests {
+  use crate::task::CommandPayload;
+
   use super::{go_arch, go_arch_name, go_os, go_os_name, OCTAFILE_DEFAULT_NAMES};
   use crate::*;
   use octafile::Version;
@@ -1520,9 +1532,12 @@ tasks:
 
     assert!(octafile.tasks["deploy"].extra.contains_key("docker"));
     let command = &octafile.tasks["pipeline"].cmds.as_ref().unwrap()[0];
-    assert_eq!(command.platforms, Some(vec!["linux/amd64".to_string()]));
-    assert!(!command.value.as_mapping().unwrap().contains_key("platforms"));
-    assert!(octafile.tasks["pipeline"].cmds.as_ref().unwrap()[1].deferred);
+    assert_eq!(command.options.platforms, Some(vec!["linux/amd64".to_string()]));
+    assert!(matches!(
+      &command.payload,
+      CommandPayload::Plugin { key, .. } if key == "docker"
+    ));
+    assert!(octafile.tasks["pipeline"].cmds.as_ref().unwrap()[1].options.deferred);
   }
 
   #[test]
@@ -1545,10 +1560,13 @@ tasks:
     let command = &octafile.tasks["pipeline"].cmds.as_ref().unwrap()[0];
 
     assert_eq!(
-      command.platforms,
+      command.options.platforms,
       Some(vec!["darwin".to_string(), "linux/arm64".to_string()])
     );
-    assert!(!command.value.as_mapping().unwrap().contains_key("platforms"));
+    assert!(matches!(
+      &command.payload,
+      CommandPayload::Task(dependency) if dependency.task == "build"
+    ));
   }
 
   #[test]
@@ -1591,7 +1609,7 @@ tasks:
 
     assert_eq!(task.timeout.unwrap().duration(), std::time::Duration::from_secs(120));
     assert_eq!(
-      task.cmds.as_ref().unwrap()[0].timeout.unwrap().duration(),
+      task.cmds.as_ref().unwrap()[0].options.timeout.unwrap().duration(),
       std::time::Duration::from_millis(1500)
     );
     let Deps::Complex(dependency) = &task.deps.as_ref().unwrap()[0] else {
@@ -1642,14 +1660,18 @@ tasks:
     let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
     let commands = octafile.tasks["pipeline"].cmds.as_ref().unwrap();
 
-    assert!(commands[0].deferred);
-    assert_eq!(commands[0].value, Value::String("echo cleanup".to_string()));
-    assert!(commands[1].deferred);
-    assert_eq!(commands[1].platforms, Some(vec!["linux".to_string()]));
-    assert_eq!(
-      commands[1].value.as_mapping().unwrap()["task"].as_str(),
-      Some("cleanup")
-    );
+    assert!(commands[0].options.deferred);
+    assert!(matches!(
+      &commands[0].payload,
+      CommandPayload::Plugin { key, value }
+        if key == "shell" && value.as_str() == Some("echo cleanup")
+    ));
+    assert!(commands[1].options.deferred);
+    assert_eq!(commands[1].options.platforms, Some(vec!["linux".to_string()]));
+    assert!(matches!(
+      &commands[1].payload,
+      CommandPayload::Task(dependency) if dependency.task == "cleanup"
+    ));
   }
 
   #[test]
@@ -1912,5 +1934,26 @@ tasks:
     assert!(octafile.includes.is_none());
     assert!(octafile.vars.is_none());
     assert!(octafile.env.is_none());
+  }
+
+  #[test]
+  fn parses_failfast_at_octafile_and_task_levels() {
+    let content = r#"
+      version: 1
+      failfast: true
+      tasks:
+        inherited:
+          shell: echo inherited
+        overridden:
+          failfast: false
+          shell: echo overridden
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "failfast");
+
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+
+    assert_eq!(octafile.failfast, Some(true));
+    assert_eq!(octafile.tasks["inherited"].failfast, None);
+    assert_eq!(octafile.tasks["overridden"].failfast, Some(false));
   }
 }

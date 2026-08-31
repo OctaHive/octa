@@ -15,6 +15,7 @@ use octa_plugin::protocol::Schema;
 use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Deserialize;
 use tokio::signal;
+use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -108,6 +109,10 @@ pub(crate) struct Cli {
   #[arg(short, long, default_value_t = false)]
   pub force: bool,
 
+  /// Cancel already running parallel tasks after the first failure
+  #[arg(short = 'F', long, default_value_t = false)]
+  pub failfast: bool,
+
   /// Watch source files and rerun selected tasks when they change
   #[arg(short = 'w', long, default_value_t = false)]
   pub watch: bool,
@@ -158,6 +163,7 @@ struct ExecutionOptions {
   parallel: bool,
   dry: bool,
   force: bool,
+  failfast: bool,
   task_args: Vec<String>,
 }
 
@@ -283,35 +289,47 @@ async fn initialize_plugins(
 }
 
 /// Executes tasks either in parallel or sequentially
-async fn execute_tasks(tasks: Vec<ExecuteItem>, parallel: bool, cancel_token: CancellationToken) -> OctaResult<()> {
+async fn execute_tasks(
+  tasks: Vec<ExecuteItem>,
+  parallel: bool,
+  failfast: bool,
+  cancel_token: CancellationToken,
+) -> OctaResult<()> {
+  // A batch token lets CLI fail-fast cancel sibling commands without cancelling a watch loop
+  // or another caller that owns the outer token.
+  let batch_token = cancel_token.child_token();
+
   if parallel {
-    let mut handles = Vec::with_capacity(tasks.len());
-    let mut results = Vec::with_capacity(tasks.len());
+    let mut handles = JoinSet::new();
+    let mut first_error = None;
 
-    // Spawn all tasks
     for task in tasks {
-      let cancel_token = cancel_token.clone();
-      let handle = tokio::spawn(async move { task.executor.execute(cancel_token, &task.command).await });
-      handles.push(handle);
+      let task_token = batch_token.clone();
+      handles.spawn(async move { task.executor.execute(task_token, &task.command).await });
     }
 
-    // Wait for all tasks to complete
-    for handle in handles {
-      match handle.await {
-        Ok(result) => results.push(result),
-        Err(e) => return Err(error::OctaError::Runtime(e.to_string())),
+    // Join in completion order so the first failure can interrupt siblings immediately.
+    while let Some(result) = handles.join_next().await {
+      let error = match result {
+        Ok(Ok(_)) => continue,
+        Ok(Err(error)) => OctaError::ExecutionError(error),
+        Err(error) => OctaError::Runtime(error.to_string()),
+      };
+
+      if first_error.is_none() {
+        if failfast {
+          batch_token.cancel();
+        }
+        first_error = Some(error);
       }
     }
 
-    // Check if any task failed
-    for result in results {
-      if let Err(e) = result {
-        return Err(OctaError::ExecutionError(e));
-      }
+    if let Some(error) = first_error {
+      return Err(error);
     }
   } else {
     for task in tasks {
-      task.executor.execute(cancel_token.clone(), &task.command).await?;
+      task.executor.execute(batch_token.clone(), &task.command).await?;
     }
   }
   Ok(())
@@ -345,7 +363,10 @@ async fn build_execute_items(
     let executor = Executor::new(
       context.plugin_manager.clone(),
       dag,
-      ExecutorConfig { silent: false },
+      ExecutorConfig {
+        silent: false,
+        failfast: options.failfast,
+      },
       None,
       Arc::clone(&context.fingerprint),
       options.dry,
@@ -385,7 +406,7 @@ async fn execute_watch(
   }
 
   let mut watcher = SourceWatcher::new(targets)?;
-  if let Err(error) = execute_tasks(tasks, options.parallel, cancel_token.clone()).await {
+  if let Err(error) = execute_tasks(tasks, options.parallel, options.failfast, cancel_token.clone()).await {
     warn!("Task execution failed; waiting for source changes: {}", error);
   }
 
@@ -400,7 +421,7 @@ async fn execute_watch(
       info!("Sources changed; restarting tasks");
       let (tasks, _) = build_execute_items(&context, commands, options).await?;
 
-      if let Err(error) = execute_tasks(tasks, options.parallel, cancel_token.clone()).await {
+      if let Err(error) = execute_tasks(tasks, options.parallel, options.failfast, cancel_token.clone()).await {
         warn!("Task execution failed; waiting for source changes: {}", error);
       }
     }
@@ -499,6 +520,7 @@ pub async fn run() -> OctaResult<()> {
     parallel: args.parallel,
     dry: args.dry,
     force: args.force,
+    failfast: args.failfast,
     task_args: args.task_args,
   };
   let summary = Arc::new(Summary::new());
@@ -529,7 +551,7 @@ pub async fn run() -> OctaResult<()> {
     .await?;
   } else {
     let (tasks, _) = build_execute_items(&execution_context, &commands, &options).await?;
-    execute_tasks(tasks, options.parallel, cancel_token).await?;
+    execute_tasks(tasks, options.parallel, options.failfast, cancel_token).await?;
   }
 
   if args.summary {
@@ -592,8 +614,9 @@ mod tests {
 
   #[test]
   fn test_cli_parse() {
-    let cli = Cli::parse_from(["octa", "--parallel", "build"]);
+    let cli = Cli::parse_from(["octa", "--parallel", "--failfast", "build"]);
     assert!(cli.parallel);
+    assert!(cli.failfast);
     assert_eq!(cli.commands, Some(vec!["build".to_string()]));
   }
 
@@ -693,6 +716,7 @@ tasks:
         parallel: false,
         dry: false,
         force: false,
+        failfast: false,
         task_args: Vec::new(),
       };
       execute_watch(
@@ -743,6 +767,7 @@ tasks:
       parallel: false,
       dry: false,
       force: false,
+      failfast: false,
       task_args: Vec::new(),
     };
     let result = execute_watch(

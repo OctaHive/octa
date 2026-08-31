@@ -33,6 +33,17 @@ use crate::{
 // Add shutdown timeout constant
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Keeps the first useful failure while allowing an originating error to replace a secondary
+/// cancellation reported by a fail-fast sibling.
+fn record_execution_error(recorded: &mut Option<ExecutorError>, error: ExecutorError) {
+  let recorded_is_cancellation = matches!(recorded.as_ref(), Some(ExecutorError::TaskCancelled(_)));
+  let error_is_cancellation = matches!(&error, ExecutorError::TaskCancelled(_));
+
+  if recorded.is_none() || recorded_is_cancellation && !error_is_cancellation {
+    *recorded = Some(error);
+  }
+}
+
 /// A task graph together with cleanup actions managed by the executor.
 ///
 /// Deferred actions are intentionally kept outside `TaskNode`: task nodes describe work,
@@ -91,11 +102,16 @@ impl<T: Eq + Hash + Identifiable> Deref for ExecutionPlan<T> {
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
   pub silent: bool,
+  /// Cancel tasks that are already running when any task in the plan fails.
+  pub failfast: bool,
 }
 
 impl Default for ExecutorConfig {
   fn default() -> Self {
-    Self { silent: true }
+    Self {
+      silent: true,
+      failfast: false,
+    }
   }
 }
 
@@ -175,12 +191,18 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     self.initialize_execution().await?;
     let (tx, rx) = self.create_task_channel();
     let mut handles = Vec::with_capacity(self.state.dag.node_count());
+    // Internal cancellation must not cancel the caller's token: the caller may reuse it for
+    // another top-level task or a subsequent watch iteration.
+    let execution_token = cancel_token.child_token();
 
     self.schedule_initial_tasks(&tx).await?;
 
-    let result = match self.process_tasks(cancel_token.clone(), rx, &tx, &mut handles).await {
+    let result = match self.process_tasks(execution_token.clone(), rx, &tx, &mut handles).await {
       Ok(_) => self.handle_completion(cancel_token, handles).await,
-      Err(e) => self.handle_error(e, cancel_token).await,
+      Err(error) => {
+        execution_token.cancel();
+        Err(error)
+      },
     };
 
     self.run_deferred().await;
@@ -246,12 +268,6 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     }
   }
 
-  async fn handle_error(&self, error: ExecutorError, cancel_token: CancellationToken) -> ExecutorResult<Vec<String>> {
-    error!("Error during task processing: {}", error);
-    cancel_token.cancel();
-    Err(error)
-  }
-
   /// Processes tasks as they become available
   async fn process_tasks(
     &self,
@@ -298,6 +314,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       fingerprint: self.state.fingerprint.clone(),
       dry: self.state.dry,
       force: self.state.force,
+      failfast: self.config.failfast,
       completed_tasks: self.state.completed_tasks.clone(),
       deferred: self.deferred.clone(),
     };
@@ -345,9 +362,18 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
 
   async fn complete_execution(&self, handles: Vec<JoinHandle<ExecutorResult<String>>>) -> ExecutorResult<Vec<String>> {
     let mut results = vec![];
+    let mut first_error = None;
 
     for handle in handles {
-      results.push(handle.await??);
+      match handle.await {
+        Ok(Ok(result)) => results.push(result),
+        Ok(Err(error)) => record_execution_error(&mut first_error, error),
+        Err(error) => record_execution_error(&mut first_error, ExecutorError::JoinError(error)),
+      }
+    }
+
+    if let Some(error) = first_error {
+      return Err(error);
     }
 
     self.log_info("All tasks completed successfully");
@@ -397,6 +423,7 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   fingerprint: Arc<Db>,
   dry: bool,
   force: bool,
+  failfast: bool,
   completed_tasks: Arc<Mutex<HashSet<String>>>,
   deferred: Arc<HashMap<String, Arc<DeferredAction<T>>>>,
 }
@@ -495,6 +522,11 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
 
   async fn handle_error(&self, error: ExecutorError) -> ExecutorResult<String> {
     error!("Task {} failed: {}", self.task.name(), error);
+    // `finished` prevents new dependants from being scheduled. The execution token additionally
+    // interrupts siblings that were already running when fail-fast behavior is requested.
+    if self.context.failfast || self.task.failfast() {
+      self.cancel_token.cancel();
+    }
     self.context.finished.cancel();
     Err(error)
   }
@@ -550,7 +582,10 @@ async fn execute_deferred_action<
   let executor = Executor::new(
     plugin_manager,
     action.plan.clone(),
-    ExecutorConfig { silent: true },
+    ExecutorConfig {
+      silent: true,
+      failfast: false,
+    },
     Some(cache),
     fingerprint,
     dry,
@@ -561,4 +596,168 @@ async fn execute_deferred_action<
   Box::pin(executor.execute(CancellationToken::new(), &action.command))
     .await
     .map(|results| results.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+  use std::{
+    collections::HashMap,
+    hash::{Hash, Hasher},
+    sync::atomic::{AtomicBool, Ordering},
+  };
+
+  use async_trait::async_trait;
+  use tempfile::TempDir;
+  use tokio::time::sleep;
+
+  use super::*;
+  use crate::task::RunMode;
+
+  #[derive(Clone)]
+  struct TestTask {
+    id: String,
+    fails: bool,
+    failfast: bool,
+    completed: Arc<AtomicBool>,
+  }
+
+  impl PartialEq for TestTask {
+    fn eq(&self, other: &Self) -> bool {
+      self.id == other.id
+    }
+  }
+
+  impl Eq for TestTask {}
+
+  impl Hash for TestTask {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+      self.id.hash(state);
+    }
+  }
+
+  #[async_trait]
+  impl Identifiable for TestTask {
+    fn id(&self) -> String {
+      self.id.clone()
+    }
+
+    fn name(&self) -> String {
+      self.id.clone()
+    }
+
+    fn is_internal(&self) -> bool {
+      false
+    }
+
+    async fn get_deps_result(&self) -> HashMap<String, String> {
+      HashMap::new()
+    }
+  }
+
+  impl TaskItem for TestTask {
+    fn run_mode(&self) -> RunMode {
+      RunMode::Always
+    }
+
+    fn failfast(&self) -> bool {
+      self.failfast
+    }
+  }
+
+  #[async_trait]
+  impl Executable<TestTask> for TestTask {
+    async fn execute(
+      &self,
+      _plugin_manager: Arc<PluginManager>,
+      _cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
+      _fingerprint: Arc<Db>,
+      _dry: bool,
+      _force: bool,
+      cancel_token: CancellationToken,
+    ) -> ExecutorResult<String> {
+      if self.fails {
+        sleep(Duration::from_millis(20)).await;
+        return Err(ExecutorError::TaskFailed(self.id.clone()));
+      }
+
+      select! {
+        _ = sleep(Duration::from_millis(150)) => {
+          self.completed.store(true, Ordering::SeqCst);
+          Ok(self.id.clone())
+        },
+        _ = cancel_token.cancelled() => Err(ExecutorError::TaskCancelled(self.id.clone())),
+      }
+    }
+
+    async fn set_result(&self, _task_name: String, _result: String) {}
+
+    async fn bypass_result(&self, _result: HashMap<String, String>) {}
+  }
+
+  async fn execute_parallel_failure(
+    executor_failfast: bool,
+    task_failfast: bool,
+  ) -> (ExecutorResult<Vec<String>>, bool) {
+    let completed = Arc::new(AtomicBool::new(false));
+    let mut dag = DAG::new();
+    dag.add_node(Arc::new(TestTask {
+      id: "failure".to_string(),
+      fails: true,
+      failfast: task_failfast,
+      completed: Arc::new(AtomicBool::new(false)),
+    }));
+    dag.add_node(Arc::new(TestTask {
+      id: "slow".to_string(),
+      fails: false,
+      failfast: false,
+      completed: completed.clone(),
+    }));
+
+    let plugin_dir = TempDir::new().unwrap();
+    let executor = Executor::new(
+      Arc::new(PluginManager::new(plugin_dir.path())),
+      dag,
+      ExecutorConfig {
+        silent: true,
+        failfast: executor_failfast,
+      },
+      None,
+      Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      false,
+      false,
+      None,
+    )
+    .unwrap();
+
+    let result = executor.execute(CancellationToken::new(), "test").await;
+    (result, completed.load(Ordering::SeqCst))
+  }
+
+  #[tokio::test]
+  async fn waits_for_running_tasks_by_default() {
+    let (result, completed) = execute_parallel_failure(false, false).await;
+
+    assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
+    assert!(completed);
+  }
+
+  #[tokio::test]
+  async fn failfast_cancels_running_tasks_from_config_or_task() {
+    for (executor_failfast, task_failfast) in [(true, false), (false, true)] {
+      let (result, completed) = execute_parallel_failure(executor_failfast, task_failfast).await;
+
+      assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
+      assert!(!completed);
+    }
+  }
+
+  #[test]
+  fn originating_error_replaces_secondary_cancellation() {
+    let mut recorded = Some(ExecutorError::TaskCancelled("sibling".to_string()));
+
+    record_execution_error(&mut recorded, ExecutorError::TaskFailed("origin".to_string()));
+    record_execution_error(&mut recorded, ExecutorError::TaskCancelled("later".to_string()));
+
+    assert!(matches!(recorded, Some(ExecutorError::TaskFailed(task)) if task == "origin"));
+  }
 }

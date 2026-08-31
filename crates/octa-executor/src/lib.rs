@@ -24,7 +24,6 @@ use std::{
 
 use envs::Envs;
 use octa_plugin_manager::plugin_manager::PluginManager;
-use serde::{Deserialize, Serialize};
 use serde_yml::to_string;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -34,7 +33,9 @@ use executor::DeferredAction;
 pub use executor::{ExecutionPlan, Executor};
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
-use octa_octafile::{AllowedRun, Deps, EnvValue, ExecuteMode, Octafile, Task, TaskCommand, Timeout};
+use octa_octafile::{
+  AllowedRun, CommandOptions, CommandPayload, Deps, EnvValue, ExecuteMode, Octafile, Task, TaskCommand, Timeout,
+};
 pub use task::TaskNode;
 use task::{CmdType, TaskConfig};
 use vars::Vars;
@@ -84,14 +85,6 @@ pub struct TaskGraphBuilder {
   defer_order: AtomicUsize,           // Declaration order for deferred commands
   // Deferred actions are collected separately and attached to the DAG when the plan is complete.
   deferred: Mutex<HashMap<String, Arc<DeferredAction<TaskNode>>>>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct TaskCmd {
-  task: String,
-  pub vars: Option<octa_octafile::Vars>,
-  pub envs: Option<octa_octafile::Envs>,
-  pub silent: Option<bool>,
 }
 
 impl TaskGraphBuilder {
@@ -216,11 +209,11 @@ impl TaskGraphBuilder {
         let mut deferred_nodes = Vec::new();
 
         for cmd in cmds {
-          if !self.matches_platforms(cmd.platforms.as_deref()) {
+          if !self.matches_platforms(cmd.options.platforms.as_deref()) {
             continue;
           }
 
-          if cmd.deferred {
+          if cmd.options.deferred {
             // Registration dependencies capture the point reached in the surrounding command list.
             let deferred = self
               .create_deferred_node(
@@ -242,9 +235,51 @@ impl TaskGraphBuilder {
             continue;
           }
 
-          match &cmd.value {
-            serde_yml::Value::String(s) => {
-              let simple = self.create_simple_command("shell", command, s, cmd.timeout);
+          match &cmd.payload {
+            CommandPayload::Task(complex) => {
+              let command_timeout = cmd.options.timeout.or(command.task.timeout);
+              let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
+              cmds = self.filter_command_by_platform(cmds);
+
+              if cmds.is_empty() {
+                continue;
+              }
+
+              for mut cmd in cmds {
+                cmd.task.timeout = command_timeout.or(cmd.task.timeout);
+                Self::inherit_failfast(command, &mut cmd);
+                let mut deps = self
+                  .process_dependencies(dag, &cmd, vec![prev.as_ref().map(Arc::clone), parent.clone()])
+                  .await?;
+
+                // Если нам пришла зависимая задача, то привязываем наши deps
+                // к ней, чтобы выстроить цепочку выполнения
+                if let Some(deps) = &deps {
+                  if let Some(parent) = &parent {
+                    dag.add_dependency(parent, deps)?;
+                  }
+                } else {
+                  deps = parent.clone();
+                }
+
+                let cnt = self
+                  .process_command(
+                    dag,
+                    dep_name.clone(),
+                    &cmd,
+                    deps,
+                    prev,
+                    complex.vars.clone(),
+                    complex.envs.clone(),
+                    None,
+                  )
+                  .await?;
+
+                index += cnt;
+              }
+            },
+            CommandPayload::Plugin { key, value } => {
+              let simple = self.create_simple_command(key, command, &to_string(value).unwrap(), cmd.options.timeout);
 
               // Fix command name
               let task = self.create_task_node(
@@ -270,98 +305,6 @@ impl TaskGraphBuilder {
               }
 
               index += 1;
-            },
-            complex => {
-              match serde_yml::from_value::<TaskCmd>(complex.clone()) {
-                Ok(complex) => {
-                  let command_timeout = cmd.timeout.or(command.task.timeout);
-                  let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
-                  cmds = self.filter_command_by_platform(cmds);
-
-                  if cmds.is_empty() {
-                    continue;
-                  }
-
-                  for mut cmd in cmds {
-                    cmd.task.timeout = command_timeout.or(cmd.task.timeout);
-                    let mut deps = self
-                      .process_dependencies(dag, &cmd, vec![prev.as_ref().map(Arc::clone), parent.clone()])
-                      .await?;
-
-                    // Если нам пришла зависимая задача, то привязываем наши deps
-                    // к ней, чтобы выстроить цепочку выполнения
-                    if let Some(deps) = &deps {
-                      if let Some(parent) = &parent {
-                        dag.add_dependency(parent, deps)?;
-                      }
-                    } else {
-                      deps = parent.clone();
-                    }
-
-                    let cnt = self
-                      .process_command(
-                        dag,
-                        dep_name.clone(),
-                        &cmd,
-                        deps,
-                        prev,
-                        complex.vars.clone(),
-                        complex.envs.clone(),
-                        None,
-                      )
-                      .await?;
-
-                    index += cnt;
-                  }
-                },
-                Err(_) => match serde_yml::from_value::<HashMap<String, serde_yml::Value>>(complex.clone()) {
-                  Ok(hashmap) => {
-                    let schema = self.plugin_manager.get_schema_keys().await;
-                    let mut plugin_key = None;
-
-                    for key in schema.keys() {
-                      if hashmap.contains_key(key) {
-                        plugin_key = Some((key, hashmap.get(key).unwrap()));
-                      }
-                    }
-
-                    if plugin_key.is_none() {
-                      return Err(ExecutorError::TaskParsedError);
-                    }
-
-                    let (key, value) = plugin_key.unwrap();
-                    let simple = self.create_simple_command(key, command, &to_string(value).unwrap(), cmd.timeout);
-
-                    // Fix command name
-                    let task = self.create_task_node(
-                      dag,
-                      dep_name.clone(),
-                      &simple,
-                      execute_vars.clone(),
-                      execute_envs.clone(),
-                    )?;
-
-                    // Если есть группирующая задача привязывает созданную к ней
-                    // Эта задача запуститься только когда выполнится parent
-                    if let Some(parent) = parent.clone() {
-                      dag.add_dependency(&parent, &task)?;
-                    }
-
-                    if !run_parallel {
-                      if let Some(prev) = prev {
-                        dag.add_dependency(prev, &task)?;
-                      }
-
-                      *prev = Some(task)
-                    }
-
-                    index += 1;
-                  },
-                  Err(e) => {
-                    return Err(ExecutorError::DeserializeError(e));
-                  },
-                },
-              }
             },
           }
         }
@@ -428,11 +371,11 @@ impl TaskGraphBuilder {
         let mut deferred_nodes = Vec::new();
 
         for cmd in cmds {
-          if !self.matches_platforms(cmd.platforms.as_deref()) {
+          if !self.matches_platforms(cmd.options.platforms.as_deref()) {
             continue;
           }
 
-          if cmd.deferred {
+          if cmd.options.deferred {
             // Dependency scopes also include their parent gates in registration requirements.
             let deferred = self
               .create_deferred_node(
@@ -454,9 +397,49 @@ impl TaskGraphBuilder {
             continue;
           }
 
-          match &cmd.value {
-            serde_yml::Value::String(s) => {
-              let simple = self.create_simple_command("shell", command, s, cmd.timeout);
+          match &cmd.payload {
+            CommandPayload::Task(complex) => {
+              let command_timeout = cmd.options.timeout.or(command.task.timeout);
+              let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
+              cmds = self.filter_command_by_platform(cmds);
+
+              if cmds.is_empty() {
+                continue;
+              }
+
+              for mut cmd in cmds {
+                cmd.task.timeout = command_timeout.or(cmd.task.timeout);
+                Self::inherit_failfast(command, &mut cmd);
+                let task =
+                  self.create_task_node(dag, dep_name.clone(), &cmd, complex.vars.clone(), complex.envs.clone())?;
+
+                let deps = self
+                  .process_dependencies(dag, &cmd, vec![prev.as_ref().map(Arc::clone)])
+                  .await?;
+                if let Some(deps) = &deps {
+                  dag.add_dependency(deps, &task)?;
+                }
+
+                // Добавляем связь с группирующей задачей
+                dag.add_dependency(&task, &group)?;
+
+                for parent in parents.iter().flatten() {
+                  dag.add_dependency(parent, &task)?;
+                }
+
+                // Если задачи должны запускаться не параллельно,
+                // то добавляем зависимость между задачами
+                if !run_parallel {
+                  if let Some(prev) = prev {
+                    dag.add_dependency(prev, &task)?;
+                  }
+
+                  *prev = Some(task)
+                }
+              }
+            },
+            CommandPayload::Plugin { key, value } => {
+              let simple = self.create_simple_command(key, command, &to_string(value).unwrap(), cmd.options.timeout);
 
               let task = self.create_task_node(
                 dag,
@@ -488,104 +471,6 @@ impl TaskGraphBuilder {
                 }
 
                 *prev = Some(task)
-              }
-            },
-            complex => {
-              match serde_yml::from_value::<TaskCmd>(complex.clone()) {
-                Ok(complex) => {
-                  let command_timeout = cmd.timeout.or(command.task.timeout);
-                  let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
-                  cmds = self.filter_command_by_platform(cmds);
-
-                  if cmds.is_empty() {
-                    continue;
-                  }
-
-                  for mut cmd in cmds {
-                    cmd.task.timeout = command_timeout.or(cmd.task.timeout);
-                    let task =
-                      self.create_task_node(dag, dep_name.clone(), &cmd, complex.vars.clone(), complex.envs.clone())?;
-
-                    let deps = self
-                      .process_dependencies(dag, &cmd, vec![prev.as_ref().map(Arc::clone)])
-                      .await?;
-                    if let Some(deps) = &deps {
-                      dag.add_dependency(deps, &task)?;
-                    }
-
-                    // Добавляем связь с группирующей задачей
-                    dag.add_dependency(&task, &group)?;
-
-                    for parent in parents.iter().flatten() {
-                      dag.add_dependency(parent, &task)?;
-                    }
-
-                    // Если задачи должны запускаться не параллельно,
-                    // то добавляем зависимость между задачами
-                    if !run_parallel {
-                      if let Some(prev) = prev {
-                        dag.add_dependency(prev, &task)?;
-                      }
-
-                      *prev = Some(task)
-                    }
-                  }
-                },
-                Err(_) => match serde_yml::from_value::<HashMap<String, serde_yml::Value>>(complex.clone()) {
-                  Ok(hashmap) => {
-                    let schema = self.plugin_manager.get_schema_keys().await;
-                    let mut plugin_key = None;
-
-                    for key in schema.keys() {
-                      if hashmap.contains_key(key) {
-                        plugin_key = Some((key, hashmap.get(key).unwrap()));
-                      }
-                    }
-
-                    if plugin_key.is_none() {
-                      return Err(ExecutorError::TaskParsedError);
-                    }
-
-                    let (key, value) = plugin_key.unwrap();
-
-                    let simple = self.create_simple_command(key, command, &to_string(value).unwrap(), cmd.timeout);
-
-                    let task = self.create_task_node(
-                      dag,
-                      dep_name.clone(),
-                      &simple,
-                      execute_vars.clone(),
-                      execute_envs.clone(),
-                    )?;
-
-                    let deps = self
-                      .process_dependencies(dag, &simple, vec![prev.as_ref().map(Arc::clone)])
-                      .await?;
-                    if let Some(deps) = &deps {
-                      dag.add_dependency(deps, &task)?;
-                    }
-
-                    // Добавляем связь с группирующей задачей
-                    dag.add_dependency(&task, &group)?;
-
-                    for parent in parents.iter().flatten() {
-                      dag.add_dependency(parent, &task)?;
-                    }
-
-                    // Если задачи должны запускаться не параллельно,
-                    // то добавляем зависимость между задачами
-                    if !run_parallel {
-                      if let Some(prev) = prev {
-                        dag.add_dependency(prev, &task)?;
-                      }
-
-                      *prev = Some(task)
-                    }
-                  },
-                  Err(e) => {
-                    return Err(ExecutorError::DeserializeError(e));
-                  },
-                },
               }
             },
           }
@@ -662,17 +547,18 @@ impl TaskGraphBuilder {
       octafile: command.octafile.clone(),
       task: Task {
         cmds: Some(vec![TaskCommand {
-          value: deferred.value.clone(),
-          platforms: None,
-          deferred: false,
-          timeout: deferred.timeout,
+          payload: deferred.payload.clone(),
+          options: CommandOptions {
+            timeout: deferred.options.timeout,
+            ..CommandOptions::default()
+          },
         }]),
         deps: None,
         platforms: None,
         condition: None,
         preconditions: None,
         sources: None,
-        timeout: deferred.timeout.or(command.task.timeout),
+        timeout: deferred.options.timeout.or(command.task.timeout),
         run: Some(AllowedRun::Always),
         extra: HashMap::new(),
         ..command.task.clone()
@@ -825,6 +711,7 @@ impl TaskGraphBuilder {
       .sources(cmd.task.sources.clone())
       .octafile_root(cmd.octafile.root().dir.clone())
       .silent(cmd.task.silent)
+      .failfast(cmd.task.failfast.or(cmd.octafile.failfast))
       .source_strategy(cmd.task.source_strategy.clone())
       .ignore_errors(cmd.task.ignore_error)
       .run_mode(self.task_run_mode(cmd))
@@ -888,11 +775,21 @@ impl TaskGraphBuilder {
             continue;
           }
 
-          for cmd in commands {
+          for mut dependency in commands {
+            Self::inherit_failfast(cmd, &mut dependency);
             let task_name = self.generate_unique_task_name(dep_name, &deps_map);
 
             self
-              .process_deps_command(dag, task_name, &cmd, None, None, prev, group.clone(), parents.clone())
+              .process_deps_command(
+                dag,
+                task_name,
+                &dependency,
+                None,
+                None,
+                prev,
+                group.clone(),
+                parents.clone(),
+              )
               .await?;
           }
         },
@@ -904,15 +801,16 @@ impl TaskGraphBuilder {
             continue;
           }
 
-          for mut cmd in commands {
-            cmd.task.timeout = c.timeout.or(cmd.task.timeout);
+          for mut dependency in commands {
+            dependency.task.timeout = c.timeout.or(dependency.task.timeout);
+            Self::inherit_failfast(cmd, &mut dependency);
             let task_name = self.generate_unique_task_name(&c.task, &deps_map);
 
             self
               .process_deps_command(
                 dag,
                 task_name,
-                &cmd,
+                &dependency,
                 c.vars.clone(),
                 c.envs.clone(),
                 prev,
@@ -950,6 +848,15 @@ impl TaskGraphBuilder {
 
   fn task_run_mode(&self, cmd: &FindResult) -> Option<AllowedRun> {
     cmd.task.run.clone().or_else(|| cmd.octafile.run.clone())
+  }
+
+  fn task_failfast(cmd: &FindResult) -> bool {
+    cmd.task.failfast.or(cmd.octafile.failfast).unwrap_or(false)
+  }
+
+  /// A task invocation belongs to both the caller and the referenced task fail-fast scopes.
+  fn inherit_failfast(parent: &FindResult, child: &mut FindResult) {
+    child.task.failfast = Some(Self::task_failfast(parent) || Self::task_failfast(child));
   }
 
   /// Build a map tracking frequency of each dependency
@@ -1416,6 +1323,75 @@ mod tests {
       overridden.timeout.unwrap().duration(),
       std::time::Duration::from_secs(2)
     );
+
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_failfast_inherits_and_overrides_octafile_default() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      failfast: true
+      tasks:
+        inherited:
+          shell: echo inherited
+        overridden:
+          failfast: false
+          shell: echo overridden
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
+    let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+    let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+    let dag = TaskGraphBuilder::new(plugin_manager)?
+      .build(octafile, "**", true, vec![])
+      .await?;
+
+    let inherited = dag.nodes().iter().find(|task| task.name == "inherited").unwrap();
+    let overridden = dag.nodes().iter().find(|task| task.name == "overridden").unwrap();
+    assert!(inherited.failfast);
+    assert!(!overridden.failfast);
+
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_failfast_is_inherited_by_task_references_and_dependencies() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      tasks:
+        pipeline:
+          failfast: true
+          execute_mode: parallel
+          deps:
+            - dependency
+          cmds:
+            - task: called
+        dependency:
+          failfast: false
+          shell: echo dependency
+        called:
+          failfast: false
+          shell: echo called
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
+    let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+    let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+    let dag = TaskGraphBuilder::new(plugin_manager)?
+      .build(octafile, "pipeline", true, vec![])
+      .await?;
+
+    let dependency = dag.nodes().iter().find(|task| task.name == "dependency").unwrap();
+    let called = dag.nodes().iter().find(|task| task.name == "called").unwrap();
+    assert!(dependency.failfast);
+    assert!(called.failfast);
 
     Ok(())
   }

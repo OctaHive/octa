@@ -1,0 +1,19 @@
+version: 1
+
+# This is the default for every task in this Octafile.
+failfast: true
+
+tasks:
+  build:
+    execute_mode: parallel
+    cmds:
+      - echo build frontend
+      - echo build backend
+
+  integration:
+    # A task can override the Octafile-level default.
+    failfast: false
+    execute_mode: parallel
+    cmds:
+      - echo test API
+      - echo test database

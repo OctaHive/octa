@@ -685,6 +685,38 @@ tasks:
 Timeouts also apply to deferred and plugin commands. When a timeout expires, Octa cancels that
 specific command, reports an error, and keeps the plugin available for subsequent executions.
 
+# Fail-fast execution
+
+By default, when one parallel task fails, Octa stops scheduling its dependants but lets work that
+is already running finish. Enable `failfast` to cancel that running work immediately. It can be set
+for the whole Octafile and overridden by an individual task:
+
+```yaml
+version: 1
+failfast: true
+
+tasks:
+  build:
+    execute_mode: parallel
+    cmds:
+      - echo build frontend
+      - echo build backend
+
+  integration:
+    failfast: false
+    execute_mode: parallel
+    cmds:
+      - echo test API
+      - echo test database
+```
+
+The `--failfast` (`-F`) CLI option applies the behavior to all commands in the current invocation,
+including commands selected together with `--parallel`:
+
+```bash
+octa --parallel --failfast lint test build
+```
+
 # Deferred commands
 
 Use `defer` to schedule cleanup after the current task finishes. Deferred commands run after successful

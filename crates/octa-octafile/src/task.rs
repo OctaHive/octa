@@ -128,12 +128,19 @@ impl From<String> for Deps {
   }
 }
 
-/// A command payload with metadata handled by Octa rather than a plugin.
+/// The executable part of a task command after the Octafile has been parsed and validated.
 #[derive(Debug, Clone)]
-pub struct TaskCommand {
-  /// Shell command, task reference, or plugin-specific command value.
-  pub value: Value,
+pub enum CommandPayload {
+  /// A reference to another task, optionally with execution overrides.
+  Task(ComplexDep),
 
+  /// A command handled by the plugin registered for `key`.
+  Plugin { key: String, value: Value },
+}
+
+/// Execution options shared by every command payload.
+#[derive(Debug, Clone, Default)]
+pub struct CommandOptions {
   /// Platforms on which this command is included in the execution plan.
   pub platforms: Option<Vec<String>>,
 
@@ -142,6 +149,13 @@ pub struct TaskCommand {
 
   /// Maximum time allowed for this command, overriding the task default.
   pub timeout: Option<Timeout>,
+}
+
+/// A typed command payload and the Octa-specific options that control its execution.
+#[derive(Debug, Clone)]
+pub struct TaskCommand {
+  pub payload: CommandPayload,
+  pub options: CommandOptions,
 }
 
 pub struct Context {
@@ -207,8 +221,8 @@ impl Context {
   }
 
   fn parse_command(&self, command: Value) -> Result<TaskCommand, String> {
-    let (value, platforms, deferred, timeout) = match command {
-      Value::String(value) => (Value::String(value), None, false, None),
+    let (value, options) = match command {
+      Value::String(value) => (Value::String(value), CommandOptions::default()),
       Value::Mapping(mut mapping) => {
         // Command metadata belongs to the wrapper and must not be passed to a plugin schema.
         let platforms = mapping
@@ -227,9 +241,23 @@ impl Context {
           if !mapping.is_empty() {
             return Err("a deferred command cannot contain sibling command fields".to_string());
           }
-          (value, platforms, true, timeout)
+          (
+            value,
+            CommandOptions {
+              platforms,
+              deferred: true,
+              timeout,
+            },
+          )
         } else {
-          (Value::Mapping(mapping), platforms, false, timeout)
+          (
+            Value::Mapping(mapping),
+            CommandOptions {
+              platforms,
+              deferred: false,
+              timeout,
+            },
+          )
         }
       },
       _ => return Err("commands must be strings, task references, or plugin commands".to_string()),
@@ -237,31 +265,36 @@ impl Context {
 
     // Validate the unwrapped value exactly like a regular command. This also delegates plugin
     // parameters to the validation schema supplied by that plugin.
-    match &value {
-      Value::String(_) => self.validate("shell", &value)?,
+    let payload = match value {
+      Value::String(command) => {
+        let value = Value::String(command);
+        self.validate("shell", &value)?;
+        CommandPayload::Plugin {
+          key: "shell".to_string(),
+          value,
+        }
+      },
       Value::Mapping(mapping) if mapping.contains_key("task") => {
-        serde_yml::from_value::<ComplexDep>(value.clone()).map_err(|error| format!("invalid task command: {error}"))?;
+        let task = serde_yml::from_value::<ComplexDep>(Value::Mapping(mapping))
+          .map_err(|error| format!("invalid task command: {error}"))?;
+        CommandPayload::Task(task)
       },
       Value::Mapping(mapping) => {
         if mapping.len() != 1 {
           return Err("a plugin command must contain exactly one plugin task type".to_string());
         }
 
-        let (key, value) = mapping.iter().next().unwrap();
-        if !self.contains(key) {
+        let (key, value) = mapping.into_iter().next().unwrap();
+        if !self.contains(&key) {
           return Err(format!("unknown plugin command type '{key}'"));
         }
-        self.validate(key, value)?;
+        self.validate(&key, &value)?;
+        CommandPayload::Plugin { key, value }
       },
       _ => return Err("commands must be strings, task references, or plugin commands".to_string()),
-    }
+    };
 
-    Ok(TaskCommand {
-      value,
-      platforms,
-      deferred,
-      timeout,
-    })
+    Ok(TaskCommand { payload, options })
   }
 }
 
@@ -286,6 +319,7 @@ pub struct Task {
   pub run: Option<AllowedRun>,                   // When task should run
   pub silent: Option<bool>,                      // Should task print to stdout or stderr
   pub execute_mode: Option<ExecuteMode>,         // How execute task commands
+  pub failfast: Option<bool>,                    // Cancel parallel work after the first failure
   pub timeout: Option<Timeout>,                  // Default timeout for task commands
   pub sources: Option<Vec<String>>,              // Sources for fingerprinting
   pub source_strategy: Option<SourceStrategies>, // Strategy for compare sources
@@ -365,6 +399,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "run" => task.run = map.next_value()?,
         "silent" => task.silent = map.next_value()?,
         "execute_mode" => task.execute_mode = map.next_value()?,
+        "failfast" => task.failfast = map.next_value()?,
         "timeout" => task.timeout = map.next_value()?,
         "sources" => task.sources = map.next_value()?,
         "source_strategy" => task.source_strategy = map.next_value()?,

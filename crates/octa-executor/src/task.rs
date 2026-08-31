@@ -54,6 +54,7 @@ pub trait SourceStrategy: Send {
 
 pub trait TaskItem {
   fn run_mode(&self) -> RunMode;
+  fn failfast(&self) -> bool;
 }
 
 /// Enums for task configuration
@@ -118,6 +119,7 @@ pub struct TaskConfig {
   pub dir: PathBuf,        // Working directory
   pub ignore_errors: bool, // Whether to continue on error
   pub silent: bool,        // Should task print to stdout or stderr
+  pub failfast: bool,      // Cancel parallel work after the first failure
 
   // Runtime behavior
   pub run_mode: RunMode,                  // Run mode
@@ -151,6 +153,7 @@ pub struct TaskConfigBuilder {
   pub dir: Option<PathBuf>,
   pub ignore_errors: Option<bool>,
   pub silent: Option<bool>,
+  pub failfast: Option<bool>,
 
   pub run_mode: Option<RunMode>,
   pub vars: Option<Vars>,
@@ -238,6 +241,11 @@ impl TaskConfigBuilder {
     self
   }
 
+  pub fn failfast(mut self, failfast: Option<bool>) -> Self {
+    self.failfast = failfast;
+    self
+  }
+
   pub fn run_mode(mut self, run_mode: Option<impl Into<RunMode>>) -> Self {
     self.run_mode = run_mode.map(Into::into);
     self
@@ -270,6 +278,7 @@ impl TaskConfigBuilder {
       dir,
       ignore_errors: self.ignore_errors.unwrap_or(false),
       silent: self.silent.unwrap_or(false),
+      failfast: self.failfast.unwrap_or(false),
       run_mode: self.run_mode.unwrap_or(RunMode::Always),
       vars: self.vars.unwrap_or_default(),
       envs: self.envs.unwrap_or_default(),
@@ -297,6 +306,7 @@ pub struct TaskNode {
   pub dir: PathBuf,        // Working directory
   pub ignore_errors: bool, // Whether to continue on error
   pub silent: bool,        // Should task print to stdout or stderr
+  pub failfast: bool,      // Cancel parallel work after the first failure
 
   // Runtime behavior
   pub run_mode: RunMode,                  // Run mode
@@ -347,6 +357,7 @@ impl TaskNode {
       dir: config.dir,
       ignore_errors: config.ignore_errors,
       silent: config.silent,
+      failfast: config.failfast,
       deps_res: Arc::new(Mutex::new(HashMap::default())),
       cmd_type: config.cmd_type,
       condition: config.condition,
@@ -847,6 +858,10 @@ impl Identifiable for TaskNode {
 impl TaskItem for TaskNode {
   fn run_mode(&self) -> RunMode {
     self.run_mode.clone()
+  }
+
+  fn failfast(&self) -> bool {
+    self.failfast
   }
 }
 
