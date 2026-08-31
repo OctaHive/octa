@@ -1,0 +1,6 @@
+version: 1
+
+default_plugin: shell
+
+tasks:
+  echo: echo This included Octafile overrides the inherited default

@@ -104,7 +104,7 @@ pub struct ExecutorConfig {
   pub silent: bool,
   /// Cancel tasks that are already running when any task in the plan fails.
   pub failfast: bool,
-  /// Shared limiter for concurrently executing non-internal tasks.
+  /// Shared limiter for executable work; graph barriers do not consume permits.
   pub concurrency: Option<Arc<Semaphore>>,
 }
 
@@ -463,8 +463,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
     let task_name = self.task.id();
     debug!("Executing task: {}", task_name);
 
-    // Internal graph barriers do not represent running user work. Deferred barriers are also
-    // internal; their nested executor acquires permits for the actual cleanup commands.
+    // Barriers do not consume capacity. Hidden executable nodes such as conditions do.
     let _permit = match self.acquire_permit().await {
       Ok(permit) => permit,
       Err(error) => return self.handle_error(error).await,
@@ -509,7 +508,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
   }
 
   async fn acquire_permit(&self) -> ExecutorResult<Option<OwnedSemaphorePermit>> {
-    if self.task.is_internal() {
+    if !self.task.requires_concurrency_permit() {
       return Ok(None);
     }
 
@@ -649,6 +648,7 @@ mod tests {
   struct TestTask {
     id: String,
     internal: bool,
+    requires_permit: bool,
     fails: bool,
     failfast: bool,
     completed: Arc<AtomicBool>,
@@ -705,6 +705,10 @@ mod tests {
     fn failfast(&self) -> bool {
       self.failfast
     }
+
+    fn requires_concurrency_permit(&self) -> bool {
+      self.requires_permit
+    }
   }
 
   #[async_trait]
@@ -751,6 +755,7 @@ mod tests {
     TestTask {
       id: id.into(),
       internal: false,
+      requires_permit: true,
       fails: false,
       failfast: false,
       completed: Arc::new(AtomicBool::new(false)),
@@ -909,6 +914,7 @@ mod tests {
     let mut dag = DAG::new();
     let mut task = test_task("internal");
     task.internal = true;
+    task.requires_permit = false;
     task.completed = completed.clone();
     dag.add_node(Arc::new(task));
     let executor = test_executor(
@@ -928,6 +934,27 @@ mod tests {
 
     assert!(result.is_ok());
     assert!(completed.load(Ordering::SeqCst));
+  }
+
+  #[tokio::test]
+  async fn hidden_executable_tasks_acquire_concurrency_permits() {
+    let mut dag = DAG::new();
+    let mut task = test_task("condition");
+    task.internal = true;
+    dag.add_node(Arc::new(task));
+    let concurrency = Arc::new(Semaphore::new(1));
+    concurrency.close();
+    let executor = test_executor(
+      dag,
+      ExecutorConfig {
+        concurrency: Some(concurrency),
+        ..ExecutorConfig::default()
+      },
+    );
+
+    let result = executor.execute(CancellationToken::new(), "test").await;
+
+    assert!(matches!(result, Err(ExecutorError::ConcurrencyLimiterClosed)));
   }
 
   #[test]

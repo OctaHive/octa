@@ -8,6 +8,6 @@ pub use error::{OctafileError, OctafileResult};
 pub use include::IncludeInfo;
 pub use octafile::{EnvValue, Envs, Octafile, ShellValue, Vars, WatchInterval};
 pub use task::{
-  AllowedRun, CommandOptions, CommandPayload, Deps, ExecuteMode, PluginSchemas, SourceStrategies, Task, TaskCommand,
-  Timeout,
+  AllowedRun, CommandOptions, CommandPayload, ConditionEvaluation, Deps, ExecuteMode, PluginCommand, PluginSchemas,
+  SourceStrategies, Task, TaskCommand, TaskCondition, TaskConditions, Timeout,
 };

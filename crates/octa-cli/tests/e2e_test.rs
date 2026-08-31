@@ -154,6 +154,32 @@ fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_global_default_plugin_for_short_commands() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join("config.yml"), "default_plugin: tpl\n")?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+tasks:
+  render: rendered by the configured default plugin
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd
+    .current_dir(tmp_dir.path())
+    .args(["--config", "config.yml", "render"])
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("rendered by the configured default plugin"));
+
+  Ok(())
+}
+
+#[test]
 fn test_task_if_condition() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   fs::write(
@@ -200,6 +226,126 @@ tasks:
   assert!(tmp_dir.path().join("executed.txt").is_file());
   assert!(!tmp_dir.path().join("skipped.txt").exists());
   assert!(!tmp_dir.path().join("also-skipped.txt").exists());
+
+  Ok(())
+}
+
+#[test]
+fn test_task_condition_phases_and_evaluation_frequency() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join("condition.tpl"), "condition passed")?;
+  #[cfg(windows)]
+  let false_condition = "exit /B 1";
+  #[cfg(not(windows))]
+  let false_condition = "false";
+  #[cfg(windows)]
+  let once_condition = "echo once>>once-checks.txt & exit /B 0";
+  #[cfg(not(windows))]
+  let once_condition = "echo once >> once-checks.txt; true";
+  #[cfg(windows)]
+  let reference_condition = "echo reference>>reference-checks.txt & exit /B 0";
+  #[cfg(not(windows))]
+  let reference_condition = "echo reference >> reference-checks.txt; true";
+  #[cfg(windows)]
+  let per_command_condition = "echo command>>command-checks.txt & if exist stop.txt (exit /B 1) else (exit /B 0)";
+  #[cfg(not(windows))]
+  let per_command_condition = "echo command >> command-checks.txt; test ! -f stop.txt";
+  let octafile = format!(
+    r#"
+version: 1
+
+tasks:
+  dependency:
+    shell: echo dependency>dependency.txt
+
+  before-skips-deps:
+    if:
+      before_deps: "{false_condition}"
+    deps:
+      - dependency
+    shell: echo task>task.txt
+
+  once:
+    if:
+      after_deps: "{once_condition}"
+    cmds:
+      - shell: echo first>once-first.txt
+      - shell: echo second>once-second.txt
+
+  per-command:
+    if:
+      after_deps:
+        shell: "{per_command_condition}"
+        evaluate: per_command
+    cmds:
+      - shell: echo stop>stop.txt
+      - shell: echo should-not-run>skipped-after-stop.txt
+
+  referenced:
+    cmds:
+      - shell: echo first>reference-first.txt
+      - shell: echo second>reference-second.txt
+
+  reference-condition:
+    cmds:
+      - task: referenced
+        if: "{reference_condition}"
+
+  plugin-condition:
+    if:
+      tpl:
+        file: condition.tpl
+    cmds:
+      - shell: echo task-plugin>task-plugin-condition.txt
+      - shell: echo command-plugin>command-plugin-condition.txt
+        if:
+          tpl: command condition passed
+"#
+  );
+  fs::write(tmp_dir.path().join("octafile.yml"), octafile)?;
+
+  for task in [
+    "before-skips-deps",
+    "once",
+    "per-command",
+    "reference-condition",
+    "plugin-condition",
+  ] {
+    let mut cmd = Command::cargo_bin("octa")?;
+    cmd.current_dir(tmp_dir.path());
+    cmd.arg(task);
+    cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+    cmd.assert().success();
+  }
+
+  assert!(!tmp_dir.path().join("dependency.txt").exists());
+  assert!(!tmp_dir.path().join("task.txt").exists());
+  assert!(tmp_dir.path().join("once-first.txt").is_file());
+  assert!(tmp_dir.path().join("once-second.txt").is_file());
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("once-checks.txt"))?
+      .lines()
+      .count(),
+    1
+  );
+  assert!(tmp_dir.path().join("stop.txt").is_file());
+  assert!(!tmp_dir.path().join("skipped-after-stop.txt").exists());
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("command-checks.txt"))?
+      .lines()
+      .count(),
+    2
+  );
+  assert!(tmp_dir.path().join("reference-first.txt").is_file());
+  assert!(tmp_dir.path().join("reference-second.txt").is_file());
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("reference-checks.txt"))?
+      .lines()
+      .count(),
+    1
+  );
+  assert!(tmp_dir.path().join("task-plugin-condition.txt").is_file());
+  assert!(tmp_dir.path().join("command-plugin-condition.txt").is_file());
 
   Ok(())
 }
@@ -495,22 +641,28 @@ fn test_run_template_plugin_file() -> Result<(), Box<dyn std::error::Error>> {
     r#"
 version: 1
 tasks:
-  hello:
+  direct:
     vars:
       source: file
     tpl:
       file: greeting.tpl
+
+  command:
+    vars:
+      source: command
+    cmds:
+      - tpl:
+          file: greeting.tpl
 "#,
   )?;
 
-  let mut cmd = Command::cargo_bin("octa")?;
-  cmd.current_dir(tmp_dir.path());
-  cmd.arg("hello");
-  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
-  cmd
-    .assert()
-    .success()
-    .stdout(predicate::str::contains("Hello from file!"));
+  for (task, expected) in [("direct", "Hello from file!"), ("command", "Hello from command!")] {
+    let mut cmd = Command::cargo_bin("octa")?;
+    cmd.current_dir(tmp_dir.path());
+    cmd.arg(task);
+    cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+    cmd.assert().success().stdout(predicate::str::contains(expected));
+  }
 
   Ok(())
 }
@@ -1089,6 +1241,32 @@ fn test_dry_run() -> Result<(), Box<dyn std::error::Error>> {
     !tmp_dir.path().join("test.txt").exists(),
     "File should not be created in dry run mode"
   );
+
+  Ok(())
+}
+
+#[test]
+fn test_dry_run_does_not_execute_plugin_condition() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+tasks:
+  guarded:
+    if:
+      tpl:
+        file: missing-condition.tpl
+    shell: echo guarded
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.args(["--dry", "guarded"]);
+
+  cmd.assert().success();
 
   Ok(())
 }

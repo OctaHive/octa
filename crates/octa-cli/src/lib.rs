@@ -39,14 +39,19 @@ use octa_octafile::{Octafile, WatchInterval};
 mod error;
 mod logger;
 
-const DEFAULT_PLUGINS: [&str; 2] = ["shell", "tpl"];
+const SHELL_PLUGIN_NAME: &str = "shell";
+const TEMPLATE_PLUGIN_NAME: &str = "tpl";
+const BUILTIN_PLUGIN_NAMES: [&str; 2] = [SHELL_PLUGIN_NAME, TEMPLATE_PLUGIN_NAME];
 const DEFAULT_TASK: &str = "default";
 const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PluginConfig {
+  #[serde(default)]
   plugins: Vec<String>,
+  default_plugin: Option<String>,
 }
 
 fn load_config<P: AsRef<Path>>(config_path: P) -> OctaResult<PluginConfig> {
@@ -256,7 +261,11 @@ async fn initialize_plugins(
   config_plugins: Vec<String>,
 ) -> OctaResult<(Arc<PluginManager>, HashMap<String, Schema>)> {
   let mut plugin_futures = Vec::new();
-  let plugins = [config_plugins, DEFAULT_PLUGINS.iter().map(|s| s.to_string()).collect()].concat();
+  let plugins = [
+    config_plugins,
+    BUILTIN_PLUGIN_NAMES.iter().map(|name| name.to_string()).collect(),
+  ]
+  .concat();
 
   // Start all plugins in parallel
   for plugin in plugins {
@@ -292,6 +301,24 @@ async fn initialize_plugins(
   }
 
   Ok((plugin_manager, plugin_keys))
+}
+
+/// Resolves the task-type key used for short commands from configuration or the built-in shell plugin.
+fn resolve_default_plugin(configured: Option<String>, schemas: &HashMap<String, Schema>) -> OctaResult<String> {
+  if let Some(key) = configured {
+    if schemas.values().any(|schema| schema.key == key) {
+      return Ok(key);
+    }
+
+    return Err(OctaError::ConfigLoadError(format!(
+      "unknown default plugin task type '{key}'"
+    )));
+  }
+
+  schemas
+    .get(SHELL_PLUGIN_NAME)
+    .map(|schema| schema.key.clone())
+    .ok_or_else(|| OctaError::PluginStartError("built-in shell plugin did not provide a schema".to_string()))
 }
 
 /// Executes tasks either in parallel or sequentially
@@ -453,12 +480,13 @@ pub async fn run() -> OctaResult<()> {
   let plugins_dir = std::env::var("OCTA_PLUGINS_DIR").unwrap_or_else(|_| "plugins".to_string());
   let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
 
-  let config_plugins = match args.config {
-    Some(config) => load_config(config)?.plugins,
-    None => vec![],
+  let config = match args.config {
+    Some(config) => load_config(config)?,
+    None => PluginConfig::default(),
   };
 
-  let (plugin_manager, plugin_schemas) = initialize_plugins(plugin_manager.clone(), config_plugins).await?;
+  let (plugin_manager, plugin_schemas) = initialize_plugins(plugin_manager.clone(), config.plugins).await?;
+  let default_plugin = resolve_default_plugin(config.default_plugin, &plugin_schemas)?;
 
   let mut validation_schemas = HashMap::new();
   for schema in plugin_schemas.values() {
@@ -474,7 +502,8 @@ pub async fn run() -> OctaResult<()> {
   }
 
   // Load octafile
-  let octafile = Octafile::load_with_schemas_from(args.octafile, args.global, args.dir, validation_schemas)?;
+  let octafile =
+    Octafile::load_with_schemas_from(args.octafile, args.global, args.dir, validation_schemas, default_plugin)?;
 
   if args.dry {
     warn!("Octa run in dry mode");
@@ -674,6 +703,7 @@ tasks:
       Some(temp_dir.path().join("Octafile.yml")),
       false,
       vec!["shell".to_string()],
+      "shell",
     )
     .unwrap();
 
@@ -713,6 +743,7 @@ tasks:
       Some(temp_dir.path().join("Octafile.yml")),
       false,
       schemas.values().map(|schema| schema.key.clone()).collect(),
+      "shell",
     )
     .unwrap();
     let commands = vec!["build".to_string()];
@@ -773,6 +804,7 @@ tasks:
       Some(temp_dir.path().join("Octafile.yml")),
       false,
       vec!["shell".to_string()],
+      "shell",
     )
     .unwrap();
     let options = ExecutionOptions {
@@ -817,11 +849,40 @@ tasks:
       plugins:
         - "plugin1"
         - "plugin2"
+      default_plugin: docker
     "#;
     let config_path = create_test_config(&temp_dir, config_content);
 
     let config = load_config(config_path).unwrap();
     assert_eq!(config.plugins, vec!["plugin1", "plugin2"]);
+    assert_eq!(config.default_plugin.as_deref(), Some("docker"));
+  }
+
+  #[test]
+  fn test_resolve_default_plugin_uses_configured_task_type() {
+    let schemas = HashMap::from([
+      (
+        SHELL_PLUGIN_NAME.to_string(),
+        Schema {
+          key: "shell-command".to_string(),
+          validation_schema: None,
+        },
+      ),
+      (
+        "custom".to_string(),
+        Schema {
+          key: "docker".to_string(),
+          validation_schema: None,
+        },
+      ),
+    ]);
+
+    assert_eq!(resolve_default_plugin(None, &schemas).unwrap(), "shell-command");
+    assert_eq!(
+      resolve_default_plugin(Some("docker".to_string()), &schemas).unwrap(),
+      "docker"
+    );
+    assert!(resolve_default_plugin(Some("missing".to_string()), &schemas).is_err());
   }
 
   #[test]

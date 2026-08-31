@@ -4,7 +4,7 @@ use std::{
   hash::{Hash, Hasher},
   io,
   path::{Path, PathBuf},
-  sync::Arc,
+  sync::{Arc, OnceLock},
   time::Duration,
 };
 
@@ -55,6 +55,7 @@ pub trait SourceStrategy: Send {
 pub trait TaskItem {
   fn run_mode(&self) -> RunMode;
   fn failfast(&self) -> bool;
+  fn requires_concurrency_permit(&self) -> bool;
 }
 
 /// Enums for task configuration
@@ -90,10 +91,139 @@ impl From<AllowedRun> for RunMode {
   }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CmdType {
-  Normal,
-  Internal,
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum NodeKind {
+  #[default]
+  Command,
+  Barrier,
+  Condition,
+}
+
+type RuntimeContext = (Vars, Envs, PathBuf);
+
+/// Shared result of a task-level condition evaluated by a condition gate node.
+#[derive(Debug, Clone)]
+struct ConditionOutcome {
+  passed: bool,
+  runtime_context: Option<RuntimeContext>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ConditionState(OnceLock<ConditionOutcome>);
+
+impl ConditionState {
+  fn set(&self, passed: bool, runtime_context: Option<RuntimeContext>) {
+    let _ = self.0.set(ConditionOutcome {
+      passed,
+      runtime_context,
+    });
+  }
+
+  fn passed(&self) -> Option<bool> {
+    self.0.get().map(|outcome| outcome.passed)
+  }
+
+  fn runtime_context(&self) -> Option<RuntimeContext> {
+    self.0.get().and_then(|outcome| outcome.runtime_context.clone())
+  }
+}
+
+#[derive(Debug, Clone, Default)]
+enum SharedConditionState {
+  #[default]
+  None,
+  Publish(Arc<ConditionState>),
+  Reuse(Arc<ConditionState>),
+}
+
+/// A normalized plugin invocation shared by task commands and conditions.
+#[derive(Debug, Clone)]
+pub(crate) struct PluginInvocation {
+  key: String,
+  value: Value,
+}
+
+impl PluginInvocation {
+  pub(crate) fn new(key: String, value: Value) -> Self {
+    Self { key, value }
+  }
+
+  fn command(&self) -> String {
+    match &self.value {
+      Value::String(command) => command.clone(),
+      value => value.to_string(),
+    }
+  }
+}
+
+/// Conditions and shared gate state attached to one executable graph node.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConditionRuntime {
+  conditions: Vec<PluginInvocation>,
+  guards: Vec<Arc<ConditionState>>,
+  shared_state: SharedConditionState,
+}
+
+impl ConditionRuntime {
+  pub(crate) fn command(
+    conditions: Vec<PluginInvocation>,
+    guards: Vec<Arc<ConditionState>>,
+    runtime_context: Option<Arc<ConditionState>>,
+  ) -> Self {
+    Self {
+      conditions,
+      guards,
+      shared_state: runtime_context.map_or(SharedConditionState::None, SharedConditionState::Reuse),
+    }
+  }
+
+  pub(crate) fn gate(
+    condition: PluginInvocation,
+    state: Arc<ConditionState>,
+    guards: Vec<Arc<ConditionState>>,
+  ) -> Self {
+    Self {
+      conditions: vec![condition],
+      guards,
+      shared_state: SharedConditionState::Publish(state),
+    }
+  }
+
+  fn conditions(&self) -> &[PluginInvocation] {
+    &self.conditions
+  }
+
+  fn should_run(&self, task_name: &str) -> ExecutorResult<bool> {
+    for guard in &self.guards {
+      match guard.passed() {
+        Some(true) => {},
+        Some(false) => {
+          self.publish(false, None);
+          return Ok(false);
+        },
+        None => {
+          return Err(ExecutorError::TaskFailed(format!(
+            "Task '{task_name}' reached an unevaluated condition gate"
+          )));
+        },
+      }
+    }
+
+    Ok(true)
+  }
+
+  fn publish(&self, passed: bool, runtime_context: Option<RuntimeContext>) {
+    if let SharedConditionState::Publish(state) = &self.shared_state {
+      state.set(passed, runtime_context);
+    }
+  }
+
+  fn shared_runtime_context(&self) -> Option<RuntimeContext> {
+    match &self.shared_state {
+      SharedConditionState::Reuse(state) => state.runtime_context(),
+      SharedConditionState::None | SharedConditionState::Publish(_) => None,
+    }
+  }
 }
 
 /// Cache implementation
@@ -128,14 +258,13 @@ pub struct TaskConfig {
   pub sources: Option<Vec<String>>,       // Sources for fingerprinting
   pub octafile_root: PathBuf,             // Directory containing the root Octafile
   pub source_strategy: SourceMethod,      // Source validation strategy
-  pub condition: Option<String>,          // Shell condition for task execution
+  condition_runtime: ConditionRuntime,    // Conditions attached to this graph node
   pub preconditions: Option<Vec<String>>, // Task preconditions
   pub timeout: Option<Timeout>,           // Maximum task execution time
 
   // State management
-  cmd_type: CmdType, // Type of task for internal use
-
-  extra: HashMap<String, Value>,
+  node_kind: NodeKind,
+  plugin: Option<PluginInvocation>,
 }
 
 impl TaskConfig {
@@ -161,13 +290,12 @@ pub struct TaskConfigBuilder {
   pub sources: Option<Vec<String>>,
   pub octafile_root: Option<PathBuf>,
   pub source_strategy: Option<SourceMethod>,
-  pub condition: Option<String>,
+  condition_runtime: ConditionRuntime,
   pub preconditions: Option<Vec<String>>,
   pub timeout: Option<Timeout>,
 
-  pub cmd_type: Option<CmdType>,
-
-  pub extra: HashMap<String, Value>,
+  node_kind: NodeKind,
+  plugin: Option<PluginInvocation>,
 }
 
 impl TaskConfigBuilder {
@@ -201,8 +329,8 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub fn condition(mut self, condition: Option<String>) -> Self {
-    self.condition = condition;
+  pub(crate) fn condition_runtime(mut self, condition_runtime: ConditionRuntime) -> Self {
+    self.condition_runtime = condition_runtime;
     self
   }
 
@@ -226,8 +354,8 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub fn extra(mut self, extra: HashMap<String, Value>) -> Self {
-    self.extra = extra;
+  pub(crate) fn plugin(mut self, plugin: Option<PluginInvocation>) -> Self {
+    self.plugin = plugin;
     self
   }
 
@@ -256,16 +384,15 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub fn cmd_type(mut self, cmd_type: Option<CmdType>) -> Self {
-    self.cmd_type = cmd_type;
+  pub(crate) fn node_kind(mut self, node_kind: NodeKind) -> Self {
+    self.node_kind = node_kind;
     self
   }
 
   pub fn build(self) -> Result<TaskConfig, &'static str> {
-    let dir = match self.cmd_type {
-      Some(CmdType::Normal) => self.dir,
-      Some(CmdType::Internal) => Some(env::current_dir().unwrap()),
-      None => self.dir,
+    let dir = match self.node_kind {
+      NodeKind::Command => self.dir,
+      NodeKind::Barrier | NodeKind::Condition => self.dir.or_else(|| Some(env::current_dir().unwrap())),
     };
 
     let dir = dir.ok_or("Missing mandatory field: dir")?;
@@ -284,12 +411,12 @@ impl TaskConfigBuilder {
       envs: self.envs.unwrap_or_default(),
       sources: self.sources,
       octafile_root,
-      condition: self.condition,
+      condition_runtime: self.condition_runtime,
       preconditions: self.preconditions,
       timeout: self.timeout,
       source_strategy: self.source_strategy.unwrap_or(SourceMethod::Hash),
-      cmd_type: self.cmd_type.unwrap_or(CmdType::Normal),
-      extra: self.extra,
+      node_kind: self.node_kind,
+      plugin: self.plugin,
     })
   }
 }
@@ -315,15 +442,14 @@ pub struct TaskNode {
   pub sources: Option<Vec<String>>,       // Sources for fingerprinting
   pub octafile_root: PathBuf,             // Directory containing the root Octafile
   pub source_strategy: SourceMethod,      // Source validation strategy
-  pub condition: Option<String>,          // Shell condition for task execution
+  condition_runtime: ConditionRuntime,    // Conditions attached to this graph node
   pub preconditions: Option<Vec<String>>, // Task run preconditions
   pub timeout: Option<Timeout>,           // Maximum task execution time
 
   // State management
   pub deps_res: Arc<Mutex<HashMap<String, String>>>, // Dependencies results
-  cmd_type: CmdType,                                 // Type of task for internal use
-
-  extra: HashMap<String, Value>,
+  node_kind: NodeKind,
+  plugin: Option<PluginInvocation>,
 }
 
 // Implement equality based on task ID
@@ -359,12 +485,22 @@ impl TaskNode {
       silent: config.silent,
       failfast: config.failfast,
       deps_res: Arc::new(Mutex::new(HashMap::default())),
-      cmd_type: config.cmd_type,
-      condition: config.condition,
+      node_kind: config.node_kind,
+      condition_runtime: config.condition_runtime,
       preconditions: config.preconditions,
       timeout: config.timeout,
-      extra: config.extra,
+      plugin: config.plugin,
     }
+  }
+
+  #[cfg(test)]
+  pub(crate) fn conditions(&self) -> Vec<String> {
+    self
+      .condition_runtime
+      .conditions()
+      .iter()
+      .map(PluginInvocation::command)
+      .collect()
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -506,6 +642,10 @@ impl TaskNode {
 
   /// Resolves the values shared by conditions, cache checks, and the task command once.
   async fn resolve_runtime_context(&self, dry: bool) -> ExecutorResult<(Vars, Envs, PathBuf)> {
+    if let Some(context) = self.condition_runtime.shared_runtime_context() {
+      return Ok(context);
+    }
+
     let dir_is_template = {
       let value = self.dir.to_string_lossy();
       value.contains("{{") && value.contains("}}")
@@ -536,7 +676,7 @@ impl TaskNode {
   }
 
   fn log_info(&self, message: String) {
-    if self.cmd_type != CmdType::Internal {
+    if self.node_kind == NodeKind::Command {
       info!("{}", message);
     }
   }
@@ -563,40 +703,47 @@ impl TaskNode {
     envs: &Envs,
     dir: &Path,
   ) -> ExecutorResult<bool> {
-    let Some(condition) = &self.condition else {
+    if self.condition_runtime.conditions().is_empty() {
       return Ok(true);
-    };
+    }
+    if dry {
+      return Ok(true);
+    }
 
-    let plugin_name = plugin_manager
-      .get_schema_keys()
-      .await
-      .remove("shell")
-      .ok_or(ExecutorError::TaskParsedError)?;
+    let plugins = plugin_manager.get_schema_keys().await;
 
     let deps_res = self.deps_res.lock().await;
     let mut vars = vars.clone();
     vars.insert("deps_result", &*deps_res);
     drop(deps_res);
 
-    match self
-      .execute_plugin_command(
-        plugin_manager,
-        &plugin_name,
-        dry,
-        condition.clone(),
-        vec![],
-        dir.to_path_buf(),
-        vars.to_hashmap(),
-        envs.clone().into(),
-        true,
-        cancel_token,
-      )
-      .await
-    {
-      Ok((code, _, _)) => Ok(code == 0),
-      Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
-      Err(error) => Err(error.into()),
+    for condition in self.condition_runtime.conditions() {
+      let plugin_name = plugins.get(&condition.key).ok_or(ExecutorError::TaskParsedError)?;
+      match self
+        .execute_plugin_command(
+          plugin_manager.clone(),
+          plugin_name,
+          dry,
+          condition.command(),
+          vec![],
+          dir.to_path_buf(),
+          vars.to_hashmap(),
+          envs.clone().into(),
+          true,
+          cancel_token.clone(),
+        )
+        .await
+      {
+        Ok((0, _, _)) => {},
+        Ok(_) => return Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+          return Err(ExecutorError::TaskCancelled(self.name.clone()));
+        },
+        Err(error) => return Err(error.into()),
+      }
     }
+
+    Ok(true)
   }
 
   async fn check_preconditions(&self, vars: &Vars) -> ExecutorResult<bool> {
@@ -677,12 +824,18 @@ impl TaskNode {
     force: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
-    let (vars, envs, dir) = self.resolve_runtime_context(dry).await?;
+    if !self.condition_runtime.should_run(&self.name)? {
+      return Ok(String::new());
+    }
 
-    if !self
+    let (vars, envs, dir) = self.resolve_runtime_context(dry).await?;
+    let condition_passed = self
       .check_condition(plugin_manager.clone(), dry, cancel_token.clone(), &vars, &envs, &dir)
-      .await?
-    {
+      .await?;
+    self
+      .condition_runtime
+      .publish(condition_passed, Some((vars.clone(), envs.clone(), dir.clone())));
+    if !condition_passed {
       self.log_info(format!(
         "Task '{}' skipped because its condition was not met",
         self.name
@@ -712,21 +865,11 @@ impl TaskNode {
     self.log_info(format!("Starting task {}", self.name));
     self.debug_log_dependencies().await;
 
-    let plugins_key = plugin_manager.get_schema_keys().await;
-    let mut result: Vec<(String, Value)> = vec![];
-    for (key, value) in &self.extra {
-      if let Some(plugin_name) = plugins_key.get(key) {
-        result.push((plugin_name.clone(), value.clone()));
-      }
-    }
-
-    if result.is_empty() {
+    let Some(plugin) = &self.plugin else {
       return Ok("".to_string());
-    }
-
-    if result.len() > 1 {
-      panic!("Several plugin keys provide in task");
-    }
+    };
+    let plugins = plugin_manager.get_schema_keys().await;
+    let plugin_name = plugins.get(&plugin.key).ok_or(ExecutorError::TaskParsedError)?;
 
     let mut vars_with_deps_results = vars.clone();
     let deps_res = self.deps_res.lock().await;
@@ -735,9 +878,9 @@ impl TaskNode {
     match self
       .execute_plugin_command(
         plugin_manager,
-        &result[0].0,
+        plugin_name,
         dry,
-        result[0].1.to_string().trim_matches('"').to_owned(),
+        plugin.command(),
         vec![],
         dir,
         vars_with_deps_results.to_hashmap(),
@@ -851,7 +994,7 @@ impl Identifiable for TaskNode {
   }
 
   fn is_internal(&self) -> bool {
-    self.cmd_type == CmdType::Internal
+    self.node_kind != NodeKind::Command
   }
 }
 
@@ -863,6 +1006,10 @@ impl TaskItem for TaskNode {
   fn failfast(&self) -> bool {
     self.failfast
   }
+
+  fn requires_concurrency_permit(&self) -> bool {
+    self.node_kind != NodeKind::Barrier
+  }
 }
 
 #[cfg(test)]
@@ -871,17 +1018,15 @@ mod tests {
   use std::{fs, time::Duration};
   use tempfile::TempDir;
 
+  fn plugin(key: &str, value: impl Into<Value>) -> Option<PluginInvocation> {
+    Some(PluginInvocation::new(key.to_owned(), value.into()))
+  }
+
   // Helper function to create a test TaskNode
   fn create_test_task(name: &str, cmd: Option<&str>, tpl: Option<String>, run_mode: Option<RunMode>) -> TaskNode {
-    let mut extra = HashMap::new();
-    if let Some(tpl) = tpl {
-      let tpl_value = Value::String(tpl);
-      extra.insert("tpl".to_owned(), tpl_value);
-    }
-    if let Some(cmd) = cmd {
-      let cmd_value = Value::String(cmd.to_owned());
-      extra.insert("shell".to_owned(), cmd_value);
-    }
+    let plugin = tpl
+      .map(|value| PluginInvocation::new("tpl".to_owned(), Value::String(value)))
+      .or_else(|| cmd.map(|value| PluginInvocation::new("shell".to_owned(), Value::String(value.to_owned()))));
 
     let task_config = TaskConfig::builder()
       .id(name.to_string())
@@ -890,7 +1035,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .extra(extra)
+      .plugin(plugin)
       .run_mode(Some(run_mode.unwrap_or(RunMode::Always)))
       .build()
       .unwrap();
@@ -1049,10 +1194,6 @@ mod tests {
     let mut vars = Vars::new();
     vars.insert("name", &"world");
 
-    let mut extra = HashMap::new();
-    let tpl_value = Value::String("Hello {{ name }}!".into());
-    extra.insert("tpl".to_owned(), tpl_value);
-
     let task_config = TaskConfig::builder()
       .id("template_task".to_string())
       .name("template_task".to_string())
@@ -1060,7 +1201,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(vars)
       .envs(Envs::new())
-      .extra(extra)
+      .plugin(plugin("tpl", "Hello {{ name }}!"))
       .build()
       .unwrap();
 
@@ -1156,10 +1297,6 @@ mod tests {
     let test_file = temp_dir.path().join("test.txt");
     fs::write(&test_file, "initial content").unwrap();
 
-    let mut extra = HashMap::new();
-    let cmd_value = Value::String("echo 'test'".to_string());
-    extra.insert("shell".to_owned(), cmd_value);
-
     let task_config = TaskConfig::builder()
       .id("source_task".to_string())
       .name("source_task".to_string())
@@ -1167,7 +1304,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .extra(extra)
+      .plugin(plugin("shell", "echo 'test'"))
       .run_mode(Some(AllowedRun::Changed))
       .sources(Some(vec![test_file.to_str().unwrap().to_string()]))
       .source_strategy(Some(SourceStrategies::Hash))
@@ -1271,10 +1408,6 @@ mod tests {
       .expect("Failed to open in-memory Sled database");
 
     let cancel_token = CancellationToken::new();
-    let mut extra = HashMap::new();
-    let cmd_value = Value::String("sleep 5".to_string());
-    extra.insert("shell".to_owned(), cmd_value);
-
     let task_config = TaskConfig::builder()
       .id("long_task".to_string())
       .name("long_task".to_string())
@@ -1282,7 +1415,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .extra(extra)
+      .plugin(plugin("shell", "sleep 5"))
       .build()
       .unwrap();
 
@@ -1338,8 +1471,6 @@ mod tests {
     let long_command = "sleep 5";
     #[cfg(windows)]
     let long_command = "ping -n 5 127.0.0.1";
-    let mut extra = HashMap::new();
-    extra.insert("shell".to_owned(), Value::String(long_command.to_string()));
     let timeout = serde_yml::from_str::<Timeout>("100ms").unwrap();
     let timed_task = TaskNode::new(
       TaskConfig::builder()
@@ -1347,7 +1478,7 @@ mod tests {
         .name("timed_task")
         .dep_name("timed_task")
         .dir(".")
-        .extra(extra)
+        .plugin(plugin("shell", long_command))
         .timeout(Some(timeout))
         .build()
         .unwrap(),
@@ -1365,15 +1496,13 @@ mod tests {
       .await;
     assert!(matches!(result, Err(ExecutorError::TaskTimedOut { .. })));
 
-    let mut extra = HashMap::new();
-    extra.insert("shell".to_owned(), Value::String("echo reusable".to_string()));
     let next_task = TaskNode::new(
       TaskConfig::builder()
         .id("next_task")
         .name("next_task")
         .dep_name("next_task")
         .dir(".")
-        .extra(extra)
+        .plugin(plugin("shell", "echo reusable"))
         .build()
         .unwrap(),
     );
@@ -1399,10 +1528,6 @@ mod tests {
       .open()
       .expect("Failed to open in-memory Sled database");
 
-    let mut extra = HashMap::new();
-    let cmd_value = Value::String("nonexistent_command".to_string());
-    extra.insert("shell".to_owned(), cmd_value);
-
     let task_config = TaskConfig::builder()
       .id("ignore_error_task".to_string())
       .name("ignore_error_task".to_string())
@@ -1410,7 +1535,7 @@ mod tests {
       .dir(PathBuf::from("."))
       .vars(Vars::new())
       .envs(Envs::new())
-      .extra(extra)
+      .plugin(plugin("shell", "nonexistent_command"))
       .ignore_errors(Some(true))
       .build()
       .unwrap();

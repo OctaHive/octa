@@ -82,7 +82,7 @@ When executing a task, the program begins searching for configuration files in t
 toward the root directory. It follows a specific order, stopping as soon as it finds either a matching file, a octafile.{yml,yaml} 
 file, or reaches the root directory with no further folders to check.
 
-To run a task from your global Octafile located in your home directory, use the --global or -g flag. This is ideal for managing 
+To run a task from your global Octafile located in your home directory, use the `--global` or `-g` flag. This is ideal for managing
 personal tasks that aren’t tied to a specific project.
 
 You can also run tasks from a specific file by simply passing it with the `--octafile` or `-o` flag, e.g., `octa -o project_tasks.yml build`.
@@ -95,6 +95,43 @@ then its parents, just as it does for the current working directory. When combin
 octa --dir ./backend build
 octa --dir ./backend --octafile config/Octafile.yml build
 ```
+
+## Default command plugin
+
+A task or an item in `cmds` written as a plain string is handled by the configured default plugin.
+Without configuration, Octa uses the task-type key returned by the built-in `shell` plugin.
+
+Set the default globally in the file passed with `--config`:
+
+```yaml
+plugins: []
+default_plugin: tpl
+```
+
+```console
+octa --config octa-config.yml render
+```
+
+An Octafile can override the global value:
+
+```yaml
+version: 1
+default_plugin: tpl
+
+tasks:
+  render: Hello {{ NAME }}
+
+  explicit-shell:
+    shell: echo "still handled by shell"
+```
+
+`default_plugin` is a task-type key returned by a loaded plugin, not the plugin executable name.
+Unknown keys are rejected while loading the Octafile. Included Octafiles inherit the effective
+default from their parent and can override it locally. Explicit plugin mappings and annotations are
+never affected by this setting.
+
+The [`example/default-plugin`](example/default-plugin) directory demonstrates both the global
+setting and a local override in an included Octafile.
 
 ## Listing and searching tasks
 
@@ -134,7 +171,7 @@ includes:
 All imported tasks will be accessible through a namespace based on the key name in the imports section. So, you'd call task `web:serve` to 
 run the serve task from web/Octafile.yml or task `backend:build` to run the build task from the ./backend/Octafile.yml file.
 
-Include paths are Tera templates. The built-in `OS` and `ARCH` variables use Go-compatible values such
+The built-in `OS` and `ARCH` variables use Go-compatible values such
 as `linux`, `darwin`, `windows`, `amd64`, and `arm64`. Variables declared in the current Octafile are
 also available:
 
@@ -1019,9 +1056,11 @@ The default interval is `100ms`. Set `interval` at the root of the Octafile or o
 command line with `--interval 1s`. Durations must be positive integers ending in `ms`, `s`, or `m`.
 
 ## Task conditions
-Use the `if` parameter to run a task only when a shell command exits successfully. A non-zero
-exit code skips the task without failing the execution plan. The condition runs after dependencies,
-so it can use task variables, environment variables, and `deps_result` template values.
+Use the `if` parameter to run a task only when a condition command exits successfully. A non-zero
+exit code skips the guarded work without failing the execution plan. A string is shorthand for a
+condition handled by the effective `default_plugin` and runs once after dependencies, so it can use
+task variables, environment variables, and `deps_result`. A one-plugin mapping can select any
+registered plugin task type explicitly; it has the same default `after_deps`/`once` behavior.
 
 ```yaml
 version: 1
@@ -1034,23 +1073,47 @@ tasks:
     if: test "{{ ENVIRONMENT }}" = "production"
     shell: ./deploy.sh
 
+  prepare: ./prepare.sh
+
+  plugin-condition:
+    if:
+      tpl: condition passed
+    shell: ./plugin-guarded.sh
+
   pipeline:
+    if:
+      before_deps: test -f config.yml
+      after_deps:
+        shell: test "$(df -Pk . | awk 'NR == 2 { print $4 }')" -gt 1048576
+        evaluate: per_command
+    deps:
+      - prepare
     cmds:
-      - shell: ./prepare.sh
-        if: test -f config.yml
+      - shell: ./build.sh
+      - shell: ./package.sh
+        if: test -n "$SIGNING_KEY"
       - shell: ./optional-check.sh
         ignore_error: true
       - task: deploy
         silent: true
 ```
 
+The phased form accepts `before_deps` and `after_deps`. String values use `evaluate: once` and
+share one result with all commands in that task invocation. `after_deps` also accepts a detailed
+form with `evaluate: per_command`, which re-runs the condition immediately before every executable
+command. This is useful for checks whose result can change while the task is running, such as free
+disk space. `before_deps` only supports `once`, because it gates the dependency subtree as a whole.
+In a detailed condition, `shell` is a plugin task type rather than a field interpreted by the
+executor; another registered plugin key can be used in its place.
+
 The condition is still evaluated when `--force` is used. In dry mode, Octa prints the task commands
 without executing the condition and treats it as successful.
 
 `if`, `silent`, and `ignore_error` can also be set on an individual command or task reference. Use
-the mapping form shown above when a command needs options. Command values override task-level
-defaults; omitted values inherit them. These options are handled by Octa and work with every plugin
-command type.
+the mapping form shown above when a command needs options. A command-level `if` is an additional
+condition and accepts either the string shorthand or a one-plugin mapping. `silent` and
+`ignore_error` override task-level defaults when present. These options are handled by Octa and
+work with every plugin command type.
 
 ## Task preconditions
 Sometimes you need to check a condition before executing a task and decide whether to run it or not.

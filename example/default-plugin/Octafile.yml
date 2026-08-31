@@ -1,0 +1,10 @@
+version: 1
+
+includes:
+  shell: ./shell/Octafile.yml
+
+tasks:
+  render: The global default routes this short task through tpl
+
+  explicit-shell:
+    shell: echo Explicit plugin mappings ignore the default

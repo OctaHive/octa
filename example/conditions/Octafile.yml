@@ -8,10 +8,20 @@ tasks:
     if: test "{{ ENVIRONMENT }}" = "production"
     shell: echo "Deploying to production"
 
+  plugin-condition:
+    if:
+      tpl: condition passed
+    shell: echo "Plugin condition passed"
+
   pipeline:
+    if:
+      before_deps: test -f Octafile.yml
+      after_deps:
+        shell: test -d .
+        evaluate: per_command
     cmds:
       - shell: echo "Preparing deployment"
-        if: test -f config.yml
+        if: test -n "{{ ENVIRONMENT }}"
       - shell: ./optional-check.sh
         ignore_error: true
       - task: deploy

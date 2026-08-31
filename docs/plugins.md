@@ -84,6 +84,15 @@ tasks:
   build: !shell cargo build
 ```
 
+The same key can be selected as `default_plugin` in the global Octa configuration or an Octafile.
+Plain string tasks, commands, and conditions are then routed to that plugin. Octa validates the
+configured value against the keys returned by loaded plugins; the plugin executable name does not
+need to match its task-type key.
+
+Task-type keys must be non-empty and must not collide with Octafile syntax such as `cmds`, `task`,
+`if`, `timeout`, or `defer`. Octa rejects conflicting keys while loading plugin schemas so that a key
+cannot be interpreted differently in tasks, commands, and conditions.
+
 The tagged value is passed to the selected plugin. An annotation can also contain a structured
 payload for plugins that accept configuration; structured values are serialized as JSON when sent
 through the current string-based Execute protocol.

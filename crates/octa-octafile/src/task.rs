@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt, path::PathBuf, time::Duration};
+use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc, time::Duration};
 
 use serde::{
   de::{DeserializeSeed, MapAccess, Visitor},
@@ -10,6 +10,37 @@ use serde_yml::Value;
 use crate::{octafile::Envs, Vars};
 
 pub type PluginSchemas = HashMap<String, Option<serde_json::Map<String, serde_json::Value>>>;
+
+// Plugin task types share YAML namespaces with task fields, command metadata, and condition
+// controls. Reject collisions during plugin registration instead of parsing the same key
+// differently depending on where it is used.
+const RESERVED_PLUGIN_KEYS: &[&str] = &[
+  "dir",
+  "desc",
+  "vars",
+  "env",
+  "dotenv",
+  "cmds",
+  "internal",
+  "platforms",
+  "ignore_error",
+  "deps",
+  "run",
+  "silent",
+  "execute_mode",
+  "failfast",
+  "timeout",
+  "sources",
+  "source_strategy",
+  "watch",
+  "if",
+  "preconditions",
+  "task",
+  "defer",
+  "evaluate",
+  "before_deps",
+  "after_deps",
+];
 
 /// A validated, non-zero timeout parsed from a human-readable duration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,8 +165,8 @@ pub enum CommandPayload {
   /// A reference to another task, optionally with execution overrides.
   Task(ComplexDep),
 
-  /// A command handled by the plugin registered for `key`.
-  Plugin { key: String, value: Value },
+  /// A command handled by a registered plugin.
+  Plugin(PluginCommand),
 }
 
 /// Execution options shared by every command payload.
@@ -150,14 +181,47 @@ pub struct CommandOptions {
   /// Maximum time allowed for this command, overriding the task default.
   pub timeout: Option<Timeout>,
 
-  /// Shell condition that must succeed before this command runs.
-  pub condition: Option<String>,
+  /// Plugin command that must succeed before this command runs.
+  pub condition: Option<PluginCommand>,
 
   /// Whether output from this command is suppressed.
   pub silent: Option<bool>,
 
   /// Whether a failure from this command is ignored.
   pub ignore_error: Option<bool>,
+}
+
+/// Controls how often a phased task condition is evaluated.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionEvaluation {
+  /// Evaluate the condition once and share its result with the task scope.
+  #[default]
+  Once,
+
+  /// Re-evaluate the condition before every command in `cmds`.
+  PerCommand,
+}
+
+/// A validated plugin task type and its YAML payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginCommand {
+  pub key: String,
+  pub value: Value,
+}
+
+/// A normalized task condition together with its evaluation policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCondition {
+  pub command: PluginCommand,
+  pub evaluate: ConditionEvaluation,
+}
+
+/// Task conditions normalized around dependency execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TaskConditions {
+  pub before_deps: Option<TaskCondition>,
+  pub after_deps: Option<TaskCondition>,
 }
 
 /// A typed command payload and the Octa-specific options that control its execution.
@@ -167,25 +231,29 @@ pub struct TaskCommand {
   pub options: CommandOptions,
 }
 
-pub struct Context {
-  validators: HashMap<String, Option<jsonschema::Validator>>,
+pub(crate) struct Context {
+  validators: Arc<HashMap<String, Option<jsonschema::Validator>>>,
+  default_plugin: String,
 }
 
 impl Context {
-  pub fn from_keys(keys: Vec<String>) -> Self {
-    let mut validators = keys.into_iter().map(|key| (key, None)).collect::<HashMap<_, _>>();
-    validators.entry("shell".to_string()).or_insert(None);
+  pub(crate) fn from_keys(keys: Vec<String>, default_plugin: impl Into<String>) -> Result<Self, String> {
+    let mut validators = HashMap::with_capacity(keys.len());
+    for key in keys {
+      validate_plugin_key(&key)?;
+      if validators.insert(key.clone(), None).is_some() {
+        return Err(format!("duplicated plugin task key '{key}'"));
+      }
+    }
 
-    Self { validators }
+    Self::new(validators, default_plugin)
   }
 
-  pub fn from_schemas(schemas: PluginSchemas) -> Result<Self, String> {
+  pub(crate) fn from_schemas(schemas: PluginSchemas, default_plugin: impl Into<String>) -> Result<Self, String> {
     let mut validators = HashMap::with_capacity(schemas.len());
 
     for (key, schema) in schemas {
-      if key.is_empty() {
-        return Err("plugin task key cannot be empty".to_string());
-      }
+      validate_plugin_key(&key)?;
 
       let validator = schema
         .map(|schema| {
@@ -197,14 +265,29 @@ impl Context {
       validators.insert(key, validator);
     }
 
-    Ok(Self { validators })
+    Self::new(validators, default_plugin)
   }
 
-  pub fn contains(&self, key: &str) -> bool {
+  fn new(
+    validators: HashMap<String, Option<jsonschema::Validator>>,
+    default_plugin: impl Into<String>,
+  ) -> Result<Self, String> {
+    let default_plugin = default_plugin.into();
+    if !validators.contains_key(&default_plugin) {
+      return Err(format!("unknown default plugin '{default_plugin}'"));
+    }
+
+    Ok(Self {
+      validators: Arc::new(validators),
+      default_plugin,
+    })
+  }
+
+  pub(crate) fn contains(&self, key: &str) -> bool {
     self.validators.contains_key(key)
   }
 
-  pub fn validate(&self, key: &str, value: &Value) -> Result<(), String> {
+  pub(crate) fn validate(&self, key: &str, value: &Value) -> Result<(), String> {
     let Some(Some(validator)) = self.validators.get(key) else {
       return Ok(());
     };
@@ -220,6 +303,99 @@ impl Context {
     } else {
       Err(format!("invalid parameters for plugin '{key}': {}", errors.join("; ")))
     }
+  }
+
+  pub(crate) fn with_default_plugin(&self, default_plugin: Option<String>) -> Result<Self, String> {
+    let default_plugin = default_plugin.unwrap_or_else(|| self.default_plugin.clone());
+    if !self.contains(&default_plugin) {
+      return Err(format!("unknown default plugin '{default_plugin}'"));
+    }
+
+    Ok(Self {
+      validators: Arc::clone(&self.validators),
+      default_plugin,
+    })
+  }
+
+  pub(crate) fn default_plugin(&self) -> &str {
+    &self.default_plugin
+  }
+
+  fn parse_condition_command(&self, value: Value) -> Result<PluginCommand, String> {
+    let (key, value) = match value {
+      Value::String(command) => (self.default_plugin().to_owned(), Value::String(command)),
+      Value::Mapping(mapping) if mapping.len() == 1 => mapping.into_iter().next().unwrap(),
+      _ => return Err("a condition must be a string or contain exactly one plugin task type".to_string()),
+    };
+
+    if !self.contains(&key) {
+      return Err(format!("unknown plugin condition type '{key}'"));
+    }
+    self.validate(&key, &value)?;
+
+    Ok(PluginCommand { key, value })
+  }
+
+  fn parse_phase_condition(&self, value: Value, before_deps: bool) -> Result<TaskCondition, String> {
+    let (command, evaluate) = match value {
+      Value::Mapping(mut mapping) => {
+        let evaluate = mapping
+          .remove("evaluate")
+          .map(serde_yml::from_value::<ConditionEvaluation>)
+          .transpose()
+          .map_err(|error| format!("invalid condition evaluation policy: {error}"))?
+          .unwrap_or_default();
+        (self.parse_condition_command(Value::Mapping(mapping))?, evaluate)
+      },
+      value => (self.parse_condition_command(value)?, ConditionEvaluation::Once),
+    };
+
+    if before_deps && evaluate == ConditionEvaluation::PerCommand {
+      return Err("'before_deps' conditions only support 'evaluate: once'".to_string());
+    }
+
+    Ok(TaskCondition { command, evaluate })
+  }
+
+  fn parse_task_conditions(&self, value: Value) -> Result<TaskConditions, String> {
+    if matches!(value, Value::String(_)) {
+      return Ok(TaskConditions {
+        before_deps: None,
+        after_deps: Some(self.parse_phase_condition(value, false)?),
+      });
+    }
+
+    let Value::Mapping(mut mapping) = value else {
+      return Err("task condition must be a string or a mapping".to_string());
+    };
+
+    if !mapping.contains_key("before_deps") && !mapping.contains_key("after_deps") {
+      return Ok(TaskConditions {
+        before_deps: None,
+        after_deps: Some(self.parse_phase_condition(Value::Mapping(mapping), false)?),
+      });
+    }
+
+    let before_deps = mapping
+      .remove("before_deps")
+      .map(|value| self.parse_phase_condition(value, true))
+      .transpose()?;
+    let after_deps = mapping
+      .remove("after_deps")
+      .map(|value| self.parse_phase_condition(value, false))
+      .transpose()?;
+
+    if let Some((key, _)) = mapping.into_iter().next() {
+      return Err(format!("unknown task condition field '{key}'"));
+    }
+    if before_deps.is_none() && after_deps.is_none() {
+      return Err("task condition must define 'before_deps' or 'after_deps'".to_string());
+    }
+
+    Ok(TaskConditions {
+      before_deps,
+      after_deps,
+    })
   }
 
   fn parse_commands(&self, commands: Vec<Value>) -> Result<Vec<TaskCommand>, String> {
@@ -246,9 +422,8 @@ impl Context {
           .map_err(|error| format!("invalid command timeout: {error}"))?;
         let condition = mapping
           .remove("if")
-          .map(serde_yml::from_value::<String>)
-          .transpose()
-          .map_err(|error| format!("invalid command condition: {error}"))?;
+          .map(|value| self.parse_condition_command(value))
+          .transpose()?;
         let silent = mapping
           .remove("silent")
           .map(serde_yml::from_value::<bool>)
@@ -292,11 +467,9 @@ impl Context {
     let payload = match value {
       Value::String(command) => {
         let value = Value::String(command);
-        self.validate("shell", &value)?;
-        CommandPayload::Plugin {
-          key: "shell".to_string(),
-          value,
-        }
+        let key = self.default_plugin().to_owned();
+        self.validate(&key, &value)?;
+        CommandPayload::Plugin(PluginCommand { key, value })
       },
       Value::Mapping(mapping) if mapping.contains_key("task") => {
         let task = serde_yml::from_value::<ComplexDep>(Value::Mapping(mapping))
@@ -313,7 +486,7 @@ impl Context {
           return Err(format!("unknown plugin command type '{key}'"));
         }
         self.validate(&key, &value)?;
-        CommandPayload::Plugin { key, value }
+        CommandPayload::Plugin(PluginCommand { key, value })
       },
       _ => return Err("commands must be strings, task references, or plugin commands".to_string()),
     };
@@ -322,10 +495,15 @@ impl Context {
   }
 }
 
-impl Default for Context {
-  fn default() -> Self {
-    Self::from_keys(Vec::new())
+fn validate_plugin_key(key: &str) -> Result<(), String> {
+  if key.is_empty() {
+    return Err("plugin task key cannot be empty".to_string());
   }
+  if RESERVED_PLUGIN_KEYS.contains(&key) {
+    return Err(format!("plugin task key '{key}' is reserved by Octafile syntax"));
+  }
+
+  Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -348,13 +526,13 @@ pub struct Task {
   pub sources: Option<Vec<String>>,              // Sources for fingerprinting
   pub source_strategy: Option<SourceStrategies>, // Strategy for compare sources
   pub watch: Option<bool>,                       // Watch sources and rerun the task
-  pub condition: Option<String>,                 // Shell condition for task execution
+  pub condition: Option<TaskConditions>,         // Plugin conditions around dependency execution
   pub preconditions: Option<Vec<String>>,        // Commands to check should run command
-  pub extra: HashMap<String, Value>,             // Captures any additional attributes
+  pub plugin: Option<PluginCommand>,             // Plugin command executed by this task
 }
 
-pub struct TaskSeed<'a> {
-  pub context: &'a Context,
+pub(crate) struct TaskSeed<'a> {
+  pub(crate) context: &'a Context,
 }
 
 impl<'de> DeserializeSeed<'de> for TaskSeed<'_> {
@@ -364,13 +542,12 @@ impl<'de> DeserializeSeed<'de> for TaskSeed<'_> {
   where
     D: Deserializer<'de>,
   {
-    // Forward to a visitor, passing the context
-    deserializer.deserialize_map(TaskVisitor { context: self.context })
+    deserializer.deserialize_any(TaskVisitor { context: self.context })
   }
 }
 
-pub struct TaskVisitor<'a> {
-  pub context: &'a Context,
+struct TaskVisitor<'a> {
+  context: &'a Context,
 }
 
 impl<'de> Visitor<'de> for TaskVisitor<'_> {
@@ -384,13 +561,15 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
   where
     E: serde::de::Error,
   {
-    let mut extra = HashMap::new();
     let cmd_value = Value::String(value.to_string());
-    self.context.validate("shell", &cmd_value).map_err(E::custom)?;
-    extra.insert("shell".to_owned(), cmd_value);
+    let default_plugin = self.context.default_plugin();
+    self.context.validate(default_plugin, &cmd_value).map_err(E::custom)?;
 
     Ok(Task {
-      extra,
+      plugin: Some(PluginCommand {
+        key: default_plugin.to_owned(),
+        value: cmd_value,
+      }),
       ..Task::default()
     })
   }
@@ -400,7 +579,6 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
     M: MapAccess<'de>,
   {
     let mut task = Task::default();
-    let mut extra = HashMap::new();
 
     while let Some(key) = map.next_key::<String>()? {
       match key.as_str() {
@@ -428,14 +606,20 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "sources" => task.sources = map.next_value()?,
         "source_strategy" => task.source_strategy = map.next_value()?,
         "watch" => task.watch = map.next_value()?,
-        "if" => task.condition = map.next_value()?,
+        "if" => {
+          let condition: Option<Value> = map.next_value()?;
+          task.condition = condition
+            .map(|condition| self.context.parse_task_conditions(condition))
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        },
         "preconditions" => task.preconditions = map.next_value()?,
         key => {
           if !self.context.contains(key) {
             return Err(serde::de::Error::custom(format!("unknown task field '{key}'")));
           }
 
-          if !extra.is_empty() {
+          if task.plugin.is_some() {
             return Err(serde::de::Error::custom(
               "a task cannot define more than one plugin task type",
             ));
@@ -443,20 +627,49 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
 
           let value = map.next_value()?;
           self.context.validate(key, &value).map_err(serde::de::Error::custom)?;
-          extra.insert(key.to_owned(), value);
+          task.plugin = Some(PluginCommand {
+            key: key.to_owned(),
+            value,
+          });
         },
       }
     }
 
-    if !extra.is_empty() {
-      if task.cmds.is_some() {
-        return Err(serde::de::Error::custom(
-          "a task cannot define both 'cmds' and a plugin task type",
-        ));
-      }
-      task.extra = extra;
+    if task.plugin.is_some() && task.cmds.is_some() {
+      return Err(serde::de::Error::custom(
+        "a task cannot define both 'cmds' and a plugin task type",
+      ));
     }
 
     Ok(task)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn both_context_constructors_reject_invalid_plugin_keys() {
+    let empty_key_error = Context::from_keys(vec![String::new()], "").err().unwrap();
+    assert_eq!(empty_key_error, "plugin task key cannot be empty");
+
+    for key in RESERVED_PLUGIN_KEYS {
+      let error = Context::from_keys(vec![(*key).to_string()], *key).err().unwrap();
+      assert_eq!(error, format!("plugin task key '{key}' is reserved by Octafile syntax"));
+    }
+
+    let schemas = PluginSchemas::from([("timeout".to_string(), None)]);
+    let schema_error = Context::from_schemas(schemas, "timeout").err().unwrap();
+    assert_eq!(schema_error, "plugin task key 'timeout' is reserved by Octafile syntax");
+  }
+
+  #[test]
+  fn key_only_context_rejects_duplicate_plugin_keys() {
+    let error = Context::from_keys(vec!["shell".to_string(), "shell".to_string()], "shell")
+      .err()
+      .unwrap();
+
+    assert_eq!(error, "duplicated plugin task key 'shell'");
   }
 }
