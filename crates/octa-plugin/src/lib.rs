@@ -66,7 +66,12 @@ pub trait Plugin: Send + Sync + 'static {
   ) -> anyhow::Result<()>;
 }
 
-type ActiveCommands = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
+struct ActiveCommand {
+  handle: JoinHandle<()>,
+  cancel_token: CancellationToken,
+}
+
+type ActiveCommands = Arc<Mutex<HashMap<String, ActiveCommand>>>;
 
 pub async fn stream_output(
   stream: impl AsyncRead + Unpin,
@@ -140,6 +145,9 @@ where
       let command_logger = logger.clone();
 
       // Spawn the command execution
+      // Every command gets a child token so it can be stopped without shutting down the plugin.
+      let command_cancel_token = cancel_token.child_token();
+      let execute_cancel_token = command_cancel_token.clone();
       let handle = tokio::spawn(async move {
         if let Err(e) = plugin
           .execute_command(
@@ -152,7 +160,7 @@ where
             envs,
             writer_clone.clone(),
             command_logger,
-            cancel_token.clone(),
+            execute_cancel_token,
           )
           .await
         {
@@ -169,7 +177,18 @@ where
       });
 
       // Store the handle with the original id
-      active_commands.lock().await.insert(id, handle);
+      active_commands.lock().await.insert(
+        id,
+        ActiveCommand {
+          handle,
+          cancel_token: command_cancel_token,
+        },
+      );
+    },
+    OctaCommand::Cancel { id } => {
+      if let Some(command) = active_commands.lock().await.get(&id) {
+        command.cancel_token.cancel();
+      }
     },
     OctaCommand::Schema => {
       let response = PluginResponse::Error {
@@ -274,8 +293,8 @@ async fn handle_conn(
   // Graceful connection shutdown
   {
     let mut commands = active_commands.lock().await;
-    for (_, handle) in commands.drain() {
-      if let Err(e) = handle.await {
+    for (_, command) in commands.drain() {
+      if let Err(e) = command.handle.await {
         logger.log(&format!("Error waiting for complete commands: {}", e))?;
       }
     }
@@ -705,6 +724,51 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn test_handle_command_cancel() {
+    let (_reader, writer) = tokio::io::duplex(1024);
+    let writer = Arc::new(Mutex::new(writer));
+    let active_commands = Arc::new(Mutex::new(HashMap::new()));
+    let plugin = Arc::new(MockPlugin {
+      version: "1.0.0".to_string(),
+      execution_delay: Some(Duration::from_secs(1)),
+      should_fail: false,
+      output_lines: vec!["first".to_string(), "second".to_string()],
+    });
+
+    handle_command(
+      OctaCommand::Execute {
+        params: "test".to_string(),
+        args: vec![],
+        dir: PathBuf::from("."),
+        envs: HashMap::new(),
+        vars: HashMap::new(),
+        dry: false,
+      },
+      writer.clone(),
+      active_commands.clone(),
+      plugin.clone(),
+      Arc::new(MockLogger::new()),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let id = active_commands.lock().await.keys().next().unwrap().clone();
+    handle_command(
+      OctaCommand::Cancel { id: id.clone() },
+      writer,
+      active_commands.clone(),
+      plugin,
+      Arc::new(MockLogger::new()),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(active_commands.lock().await[&id].cancel_token.is_cancelled());
+  }
+
+  #[tokio::test]
   async fn test_handle_command_with_failure() {
     let (reader, writer) = tokio::io::duplex(1024);
     let writer = Arc::new(Mutex::new(writer));
@@ -1062,7 +1126,7 @@ mod tests {
     {
       let commands = active_commands.lock().await;
       for handle in commands.values() {
-        assert!(handle.is_finished());
+        assert!(handle.handle.is_finished());
       }
     }
 

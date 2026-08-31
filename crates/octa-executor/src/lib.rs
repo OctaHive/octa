@@ -34,7 +34,7 @@ use executor::DeferredAction;
 pub use executor::{ExecutionPlan, Executor};
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
-use octa_octafile::{AllowedRun, Deps, EnvValue, ExecuteMode, Octafile, Task, TaskCommand};
+use octa_octafile::{AllowedRun, Deps, EnvValue, ExecuteMode, Octafile, Task, TaskCommand, Timeout};
 pub use task::TaskNode;
 use task::{CmdType, TaskConfig};
 use vars::Vars;
@@ -244,7 +244,7 @@ impl TaskGraphBuilder {
 
           match &cmd.value {
             serde_yml::Value::String(s) => {
-              let simple = self.create_simple_command("shell", command, s);
+              let simple = self.create_simple_command("shell", command, s, cmd.timeout);
 
               // Fix command name
               let task = self.create_task_node(
@@ -274,6 +274,7 @@ impl TaskGraphBuilder {
             complex => {
               match serde_yml::from_value::<TaskCmd>(complex.clone()) {
                 Ok(complex) => {
+                  let command_timeout = cmd.timeout.or(command.task.timeout);
                   let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
                   cmds = self.filter_command_by_platform(cmds);
 
@@ -281,7 +282,8 @@ impl TaskGraphBuilder {
                     continue;
                   }
 
-                  for cmd in cmds {
+                  for mut cmd in cmds {
+                    cmd.task.timeout = command_timeout.or(cmd.task.timeout);
                     let mut deps = self
                       .process_dependencies(dag, &cmd, vec![prev.as_ref().map(Arc::clone), parent.clone()])
                       .await?;
@@ -328,7 +330,7 @@ impl TaskGraphBuilder {
                     }
 
                     let (key, value) = plugin_key.unwrap();
-                    let simple = self.create_simple_command(key, command, &to_string(value).unwrap());
+                    let simple = self.create_simple_command(key, command, &to_string(value).unwrap(), cmd.timeout);
 
                     // Fix command name
                     let task = self.create_task_node(
@@ -454,7 +456,7 @@ impl TaskGraphBuilder {
 
           match &cmd.value {
             serde_yml::Value::String(s) => {
-              let simple = self.create_simple_command("shell", command, s);
+              let simple = self.create_simple_command("shell", command, s, cmd.timeout);
 
               let task = self.create_task_node(
                 dag,
@@ -491,6 +493,7 @@ impl TaskGraphBuilder {
             complex => {
               match serde_yml::from_value::<TaskCmd>(complex.clone()) {
                 Ok(complex) => {
+                  let command_timeout = cmd.timeout.or(command.task.timeout);
                   let mut cmds = self.find_and_filter_commands(&command.octafile, &complex.task)?;
                   cmds = self.filter_command_by_platform(cmds);
 
@@ -498,7 +501,8 @@ impl TaskGraphBuilder {
                     continue;
                   }
 
-                  for cmd in cmds {
+                  for mut cmd in cmds {
+                    cmd.task.timeout = command_timeout.or(cmd.task.timeout);
                     let task =
                       self.create_task_node(dag, dep_name.clone(), &cmd, complex.vars.clone(), complex.envs.clone())?;
 
@@ -544,7 +548,7 @@ impl TaskGraphBuilder {
 
                     let (key, value) = plugin_key.unwrap();
 
-                    let simple = self.create_simple_command(key, command, &to_string(value).unwrap());
+                    let simple = self.create_simple_command(key, command, &to_string(value).unwrap(), cmd.timeout);
 
                     let task = self.create_task_node(
                       dag,
@@ -661,12 +665,14 @@ impl TaskGraphBuilder {
           value: deferred.value.clone(),
           platforms: None,
           deferred: false,
+          timeout: deferred.timeout,
         }]),
         deps: None,
         platforms: None,
         condition: None,
         preconditions: None,
         sources: None,
+        timeout: deferred.timeout.or(command.task.timeout),
         run: Some(AllowedRun::Always),
         extra: HashMap::new(),
         ..command.task.clone()
@@ -815,6 +821,7 @@ impl TaskGraphBuilder {
       .envs(envs)
       .condition(cmd.task.condition.clone())
       .preconditions(cmd.task.preconditions.clone())
+      .timeout(cmd.task.timeout)
       .sources(cmd.task.sources.clone())
       .octafile_root(cmd.octafile.root().dir.clone())
       .silent(cmd.task.silent)
@@ -897,7 +904,8 @@ impl TaskGraphBuilder {
             continue;
           }
 
-          for cmd in commands {
+          for mut cmd in commands {
+            cmd.task.timeout = c.timeout.or(cmd.task.timeout);
             let task_name = self.generate_unique_task_name(&c.task, &deps_map);
 
             self
@@ -980,7 +988,13 @@ impl TaskGraphBuilder {
   }
 
   /// Create a simple command from a complex one
-  fn create_simple_command(&self, plugin_name: &str, command: &FindResult, cmd: &str) -> FindResult {
+  fn create_simple_command(
+    &self,
+    plugin_name: &str,
+    command: &FindResult,
+    cmd: &str,
+    timeout: Option<Timeout>,
+  ) -> FindResult {
     let mut extra = HashMap::new();
     let cmd_value = serde_yml::Value::String(cmd.to_string());
     extra.insert(plugin_name.to_owned(), cmd_value);
@@ -992,6 +1006,7 @@ impl TaskGraphBuilder {
         cmds: None,
         extra,
         deps: None,
+        timeout: timeout.or(command.task.timeout),
         ..command.task.clone()
       },
     }
@@ -1362,6 +1377,46 @@ mod tests {
     let tasks: Vec<String> = dag.nodes().iter().map(|n| n.name.clone()).collect();
 
     assert!(tasks.contains(&"test".to_owned()));
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn test_command_timeout_inherits_and_overrides_task_timeout() -> ExecutorResult<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let content = r#"
+      version: 1
+      tasks:
+        called:
+          timeout: 20s
+          shell: echo called
+        pipeline:
+          timeout: 10s
+          cmds:
+            - echo inherited
+            - task: called
+              timeout: 2s
+    "#;
+    let octafile_path = temp_dir.path().join("Octafile.yml");
+    fs::write(&octafile_path, content)?;
+
+    let octafile = Octafile::load(Some(octafile_path), false, vec![])?;
+    let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+    let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+    let dag = TaskGraphBuilder::new(plugin_manager)?
+      .build(octafile, "pipeline", false, vec![])
+      .await?;
+
+    let inherited = dag.nodes().iter().find(|task| task.name == "echo inherited").unwrap();
+    let overridden = dag.nodes().iter().find(|task| task.name == "called").unwrap();
+    assert_eq!(
+      inherited.timeout.unwrap().duration(),
+      std::time::Duration::from_secs(10)
+    );
+    assert_eq!(
+      overridden.timeout.unwrap().duration(),
+      std::time::Duration::from_secs(2)
+    );
+
     Ok(())
   }
 

@@ -16,6 +16,9 @@ pub enum ExecutorError {
   #[error("Task {0} cancelled")]
   TaskCancelled(String),
 
+  #[error("Task {task} exceeded timeout {timeout}")]
+  TaskTimedOut { task: String, timeout: String },
+
   #[error("Missing plugin keys in task")]
   TaskParsedError,
 

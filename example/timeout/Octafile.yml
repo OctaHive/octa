@@ -1,0 +1,20 @@
+version: 1
+
+tasks:
+  build:
+    timeout: 5m
+    cmds:
+      - echo Building
+      - shell: echo Running a command with a shorter timeout
+        timeout: 30s
+      - task: verify
+        timeout: 1m
+
+  verify:
+    shell: echo Verifying
+
+  pipeline:
+    deps:
+      - task: build
+        timeout: 10m
+    shell: echo Pipeline completed

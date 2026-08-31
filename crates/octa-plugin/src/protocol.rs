@@ -29,6 +29,9 @@ pub enum OctaCommand {
     vars: HashMap<String, Value>,
     dry: bool,
   },
+  Cancel {
+    id: String,
+  },
   Shutdown,
 }
 

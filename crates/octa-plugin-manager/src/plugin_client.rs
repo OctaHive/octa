@@ -286,6 +286,35 @@ impl PluginClient {
     }
   }
 
+  /// Cancels one command and consumes its terminal response so the client remains reusable.
+  pub async fn cancel_and_wait(&mut self, id: &str) -> Result<(), PluginClientError> {
+    let command = OctaCommand::Cancel { id: id.to_owned() };
+    let command_json = serde_json::to_string(&command)? + "\n";
+    {
+      let mut writer = self.inner.writer.lock().await;
+      let writer = writer.as_mut().ok_or(PluginClientError::WriterClosed)?;
+      writer.write_all(command_json.as_bytes()).await?;
+      writer.flush().await?;
+    }
+
+    let wait_for_terminal_response =
+      async {
+        loop {
+          match self.response_rx.recv().await {
+            Some(
+              PluginResponse::ExitStatus { id: response_id, .. } | PluginResponse::Error { id: response_id, .. },
+            ) if response_id == id => return Ok(()),
+            Some(_) => {},
+            None => return Err(PluginClientError::ConnectionClosed),
+          }
+        }
+      };
+
+    tokio::time::timeout(Duration::from_secs(5), wait_for_terminal_response)
+      .await
+      .map_err(|_| PluginClientError::Protocol(format!("Timed out while cancelling command {id}")))?
+  }
+
   pub async fn shutdown(&mut self) -> Result<(), PluginClientError> {
     if self.response_rx.is_closed() {
       // Connection was already closed from server side
@@ -501,6 +530,11 @@ mod tests {
           Some(PluginResponse::Started {
             id: "test-id".to_string(),
           })
+        } else if buffer.contains("Cancel") {
+          Some(PluginResponse::ExitStatus {
+            id: "test-id".to_string(),
+            code: -1,
+          })
         } else if buffer.contains("Shutdown") {
           Some(PluginResponse::Shutdown {
             message: "Shutting down".to_string(),
@@ -593,6 +627,34 @@ mod tests {
       "No Execute message found in messages: {:?}",
       messages
     );
+  }
+
+  #[tokio::test]
+  async fn test_cancel_command() {
+    let mut server = TestServer::new().await;
+    server.start("execute".to_string()).await;
+
+    let mut client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let id = client
+      .execute(
+        "test".to_string(),
+        false,
+        vec![],
+        PathBuf::from("."),
+        HashMap::new(),
+        HashMap::new(),
+        CancellationToken::new(),
+      )
+      .await
+      .unwrap();
+
+    client.cancel_and_wait(&id).await.unwrap();
+    client.shutdown().await.unwrap();
+    drop(client);
+    let messages = server.stop().await;
+
+    assert!(messages.iter().any(|message| message.contains("Cancel")));
   }
 
   #[tokio::test]

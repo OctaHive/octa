@@ -5,6 +5,7 @@ use std::{
   io,
   path::{Path, PathBuf},
   sync::Arc,
+  time::Duration,
 };
 
 use async_trait::async_trait;
@@ -15,12 +16,12 @@ use octa_plugin_manager::plugin_manager::PluginManager;
 use serde_json::Value;
 use sled::Db;
 use tera::{Context, Tera};
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, enabled, error, info, Level};
 
 use octa_dag::Identifiable;
-use octa_octafile::{AllowedRun, SourceStrategies};
+use octa_octafile::{AllowedRun, SourceStrategies, Timeout};
 
 use crate::{
   envs::Envs,
@@ -127,6 +128,7 @@ pub struct TaskConfig {
   pub source_strategy: SourceMethod,      // Source validation strategy
   pub condition: Option<String>,          // Shell condition for task execution
   pub preconditions: Option<Vec<String>>, // Task preconditions
+  pub timeout: Option<Timeout>,           // Maximum task execution time
 
   // State management
   cmd_type: CmdType, // Type of task for internal use
@@ -158,6 +160,7 @@ pub struct TaskConfigBuilder {
   pub source_strategy: Option<SourceMethod>,
   pub condition: Option<String>,
   pub preconditions: Option<Vec<String>>,
+  pub timeout: Option<Timeout>,
 
   pub cmd_type: Option<CmdType>,
 
@@ -197,6 +200,11 @@ impl TaskConfigBuilder {
 
   pub fn condition(mut self, condition: Option<String>) -> Self {
     self.condition = condition;
+    self
+  }
+
+  pub fn timeout(mut self, timeout: Option<Timeout>) -> Self {
+    self.timeout = timeout;
     self
   }
 
@@ -269,6 +277,7 @@ impl TaskConfigBuilder {
       octafile_root,
       condition: self.condition,
       preconditions: self.preconditions,
+      timeout: self.timeout,
       source_strategy: self.source_strategy.unwrap_or(SourceMethod::Hash),
       cmd_type: self.cmd_type.unwrap_or(CmdType::Normal),
       extra: self.extra,
@@ -298,6 +307,7 @@ pub struct TaskNode {
   pub source_strategy: SourceMethod,      // Source validation strategy
   pub condition: Option<String>,          // Shell condition for task execution
   pub preconditions: Option<Vec<String>>, // Task run preconditions
+  pub timeout: Option<Timeout>,           // Maximum task execution time
 
   // State management
   pub deps_res: Arc<Mutex<HashMap<String, String>>>, // Dependencies results
@@ -341,6 +351,7 @@ impl TaskNode {
       cmd_type: config.cmd_type,
       condition: config.condition,
       preconditions: config.preconditions,
+      timeout: config.timeout,
       extra: config.extra,
     }
   }
@@ -412,6 +423,7 @@ impl TaskNode {
           },
           Err(e) => {
             if cancel_token.is_cancelled() {
+              let _ = client.cancel_and_wait(&command_id).await;
               return Err(io::Error::new(io::ErrorKind::Interrupted, "Command cancelled"));
             }
 
@@ -644,33 +656,8 @@ impl TaskNode {
     }
   }
 
-  /// Handle execution errors
-  fn handle_execution_error(&self, error: io::Error) -> ExecutorResult<String> {
-    if self.ignore_errors {
-      error!("Task {} failed but errors ignored. Error: {}", self.name, error);
-      Ok("".to_string())
-    } else {
-      Err(ExecutorError::TaskFailed(error.to_string()))
-    }
-  }
-}
-
-#[async_trait]
-impl Executable<TaskNode> for TaskNode {
-  /// Stores the result of a dependent task
-  async fn set_result(&self, task_name: String, res: String) {
-    let mut deps_res = self.deps_res.lock().await;
-
-    deps_res.insert(task_name, res);
-  }
-
-  async fn bypass_result(&self, result: HashMap<String, String>) {
-    let mut deps_res = self.deps_res.lock().await;
-    *deps_res = result
-  }
-
-  /// Executes the task and returns the result
-  async fn execute(
+  /// Executes the task without applying its timeout wrapper.
+  async fn execute_inner(
     &self,
     plugin_manager: Arc<PluginManager>,
     cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
@@ -712,12 +699,9 @@ impl Executable<TaskNode> for TaskNode {
     }
 
     self.log_info(format!("Starting task {}", self.name));
-
-    // Debug information about dependency results
     self.debug_log_dependencies().await;
 
     let plugins_key = plugin_manager.get_schema_keys().await;
-
     let mut result: Vec<(String, Value)> = vec![];
     for (key, value) in &self.extra {
       if let Some(plugin_name) = plugins_key.get(key) {
@@ -733,7 +717,6 @@ impl Executable<TaskNode> for TaskNode {
       panic!("Several plugin keys provide in task");
     }
 
-    // Add dependency results to template context
     let mut vars_with_deps_results = vars.clone();
     let deps_res = self.deps_res.lock().await;
     vars_with_deps_results.insert("deps_result", &*deps_res);
@@ -766,12 +749,77 @@ impl Executable<TaskNode> for TaskNode {
           }
         } else {
           self.update_cache(stdout.trim(), vars, &cache).await?;
-
           Ok(stdout.trim().to_string())
         }
       },
-      Err(e) if e.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
-      Err(e) => self.handle_execution_error(e),
+      Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
+      Err(error) => self.handle_execution_error(error),
+    }
+  }
+
+  /// Handle execution errors
+  fn handle_execution_error(&self, error: io::Error) -> ExecutorResult<String> {
+    if self.ignore_errors {
+      error!("Task {} failed but errors ignored. Error: {}", self.name, error);
+      Ok("".to_string())
+    } else {
+      Err(ExecutorError::TaskFailed(error.to_string()))
+    }
+  }
+}
+
+#[async_trait]
+impl Executable<TaskNode> for TaskNode {
+  /// Stores the result of a dependent task
+  async fn set_result(&self, task_name: String, res: String) {
+    let mut deps_res = self.deps_res.lock().await;
+
+    deps_res.insert(task_name, res);
+  }
+
+  async fn bypass_result(&self, result: HashMap<String, String>) {
+    let mut deps_res = self.deps_res.lock().await;
+    *deps_res = result
+  }
+
+  /// Executes the task and returns the result
+  async fn execute(
+    &self,
+    plugin_manager: Arc<PluginManager>,
+    cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
+    fingerprint: Arc<Db>,
+    dry: bool,
+    force: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<String> {
+    let Some(timeout) = self.timeout else {
+      return self
+        .execute_inner(plugin_manager, cache, fingerprint, dry, force, cancel_token)
+        .await;
+    };
+
+    // A child token limits cancellation to this command while preserving the caller's token.
+    let command_token = cancel_token.child_token();
+    let execution = self.execute_inner(plugin_manager, cache, fingerprint, dry, force, command_token.clone());
+    tokio::pin!(execution);
+
+    tokio::select! {
+      result = &mut execution => result,
+      _ = time::sleep(timeout.duration()) => {
+        command_token.cancel();
+        // Wait for protocol cleanup so the plugin can accept another command immediately.
+        let _ = time::timeout(Duration::from_secs(5), &mut execution).await;
+        let error = ExecutorError::TaskTimedOut {
+          task: self.name.clone(),
+          timeout: timeout.to_string(),
+        };
+        if self.ignore_errors {
+          error!("Task {} failed but errors ignored. Error: {}", self.name, error);
+          Ok(String::new())
+        } else {
+          Err(error)
+        }
+      }
     }
   }
 }
@@ -1256,6 +1304,76 @@ mod tests {
     assert!(matches!(result, Err(ExecutorError::TaskCancelled(_))));
 
     cancel_handle.await.unwrap();
+    plugin_manager.shutdown_all().await;
+  }
+
+  #[tokio::test]
+  async fn test_task_timeout_stops_command_and_keeps_plugin_reusable() {
+    let db = Arc::new(sled::Config::new().temporary(true).open().unwrap());
+    let cache = Arc::new(Mutex::new(IndexMap::new()));
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+
+    #[cfg(not(windows))]
+    let long_command = "sleep 5";
+    #[cfg(windows)]
+    let long_command = "ping -n 5 127.0.0.1";
+    let mut extra = HashMap::new();
+    extra.insert("shell".to_owned(), Value::String(long_command.to_string()));
+    let timeout = serde_yml::from_str::<Timeout>("100ms").unwrap();
+    let timed_task = TaskNode::new(
+      TaskConfig::builder()
+        .id("timed_task")
+        .name("timed_task")
+        .dep_name("timed_task")
+        .dir(".")
+        .extra(extra)
+        .timeout(Some(timeout))
+        .build()
+        .unwrap(),
+    );
+
+    let result = timed_task
+      .execute(
+        plugin_manager.clone(),
+        cache.clone(),
+        db.clone(),
+        false,
+        false,
+        CancellationToken::new(),
+      )
+      .await;
+    assert!(matches!(result, Err(ExecutorError::TaskTimedOut { .. })));
+
+    let mut extra = HashMap::new();
+    extra.insert("shell".to_owned(), Value::String("echo reusable".to_string()));
+    let next_task = TaskNode::new(
+      TaskConfig::builder()
+        .id("next_task")
+        .name("next_task")
+        .dep_name("next_task")
+        .dir(".")
+        .extra(extra)
+        .build()
+        .unwrap(),
+    );
+    let result = next_task
+      .execute(
+        plugin_manager.clone(),
+        cache,
+        db,
+        false,
+        false,
+        CancellationToken::new(),
+      )
+      .await;
+
+    assert_eq!(result.unwrap(), "reusable");
     plugin_manager.shutdown_all().await;
   }
 

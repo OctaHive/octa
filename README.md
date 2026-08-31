@@ -653,6 +653,38 @@ tasks:
       - task: next
 ```
 
+# Command timeouts
+
+Use `timeout` to stop commands that run longer than expected. A task-level timeout is the default
+for every command in that task; an individual command or task reference can override it. Durations
+support units such as `ms`, `s`, `m`, and `h`.
+
+```yaml
+version: 1
+
+tasks:
+  test:
+    timeout: 10m
+    cmds:
+      - cargo test --workspace
+      - shell: cargo test --test e2e_test
+        timeout: 2m
+      - task: integration
+        timeout: 5m
+
+  integration:
+    shell: ./scripts/integration-test.sh
+
+  deploy:
+    deps:
+      - task: test
+        timeout: 5m
+    shell: ./scripts/deploy.sh
+```
+
+Timeouts also apply to deferred and plugin commands. When a timeout expires, Octa cancels that
+specific command, reports an error, and keeps the plugin available for subsequent executions.
+
 # Deferred commands
 
 Use `defer` to schedule cleanup after the current task finishes. Deferred commands run after successful

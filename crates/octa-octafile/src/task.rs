@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, fmt, path::PathBuf, time::Duration};
 
 use serde::{
   de::{DeserializeSeed, MapAccess, Visitor},
@@ -10,6 +10,47 @@ use serde_yml::Value;
 use crate::{octafile::Envs, Vars};
 
 pub type PluginSchemas = HashMap<String, Option<serde_json::Map<String, serde_json::Value>>>;
+
+/// A validated, non-zero timeout parsed from a human-readable duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeout(Duration);
+
+impl Timeout {
+  /// Returns the duration used by the executor.
+  pub fn duration(self) -> Duration {
+    self.0
+  }
+}
+
+impl fmt::Display for Timeout {
+  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    humantime::format_duration(self.0).fmt(formatter)
+  }
+}
+
+impl<'de> Deserialize<'de> for Timeout {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let value = String::deserialize(deserializer)?;
+    let duration = humantime::parse_duration(&value).map_err(serde::de::Error::custom)?;
+    if duration.is_zero() {
+      return Err(serde::de::Error::custom("timeout must be greater than zero"));
+    }
+
+    Ok(Self(duration))
+  }
+}
+
+impl Serialize for Timeout {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    serializer.serialize_str(&self.to_string())
+  }
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -71,6 +112,7 @@ pub struct ComplexDep {
   pub vars: Option<Vars>,
   pub envs: Option<Envs>,
   pub silent: Option<bool>,
+  pub timeout: Option<Timeout>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -97,6 +139,9 @@ pub struct TaskCommand {
 
   /// Whether the command must run after the main execution plan finishes.
   pub deferred: bool,
+
+  /// Maximum time allowed for this command, overriding the task default.
+  pub timeout: Option<Timeout>,
 }
 
 pub struct Context {
@@ -162,8 +207,8 @@ impl Context {
   }
 
   fn parse_command(&self, command: Value) -> Result<TaskCommand, String> {
-    let (value, platforms, deferred) = match command {
-      Value::String(value) => (Value::String(value), None, false),
+    let (value, platforms, deferred, timeout) = match command {
+      Value::String(value) => (Value::String(value), None, false, None),
       Value::Mapping(mut mapping) => {
         // Command metadata belongs to the wrapper and must not be passed to a plugin schema.
         let platforms = mapping
@@ -171,15 +216,20 @@ impl Context {
           .map(serde_yml::from_value::<Vec<String>>)
           .transpose()
           .map_err(|error| format!("invalid command platforms: {error}"))?;
+        let timeout = mapping
+          .remove("timeout")
+          .map(serde_yml::from_value::<Timeout>)
+          .transpose()
+          .map_err(|error| format!("invalid command timeout: {error}"))?;
         if let Some(value) = mapping.remove("defer") {
           // `defer` wraps exactly one ordinary command. Sibling command fields would make the
-          // command type ambiguous, while metadata such as `platforms` was removed above.
+          // command type ambiguous, while metadata such as `platforms` and `timeout` was removed above.
           if !mapping.is_empty() {
             return Err("a deferred command cannot contain sibling command fields".to_string());
           }
-          (value, platforms, true)
+          (value, platforms, true, timeout)
         } else {
-          (Value::Mapping(mapping), platforms, false)
+          (Value::Mapping(mapping), platforms, false, timeout)
         }
       },
       _ => return Err("commands must be strings, task references, or plugin commands".to_string()),
@@ -210,6 +260,7 @@ impl Context {
       value,
       platforms,
       deferred,
+      timeout,
     })
   }
 }
@@ -235,6 +286,7 @@ pub struct Task {
   pub run: Option<AllowedRun>,                   // When task should run
   pub silent: Option<bool>,                      // Should task print to stdout or stderr
   pub execute_mode: Option<ExecuteMode>,         // How execute task commands
+  pub timeout: Option<Timeout>,                  // Default timeout for task commands
   pub sources: Option<Vec<String>>,              // Sources for fingerprinting
   pub source_strategy: Option<SourceStrategies>, // Strategy for compare sources
   pub watch: Option<bool>,                       // Watch sources and rerun the task
@@ -313,6 +365,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "run" => task.run = map.next_value()?,
         "silent" => task.silent = map.next_value()?,
         "execute_mode" => task.execute_mode = map.next_value()?,
+        "timeout" => task.timeout = map.next_value()?,
         "sources" => task.sources = map.next_value()?,
         "source_strategy" => task.source_strategy = map.next_value()?,
         "watch" => task.watch = map.next_value()?,

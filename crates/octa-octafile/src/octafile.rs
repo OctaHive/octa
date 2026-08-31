@@ -1569,6 +1569,61 @@ tasks:
   }
 
   #[test]
+  fn parses_task_command_and_dependency_timeouts() {
+    let content = r#"
+      version: 1
+      tasks:
+        pipeline:
+          timeout: 2m
+          deps:
+            - task: prepare
+              timeout: 30s
+          cmds:
+            - shell: echo build
+              timeout: 1500ms
+        prepare:
+          shell: echo prepare
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "timeouts");
+
+    let octafile = Octafile::load(Some(file_path), false, vec![]).unwrap();
+    let task = &octafile.tasks["pipeline"];
+
+    assert_eq!(task.timeout.unwrap().duration(), std::time::Duration::from_secs(120));
+    assert_eq!(
+      task.cmds.as_ref().unwrap()[0].timeout.unwrap().duration(),
+      std::time::Duration::from_millis(1500)
+    );
+    let Deps::Complex(dependency) = &task.deps.as_ref().unwrap()[0] else {
+      panic!("expected a complex dependency");
+    };
+    assert_eq!(
+      dependency.timeout.unwrap().duration(),
+      std::time::Duration::from_secs(30)
+    );
+  }
+
+  #[test]
+  fn rejects_invalid_and_zero_timeouts() {
+    for timeout in ["later", "0s"] {
+      let content = format!(
+        r#"
+          version: 1
+          tasks:
+            build:
+              timeout: {timeout}
+              shell: echo build
+        "#
+      );
+      let (_temp_dir, file_path) = create_temp_octafile(&content, "invalid_timeout");
+
+      let error = Octafile::load(Some(file_path), false, vec![]).unwrap_err();
+
+      assert!(error.to_string().contains("timeout"));
+    }
+  }
+
+  #[test]
   fn parses_deferred_commands() {
     let content = r#"
       version: 1
@@ -1753,6 +1808,7 @@ tasks:
           run: once
           silent: true
           execute_mode: parallel
+          timeout: 2m
           sources:
             - "src/**/*.rs"
           source_strategy: hash
@@ -1777,6 +1833,7 @@ tasks:
     assert!(task.run.is_some());
     assert_eq!(task.silent, Some(true));
     assert!(task.execute_mode.is_some());
+    assert_eq!(task.timeout.unwrap().duration(), std::time::Duration::from_secs(120));
     assert!(task.sources.is_some());
     assert!(task.source_strategy.is_some());
     assert_eq!(task.watch, Some(true));
