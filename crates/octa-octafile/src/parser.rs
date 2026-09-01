@@ -306,3 +306,163 @@ fn is_standard_tag(tag: &Tag) -> bool {
 pub(crate) fn location_error(marker: Marker, message: &str) -> String {
   format!("{message} at line {}, column {}", marker.line(), marker.col() + 1)
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn standard_tag(suffix: &str) -> Tag {
+    Tag {
+      handle: "tag:yaml.org,2002:".to_owned(),
+      suffix: suffix.to_owned(),
+    }
+  }
+
+  #[test]
+  fn parses_annotations_collections_and_aliases() {
+    let node = parse(
+      r#"!shell
+command: run
+nested: !tpl value
+items: &items [one, 2]
+copy: *items
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(node.annotation(), Some("shell"));
+    assert_eq!(node.marker().line(), 2);
+    let value = node.into_untagged_value().unwrap();
+    let mapping = value.as_mapping().unwrap();
+    assert!(matches!(mapping.get("nested"), Some(Value::Tagged(_))));
+    assert_eq!(mapping.get("items"), mapping.get("copy"));
+
+    let tagged = parse("!shell echo hello").unwrap().into_value().unwrap();
+    assert!(matches!(tagged, Value::Tagged(_)));
+  }
+
+  #[test]
+  fn exposes_node_shapes_without_converting_them() {
+    let mapping = parse("key: value").unwrap();
+    assert!(mapping.clone().into_mapping().is_some());
+    assert_eq!(mapping.as_str(), None);
+
+    let scalar = parse("value").unwrap();
+    assert_eq!(scalar.as_str(), Some("value"));
+    assert!(scalar.into_mapping().is_none());
+  }
+
+  #[test]
+  fn reports_document_and_mapping_errors() {
+    assert_eq!(parse("").unwrap_err(), "empty YAML document");
+    assert_eq!(
+      parse("---\none\n---\ntwo\n").unwrap_err(),
+      "Octafile must contain a single YAML document"
+    );
+    assert!(parse("[").is_err());
+
+    let duplicate = parse("key: one\nkey: two\n").unwrap().into_value().unwrap_err();
+    assert!(duplicate.contains("duplicated key 'key'"));
+
+    let invalid_key = parse("? [one, two]\n: value\n").unwrap().into_value().unwrap_err();
+    assert!(invalid_key.contains("mapping keys must be strings"));
+    assert!(parse("value: *missing\n").is_err());
+  }
+
+  #[test]
+  fn converts_explicit_and_implicit_scalar_types() {
+    let bool_tag = standard_tag("bool");
+    assert_eq!(
+      scalar_value("TRUE", TScalarStyle::Plain, Some(&bool_tag)),
+      Value::Bool(true)
+    );
+    assert_eq!(
+      scalar_value("false", TScalarStyle::Plain, Some(&bool_tag)),
+      Value::Bool(false)
+    );
+    assert_eq!(
+      scalar_value("not-a-bool", TScalarStyle::Plain, Some(&bool_tag)),
+      Value::String("not-a-bool".to_owned())
+    );
+
+    let int_tag = standard_tag("int");
+    assert_eq!(
+      scalar_value("42", TScalarStyle::Plain, Some(&int_tag)),
+      Value::Number(42.into())
+    );
+    assert_eq!(
+      scalar_value("invalid", TScalarStyle::Plain, Some(&int_tag)),
+      Value::String("invalid".to_owned())
+    );
+
+    let float_tag = standard_tag("float");
+    assert_eq!(
+      scalar_value("1.5", TScalarStyle::Plain, Some(&float_tag)),
+      Value::Number(Number::from(1.5))
+    );
+    assert_eq!(
+      scalar_value("invalid", TScalarStyle::Plain, Some(&float_tag)),
+      Value::String("invalid".to_owned())
+    );
+
+    let null_tag = standard_tag("null");
+    assert_eq!(scalar_value("null", TScalarStyle::Plain, Some(&null_tag)), Value::Null);
+    assert_eq!(
+      scalar_value("value", TScalarStyle::Plain, Some(&null_tag)),
+      Value::String("value".to_owned())
+    );
+    assert_eq!(
+      scalar_value("42", TScalarStyle::DoubleQuoted, None),
+      Value::String("42".to_owned())
+    );
+
+    assert_eq!(
+      yaml_value(Yaml::Real("2.5".to_owned())),
+      Value::Number(Number::from(2.5))
+    );
+    assert_eq!(
+      yaml_value(Yaml::Real("invalid".to_owned())),
+      Value::String("invalid".to_owned())
+    );
+    assert_eq!(yaml_value(Yaml::BadValue), Value::Null);
+  }
+
+  #[test]
+  fn loader_retains_structural_errors() {
+    let marker = parse("value").unwrap().marker();
+
+    let mut loader = Loader::default();
+    loader.on_event(Event::Alias(42), marker);
+    assert!(loader.error.as_deref().unwrap().contains("unknown YAML alias"));
+
+    let mut loader = Loader::default();
+    loader.close_container(true, marker);
+    assert!(loader.error.as_deref().unwrap().contains("unexpected collection end"));
+    loader.push_node(parse("ignored").unwrap(), 1);
+    loader.on_event(Event::Nothing, marker);
+    assert!(loader.documents.is_empty());
+
+    let mut loader = Loader::default();
+    loader.stack.push(Container {
+      value: ContainerValue::Mapping {
+        entries: Vec::new(),
+        key: Some(parse("key").unwrap()),
+      },
+      anchor: 0,
+      tag: None,
+      marker,
+    });
+    loader.close_container(false, marker);
+    assert!(loader.error.as_deref().unwrap().contains("mapping value is missing"));
+
+    let mut loader = Loader::default();
+    loader.stack.push(Container {
+      value: ContainerValue::Sequence(Vec::new()),
+      anchor: 0,
+      tag: None,
+      marker,
+    });
+    loader.close_container(false, marker);
+    assert!(loader.error.as_deref().unwrap().contains("unexpected collection end"));
+  }
+}

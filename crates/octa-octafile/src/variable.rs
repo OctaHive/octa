@@ -304,4 +304,12 @@ mod tests {
     assert!(Variable::from_json(json!({ "required": "prompt", "question": 1 })).is_err());
     assert!(Variable::from_json(json!({ "required": "prompt", "enum": "production" })).is_err());
   }
+
+  #[test]
+  fn distinguishes_object_values_from_invalid_explicit_definitions() {
+    let object = Variable::from_json(json!({ "sh": 1 })).unwrap();
+    assert_eq!(object.into_value(), Some(json!({ "sh": 1 })));
+
+    assert!(Variable::from_json(json!({ "sh": 1, "secret": true })).is_err());
+  }
 }

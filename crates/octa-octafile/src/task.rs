@@ -649,6 +649,21 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
 mod tests {
   use super::*;
 
+  fn context() -> Context {
+    Context::from_keys(vec!["shell".to_owned(), "tpl".to_owned()], "shell").unwrap()
+  }
+
+  fn yaml_value(content: &str) -> Value {
+    serde_yml::from_str(content).unwrap()
+  }
+
+  fn parse_task(context: &Context, content: &str) -> Result<Task, String> {
+    let value = yaml_value(content);
+    TaskSeed { context }
+      .deserialize(serde_yml::Deserializer::new(&value))
+      .map_err(|error| error.to_string())
+  }
+
   #[test]
   fn both_context_constructors_reject_invalid_plugin_keys() {
     let empty_key_error = Context::from_keys(vec![String::new()], "").err().unwrap();
@@ -671,5 +686,88 @@ mod tests {
       .unwrap();
 
     assert_eq!(error, "duplicated plugin task key 'shell'");
+  }
+
+  #[test]
+  fn serializes_timeouts_and_converts_public_shorthand_types() {
+    let timeout: Timeout = serde_yml::from_str("2s").unwrap();
+    assert_eq!(timeout.duration(), Duration::from_secs(2));
+    assert_eq!(
+      serde_yml::from_str::<Timeout>(&serde_yml::to_string(&timeout).unwrap()).unwrap(),
+      timeout
+    );
+
+    assert_eq!(ExecuteMode::from("parallel".to_owned()), ExecuteMode::Parallel);
+    assert_eq!(ExecuteMode::from("sequentially".to_owned()), ExecuteMode::Sequentially);
+    assert_eq!(
+      SourceStrategies::from("timestamp".to_owned()),
+      SourceStrategies::Timestamp
+    );
+    assert_eq!(SourceStrategies::from("hash".to_owned()), SourceStrategies::Hash);
+    assert_eq!(AllowedRun::from("once".to_owned()), AllowedRun::Once);
+    assert_eq!(AllowedRun::from("always".to_owned()), AllowedRun::Always);
+    assert_eq!(AllowedRun::from("changed".to_owned()), AllowedRun::Changed);
+    assert!(matches!(Deps::from("build".to_owned()), Deps::Simple(task) if task == "build"));
+  }
+
+  #[test]
+  fn rejects_invalid_condition_shapes() {
+    let context = context();
+
+    let error = context
+      .parse_condition_command(yaml_value("unknown: command"))
+      .unwrap_err();
+    assert_eq!(error, "unknown plugin condition type 'unknown'");
+
+    let error = context
+      .parse_task_conditions(yaml_value("before_deps: echo check\nunexpected: value"))
+      .unwrap_err();
+    assert_eq!(error, "unknown task condition field 'unexpected'");
+
+    assert_eq!(
+      context.parse_task_conditions(yaml_value("[one, two]")).unwrap_err(),
+      "task condition must be a string or a mapping"
+    );
+  }
+
+  #[test]
+  fn rejects_ambiguous_and_unknown_commands() {
+    let context = context();
+    let cases = [
+      ("1", "commands must be strings, task references, or plugin commands"),
+      (
+        "shell: one\ntpl: two",
+        "a plugin command must contain exactly one plugin task type",
+      ),
+      ("unknown: command", "unknown plugin command type 'unknown'"),
+      (
+        "defer:\n  shell: cleanup\nshell: build",
+        "a deferred command cannot contain sibling command fields",
+      ),
+      (
+        "defer: [one, two]",
+        "commands must be strings, task references, or plugin commands",
+      ),
+    ];
+
+    for (yaml, expected) in cases {
+      assert_eq!(context.parse_command(yaml_value(yaml)).unwrap_err(), expected);
+    }
+
+    assert!(context
+      .parse_command(yaml_value("task: build\nunknown: value"))
+      .unwrap_err()
+      .starts_with("invalid task command:"));
+  }
+
+  #[test]
+  fn task_seed_rejects_invalid_shapes_and_conflicting_payloads() {
+    let context = context();
+
+    let error = parse_task(&context, "[one, two]").unwrap_err();
+    assert!(error.contains("a string or a map representing a Task"));
+
+    let error = parse_task(&context, "cmds: [echo one]\nshell: echo two").unwrap_err();
+    assert!(error.contains("a task cannot define both 'cmds' and a plugin task type"));
   }
 }
