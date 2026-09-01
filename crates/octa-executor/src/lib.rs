@@ -1200,6 +1200,16 @@ mod tests {
   use std::fs;
   use tempfile::TempDir;
 
+  use crate::vars::VariablePrompt;
+
+  struct TestVariableResolver;
+
+  impl VariableResolver for TestVariableResolver {
+    fn resolve(&self, _prompt: &VariablePrompt) -> Result<String, String> {
+      Ok("value".to_owned())
+    }
+  }
+
   fn create_test_task() -> Task {
     Task {
       plugin: Some(PluginCommand {
@@ -1231,9 +1241,10 @@ mod tests {
   async fn test_task_graph_builder_new() -> ExecutorResult<()> {
     let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
     let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
-    let builder = TaskGraphBuilder::new(plugin_manager)?;
+    let builder = TaskGraphBuilder::new(plugin_manager)?.with_variable_resolver(Arc::new(TestVariableResolver));
     assert!(builder.command_args.is_empty());
     assert!(builder.variable_overrides.is_empty());
+    assert!(builder.variable_resolver.is_some());
     assert!(builder.dir.exists());
     Ok(())
   }

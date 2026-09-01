@@ -267,3 +267,41 @@ impl<'de> Deserialize<'de> for Variable {
     Self::from_json(value).map_err(serde::de::Error::custom)
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use serde_json::json;
+
+  #[test]
+  fn preserves_plain_object_variables() {
+    let variable = Variable::from_json(json!({ "nested": true })).unwrap();
+
+    assert!(!variable.is_required());
+    assert_eq!(variable.required_mode(), None);
+    assert_eq!(variable.template_value(), Some(json!({ "nested": true })));
+    assert_eq!(variable.configuration_value(), json!({ "nested": true }));
+    assert!(format!("{variable:?}").contains("nested"));
+  }
+
+  #[test]
+  fn preserves_non_secret_shell_variables() {
+    let variable = Variable::from_json(json!({ "sh": "git rev-parse HEAD" })).unwrap();
+
+    assert_eq!(variable.template_value(), Some(json!({ "sh": "git rev-parse HEAD" })));
+    assert_eq!(variable.configuration_value(), json!({ "sh": "git rev-parse HEAD" }));
+  }
+
+  #[test]
+  fn required_variables_have_no_template_value() {
+    let variable = Variable::from_json(json!({ "required": true })).unwrap();
+
+    assert_eq!(variable.template_value(), None);
+  }
+
+  #[test]
+  fn rejects_non_string_questions_and_non_list_enums() {
+    assert!(Variable::from_json(json!({ "required": "prompt", "question": 1 })).is_err());
+    assert!(Variable::from_json(json!({ "required": "prompt", "enum": "production" })).is_err());
+  }
+}

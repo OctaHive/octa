@@ -979,6 +979,36 @@ mod tests {
   }
 
   #[test]
+  fn generates_default_text_questions_and_rejects_empty_answers() {
+    let configured: octa_octafile::Vars = serde_yml::from_str("TOKEN:\n  required: prompt\n").unwrap();
+    let resolver = FixedResolver::new("");
+    let mut vars = Vars::with_variables(configured);
+
+    assert!(matches!(
+      vars.resolve_required(Some(&resolver)),
+      Err(ExecutorError::RequiredVariableMissing(name)) if name == "TOKEN"
+    ));
+    assert_eq!(
+      resolver.prompts.lock().unwrap()[0].question,
+      "Enter a value for 'TOKEN'"
+    );
+  }
+
+  #[test]
+  fn inherited_secret_requirement_cannot_be_downgraded() {
+    let parent: octa_octafile::Vars = serde_yml::from_str("TOKEN:\n  required: prompt\n  secret: true\n").unwrap();
+    let child: octa_octafile::Vars = serde_yml::from_str("TOKEN:\n  required: prompt\n").unwrap();
+    let resolver = FixedResolver::new("hidden");
+    let parent = Vars::with_variables(parent);
+    let mut vars = Vars::with_variables_and_parent(child, parent);
+
+    vars.resolve_required(Some(&resolver)).unwrap();
+
+    assert!(resolver.prompts.lock().unwrap()[0].secret);
+    assert_eq!(vars.secret_names(), vec!["TOKEN"]);
+  }
+
+  #[test]
   fn validates_enum_values_from_non_interactive_sources() {
     let required: octa_octafile::Vars =
       serde_yml::from_str("ENVIRONMENT:\n  required: true\n  enum: [development, production]\n").unwrap();
