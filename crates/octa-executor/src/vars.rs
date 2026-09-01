@@ -30,6 +30,7 @@ pub struct Vars {
   values: IndexMap<String, Value>,
   // Sensitivity is runtime metadata and must stay separate from values passed to Tera/plugins.
   secrets: HashSet<String>,
+  required_vars: IndexMap<String, RequiredVar>,
   parent: Option<Arc<Vars>>, // Link to parent variables
   dir: Option<PathBuf>,      // Directory used by shell-backed values in this context
   expanded: bool,            // Indicates that all inherited values have been expanded
@@ -39,12 +40,29 @@ pub struct Vars {
 struct VariableLayer {
   values: IndexMap<String, Value>,
   secrets: HashSet<String>,
+  required_vars: IndexMap<String, RequiredVar>,
   dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequiredVar {
+  secret: bool,
+}
+
+struct SuppliedRequiredVar {
+  value: Value,
+  secret: bool,
+}
+
+struct ResolvedVars {
+  values: IndexMap<String, Value>,
+  secrets: HashSet<String>,
+  required_vars: IndexMap<String, RequiredVar>,
 }
 
 impl PartialEq for Vars {
   fn eq(&self, other: &Self) -> bool {
-    self.values == other.values && self.secrets == other.secrets
+    self.values == other.values && self.secrets == other.secrets && self.required_vars == other.required_vars
   }
 }
 
@@ -55,6 +73,7 @@ impl Vars {
     Self {
       values: IndexMap::new(),
       secrets: HashSet::new(),
+      required_vars: IndexMap::new(),
       parent: None,
       dir: None,
       expanded: false,
@@ -65,6 +84,7 @@ impl Vars {
     Self {
       values: IndexMap::new(),
       secrets: HashSet::new(),
+      required_vars: IndexMap::new(),
       parent: Some(Arc::new(parent)),
       dir: None,
       expanded: false,
@@ -99,12 +119,14 @@ impl Vars {
     // Generic runtime values carry no sensitivity metadata and therefore replace secrets as public values.
     self.values = serialized_values(&value);
     self.secrets.clear();
+    self.required_vars.clear();
     self.expanded = false;
   }
 
   pub(crate) fn set_variables(&mut self, variables: OctafileVars) {
     self.values.clear();
     self.secrets.clear();
+    self.required_vars.clear();
     self.extend_variables(variables);
   }
 
@@ -155,7 +177,11 @@ impl Vars {
     // Consume the typed parser representation directly so secret metadata is not lost in Serde.
     for (key, variable) in variables {
       let secret = variable.is_secret();
-      let value = variable.into_value();
+      let Some(value) = variable.into_value() else {
+        self.required_vars.insert(key, RequiredVar { secret });
+        continue;
+      };
+
       self.values.insert(key.clone(), value);
       if secret {
         self.secrets.insert(key);
@@ -178,9 +204,10 @@ impl Vars {
     }
 
     let contexts = self.collect_context_chain();
-    let (values, secrets) = self.process_context_chain(contexts, &mut tera, dry).await?;
-    self.values = values;
-    self.secrets = secrets;
+    let resolved = self.process_context_chain(contexts, &mut tera, dry).await?;
+    self.values = resolved.values;
+    self.secrets = resolved.secrets;
+    self.required_vars = resolved.required_vars;
     // Expansion flattens the hierarchy, so retaining parents would process them a second time.
     self.parent = None;
     self.expanded = true;
@@ -196,6 +223,7 @@ impl Vars {
       contexts.push(VariableLayer {
         values: vars.values.clone(),
         secrets: vars.secrets.clone(),
+        required_vars: vars.required_vars.clone(),
         dir: vars.dir.clone(),
       });
       current = vars.parent.as_ref().map(|p| p.as_ref());
@@ -209,9 +237,18 @@ impl Vars {
     contexts: Vec<VariableLayer>,
     tera: &mut Tera,
     dry: bool,
-  ) -> ExecutorResult<(IndexMap<String, Value>, HashSet<String>)> {
-    let mut accumulated = IndexMap::new();
-    let mut secrets = HashSet::new();
+  ) -> ExecutorResult<ResolvedVars> {
+    let required_vars = collect_required_vars(&contexts);
+    let supplied_required_vars = collect_supplied_required_vars(&contexts, &required_vars)?;
+    let mut accumulated = supplied_required_vars
+      .iter()
+      .map(|(key, supplied)| (key.clone(), supplied.value.clone()))
+      .collect::<IndexMap<_, _>>();
+    let mut secrets = supplied_required_vars
+      .iter()
+      .filter(|(key, supplied)| supplied.secret || required_vars.get(*key).is_some_and(|required| required.secret))
+      .map(|(key, _)| key.clone())
+      .collect::<HashSet<_>>();
 
     // Each value is added immediately after expansion. This preserves YAML declaration order
     // and makes earlier values in the same `vars` mapping available to later ones.
@@ -219,6 +256,7 @@ impl Vars {
       let VariableLayer {
         values,
         secrets: layer_secrets,
+        required_vars: _,
         dir,
       } = layer;
       let current_dir = match dir {
@@ -227,6 +265,10 @@ impl Vars {
       };
 
       for (key, value) in values {
+        // Required values are concrete inputs and were inserted before dependent declarations.
+        if required_vars.contains_key(&key) {
+          continue;
+        }
         let secret = layer_secrets.contains(&key);
         let template_context = Context::from_serialize(&accumulated).map_err(|error| {
           ExecutorError::VariableExpandError(key.clone(), format!("failed to build template context: {error}"))
@@ -248,7 +290,13 @@ impl Vars {
       }
     }
 
-    Ok((accumulated, secrets))
+    validate_required_vars(&required_vars, accumulated.iter())?;
+
+    Ok(ResolvedVars {
+      values: accumulated,
+      secrets,
+      required_vars,
+    })
   }
 
   async fn process_template_value(
@@ -331,9 +379,91 @@ impl Vars {
   }
 }
 
+fn collect_required_vars(contexts: &[VariableLayer]) -> IndexMap<String, RequiredVar> {
+  let mut required_vars = IndexMap::new();
+  for layer in contexts {
+    for (key, required) in &layer.required_vars {
+      required_vars
+        .entry(key.clone())
+        .and_modify(|current: &mut RequiredVar| current.secret |= required.secret)
+        .or_insert(*required);
+    }
+  }
+  required_vars
+}
+
+fn collect_supplied_required_vars(
+  contexts: &[VariableLayer],
+  required_vars: &IndexMap<String, RequiredVar>,
+) -> ExecutorResult<IndexMap<String, SuppliedRequiredVar>> {
+  let mut supplied = IndexMap::new();
+  for layer in contexts {
+    for (key, value) in &layer.values {
+      if required_vars.contains_key(key) {
+        supplied.insert(
+          key.clone(),
+          SuppliedRequiredVar {
+            value: value.clone(),
+            secret: layer.secrets.contains(key),
+          },
+        );
+      }
+    }
+  }
+
+  validate_required_vars(
+    required_vars,
+    supplied.iter().map(|(key, supplied)| (key, &supplied.value)),
+  )?;
+  for (key, supplied) in &supplied {
+    if shell_command(&supplied.value).is_some() || value_contains_template(&supplied.value) {
+      return Err(ExecutorError::RequiredVariableNotConcrete(key.clone()));
+    }
+  }
+
+  Ok(supplied)
+}
+
+fn validate_required_vars<'a>(
+  required_vars: &IndexMap<String, RequiredVar>,
+  values: impl Iterator<Item = (&'a String, &'a Value)>,
+) -> ExecutorResult<()> {
+  let mut supplied = HashMap::new();
+  for (key, value) in values {
+    supplied.insert(key, value);
+  }
+
+  for key in required_vars.keys() {
+    if supplied.get(key).is_none_or(|value| is_empty_value(value)) {
+      return Err(ExecutorError::RequiredVariableMissing(key.clone()));
+    }
+  }
+
+  Ok(())
+}
+
 fn shell_command(value: &Value) -> Option<&str> {
   let object = value.as_object()?;
   (object.len() == 1).then(|| object.get("sh")?.as_str()).flatten()
+}
+
+fn is_empty_value(value: &Value) -> bool {
+  match value {
+    Value::Null => true,
+    Value::String(value) => value.trim().is_empty(),
+    Value::Array(values) => values.is_empty(),
+    Value::Object(values) => values.is_empty(),
+    Value::Bool(_) | Value::Number(_) => false,
+  }
+}
+
+fn value_contains_template(value: &Value) -> bool {
+  match value {
+    Value::String(value) => TEMPLATE_REGEX.is_match(value),
+    Value::Array(values) => values.iter().any(value_contains_template),
+    Value::Object(values) => values.values().any(value_contains_template),
+    Value::Null | Value::Bool(_) | Value::Number(_) => false,
+  }
 }
 
 fn values_as_environment(values: &IndexMap<String, Value>) -> HashMap<String, String> {
@@ -409,6 +539,7 @@ impl Debug for Vars {
 
     f.debug_struct("Vars")
       .field("values", &values)
+      .field("required_vars", &self.required_vars.keys().collect::<Vec<_>>())
       .field("parent", &self.parent)
       .field("dir", &self.dir)
       .field("expanded", &self.expanded)
@@ -426,6 +557,7 @@ impl From<Context> for Vars {
         .unwrap_or_default(),
       // Tera Context contains values only and cannot carry secret metadata.
       secrets: HashSet::new(),
+      required_vars: IndexMap::new(),
       parent: None,
       dir: None,
       expanded: false,
@@ -648,6 +780,113 @@ mod tests {
     assert!(!format!("{vars}").contains("token-123"));
     assert!(!format!("{vars:?}").contains("token-123"));
     assert!(format!("{vars}").contains("*****"));
+  }
+
+  #[tokio::test]
+  async fn validates_required_variables_after_merging_layers() {
+    let required: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      API_TOKEN:
+        required: true
+        secret: true
+      "#,
+    )
+    .unwrap();
+    let parent = Vars::with_variables(required);
+    let mut vars = Vars::with_value_and_parent(json!({ "API_TOKEN": "external-token" }), parent);
+
+    vars.expand(true).await.unwrap();
+
+    assert_eq!(vars.get("API_TOKEN"), Some(&Value::String("external-token".to_owned())));
+    assert_eq!(vars.secret_names(), vec!["API_TOKEN"]);
+    assert!(!format!("{vars}").contains("external-token"));
+  }
+
+  #[tokio::test]
+  async fn child_requirement_accepts_an_inherited_value() {
+    let required: octa_octafile::Vars = serde_yml::from_str("PROFILE:\n  required: true\n").unwrap();
+    let parent = Vars::with_value(json!({ "PROFILE": "production" }));
+    let mut vars = Vars::with_variables_and_parent(required, parent);
+
+    vars.expand(true).await.unwrap();
+
+    assert_eq!(vars.get("PROFILE"), Some(&Value::String("production".to_owned())));
+  }
+
+  #[tokio::test]
+  async fn required_values_are_available_to_configured_templates() {
+    let configured: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      TOKEN:
+        required: true
+      HEADER: "Bearer {{ TOKEN }}"
+      "#,
+    )
+    .unwrap();
+    let parent = Vars::with_variables(configured);
+    let mut vars = Vars::with_value_and_parent(json!({ "TOKEN": "external-token" }), parent);
+
+    vars.expand(true).await.unwrap();
+
+    assert_eq!(
+      vars.get("HEADER"),
+      Some(&Value::String("Bearer external-token".to_owned()))
+    );
+  }
+
+  #[tokio::test]
+  async fn required_values_must_be_concrete() {
+    let required: octa_octafile::Vars = serde_yml::from_str("TOKEN:\n  required: true\n").unwrap();
+
+    for value in [json!("{{ PREFIX }}"), json!({ "sh": "echo token" })] {
+      let parent = Vars::with_variables(required.clone());
+      let mut vars = Vars::with_value_and_parent(json!({ "TOKEN": value }), parent);
+      assert!(matches!(
+        vars.expand(true).await,
+        Err(ExecutorError::RequiredVariableNotConcrete(name)) if name == "TOKEN"
+      ));
+    }
+  }
+
+  #[tokio::test]
+  async fn rejects_missing_and_empty_required_values() {
+    let required: octa_octafile::Vars = serde_yml::from_str("VALUE:\n  required: true\n").unwrap();
+    let mut missing = Vars::with_variables(required.clone());
+    assert!(matches!(
+      missing.expand(true).await,
+      Err(ExecutorError::RequiredVariableMissing(name)) if name == "VALUE"
+    ));
+
+    for value in [Value::Null, json!("  "), json!([]), json!({})] {
+      let parent = Vars::with_variables(required.clone());
+      let mut vars = Vars::with_value_and_parent(json!({ "VALUE": value }), parent);
+      assert!(matches!(
+        vars.expand(true).await,
+        Err(ExecutorError::RequiredVariableMissing(name)) if name == "VALUE"
+      ));
+    }
+  }
+
+  #[tokio::test]
+  async fn validates_required_variables_before_running_shell_values() {
+    let temp_dir = TempDir::new().unwrap();
+    let marker = temp_dir.path().join("executed");
+    #[cfg(windows)]
+    let command = "echo executed>executed";
+    #[cfg(not(windows))]
+    let command = "touch executed";
+    let values: octa_octafile::Vars = serde_yml::from_str(&format!(
+      "SIDE_EFFECT:\n  sh: '{command}'\nREQUIRED:\n  required: true\n"
+    ))
+    .unwrap();
+    let mut vars = Vars::with_variables(values);
+    vars.set_dir(temp_dir.path());
+
+    assert!(matches!(
+      vars.expand(false).await,
+      Err(ExecutorError::RequiredVariableMissing(name)) if name == "REQUIRED"
+    ));
+    assert!(!marker.exists());
   }
 
   #[tokio::test]

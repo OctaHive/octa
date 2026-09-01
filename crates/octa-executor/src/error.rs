@@ -95,6 +95,12 @@ pub enum ExecutorError {
   #[error("Failed to expand variable: {0}: {1}")]
   VariableExpandError(String, String),
 
+  #[error("Required variable '{0}' is not set")]
+  RequiredVariableMissing(String),
+
+  #[error("Required variable '{0}' must be supplied as a concrete value")]
+  RequiredVariableNotConcrete(String),
+
   #[error("Failed to get included octafile: {0}")]
   GetCotafile(#[from] OctafileError),
 

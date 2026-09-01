@@ -884,6 +884,71 @@ tasks:
 }
 
 #[test]
+fn test_required_variables() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+vars:
+  GLOBAL_REQUIRED:
+    required: true
+  DISPLAY: "configured-{{ GLOBAL_REQUIRED }}"
+
+tasks:
+  deploy:
+    vars:
+      TASK_SECRET:
+        required: true
+        secret: true
+    shell: echo "{{ DISPLAY }} {{ TASK_SECRET }}"
+"#,
+  )?;
+
+  let mut list = Command::cargo_bin("octa")?;
+  list
+    .current_dir(tmp_dir.path())
+    .arg("--list-tasks")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  list.assert().success().stdout(predicate::str::contains("deploy"));
+
+  let mut missing = Command::cargo_bin("octa")?;
+  missing
+    .current_dir(tmp_dir.path())
+    .args(["deploy", "GLOBAL_REQUIRED=present"])
+    .env_remove("TASK_SECRET")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  missing
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("Required variable 'TASK_SECRET' is not set"));
+
+  let mut supplied = Command::cargo_bin("octa")?;
+  supplied
+    .current_dir(tmp_dir.path())
+    .args(["deploy", "TASK_SECRET=token"])
+    .env("GLOBAL_REQUIRED", "environment")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  supplied
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("configured-environment token"));
+
+  let mut empty = Command::cargo_bin("octa")?;
+  empty
+    .current_dir(tmp_dir.path())
+    .args(["deploy", "GLOBAL_REQUIRED=present", "TASK_SECRET="])
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  empty
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("Required variable 'TASK_SECRET' is not set"));
+
+  Ok(())
+}
+
+#[test]
 fn test_file_option() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");

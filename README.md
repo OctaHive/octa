@@ -476,14 +476,39 @@ vars:
 Secret values remain available to templates and commands. Output produced by the command itself is
 not redacted, and a variable derived from a secret must be marked as secret separately.
 
-When evaluating variables for a task, Octa will search for them along the entire execution path 
-in the following order:
+Mark a variable as required when its value must be supplied by another variable layer:
 
-* Values passed when running the task
+```yaml
+tasks:
+  deploy:
+    vars:
+      API_TOKEN:
+        required: true
+        secret: true
+    shell: ./deploy.sh
+```
+
+```console
+octa deploy API_TOKEN=token
+```
+
+A required variable cannot define `value` or `sh`. CLI variables, process environment variables,
+include variables, and variables passed by another task can satisfy the requirement. Validation is
+performed only when the affected task runs, after all variable layers have been merged; listing
+tasks does not trigger runtime validation. Missing, null, whitespace-only, and empty collection
+values fail with an error. Supplied values must be concrete rather than `sh` or template
+expressions, which makes them available while configured variables are expanded. `secret: true`
+also redacts a value supplied by another layer.
+
+When evaluating variables for a task, Octa applies them in the following order, from highest to
+lowest priority:
+
+* Values passed as named arguments when invoking Octa
+* Process environment variables
+* Values passed when running the task from another task
 * Values defined for the task
 * Values in the Octafile where the task is defined
-* Values in parent Octafiles
-* Values passed when invoking octa
+* Values in parent Octafiles, starting with the nearest parent
 
 ```yaml
 version: 1

@@ -1,0 +1,9 @@
+version: 1
+
+tasks:
+  deploy:
+    vars:
+      API_TOKEN:
+        required: true
+        secret: true
+    shell: echo "API token is configured"

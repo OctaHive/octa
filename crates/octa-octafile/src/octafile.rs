@@ -323,7 +323,7 @@ impl Octafile {
 
     let octafile = Arc::new(octafile);
     let _ = octafile._self.set(Arc::clone(&octafile));
-    Self::load_includes(Arc::clone(&octafile), &context, variable_overrides)?;
+    Self::load_includes(Arc::clone(&octafile), &context, variable_overrides, &HashSet::new())?;
 
     Ok(octafile)
   }
@@ -507,6 +507,7 @@ impl Octafile {
     octafile: Arc<Octafile>,
     context: &Context,
     variable_overrides: &[(String, String)],
+    inherited_secret_vars: &HashSet<String>,
   ) -> OctafileResult<()> {
     let includes = match &octafile.includes {
       Some(includes) => includes,
@@ -517,13 +518,22 @@ impl Octafile {
     let context = context
       .with_default_plugin(Some(octafile.default_plugin.clone()))
       .map_err(OctafileError::PluginSchemaError)?;
+    let mut secret_vars = inherited_secret_vars.clone();
+    if let Some(vars) = &octafile.vars {
+      secret_vars.extend(
+        vars
+          .iter()
+          .filter(|(_, variable)| variable.is_secret())
+          .map(|(name, _)| name.clone()),
+      );
+    }
 
     for (name, include) in includes {
       let (path_template, optional) = match include {
         IncludeInfo::Simple(path) => (path.as_str(), false),
         IncludeInfo::Complex(complex) => (complex.octafile.as_str(), complex.optional.unwrap_or(false)),
       };
-      let rendered_path = Self::render_include_path(&octafile, path_template, variable_overrides)?;
+      let rendered_path = Self::render_include_path(&octafile, path_template, variable_overrides, &secret_vars)?;
       let unresolved_path = octafile.dir.join(&rendered_path);
       let path = match unresolved_path.canonicalize() {
         Ok(path) => Octafile::find_octafile(Some(path))?
@@ -577,7 +587,12 @@ impl Octafile {
 
       // Recursively process nested includes
       if include_octafile.includes.is_some() {
-        Self::load_includes(Arc::clone(&include_octafile), &context, variable_overrides)?;
+        Self::load_includes(
+          Arc::clone(&include_octafile),
+          &context,
+          variable_overrides,
+          &secret_vars,
+        )?;
       }
 
       octafile
@@ -595,6 +610,7 @@ impl Octafile {
     octafile: &Octafile,
     path: &str,
     variable_overrides: &[(String, String)],
+    secret_vars: &HashSet<String>,
   ) -> OctafileResult<String> {
     let mut template_context = match &octafile.vars {
       Some(vars) => {
@@ -602,16 +618,18 @@ impl Octafile {
         let values: IndexMap<_, _> = vars
           .iter()
           .filter(|(_, variable)| !variable.is_secret())
-          .map(|(key, variable)| (key, variable.template_value()))
+          .filter_map(|(key, variable)| variable.template_value().map(|value| (key, value)))
           .collect();
         TeraContext::from_serialize(values)
       },
       None => Ok(TeraContext::new()),
     }
     .map_err(|error| OctafileError::IncludeTemplateError(path.to_owned(), error.to_string()))?;
-    // Runtime overrides are inserted after Octafile variables, while platform constants remain reserved.
+    // Public runtime overrides win over Octafile variables, while secrets stay out of filesystem paths.
     for (name, value) in variable_overrides {
-      template_context.insert(name, value);
+      if !secret_vars.contains(name) {
+        template_context.insert(name, value);
+      }
     }
     template_context.insert("OS", go_os());
     template_context.insert("ARCH", go_arch());
@@ -1126,6 +1144,45 @@ tasks:
 
     assert!(matches!(error, OctafileError::IncludeTemplateError(_, _)));
     assert!(!message.contains("private-path"));
+  }
+
+  #[test]
+  fn does_not_expose_secret_runtime_variables_to_nested_include_templates() {
+    let temp_dir = TempDir::new().unwrap();
+    let root_path = temp_dir.path().join("Octafile.yml");
+    fs::write(
+      &root_path,
+      r#"
+version: 1
+vars:
+  TOKEN:
+    required: true
+    secret: true
+includes:
+  child: Child.yml
+tasks: {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+      temp_dir.path().join("Child.yml"),
+      r#"
+version: 1
+includes:
+  private: Missing-{{TOKEN}}.yml
+tasks: {}
+"#,
+    )
+    .unwrap();
+
+    let schemas = PluginSchemas::from([("shell".to_owned(), None)]);
+    let variables = vec![("TOKEN".to_owned(), "literal-secret".to_owned())];
+    let error = Octafile::load_with_schemas_and_vars_from(Some(root_path), false, None, schemas, "shell", &variables)
+      .unwrap_err();
+    let message = error.to_string();
+
+    assert!(matches!(error, OctafileError::IncludeTemplateError(_, _)));
+    assert!(!message.contains("literal-secret"));
   }
 
   #[test]
@@ -2299,13 +2356,36 @@ tasks:
     assert!(!format!("{:?}", vars["TOKEN"]).contains("secret-value"));
     assert_eq!(
       vars["TOKEN"].clone().into_value(),
-      serde_json::Value::String("secret-value".to_owned())
+      Some(serde_json::Value::String("secret-value".to_owned()))
     );
     assert!(vars["DYNAMIC"].is_secret());
     assert_eq!(
       vars["DYNAMIC"].clone().into_value(),
-      serde_json::json!({ "sh": "echo dynamic" })
+      Some(serde_json::json!({ "sh": "echo dynamic" }))
     );
+
+    let serialized = serde_yml::to_string(&vars).unwrap();
+    assert_eq!(serde_yml::from_str::<Vars>(&serialized).unwrap(), vars);
+  }
+
+  #[test]
+  fn parses_required_variables() {
+    let vars: Vars = serde_yml::from_str(
+      r#"
+      API_URL:
+        required: true
+      API_TOKEN:
+        required: true
+        secret: true
+      "#,
+    )
+    .unwrap();
+
+    assert!(vars["API_URL"].is_required());
+    assert!(!vars["API_URL"].is_secret());
+    assert_eq!(vars["API_URL"].clone().into_value(), None);
+    assert!(vars["API_TOKEN"].is_required());
+    assert!(vars["API_TOKEN"].is_secret());
 
     let serialized = serde_yml::to_string(&vars).unwrap();
     assert_eq!(serde_yml::from_str::<Vars>(&serialized).unwrap(), vars);
@@ -2317,6 +2397,19 @@ tasks:
       "value: hidden\n    sh: echo hidden\n    secret: true",
       "value: hidden\n    secret: yes",
       "value: hidden\n    secret: true\n    unknown: value",
+    ] {
+      let yaml = format!("TOKEN:\n    {definition}\n");
+      assert!(serde_yml::from_str::<Vars>(&yaml).is_err(), "accepted {definition}");
+    }
+  }
+
+  #[test]
+  fn rejects_invalid_required_variables_during_parsing() {
+    for definition in [
+      "required: yes",
+      "required: true\n    value: fallback",
+      "required: true\n    sh: echo fallback",
+      "required: true\n    unknown: value",
     ] {
       let yaml = format!("TOKEN:\n    {definition}\n");
       assert!(serde_yml::from_str::<Vars>(&yaml).is_err(), "accepted {definition}");

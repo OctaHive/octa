@@ -3,7 +3,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-/// A validated variable definition with its value source and logging sensitivity.
+/// A validated variable definition with its value source, requirement, and logging sensitivity.
 #[derive(Clone, Eq, PartialEq)]
 pub struct Variable {
   value: VariableValue,
@@ -32,6 +32,7 @@ impl fmt::Debug for Variable {
 enum VariableValue {
   Value(Value),
   Shell(String),
+  Required,
 }
 
 impl Variable {
@@ -40,23 +41,30 @@ impl Variable {
     self.secret
   }
 
+  /// Returns whether a higher-priority variable layer must provide the value.
+  pub fn is_required(&self) -> bool {
+    matches!(self.value, VariableValue::Required)
+  }
+
   /// Returns the value representation consumed by the executor.
-  pub fn into_value(self) -> Value {
+  pub fn into_value(self) -> Option<Value> {
     match self.value {
-      VariableValue::Value(value) => value,
-      VariableValue::Shell(command) => serde_json::json!({ "sh": command }),
+      VariableValue::Value(value) => Some(value),
+      VariableValue::Shell(command) => Some(serde_json::json!({ "sh": command })),
+      VariableValue::Required => None,
     }
   }
 
   /// Returns the unresolved value used while rendering include path templates.
-  pub(crate) fn template_value(&self) -> Value {
+  pub(crate) fn template_value(&self) -> Option<Value> {
     match &self.value {
-      VariableValue::Value(value) => value.clone(),
-      VariableValue::Shell(command) => serde_json::json!({ "sh": command }),
+      VariableValue::Value(value) => Some(value.clone()),
+      VariableValue::Shell(command) => Some(serde_json::json!({ "sh": command })),
+      VariableValue::Required => None,
     }
   }
 
-  /// Parses both shorthand values and explicit secret variable definitions.
+  /// Parses shorthand values and explicit variable definitions.
   fn from_json(value: Value) -> Result<Self, String> {
     let Value::Object(mut definition) = value else {
       return Ok(Self {
@@ -65,7 +73,7 @@ impl Variable {
       });
     };
 
-    if !definition.contains_key("secret") {
+    if !definition.contains_key("secret") && !definition.contains_key("required") {
       // An exact `{ sh: ... }` mapping is executable; every other mapping remains user data.
       if definition.len() == 1 {
         if let Some(Value::String(command)) = definition.get("sh") {
@@ -81,23 +89,40 @@ impl Variable {
       });
     }
 
-    // Once `secret` is present, the mapping is metadata rather than an arbitrary object value.
+    // Metadata keys turn the mapping into a variable definition rather than an arbitrary object value.
     if let Some(name) = definition
       .keys()
-      .find(|name| !matches!(name.as_str(), "value" | "sh" | "secret"))
+      .find(|name| !matches!(name.as_str(), "value" | "sh" | "secret" | "required"))
     {
-      return Err(format!("unknown secret variable option '{name}'"));
+      return Err(format!("unknown variable option '{name}'"));
     }
 
     let secret = definition
       .remove("secret")
-      .and_then(|value| value.as_bool())
-      .ok_or_else(|| "'secret' must be a boolean".to_owned())?;
+      .map(|value| value.as_bool().ok_or_else(|| "'secret' must be a boolean".to_owned()))
+      .transpose()?
+      .unwrap_or(false);
+    let required = definition
+      .remove("required")
+      .map(|value| value.as_bool().ok_or_else(|| "'required' must be a boolean".to_owned()))
+      .transpose()?
+      .unwrap_or(false);
+
+    if required {
+      if definition.contains_key("value") || definition.contains_key("sh") {
+        return Err("a required variable cannot define 'value' or 'sh'".to_owned());
+      }
+      return Ok(Self {
+        value: VariableValue::Required,
+        secret,
+      });
+    }
+
     let value = match (definition.remove("value"), definition.remove("sh")) {
       (Some(value), None) => VariableValue::Value(value),
       (None, Some(Value::String(command))) => VariableValue::Shell(command),
       (None, Some(_)) => return Err("'sh' must be a string".to_owned()),
-      _ => return Err("a secret variable must define exactly one of 'value' or 'sh'".to_owned()),
+      _ => return Err("a variable definition must contain exactly one of 'value' or 'sh'".to_owned()),
     };
 
     Ok(Self { value, secret })
@@ -110,6 +135,8 @@ impl Variable {
       (VariableValue::Shell(command), false) => serde_json::json!({ "sh": command }),
       (VariableValue::Value(value), true) => serde_json::json!({ "value": value, "secret": true }),
       (VariableValue::Shell(command), true) => serde_json::json!({ "sh": command, "secret": true }),
+      (VariableValue::Required, false) => serde_json::json!({ "required": true }),
+      (VariableValue::Required, true) => serde_json::json!({ "required": true, "secret": true }),
     }
   }
 }
