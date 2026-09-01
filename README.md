@@ -9,6 +9,7 @@ functionality missing, so I decided to create my own builder.
 # The differences from go-task
 * Support for a plugin system to extend the builder’s functionality
 * Support run tasks using wildcards, for example `*:docker` run all first child docker tasks, or you can run `**:docker` and run all nested docker task
+* Support true parallel execution of commands within a single task
 * Support returning dependency task results. This is useful, for example, when you need to process the result of a task in its parent task.
 * Support rendering templates and return result of rendering as task result
 
