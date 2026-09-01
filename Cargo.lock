@@ -1278,6 +1278,7 @@ dependencies = [
  "nu-ansi-term",
  "octa-executor",
  "octa-finder",
+ "octa-monorepo",
  "octa-octafile",
  "octa-plugin",
  "octa-plugin-manager",
@@ -1364,6 +1365,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+]
+
+[[package]]
+name = "octa-monorepo"
+version = "0.2.1"
+dependencies = [
+ "globset",
+ "ignore",
+ "octa-octafile",
+ "serde",
+ "serde_json",
+ "sled",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

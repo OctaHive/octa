@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, fs::File, io::Read, path::Path};
 
 use serde_yml::{Mapping, Number, Tag as ValueTag, TaggedValue, Value};
 use yaml_rust2::{
@@ -6,6 +6,8 @@ use yaml_rust2::{
   scanner::{Marker, TScalarStyle},
   Yaml,
 };
+
+use crate::error::{OctafileError, OctafileResult};
 
 #[derive(Clone, Debug)]
 /// YAML node that keeps the source marker and tag discarded by the regular yaml-rust2 DOM loader.
@@ -251,6 +253,20 @@ pub(crate) fn parse(content: &str) -> Result<Node, String> {
     0 => Err("empty YAML document".to_string()),
     _ => Err("Octafile must contain a single YAML document".to_string()),
   }
+}
+
+pub(crate) fn parse_file(path: &Path) -> OctafileResult<Node> {
+  let path_str = path.display().to_string();
+  let mut file = File::open(path).map_err(|error| match error.kind() {
+    std::io::ErrorKind::NotFound => OctafileError::NotFoundError(path_str.clone()),
+    _ => OctafileError::IoError(error),
+  })?;
+  let mut content = String::new();
+  file
+    .read_to_string(&mut content)
+    .map_err(|_| OctafileError::ReadError(path_str.clone()))?;
+
+  parse(&content).map_err(|error| OctafileError::ParseError(path_str, error))
 }
 
 fn scalar_value(value: &str, style: TScalarStyle, tag: Option<&Tag>) -> Value {

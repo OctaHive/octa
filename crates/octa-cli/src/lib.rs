@@ -36,7 +36,7 @@ use octa_executor::{
   Executor, TaskGraphBuilder, TaskNode,
 };
 use octa_finder::OctaFinder;
-use octa_octafile::{Octafile, WatchInterval};
+use octa_octafile::{Octafile, SyntheticInclude, WatchInterval};
 
 mod error;
 mod logger;
@@ -525,6 +525,24 @@ fn tasks_request_watch(octafile: &Arc<Octafile>, commands: &[String]) -> bool {
   })
 }
 
+fn qualify_monorepo_commands(commands: Vec<String>, namespace: Option<&[String]>) -> Vec<String> {
+  let Some(namespace) = namespace.filter(|namespace| !namespace.is_empty()) else {
+    return commands;
+  };
+  let prefix = namespace.join(":");
+
+  commands
+    .into_iter()
+    .map(|command| {
+      if command.contains(':') {
+        command
+      } else {
+        format!("{prefix}:{command}")
+      }
+    })
+    .collect()
+}
+
 async fn execute_watch(
   context: ExecutionContext,
   commands: &[String],
@@ -602,14 +620,50 @@ pub async fn run() -> OctaResult<()> {
     }
   }
 
-  // Load octafile
-  let octafile = Octafile::load_with_schemas_and_vars_from(
-    args.octafile,
-    args.global,
-    args.dir,
+  let fingerprint = Arc::new(sled::open(format!("{}/fingerprint", *OCTA_DATA_DIR))?);
+  if args.clean_cache {
+    fingerprint.clear()?;
+    octa_monorepo::clear_cache(&fingerprint)?;
+    plugin_manager.shutdown_all().await;
+    return Ok(());
+  }
+
+  let entry_path = Octafile::resolve_path(args.octafile.clone(), args.global, args.dir.clone())?;
+  let working_dir = match &args.dir {
+    Some(path) if path.is_absolute() => path.clone(),
+    Some(path) => env::current_dir()?.join(path),
+    None => env::current_dir()?,
+  };
+  let monorepo = octa_monorepo::resolve(
+    &entry_path,
+    &working_dir,
+    args.octafile.is_some() || args.global,
+    &fingerprint,
+  )?;
+  let synthetic_includes = monorepo
+    .projects
+    .iter()
+    .map(|project| SyntheticInclude {
+      namespace: project.namespace.clone(),
+      path: project.octafile.clone(),
+    })
+    .collect::<Vec<_>>();
+  if !synthetic_includes.is_empty() {
+    info!(
+      "Loaded {} monorepo projects{}",
+      synthetic_includes.len(),
+      if monorepo.cache_hit { " from cache" } else { "" }
+    );
+  }
+
+  let octafile = Octafile::load_with_schemas_vars_and_includes_from(
+    Some(monorepo.root_octafile),
+    false,
+    None,
     validation_schemas,
     default_plugin,
     &args.vars,
+    &synthetic_includes,
   )?;
 
   if args.dry {
@@ -639,17 +693,14 @@ pub async fn run() -> OctaResult<()> {
     return Ok(());
   }
 
-  let fingerprint = Arc::new(sled::open(format!("{}/fingerprint", *OCTA_DATA_DIR))?);
-
-  if args.clean_cache {
-    fingerprint.clear()?;
-
-    return Ok(());
-  }
-
-  if args.commands.is_none()
+  let use_default_task = args.commands.is_none();
+  let commands = qualify_monorepo_commands(
+    args.commands.unwrap_or_else(|| vec![DEFAULT_TASK.to_string()]),
+    monorepo.current_namespace.as_deref(),
+  );
+  if use_default_task
     && OctaFinder::new()
-      .find_by_path(Arc::clone(&octafile), DEFAULT_TASK)
+      .find_by_path(Arc::clone(&octafile), &commands[0])
       .is_empty()
   {
     Cli::command().print_help().unwrap();
@@ -658,7 +709,6 @@ pub async fn run() -> OctaResult<()> {
     return Ok(());
   }
 
-  let commands = args.commands.unwrap_or_else(|| vec![DEFAULT_TASK.to_string()]);
   let options = ExecutionOptions {
     parallel: args.parallel,
     dry: args.dry,
@@ -779,6 +829,23 @@ mod tests {
     assert_eq!(cli.commands, Some(vec!["build".to_string()]));
 
     assert!(Cli::try_parse_from(["octa", "--concurrency", "0", "build"]).is_err());
+  }
+
+  #[test]
+  fn qualifies_only_bare_commands_inside_a_monorepo_project() {
+    let namespace = ["packages".to_owned(), "api".to_owned()];
+    let commands = vec![
+      "build".to_owned(),
+      "*".to_owned(),
+      "packages:web:build".to_owned(),
+      "::root".to_owned(),
+    ];
+
+    assert_eq!(
+      qualify_monorepo_commands(commands, Some(&namespace)),
+      ["packages:api:build", "packages:api:*", "packages:web:build", "::root"]
+    );
+    assert_eq!(qualify_monorepo_commands(vec!["build".to_owned()], None), ["build"]);
   }
 
   #[test]

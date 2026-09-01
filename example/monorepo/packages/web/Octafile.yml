@@ -1,0 +1,5 @@
+version: 1
+
+tasks:
+  build:
+    shell: echo Building web package

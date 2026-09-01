@@ -1,0 +1,14 @@
+version: 1
+
+monorepo:
+  roots:
+    - packages/*
+    - services/**
+  exclude:
+    - target
+    - node_modules
+  max_depth: 3
+
+tasks:
+  info:
+    shell: echo Monorepo root

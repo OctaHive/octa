@@ -2,12 +2,16 @@ use dotenvy::Error as DotenvError;
 use thiserror::Error;
 
 use octa_executor::error::ExecutorError;
+use octa_monorepo::MonorepoError;
 use octa_octafile::OctafileError;
 
 pub type OctaResult<T> = Result<T, OctaError>;
 
 #[derive(Error, Debug)]
 pub enum OctaError {
+  #[error(transparent)]
+  Io(#[from] std::io::Error),
+
   #[error("Failed to execute task: {0}")]
   Runtime(String),
 
@@ -32,6 +36,9 @@ pub enum OctaError {
 
   #[error(transparent)]
   OctafileLoad(#[from] OctafileError),
+
+  #[error(transparent)]
+  Monorepo(#[from] MonorepoError),
 
   #[error(transparent)]
   ExecutionError(#[from] ExecutorError),

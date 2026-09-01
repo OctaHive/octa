@@ -1,0 +1,23 @@
+[package]
+name = "octa-monorepo"
+description = "Monorepo Octafile discovery and caching"
+version = "0.2.1"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+include = ["src/"]
+
+[dependencies]
+globset = "0.4.18"
+ignore = "0.4.25"
+octa-octafile = { version = "0.2.1", path = "../octa-octafile" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sled = "0.34"
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.27"

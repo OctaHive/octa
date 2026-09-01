@@ -1,0 +1,5 @@
+version: 1
+
+tasks:
+  test:
+    shell: echo Testing backend jobs service

@@ -1,8 +1,6 @@
 use std::{
   collections::{HashMap, HashSet},
   env, fmt,
-  fs::File,
-  io::Read,
   path::{Path, PathBuf},
   str::FromStr,
   sync::{Arc, Mutex, OnceLock},
@@ -18,6 +16,7 @@ use tracing::{debug, info};
 use crate::{
   error::{OctafileError, OctafileResult},
   include::IncludeInfo,
+  monorepo::MonorepoConfig,
   parser::{self, location_error, Node},
   task::{AllowedRun, Context, PluginCommand, PluginSchemas, Task, TaskSeed},
   variable::Variable,
@@ -37,6 +36,15 @@ const OCTAFILE_DEFAULT_NAMES: [&str; 8] = [
 /// Variables retain YAML declaration order so a value can reference variables declared before it.
 pub type Vars = IndexMap<String, Variable>;
 pub type Envs = HashMap<String, EnvValue>;
+
+/// An automatically discovered Octafile exposed through a logical task namespace.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SyntheticInclude {
+  /// Logical namespace used by task lookup and listing.
+  pub namespace: Vec<String>,
+  /// Octafile loaded as a direct child of the monorepo root.
+  pub path: PathBuf,
+}
 
 /// A literal environment value or a command that produces it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -191,6 +199,9 @@ pub struct Octafile {
   // list of included octafiles
   pub includes: Option<HashMap<String, IncludeInfo>>,
 
+  // Automatic project discovery configuration
+  pub monorepo: Option<MonorepoConfig>,
+
   // List of task
   pub tasks: HashMap<String, Task>,
 
@@ -201,6 +212,9 @@ pub struct Octafile {
   // Name of octafile
   // #[serde(skip)]
   _name: String,
+
+  // Logical namespace used by task lookup
+  _namespace: Vec<String>,
 
   // Internal list of octafiles
   // #[serde(skip)]
@@ -228,6 +242,8 @@ impl fmt::Debug for Octafile {
       .field("interval", &self.interval)
       .field("default_plugin", &self.default_plugin)
       .field("includes", &self.includes)
+      .field("monorepo", &self.monorepo)
+      .field("namespace", &self.namespace_path())
       .field("tasks", &self.tasks)
       .field("dir", &self.dir)
       .finish()
@@ -242,7 +258,7 @@ impl Octafile {
     default_plugin: impl Into<String>,
   ) -> OctafileResult<Arc<Self>> {
     let context = Context::from_keys(plugin_keys, default_plugin).map_err(OctafileError::PluginSchemaError)?;
-    Self::load_with_context(path, global, None, context, &[])
+    Self::load_with_context(path, global, None, context, &[], &[])
   }
 
   pub fn load_with_schemas(
@@ -263,7 +279,7 @@ impl Octafile {
     default_plugin: impl Into<String>,
   ) -> OctafileResult<Arc<Self>> {
     let context = Context::from_schemas(schemas, default_plugin).map_err(OctafileError::PluginSchemaError)?;
-    Self::load_with_context(path, global, search_dir, context, &[])
+    Self::load_with_context(path, global, search_dir, context, &[], &[])
   }
 
   /// Loads an Octafile with string variable overrides available to include path templates.
@@ -276,7 +292,28 @@ impl Octafile {
     variable_overrides: &[(String, String)],
   ) -> OctafileResult<Arc<Self>> {
     let context = Context::from_schemas(schemas, default_plugin).map_err(OctafileError::PluginSchemaError)?;
-    Self::load_with_context(path, global, search_dir, context, variable_overrides)
+    Self::load_with_context(path, global, search_dir, context, variable_overrides, &[])
+  }
+
+  /// Loads an Octafile after merging automatically discovered projects as direct includes.
+  pub fn load_with_schemas_vars_and_includes_from(
+    path: Option<PathBuf>,
+    global: bool,
+    search_dir: Option<PathBuf>,
+    schemas: PluginSchemas,
+    default_plugin: impl Into<String>,
+    variable_overrides: &[(String, String)],
+    synthetic_includes: &[SyntheticInclude],
+  ) -> OctafileResult<Arc<Self>> {
+    let context = Context::from_schemas(schemas, default_plugin).map_err(OctafileError::PluginSchemaError)?;
+    Self::load_with_context(
+      path,
+      global,
+      search_dir,
+      context,
+      variable_overrides,
+      synthetic_includes,
+    )
   }
 
   fn load_with_context(
@@ -285,7 +322,32 @@ impl Octafile {
     search_dir: Option<PathBuf>,
     context: Context,
     variable_overrides: &[(String, String)],
+    synthetic_includes: &[SyntheticInclude],
   ) -> OctafileResult<Arc<Self>> {
+    let path = Self::resolve_path(path, global, search_dir)?;
+
+    debug!("Loading octafile: {}", path.display());
+
+    let mut octafile = Self::read_octafile(&path, &context)?;
+    octafile.set_attributes(&path)?;
+    let synthetic_namespaces = octafile.merge_synthetic_includes(synthetic_includes, variable_overrides)?;
+    octafile._self = OnceLock::new();
+
+    let octafile = Arc::new(octafile);
+    let _ = octafile._self.set(Arc::clone(&octafile));
+    Self::load_includes(
+      Arc::clone(&octafile),
+      &context,
+      variable_overrides,
+      &HashSet::new(),
+      Some(&synthetic_namespaces),
+    )?;
+
+    Ok(octafile)
+  }
+
+  /// Resolves the Octafile path without parsing or loading its includes.
+  pub fn resolve_path(path: Option<PathBuf>, global: bool, search_dir: Option<PathBuf>) -> OctafileResult<PathBuf> {
     let search_dir = match search_dir {
       Some(path) if path.is_absolute() => Some(path),
       Some(path) => Some(env::current_dir()?.join(path)),
@@ -313,19 +375,7 @@ impl Octafile {
       },
     }?
     .ok_or(OctafileError::NotSearchedError)?;
-    let path = path.canonicalize().map_err(OctafileError::IoError)?;
-
-    debug!("Loading octafile: {}", path.display());
-
-    let mut octafile = Self::read_octafile(&path, &context)?;
-    octafile.set_attributes(&path)?;
-    octafile._self = OnceLock::new();
-
-    let octafile = Arc::new(octafile);
-    let _ = octafile._self.set(Arc::clone(&octafile));
-    Self::load_includes(Arc::clone(&octafile), &context, variable_overrides, &HashSet::new())?;
-
-    Ok(octafile)
+    path.canonicalize().map_err(OctafileError::IoError)
   }
 
   fn deserialize_with_context(value: Node, context: &Context) -> Result<Self, String> {
@@ -389,6 +439,11 @@ impl Octafile {
         "default_plugin" => {},
         "includes" => {
           octafile.includes = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "monorepo" => {
+          let config: MonorepoConfig = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+          config.validate()?;
+          octafile.monorepo = Some(config);
         },
         "tasks" => {
           let tasks_map = value
@@ -502,12 +557,74 @@ impl Octafile {
     path
   }
 
+  /// Returns the logical task namespace assigned while loading the include hierarchy.
+  pub fn namespace_path(&self) -> Vec<String> {
+    self._namespace.clone()
+  }
+
+  fn merge_synthetic_includes(
+    &mut self,
+    synthetic_includes: &[SyntheticInclude],
+    variable_overrides: &[(String, String)],
+  ) -> OctafileResult<HashMap<String, Vec<String>>> {
+    if synthetic_includes.is_empty() {
+      return Ok(HashMap::new());
+    }
+
+    let mut explicit_paths = HashSet::new();
+    let secret_vars = self.secret_var_names();
+    if let Some(includes) = &self.includes {
+      for include in includes.values() {
+        let template = match include {
+          IncludeInfo::Simple(path) => path.as_str(),
+          IncludeInfo::Complex(include) => include.octafile.as_str(),
+        };
+        let rendered = Self::render_include_path(self, template, variable_overrides, &secret_vars)?;
+        let path = self.dir.join(rendered);
+        if let Ok(path) = path.canonicalize() {
+          if let Some(path) = Self::find_octafile(Some(path))? {
+            explicit_paths.insert(path.canonicalize().map_err(OctafileError::IoError)?);
+          }
+        }
+      }
+    }
+
+    let includes = self.includes.get_or_insert_with(HashMap::new);
+    let mut namespaces = HashMap::new();
+    for include in synthetic_includes {
+      let path = include.path.canonicalize().map_err(OctafileError::IoError)?;
+      if explicit_paths.contains(&path) {
+        continue;
+      }
+
+      let name = include.namespace.join(":");
+      if includes.contains_key(&name) {
+        return Err(OctafileError::MonorepoIncludeConflict(name));
+      }
+      includes.insert(name.clone(), IncludeInfo::Simple(path.to_string_lossy().into_owned()));
+      namespaces.insert(name, include.namespace.clone());
+    }
+
+    Ok(namespaces)
+  }
+
+  fn secret_var_names(&self) -> HashSet<String> {
+    self
+      .vars
+      .iter()
+      .flat_map(|vars| vars.iter())
+      .filter(|(_, variable)| variable.is_secret())
+      .map(|(name, _)| name.clone())
+      .collect()
+  }
+
   /// Load including octafiles
   fn load_includes(
     octafile: Arc<Octafile>,
     context: &Context,
     variable_overrides: &[(String, String)],
     inherited_secret_vars: &HashSet<String>,
+    namespace_overrides: Option<&HashMap<String, Vec<String>>>,
   ) -> OctafileResult<()> {
     let includes = match &octafile.includes {
       Some(includes) => includes,
@@ -519,14 +636,7 @@ impl Octafile {
       .with_default_plugin(Some(octafile.default_plugin.clone()))
       .map_err(OctafileError::PluginSchemaError)?;
     let mut secret_vars = inherited_secret_vars.clone();
-    if let Some(vars) = &octafile.vars {
-      secret_vars.extend(
-        vars
-          .iter()
-          .filter(|(_, variable)| variable.is_secret())
-          .map(|(name, _)| name.clone()),
-      );
-    }
+    secret_vars.extend(octafile.secret_var_names());
 
     for (name, include) in includes {
       let (path_template, optional) = match include {
@@ -553,6 +663,14 @@ impl Octafile {
         Ok(mut t) => {
           t._parent = Some(Arc::clone(&octafile));
           t._name = name.clone();
+          t._namespace = namespace_overrides
+            .and_then(|overrides| overrides.get(name))
+            .cloned()
+            .unwrap_or_else(|| {
+              let mut namespace = octafile._namespace.clone();
+              namespace.push(name.clone());
+              namespace
+            });
 
           if let IncludeInfo::Complex(inc_info) = include {
             if let Some(vars) = inc_info.vars.clone() {
@@ -592,6 +710,7 @@ impl Octafile {
           &context,
           variable_overrides,
           &secret_vars,
+          None,
         )?;
       }
 
@@ -655,41 +774,27 @@ impl Octafile {
   /// Reads and parses a taskfile from the given path
   fn read_octafile<P: AsRef<Path>>(taskfile_path: P, context: &Context) -> OctafileResult<Octafile> {
     let path = taskfile_path.as_ref();
+    let yaml_value = parser::parse_file(path)?;
     let path_str = path.display().to_string();
-
-    let mut file = File::open(path).map_err(|e| match e.kind() {
-      std::io::ErrorKind::NotFound => OctafileError::NotFoundError(path_str.clone()),
-      _ => OctafileError::IoError(e),
-    })?;
-
-    let mut content = String::new();
-    file
-      .read_to_string(&mut content)
-      .map_err(|_| OctafileError::ReadError(path_str.clone()))?;
-
-    let yaml_value = parser::parse(&content).map_err(|error| OctafileError::ParseError(path_str.clone(), error))?;
 
     Octafile::deserialize_with_context(yaml_value, context).map_err(|e| OctafileError::ParseError(path_str, e))
   }
 
+  /// Finds the highest-priority default Octafile name in one directory.
+  pub fn find_in_directory(directory: &Path) -> Option<PathBuf> {
+    OCTAFILE_DEFAULT_NAMES
+      .iter()
+      .map(|name| directory.join(name))
+      .find(|path| path.is_file())
+  }
+
   /// Try to find octafile config traversing to root directory from current directory
   fn find_octafile(path: Option<PathBuf>) -> OctafileResult<Option<PathBuf>> {
-    if let Some(path) = path {
-      if path.is_dir() {
-        for taskfile_name in OCTAFILE_DEFAULT_NAMES {
-          let potential_path = path.join(taskfile_name);
-          if potential_path.is_file() {
-            return Ok(Some(potential_path));
-          }
-        }
-      } else {
-        return Ok(Some(path));
-      }
-    } else {
-      return Self::find_octafile_from(env::current_dir()?);
+    match path {
+      Some(path) if path.is_dir() => Ok(Self::find_in_directory(&path)),
+      Some(path) => Ok(Some(path)),
+      None => Self::find_octafile_from(env::current_dir()?),
     }
-
-    Ok(None)
   }
 
   fn find_octafile_from(mut current_dir: PathBuf) -> OctafileResult<Option<PathBuf>> {
@@ -698,11 +803,8 @@ impl Octafile {
     }
 
     loop {
-      for taskfile_name in OCTAFILE_DEFAULT_NAMES {
-        let potential_path = current_dir.join(taskfile_name);
-        if potential_path.is_file() {
-          return Ok(Some(potential_path));
-        }
+      if let Some(path) = Self::find_in_directory(&current_dir) {
+        return Ok(Some(path));
       }
 
       if !current_dir.pop() {
@@ -763,6 +865,7 @@ mod tests {
   use octafile::Version;
   use pretty_assertions::assert_eq;
   use serde_yml::Value;
+  use std::collections::HashMap;
   use std::env;
   use std::fs;
   use std::path::PathBuf;
@@ -2460,5 +2563,95 @@ tasks: {}
     assert_eq!(octafile.failfast, Some(true));
     assert_eq!(octafile.tasks["inherited"].failfast, None);
     assert_eq!(octafile.tasks["overridden"].failfast, Some(false));
+  }
+
+  #[test]
+  fn parses_and_validates_monorepo_configuration() {
+    let content = r#"
+      version: 1
+      monorepo:
+        roots:
+          - packages/*
+          - services/**
+        exclude:
+          - target
+        max_depth: 3
+      tasks: {}
+    "#;
+    let (_temp_dir, file_path) = create_temp_octafile(content, "monorepo_config");
+
+    let octafile = Octafile::load(Some(file_path), false, vec!["shell".to_owned()], "shell").unwrap();
+    let config = octafile.monorepo.as_ref().unwrap();
+    assert_eq!(config.roots, ["packages/*", "services/**"]);
+    assert_eq!(config.exclude, ["target"]);
+    assert_eq!(config.max_depth, 3);
+
+    for monorepo in ["roots: []", "roots: [packages/**]\n        max_depth: 0"] {
+      let content = format!("version: 1\nmonorepo:\n        {monorepo}\ntasks: {{}}\n");
+      let (_temp_dir, file_path) = create_temp_octafile(&content, "invalid_monorepo_config");
+      assert!(Octafile::load(Some(file_path), false, vec!["shell".to_owned()], "shell").is_err());
+    }
+  }
+
+  #[test]
+  fn loads_discovered_projects_under_logical_namespaces() {
+    let temp_dir = TempDir::new().unwrap();
+    let root_path = temp_dir.path().join("Octafile.yml");
+    let project_dir = temp_dir.path().join("packages/api");
+    let project_path = project_dir.join("Octafile.yml");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(&root_path, "version: 1\ntasks: {}\n").unwrap();
+    fs::write(&project_path, "version: 1\ntasks:\n  build: echo build\n").unwrap();
+    let schemas = HashMap::from([("shell".to_owned(), None)]);
+    let discovered = SyntheticInclude {
+      namespace: vec!["packages".to_owned(), "api".to_owned()],
+      path: project_path,
+    };
+
+    let root = Octafile::load_with_schemas_vars_and_includes_from(
+      Some(root_path),
+      false,
+      None,
+      schemas,
+      "shell",
+      &[],
+      &[discovered],
+    )
+    .unwrap();
+    let project = root.get_included("packages:api").unwrap().unwrap();
+
+    assert_eq!(project.hierarchy_path(), ["packages:api"]);
+    assert_eq!(project.namespace_path(), ["packages", "api"]);
+    assert!(project.tasks.contains_key("build"));
+  }
+
+  #[test]
+  fn does_not_load_an_explicit_include_twice_when_it_is_discovered() {
+    let temp_dir = TempDir::new().unwrap();
+    let root_path = temp_dir.path().join("Octafile.yml");
+    let project_dir = temp_dir.path().join("packages/api");
+    let project_path = project_dir.join("Octafile.yml");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::write(&root_path, "version: 1\nincludes:\n  api: packages/api\ntasks: {}\n").unwrap();
+    fs::write(&project_path, "version: 1\ntasks: {}\n").unwrap();
+    let discovered = SyntheticInclude {
+      namespace: vec!["packages".to_owned(), "api".to_owned()],
+      path: project_path,
+    };
+
+    let root = Octafile::load_with_schemas_vars_and_includes_from(
+      Some(root_path),
+      false,
+      None,
+      HashMap::from([("shell".to_owned(), None)]),
+      "shell",
+      &[],
+      &[discovered],
+    )
+    .unwrap();
+
+    assert_eq!(root.get_all_included().unwrap().len(), 1);
+    assert!(root.get_included("api").unwrap().is_some());
+    assert!(root.get_included("packages:api").unwrap().is_none());
   }
 }

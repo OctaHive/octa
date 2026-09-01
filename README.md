@@ -187,6 +187,44 @@ includes:
   profile: ./profiles/Octafile_{{PROFILE}}.yml
 ```
 
+## Monorepo discovery
+
+A root Octafile can automatically discover Octafiles in monorepo projects:
+
+```yaml
+version: 1
+
+monorepo:
+  roots:
+    - packages/*
+    - services/**
+  exclude:
+    - target
+    - node_modules
+  max_depth: 5
+```
+
+`*` matches exactly one directory level. `**` searches recursively and is bounded by
+`max_depth`, which defaults to `5`. Excluded directory names are pruned before traversal;
+relative glob patterns can also be used for more specific exclusions. Octa always excludes
+`.git` and `.octa` from discovery.
+
+Discovered task names use the same colon-separated namespaces as explicit includes. For
+example, `packages/api/Octafile.yml` exposes its `build` task as
+`packages:api:build`. Wildcards work uniformly for both forms, such as
+`octa 'packages:*:build'` or `octa '**:test'`.
+
+When Octa is invoked inside a discovered project, an unqualified name such as `build`
+resolves to that project. Use `::task-name` to address a task in the monorepo root. Passing
+`--octafile` explicitly keeps that file as the entry point and does not activate an ancestor's
+monorepo configuration.
+
+Octa caches only the discovered project paths, not parsed tasks. The cache is reused while the
+traversed directory hierarchy is unchanged and is rebuilt when directories or discovered
+Octafiles are added or removed. Use `--clean-cache` to clear it manually.
+
+See [`example/monorepo`](example/monorepo) for a runnable layout.
+
 ## Advanced including options
 If you are using the extended task file import option, you can use the following settings:
 

@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 octa-finder = { version = "0.2.1", path = "../octa-finder" }
+octa-monorepo = { version = "0.2.1", path = "../octa-monorepo" }
 octa-octafile = { version = "0.2.1", path = "../octa-octafile" }
 octa-executor = { version = "0.2.1", path = "../octa-executor" }
 octa-plugin-manager = { version = "0.2.1", path = "../octa-plugin-manager" }

@@ -26,7 +26,6 @@ impl OctaFinder {
 
   /// Finds tasks by their path in the octafile hierarchy
   pub fn find_by_path(&self, octafile: Arc<Octafile>, path: &str) -> Vec<FindResult> {
-    let mut results = Vec::new();
     let mut current = octafile;
     let mut current_path = path;
 
@@ -42,21 +41,22 @@ impl OctaFinder {
         current = parent.clone();
         current_path = current_path.strip_prefix(":").unwrap();
       } else {
-        return results;
+        return Vec::new();
       }
     }
 
-    let search_segments: Vec<&str> = current_path.split(':').collect();
-
     debug!("Searching in path: {}", path);
+    if !current_path.contains('*') {
+      let results = self.find_exact(current, current_path).into_iter().collect::<Vec<_>>();
+      debug!("Found {} results for path: {}", results.len(), path);
+      return results;
+    }
 
-    let curr_path = if current.is_root() {
-      String::new()
-    } else {
-      current.hierarchy_path().join(":")
-    };
-
-    self.search_recursive(current, &search_segments, 0, &mut results, curr_path);
+    let mut pattern = current.namespace_path();
+    pattern.extend(current_path.split(':').map(str::to_owned));
+    let mut results = Vec::new();
+    self.collect_matching(current, &pattern, &mut results);
+    results.sort_by(|left, right| left.name.cmp(&right.name));
 
     debug!("Found {} results for path: {}", results.len(), path);
     results
@@ -80,135 +80,86 @@ impl OctaFinder {
       .collect()
   }
 
-  /// Recursively searches for tasks matching the path pattern
-  fn search_recursive(
-    &self,
-    octafile: Arc<Octafile>,
-    search_segments: &[&str],
-    depth: usize,
-    results: &mut Vec<FindResult>,
-    path: String,
-  ) {
-    if depth >= search_segments.len() {
-      return;
+  fn collect_matching(&self, octafile: Arc<Octafile>, pattern: &[String], results: &mut Vec<FindResult>) {
+    let namespace = octafile.namespace_path();
+    for (key, task) in &octafile.tasks {
+      let mut qualified = namespace.clone();
+      qualified.push(key.clone());
+      if matches_segments(pattern, &qualified) {
+        results.push(FindResult {
+          name: qualified.join(":"),
+          octafile: Arc::clone(&octafile),
+          task: task.clone(),
+        });
+      }
     }
 
-    match search_segments[depth] {
-      "*" => self.handle_wildcard_search(octafile, search_segments, depth, results, &path),
-      "**" => self.handle_recursive_search(octafile, search_segments, depth, results, &path),
-      segment => self.handle_exact_search(octafile, search_segments, depth, results, &path, segment),
-    }
-  }
-
-  /// Handles wildcard (*) search pattern
-  fn handle_wildcard_search(
-    &self,
-    octafile: Arc<Octafile>,
-    search_segments: &[&str],
-    depth: usize,
-    results: &mut Vec<FindResult>,
-    path: &str,
-  ) {
-    for (name, octafile) in octafile.get_all_included().unwrap() {
-      self.search_recursive(
-        Arc::clone(&octafile),
-        search_segments,
-        depth + 1,
-        results,
-        self.join_path(path, &name),
-      );
-    }
-  }
-
-  /// Handles recursive (**) search pattern
-  fn handle_recursive_search(
-    &self,
-    octafile: Arc<Octafile>,
-    search_segments: &[&str],
-    depth: usize,
-    results: &mut Vec<FindResult>,
-    path: &str,
-  ) {
     if let Ok(included) = octafile.get_all_included() {
-      if !included.is_empty() {
-        for (name, octafile) in included {
-          self.search_recursive(
-            Arc::clone(&octafile),
-            search_segments,
-            depth,
-            results,
-            self.join_path(path, &name),
-          );
-        }
-      }
-    }
-
-    if search_segments.len() > 1 {
-      let key = search_segments[1];
-      if let Some(task) = octafile.tasks.get(key) {
-        results.push(FindResult {
-          name: self.join_path(path, key),
-          octafile: Arc::clone(&octafile),
-          task: task.clone(),
-        });
-      }
-    } else {
-      for (key, task) in octafile.tasks.iter() {
-        results.push(FindResult {
-          name: self.join_path(path, key),
-          octafile: Arc::clone(&octafile),
-          task: task.clone(),
-        });
+      for included in included.into_values() {
+        self.collect_matching(included, pattern, results);
       }
     }
   }
 
-  /// Handles exact segment match search
-  fn handle_exact_search(
-    &self,
-    octafile: Arc<Octafile>,
-    search_segments: &[&str],
-    depth: usize,
-    results: &mut Vec<FindResult>,
-    path: &str,
-    segment: &str,
-  ) {
-    if depth < search_segments.len() - 1 {
-      // Check included octafiles
-      if let Some(included) = octafile.get_all_included().unwrap().get(segment) {
-        self.search_recursive(
-          Arc::clone(included),
-          search_segments,
-          depth + 1,
-          results,
-          self.join_path(path, segment),
-        );
-      }
-    } else {
-      // Check for task match
-      if let Some(task) = octafile.tasks.get(segment) {
-        results.push(FindResult {
-          name: self.join_path(path, segment),
-          octafile: Arc::clone(&octafile),
-          task: task.clone(),
-        });
-      }
+  fn find_exact(&self, octafile: Arc<Octafile>, path: &str) -> Option<FindResult> {
+    let segments = path.split(':').collect::<Vec<_>>();
+    let (task_name, namespace) = segments.split_last()?;
+    if task_name.is_empty() || namespace.iter().any(|segment| segment.is_empty()) {
+      return None;
     }
+
+    let octafile = Self::find_descendant(octafile, namespace)?;
+    let task = octafile.tasks.get(*task_name)?.clone();
+    let mut qualified = octafile.namespace_path();
+    qualified.push((*task_name).to_owned());
+    Some(FindResult {
+      name: qualified.join(":"),
+      octafile,
+      task,
+    })
   }
 
-  fn join_path(&self, current: &str, segment: &str) -> String {
-    if current.is_empty() {
-      segment.to_string()
-    } else {
-      format!("{}:{}", current, segment)
+  fn find_descendant(octafile: Arc<Octafile>, namespace: &[&str]) -> Option<Arc<Octafile>> {
+    if namespace.is_empty() {
+      return Some(octafile);
     }
+
+    for consumed in (1..=namespace.len()).rev() {
+      // A discovered project is a direct include whose key may cover several logical segments.
+      let name = namespace[..consumed].join(":");
+      let Some(included) = octafile.get_included(&name).ok()? else {
+        continue;
+      };
+      if let Some(found) = Self::find_descendant(included, &namespace[consumed..]) {
+        return Some(found);
+      }
+    }
+
+    None
+  }
+}
+
+fn matches_segments(pattern: &[String], candidate: &[String]) -> bool {
+  match (pattern.split_first(), candidate.split_first()) {
+    (None, None) => true,
+    (None, Some(_)) => false,
+    (Some((head, tail)), _) if head == "**" => {
+      matches_segments(tail, candidate)
+        || candidate
+          .split_first()
+          .is_some_and(|(_, candidate_tail)| matches_segments(pattern, candidate_tail))
+    },
+    (Some(_), None) => false,
+    (Some((head, tail)), Some((candidate_head, candidate_tail))) => {
+      (head == "*" || head == candidate_head) && matches_segments(tail, candidate_tail)
+    },
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use octa_octafile::PluginCommand;
+  use octa_octafile::{PluginCommand, SyntheticInclude};
   use serde_yml::Value;
   use std::path::PathBuf;
   use tempfile::TempDir;
@@ -265,6 +216,17 @@ mod tests {
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].name, "test");
+  }
+
+  #[test]
+  fn test_exact_search_rejects_invalid_and_missing_paths() {
+    let finder = OctaFinder::new();
+    let (_temp_dir, file_path) = create_gen_test_yaml(vec![("test", create_test_task("test"))]);
+    let octafile = Octafile::load(Some(file_path), false, vec!["shell".to_string()], "shell").unwrap();
+
+    assert!(finder.find_by_path(Arc::clone(&octafile), "").is_empty());
+    assert!(finder.find_by_path(Arc::clone(&octafile), "child:").is_empty());
+    assert!(finder.find_by_path(octafile, "missing:test").is_empty());
   }
 
   #[traced_test]
@@ -614,5 +576,46 @@ mod tests {
     assert_eq!(by_description[0].name, "build");
 
     assert!(finder.search(root, "missing").is_empty());
+  }
+
+  #[test]
+  fn test_discovered_projects_use_the_same_colon_wildcards_as_includes() {
+    let temp_dir = TempDir::new().unwrap();
+    let root_path = create_test_yaml(&temp_dir, "", "version: 1\ntasks: {}\n");
+    let api_path = create_test_yaml(&temp_dir, "packages/api", "version: 1\ntasks:\n  build: echo api\n");
+    let web_path = create_test_yaml(&temp_dir, "packages/web", "version: 1\ntasks:\n  build: echo web\n");
+    let root = Octafile::load_with_schemas_vars_and_includes_from(
+      Some(root_path),
+      false,
+      None,
+      std::collections::HashMap::from([("shell".to_owned(), None)]),
+      "shell",
+      &[],
+      &[
+        SyntheticInclude {
+          namespace: vec!["packages".to_owned(), "api".to_owned()],
+          path: api_path,
+        },
+        SyntheticInclude {
+          namespace: vec!["packages".to_owned(), "web".to_owned()],
+          path: web_path,
+        },
+      ],
+    )
+    .unwrap();
+    let finder = OctaFinder::new();
+
+    let exact = finder.find_by_path(Arc::clone(&root), "packages:api:build");
+    assert_eq!(
+      exact.iter().map(|result| result.name.as_str()).collect::<Vec<_>>(),
+      ["packages:api:build"]
+    );
+    let wildcard = finder.find_by_path(Arc::clone(&root), "packages:*:build");
+    assert_eq!(
+      wildcard.iter().map(|result| result.name.as_str()).collect::<Vec<_>>(),
+      ["packages:api:build", "packages:web:build"]
+    );
+    let recursive = finder.find_by_path(root, "packages:**");
+    assert_eq!(recursive.len(), 2);
   }
 }

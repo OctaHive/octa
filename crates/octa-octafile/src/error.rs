@@ -13,6 +13,9 @@ pub enum OctafileError {
   #[error("Failed to render included Octafile path '{0}': {1}")]
   IncludeTemplateError(String, String),
 
+  #[error("Discovered monorepo project namespace '{0}' conflicts with an explicit include")]
+  MonorepoIncludeConflict(String),
+
   #[error("Octafile {0} parsing error: {1}")]
   ParseError(String, String),
 

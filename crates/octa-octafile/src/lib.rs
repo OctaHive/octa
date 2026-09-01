@@ -1,5 +1,6 @@
 mod error;
 mod include;
+mod monorepo;
 mod octafile;
 mod parser;
 mod task;
@@ -7,7 +8,8 @@ mod variable;
 
 pub use error::{OctafileError, OctafileResult};
 pub use include::IncludeInfo;
-pub use octafile::{EnvValue, Envs, Octafile, ShellValue, Vars, WatchInterval};
+pub use monorepo::{read_monorepo_config, MonorepoConfig};
+pub use octafile::{EnvValue, Envs, Octafile, ShellValue, SyntheticInclude, Vars, WatchInterval};
 pub use task::{
   AllowedRun, CommandOptions, CommandPayload, ConditionEvaluation, Deps, ExecuteMode, PluginCommand, PluginSchemas,
   SourceStrategies, Task, TaskCommand, TaskCondition, TaskConditions, Timeout,

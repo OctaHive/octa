@@ -130,6 +130,98 @@ tasks:
 }
 
 #[test]
+fn test_monorepo_tasks_use_colon_namespaces() -> Result<(), Box<dyn std::error::Error>> {
+  let workspace = TempDir::new()?;
+  let api_dir = workspace.path().join("packages/api");
+  let web_dir = workspace.path().join("packages/web");
+  fs::create_dir_all(&api_dir)?;
+  fs::create_dir_all(&web_dir)?;
+  fs::write(
+    workspace.path().join("Octafile.yml"),
+    r#"
+version: 1
+monorepo:
+  roots:
+    - packages/*
+tasks:
+  root:
+    shell: echo root
+"#,
+  )?;
+  fs::write(
+    api_dir.join("Octafile.yml"),
+    "version: 1\ntasks:\n  build:\n    shell: echo api-build\n",
+  )?;
+  fs::write(
+    web_dir.join("Octafile.yml"),
+    "version: 1\ntasks:\n  build:\n    shell: echo web-build\n",
+  )?;
+
+  let mut run = Command::cargo_bin("octa")?;
+  run
+    .current_dir(workspace.path())
+    .args(["packages:api:build"])
+    .env("OCTA_CACHE_DIR", workspace.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  run.assert().success().stdout(predicate::str::contains("api-build"));
+
+  let mut list = Command::cargo_bin("octa")?;
+  list
+    .current_dir(workspace.path())
+    .arg("--list-tasks")
+    .env("OCTA_CACHE_DIR", workspace.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  list
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("packages:api:build"))
+    .stdout(predicate::str::contains("packages:web:build"))
+    .stdout(predicate::str::contains("packages/api").not());
+
+  Ok(())
+}
+
+#[test]
+fn test_monorepo_uses_the_current_project_for_bare_task_names() -> Result<(), Box<dyn std::error::Error>> {
+  let workspace = TempDir::new()?;
+  let api_dir = workspace.path().join("packages/api");
+  let nested_dir = api_dir.join("src/nested");
+  fs::create_dir_all(&nested_dir)?;
+  fs::write(
+    workspace.path().join("Octafile.yml"),
+    "version: 1\nmonorepo:\n  roots: [packages/**]\ntasks: {}\n",
+  )?;
+  fs::write(
+    api_dir.join("Octafile.yml"),
+    "version: 1\ntasks:\n  build:\n    shell: echo current-project\n",
+  )?;
+
+  let mut command = Command::cargo_bin("octa")?;
+  command
+    .current_dir(&nested_dir)
+    .arg("build")
+    .env("OCTA_CACHE_DIR", workspace.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  command
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("current-project"));
+
+  let mut explicit = Command::cargo_bin("octa")?;
+  explicit
+    .current_dir(&api_dir)
+    .args(["--octafile", "Octafile.yml", "build"])
+    .env("OCTA_CACHE_DIR", workspace.path().join("explicit-cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  explicit
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("current-project"));
+
+  Ok(())
+}
+
+#[test]
 fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");
