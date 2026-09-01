@@ -101,6 +101,15 @@ pub enum ExecutorError {
   #[error("Required variable '{0}' must be supplied as a concrete value")]
   RequiredVariableNotConcrete(String),
 
+  #[error("Required variable '{0}' must be one of: {1}")]
+  RequiredVariableNotAllowed(String, String),
+
+  #[error("Interactive input is unavailable for required variable '{0}'; supply {0}=VALUE on the command line")]
+  VariablePromptUnavailable(String),
+
+  #[error("Failed to read required variable '{0}': {1}")]
+  VariablePromptFailed(String, String),
+
   #[error("Failed to get included octafile: {0}")]
   GetCotafile(#[from] OctafileError),
 

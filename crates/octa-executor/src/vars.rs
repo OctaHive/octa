@@ -8,7 +8,7 @@ use std::{
 
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
-use octa_octafile::Vars as OctafileVars;
+use octa_octafile::{RequiredMode, VariableSource, Vars as OctafileVars};
 use octa_plugin::logger::collect_value_redactions;
 use regex::Regex;
 use serde::Serialize;
@@ -44,9 +44,12 @@ struct VariableLayer {
   dir: Option<PathBuf>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RequiredVar {
+  mode: RequiredMode,
   secret: bool,
+  enum_values: Option<Vec<String>>,
+  question: Option<String>,
 }
 
 struct SuppliedRequiredVar {
@@ -58,6 +61,20 @@ struct ResolvedVars {
   values: IndexMap<String, Value>,
   secrets: HashSet<String>,
   required_vars: IndexMap<String, RequiredVar>,
+}
+
+/// Describes one missing variable that may be requested from an external input provider.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct VariablePrompt {
+  pub name: String,
+  pub question: String,
+  pub enum_values: Option<Vec<String>>,
+  pub secret: bool,
+}
+
+/// Resolves interactive input without coupling the executor to a terminal implementation.
+pub trait VariableResolver: Send + Sync {
+  fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String>;
 }
 
 impl PartialEq for Vars {
@@ -177,9 +194,23 @@ impl Vars {
     // Consume the typed parser representation directly so secret metadata is not lost in Serde.
     for (key, variable) in variables {
       let secret = variable.is_secret();
-      let Some(value) = variable.into_value() else {
-        self.required_vars.insert(key, RequiredVar { secret });
-        continue;
+      let enum_values = variable.enum_values().map(<[String]>::to_vec);
+      let question = variable.question().map(str::to_owned);
+      let value = match variable.into_source() {
+        VariableSource::Value(value) => value,
+        VariableSource::Shell(command) => serde_json::json!({ "sh": command }),
+        VariableSource::Required(mode) => {
+          self.required_vars.insert(
+            key,
+            RequiredVar {
+              mode,
+              secret,
+              enum_values,
+              question,
+            },
+          );
+          continue;
+        },
       };
 
       self.values.insert(key.clone(), value);
@@ -194,6 +225,58 @@ impl Vars {
 
   pub fn iter(&self) -> impl Iterator<Item = (String, Value)> + '_ {
     self.values.iter().map(|(key, value)| (key.clone(), value.clone()))
+  }
+
+  /// Resolves prompt-backed requirements while the execution plan is being built.
+  pub(crate) fn resolve_required(&mut self, resolver: Option<&dyn VariableResolver>) -> ExecutorResult<()> {
+    let contexts = self.collect_context_chain();
+    let required_vars = collect_required_vars(&contexts);
+    let supplied = collect_supplied_required_vars(&contexts, &required_vars);
+    let mut prompts = Vec::new();
+
+    // Validate the complete non-interactive configuration before asking the user for anything.
+    for (name, required) in &required_vars {
+      if let Some(value) = supplied.get(name).filter(|value| !is_empty_value(&value.value)) {
+        validate_required_value(name, required.enum_values.as_deref(), &value.value)?;
+        continue;
+      }
+
+      if required.mode == RequiredMode::Strict {
+        return Err(ExecutorError::RequiredVariableMissing(name.clone()));
+      }
+
+      prompts.push((name.clone(), required.clone()));
+    }
+
+    for (name, required) in prompts {
+      let resolver = resolver.ok_or_else(|| ExecutorError::VariablePromptUnavailable(name.clone()))?;
+      let question = required.question.unwrap_or_else(|| {
+        if required.enum_values.is_some() {
+          format!("Select a value for '{name}'")
+        } else {
+          format!("Enter a value for '{name}'")
+        }
+      });
+      let prompt = VariablePrompt {
+        name: name.clone(),
+        question,
+        enum_values: required.enum_values.clone(),
+        secret: required.secret,
+      };
+      let value = Value::String(
+        resolver
+          .resolve(&prompt)
+          .map_err(|message| ExecutorError::VariablePromptFailed(name.clone(), message))?,
+      );
+      validate_required_value(&name, required.enum_values.as_deref(), &value)?;
+
+      self.values.insert(name.clone(), value);
+      if required.secret {
+        self.secrets.insert(name);
+      }
+    }
+
+    Ok(())
   }
 
   pub async fn expand(&mut self, dry: bool) -> ExecutorResult<()> {
@@ -239,7 +322,13 @@ impl Vars {
     dry: bool,
   ) -> ExecutorResult<ResolvedVars> {
     let required_vars = collect_required_vars(&contexts);
-    let supplied_required_vars = collect_supplied_required_vars(&contexts, &required_vars)?;
+    let supplied_required_vars = collect_supplied_required_vars(&contexts, &required_vars);
+    validate_required_vars(
+      &required_vars,
+      supplied_required_vars
+        .iter()
+        .map(|(key, supplied)| (key, &supplied.value)),
+    )?;
     let mut accumulated = supplied_required_vars
       .iter()
       .map(|(key, supplied)| (key.clone(), supplied.value.clone()))
@@ -289,8 +378,6 @@ impl Vars {
         }
       }
     }
-
-    validate_required_vars(&required_vars, accumulated.iter())?;
 
     Ok(ResolvedVars {
       values: accumulated,
@@ -380,13 +467,14 @@ impl Vars {
 }
 
 fn collect_required_vars(contexts: &[VariableLayer]) -> IndexMap<String, RequiredVar> {
-  let mut required_vars = IndexMap::new();
+  let mut required_vars: IndexMap<String, RequiredVar> = IndexMap::new();
   for layer in contexts {
     for (key, required) in &layer.required_vars {
-      required_vars
-        .entry(key.clone())
-        .and_modify(|current: &mut RequiredVar| current.secret |= required.secret)
-        .or_insert(*required);
+      let mut required = required.clone();
+      if let Some(previous) = required_vars.get(key) {
+        required.secret |= previous.secret;
+      }
+      required_vars.insert(key.clone(), required);
     }
   }
   required_vars
@@ -395,7 +483,7 @@ fn collect_required_vars(contexts: &[VariableLayer]) -> IndexMap<String, Require
 fn collect_supplied_required_vars(
   contexts: &[VariableLayer],
   required_vars: &IndexMap<String, RequiredVar>,
-) -> ExecutorResult<IndexMap<String, SuppliedRequiredVar>> {
+) -> IndexMap<String, SuppliedRequiredVar> {
   let mut supplied = IndexMap::new();
   for layer in contexts {
     for (key, value) in &layer.values {
@@ -411,17 +499,7 @@ fn collect_supplied_required_vars(
     }
   }
 
-  validate_required_vars(
-    required_vars,
-    supplied.iter().map(|(key, supplied)| (key, &supplied.value)),
-  )?;
-  for (key, supplied) in &supplied {
-    if shell_command(&supplied.value).is_some() || value_contains_template(&supplied.value) {
-      return Err(ExecutorError::RequiredVariableNotConcrete(key.clone()));
-    }
-  }
-
-  Ok(supplied)
+  supplied
 }
 
 fn validate_required_vars<'a>(
@@ -434,9 +512,33 @@ fn validate_required_vars<'a>(
   }
 
   for key in required_vars.keys() {
-    if supplied.get(key).is_none_or(|value| is_empty_value(value)) {
+    let Some(value) = supplied.get(key).filter(|value| !is_empty_value(value)) else {
       return Err(ExecutorError::RequiredVariableMissing(key.clone()));
-    }
+    };
+    validate_required_value(key, required_vars[key].enum_values.as_deref(), value)?;
+  }
+
+  Ok(())
+}
+
+fn validate_required_value(name: &str, enum_values: Option<&[String]>, value: &Value) -> ExecutorResult<()> {
+  if is_empty_value(value) {
+    return Err(ExecutorError::RequiredVariableMissing(name.to_owned()));
+  }
+  if shell_command(value).is_some() || value_contains_template(value) {
+    return Err(ExecutorError::RequiredVariableNotConcrete(name.to_owned()));
+  }
+  let Some(enum_values) = enum_values else {
+    return Ok(());
+  };
+  let valid = value
+    .as_str()
+    .is_some_and(|value| enum_values.iter().any(|allowed| allowed == value));
+  if !valid {
+    return Err(ExecutorError::RequiredVariableNotAllowed(
+      name.to_owned(),
+      enum_values.join(", "),
+    ));
   }
 
   Ok(())
@@ -573,11 +675,32 @@ impl From<Vars> for Context {
 
 #[cfg(test)]
 mod tests {
-  use std::fs;
+  use std::{fs, sync::Mutex};
 
   use super::*;
   use serde_json::json;
   use tempfile::TempDir;
+
+  struct FixedResolver {
+    value: String,
+    prompts: Mutex<Vec<VariablePrompt>>,
+  }
+
+  impl FixedResolver {
+    fn new(value: &str) -> Self {
+      Self {
+        value: value.to_owned(),
+        prompts: Mutex::new(Vec::new()),
+      }
+    }
+  }
+
+  impl VariableResolver for FixedResolver {
+    fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String> {
+      self.prompts.lock().unwrap().push(prompt.clone());
+      Ok(self.value.clone())
+    }
+  }
 
   #[test]
   fn test_new_vars() {
@@ -800,6 +923,94 @@ mod tests {
     assert_eq!(vars.get("API_TOKEN"), Some(&Value::String("external-token".to_owned())));
     assert_eq!(vars.secret_names(), vec!["API_TOKEN"]);
     assert!(!format!("{vars}").contains("external-token"));
+  }
+
+  #[tokio::test]
+  async fn resolves_prompted_variables_and_preserves_metadata() {
+    let configured: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      ENVIRONMENT:
+        required: prompt
+        secret: true
+        question: Choose environment
+        enum: [development, production]
+      MESSAGE: "Deploying to {{ ENVIRONMENT }}"
+      "#,
+    )
+    .unwrap();
+    let resolver = FixedResolver::new("production");
+    let mut vars = Vars::with_variables(configured);
+
+    vars.resolve_required(Some(&resolver)).unwrap();
+    vars.expand(true).await.unwrap();
+
+    assert_eq!(vars.get("ENVIRONMENT"), Some(&json!("production")));
+    assert_eq!(vars.get("MESSAGE"), Some(&json!("Deploying to production")));
+    assert_eq!(vars.secret_names(), vec!["ENVIRONMENT"]);
+    assert_eq!(
+      *resolver.prompts.lock().unwrap(),
+      vec![VariablePrompt {
+        name: "ENVIRONMENT".to_owned(),
+        question: "Choose environment".to_owned(),
+        enum_values: Some(vec!["development".to_owned(), "production".to_owned()]),
+        secret: true,
+      }]
+    );
+  }
+
+  #[test]
+  fn generates_default_questions_and_rejects_unavailable_input() {
+    let configured: octa_octafile::Vars =
+      serde_yml::from_str("ENVIRONMENT:\n  required: prompt\n  enum: [development, production]\n").unwrap();
+    let resolver = FixedResolver::new("development");
+    let mut vars = Vars::with_variables(configured.clone());
+
+    vars.resolve_required(Some(&resolver)).unwrap();
+    assert_eq!(
+      resolver.prompts.lock().unwrap()[0].question,
+      "Select a value for 'ENVIRONMENT'"
+    );
+
+    let mut vars = Vars::with_variables(configured);
+    assert!(matches!(
+      vars.resolve_required(None),
+      Err(ExecutorError::VariablePromptUnavailable(name)) if name == "ENVIRONMENT"
+    ));
+  }
+
+  #[test]
+  fn validates_enum_values_from_non_interactive_sources() {
+    let required: octa_octafile::Vars =
+      serde_yml::from_str("ENVIRONMENT:\n  required: true\n  enum: [development, production]\n").unwrap();
+    let parent = Vars::with_variables(required);
+    let mut vars = Vars::with_value_and_parent(json!({ "ENVIRONMENT": "testing" }), parent);
+
+    assert!(matches!(
+      vars.resolve_required(None),
+      Err(ExecutorError::RequiredVariableNotAllowed(name, allowed))
+        if name == "ENVIRONMENT" && allowed == "development, production"
+    ));
+  }
+
+  #[test]
+  fn validates_strict_requirements_before_prompting() {
+    let configured: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      ENVIRONMENT:
+        required: prompt
+      TOKEN:
+        required: true
+      "#,
+    )
+    .unwrap();
+    let resolver = FixedResolver::new("production");
+    let mut vars = Vars::with_variables(configured);
+
+    assert!(matches!(
+      vars.resolve_required(Some(&resolver)),
+      Err(ExecutorError::RequiredVariableMissing(name)) if name == "TOKEN"
+    ));
+    assert!(resolver.prompts.lock().unwrap().is_empty());
   }
 
   #[tokio::test]

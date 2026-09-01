@@ -492,13 +492,40 @@ tasks:
 octa deploy API_TOKEN=token
 ```
 
+Use `required: prompt` to request a missing value interactively. `question` customizes the prompt;
+when it is omitted, Octa generates a question from the variable name. An optional `enum` presents
+the allowed string values as a selection:
+
+```yaml
+tasks:
+  deploy:
+    vars:
+      ENVIRONMENT:
+        required: prompt
+        question: Select deployment environment
+        enum:
+          - development
+          - staging
+          - production
+    shell: ./deploy.sh
+```
+
+Values supplied without a prompt are also checked against `enum`. An enum always uses the selection
+UI because its options are already present in the Octafile. A secret variable without an enum uses
+hidden input. `required: true` remains strictly non-interactive. A prompt also fails instead of
+waiting for input when no terminal is attached or when `--non-interactive` is used, so CI runs cannot
+hang.
+
+Prompts are resolved while Octa builds the selected execution graph, before any command starts.
+Consequently, a reachable task may request its variables even when a later `if` condition skips it.
+
 A required variable cannot define `value` or `sh`. CLI variables, process environment variables,
 include variables, and variables passed by another task can satisfy the requirement. Validation is
-performed only when the affected task runs, after all variable layers have been merged; listing
-tasks does not trigger runtime validation. Missing, null, whitespace-only, and empty collection
-values fail with an error. Supplied values must be concrete rather than `sh` or template
-expressions, which makes them available while configured variables are expanded. `secret: true`
-also redacts a value supplied by another layer.
+performed after all variable layers have been merged while Octa builds the selected execution
+graph; listing tasks does not trigger it. Missing, null, whitespace-only, and empty collection values
+fail with an error. Supplied values must be concrete rather than `sh` or template expressions,
+which makes them available while configured variables are expanded. `secret: true` also redacts a
+value supplied by another layer.
 
 When evaluating variables for a task, Octa applies them in the following order, from highest to
 lowest priority:

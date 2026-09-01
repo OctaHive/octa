@@ -903,6 +903,13 @@ tasks:
         required: true
         secret: true
     shell: echo "{{ DISPLAY }} {{ TASK_SECRET }}"
+
+  select-environment:
+    vars:
+      ENVIRONMENT:
+        required: prompt
+        enum: [development, production]
+    shell: echo "{{ ENVIRONMENT }}"
 "#,
   )?;
 
@@ -944,6 +951,39 @@ tasks:
     .assert()
     .failure()
     .stderr(predicate::str::contains("Required variable 'TASK_SECRET' is not set"));
+
+  let mut non_interactive = Command::cargo_bin("octa")?;
+  non_interactive
+    .current_dir(tmp_dir.path())
+    .args(["select-environment", "--non-interactive"])
+    .env_remove("ENVIRONMENT")
+    .env("GLOBAL_REQUIRED", "present")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  non_interactive.assert().failure().stderr(predicate::str::contains(
+    "Interactive input is unavailable for required variable 'ENVIRONMENT'",
+  ));
+
+  let mut selected = Command::cargo_bin("octa")?;
+  selected
+    .current_dir(tmp_dir.path())
+    .args(["select-environment", "ENVIRONMENT=production"])
+    .env("GLOBAL_REQUIRED", "present")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  selected
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("production"));
+
+  let mut invalid = Command::cargo_bin("octa")?;
+  invalid
+    .current_dir(tmp_dir.path())
+    .args(["select-environment", "ENVIRONMENT=testing"])
+    .env("GLOBAL_REQUIRED", "present")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  invalid
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("must be one of: development, production"));
 
   Ok(())
 }

@@ -2,14 +2,15 @@ use std::{
   collections::HashMap,
   env,
   fs::File,
-  io::{self, Read},
+  io::{self, IsTerminal, Read},
   num::NonZeroUsize,
   path::{Path, PathBuf},
-  sync::Arc,
+  sync::{Arc, Mutex},
 };
 
 use clap::{CommandFactory, Parser};
 use clap_complete::aot::{generate, Generator, Shell};
+use dialoguer::{Input, Password, Select};
 use lazy_static::lazy_static;
 use logger::{ChronoLocal, OctaFormatter};
 use octa_plugin::protocol::Schema;
@@ -30,6 +31,7 @@ use error::{OctaError, OctaResult};
 use octa_executor::{
   executor::ExecutorConfig,
   summary::Summary,
+  vars::{VariablePrompt, VariableResolver},
   watcher::{SourceWatcher, WatchTarget},
   Executor, TaskGraphBuilder, TaskNode,
 };
@@ -121,6 +123,10 @@ pub(crate) struct Cli {
 
   #[arg(long, default_value_t = false)]
   pub summary: bool,
+
+  /// Never request missing variables interactively
+  #[arg(long, default_value_t = false)]
+  pub non_interactive: bool,
 
   #[arg(short, long, default_value_t = false)]
   pub force: bool,
@@ -222,6 +228,57 @@ struct ExecutionContext {
   fingerprint: Arc<sled::Db>,
   summary: Arc<Summary>,
   concurrency: Option<Arc<Semaphore>>,
+  variable_resolver: Option<Arc<dyn VariableResolver>>,
+}
+
+struct TerminalVariableResolver {
+  // Equivalent requirements reuse answers across dependencies, commands and watch rebuilds.
+  values: Mutex<HashMap<VariablePrompt, String>>,
+}
+
+impl TerminalVariableResolver {
+  fn new() -> Self {
+    Self {
+      values: Mutex::new(HashMap::new()),
+    }
+  }
+
+  fn read(&self, prompt: &VariablePrompt) -> Result<String, String> {
+    // Enum options are already part of the Octafile, so selecting one does not expose a runtime secret.
+    if let Some(enum_values) = &prompt.enum_values {
+      let selected = Select::new()
+        .with_prompt(&prompt.question)
+        .items(enum_values)
+        .interact()
+        .map_err(|error| error.to_string())?;
+      return Ok(enum_values[selected].clone());
+    }
+
+    if prompt.secret {
+      return Password::new()
+        .with_prompt(&prompt.question)
+        .interact()
+        .map_err(|error| error.to_string());
+    }
+
+    Input::<String>::new()
+      .with_prompt(&prompt.question)
+      .interact_text()
+      .map_err(|error| error.to_string())
+  }
+}
+
+impl VariableResolver for TerminalVariableResolver {
+  fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String> {
+    let mut values = self.values.lock().map_err(|error| error.to_string())?;
+    if let Some(value) = values.get(prompt) {
+      return Ok(value.clone());
+    }
+
+    let value = self.read(prompt)?;
+    values.insert(prompt.clone(), value.clone());
+    Ok(value)
+  }
 }
 
 /// Sets up signal handling for graceful shutdown
@@ -415,7 +472,11 @@ async fn build_execute_items(
   let mut watch_targets = Vec::new();
 
   for command in commands {
-    let builder = TaskGraphBuilder::new(context.plugin_manager.clone())?.with_variable_overrides(options.vars.clone());
+    let mut builder =
+      TaskGraphBuilder::new(context.plugin_manager.clone())?.with_variable_overrides(options.vars.clone());
+    if let Some(resolver) = &context.variable_resolver {
+      builder = builder.with_variable_resolver(resolver.clone());
+    }
     let dag = builder
       .build(
         Arc::clone(&context.octafile),
@@ -607,12 +668,16 @@ pub async fn run() -> OctaResult<()> {
     task_args: args.task_args,
   };
   let summary = Arc::new(Summary::new());
+  let variable_resolver: Option<Arc<dyn VariableResolver>> =
+    (!args.non_interactive && io::stdin().is_terminal() && io::stderr().is_terminal())
+      .then(|| Arc::new(TerminalVariableResolver::new()) as Arc<dyn VariableResolver>);
   let execution_context = ExecutionContext {
     plugin_manager: plugin_manager.clone(),
     octafile: Arc::clone(&octafile),
     fingerprint: Arc::clone(&fingerprint),
     summary: summary.clone(),
     concurrency: args.concurrency.map(|limit| Arc::new(Semaphore::new(limit.get()))),
+    variable_resolver,
   };
   let watch = args.watch || tasks_request_watch(&octafile, &commands);
 
@@ -698,13 +763,45 @@ mod tests {
 
   #[test]
   fn test_cli_parse() {
-    let cli = Cli::parse_from(["octa", "--parallel", "--failfast", "--concurrency", "4", "build"]);
+    let cli = Cli::parse_from([
+      "octa",
+      "--parallel",
+      "--failfast",
+      "--non-interactive",
+      "--concurrency",
+      "4",
+      "build",
+    ]);
     assert!(cli.parallel);
     assert!(cli.failfast);
+    assert!(cli.non_interactive);
     assert_eq!(cli.concurrency.map(NonZeroUsize::get), Some(4));
     assert_eq!(cli.commands, Some(vec!["build".to_string()]));
 
     assert!(Cli::try_parse_from(["octa", "--concurrency", "0", "build"]).is_err());
+  }
+
+  #[test]
+  fn terminal_variable_resolver_reuses_values() {
+    let prompt = VariablePrompt {
+      name: "ENVIRONMENT".to_owned(),
+      question: "Select environment".to_owned(),
+      enum_values: None,
+      secret: false,
+    };
+    let resolver = TerminalVariableResolver::new();
+    resolver
+      .values
+      .lock()
+      .unwrap()
+      .insert(prompt.clone(), "production".to_owned());
+    assert_eq!(resolver.resolve(&prompt), Ok("production".to_owned()));
+
+    let constrained = VariablePrompt {
+      enum_values: Some(vec!["development".to_owned(), "production".to_owned()]),
+      ..prompt
+    };
+    assert!(!resolver.values.lock().unwrap().contains_key(&constrained));
   }
 
   #[test]
@@ -816,6 +913,7 @@ tasks:
           fingerprint,
           summary: Arc::new(Summary::new()),
           concurrency: None,
+          variable_resolver: None,
         },
         &commands,
         &options,
@@ -870,6 +968,7 @@ tasks:
         fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
         summary: Arc::new(Summary::new()),
         concurrency: None,
+        variable_resolver: None,
       },
       &["build".to_string()],
       &options,

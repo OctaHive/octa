@@ -12,4 +12,4 @@ pub use task::{
   AllowedRun, CommandOptions, CommandPayload, ConditionEvaluation, Deps, ExecuteMode, PluginCommand, PluginSchemas,
   SourceStrategies, Task, TaskCommand, TaskCondition, TaskConditions, Timeout,
 };
-pub use variable::Variable;
+pub use variable::{RequiredMode, Variable, VariableSource};

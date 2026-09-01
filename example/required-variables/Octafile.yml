@@ -7,3 +7,14 @@ tasks:
         required: true
         secret: true
     shell: echo "API token is configured"
+
+  select-environment:
+    vars:
+      ENVIRONMENT:
+        required: prompt
+        question: Select deployment environment
+        enum:
+          - development
+          - staging
+          - production
+    shell: echo "Deploying to {{ ENVIRONMENT }}"

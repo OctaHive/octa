@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -6,8 +6,10 @@ use serde_json::Value;
 /// A validated variable definition with its value source, requirement, and logging sensitivity.
 #[derive(Clone, Eq, PartialEq)]
 pub struct Variable {
-  value: VariableValue,
+  source: VariableSource,
   secret: bool,
+  enum_values: Option<Vec<String>>,
+  question: Option<String>,
 }
 
 impl fmt::Debug for Variable {
@@ -16,7 +18,7 @@ impl fmt::Debug for Variable {
     let value = if self.secret {
       &"*****" as &dyn fmt::Debug
     } else {
-      &self.value as &dyn fmt::Debug
+      &self.source as &dyn fmt::Debug
     };
 
     formatter
@@ -29,10 +31,17 @@ impl fmt::Debug for Variable {
 
 /// Keeps the source form until the executor is ready to resolve the variable.
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum VariableValue {
+pub enum VariableSource {
   Value(Value),
   Shell(String),
-  Required,
+  Required(RequiredMode),
+}
+
+/// Controls how an absent required variable is handled before task execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequiredMode {
+  Strict,
+  Prompt,
 }
 
 impl Variable {
@@ -43,24 +52,47 @@ impl Variable {
 
   /// Returns whether a higher-priority variable layer must provide the value.
   pub fn is_required(&self) -> bool {
-    matches!(self.value, VariableValue::Required)
+    matches!(self.source, VariableSource::Required(_))
+  }
+
+  /// Returns the missing-value behavior for a required variable.
+  pub fn required_mode(&self) -> Option<RequiredMode> {
+    match self.source {
+      VariableSource::Required(mode) => Some(mode),
+      _ => None,
+    }
+  }
+
+  /// Returns the allowed values for a required variable.
+  pub fn enum_values(&self) -> Option<&[String]> {
+    self.enum_values.as_deref()
+  }
+
+  /// Returns the custom interactive question, when configured.
+  pub fn question(&self) -> Option<&str> {
+    self.question.as_deref()
   }
 
   /// Returns the value representation consumed by the executor.
   pub fn into_value(self) -> Option<Value> {
-    match self.value {
-      VariableValue::Value(value) => Some(value),
-      VariableValue::Shell(command) => Some(serde_json::json!({ "sh": command })),
-      VariableValue::Required => None,
+    match self.source {
+      VariableSource::Value(value) => Some(value),
+      VariableSource::Shell(command) => Some(serde_json::json!({ "sh": command })),
+      VariableSource::Required(_) => None,
     }
+  }
+
+  /// Returns the typed source consumed by the executor.
+  pub fn into_source(self) -> VariableSource {
+    self.source
   }
 
   /// Returns the unresolved value used while rendering include path templates.
   pub(crate) fn template_value(&self) -> Option<Value> {
-    match &self.value {
-      VariableValue::Value(value) => Some(value.clone()),
-      VariableValue::Shell(command) => Some(serde_json::json!({ "sh": command })),
-      VariableValue::Required => None,
+    match &self.source {
+      VariableSource::Value(value) => Some(value.clone()),
+      VariableSource::Shell(command) => Some(serde_json::json!({ "sh": command })),
+      VariableSource::Required(_) => None,
     }
   }
 
@@ -68,32 +100,43 @@ impl Variable {
   fn from_json(value: Value) -> Result<Self, String> {
     let Value::Object(mut definition) = value else {
       return Ok(Self {
-        value: VariableValue::Value(value),
+        source: VariableSource::Value(value),
         secret: false,
+        enum_values: None,
+        question: None,
       });
     };
 
-    if !definition.contains_key("secret") && !definition.contains_key("required") {
+    if !definition
+      .keys()
+      .any(|name| matches!(name.as_str(), "secret" | "required" | "enum" | "question"))
+    {
       // An exact `{ sh: ... }` mapping is executable; every other mapping remains user data.
       if definition.len() == 1 {
         if let Some(Value::String(command)) = definition.get("sh") {
           return Ok(Self {
-            value: VariableValue::Shell(command.clone()),
+            source: VariableSource::Shell(command.clone()),
             secret: false,
+            enum_values: None,
+            question: None,
           });
         }
       }
       return Ok(Self {
-        value: VariableValue::Value(Value::Object(definition)),
+        source: VariableSource::Value(Value::Object(definition)),
         secret: false,
+        enum_values: None,
+        question: None,
       });
     }
 
     // Metadata keys turn the mapping into a variable definition rather than an arbitrary object value.
-    if let Some(name) = definition
-      .keys()
-      .find(|name| !matches!(name.as_str(), "value" | "sh" | "secret" | "required"))
-    {
+    if let Some(name) = definition.keys().find(|name| {
+      !matches!(
+        name.as_str(),
+        "value" | "sh" | "secret" | "required" | "enum" | "question"
+      )
+    }) {
       return Err(format!("unknown variable option '{name}'"));
     }
 
@@ -102,43 +145,108 @@ impl Variable {
       .map(|value| value.as_bool().ok_or_else(|| "'secret' must be a boolean".to_owned()))
       .transpose()?
       .unwrap_or(false);
-    let required = definition
-      .remove("required")
-      .map(|value| value.as_bool().ok_or_else(|| "'required' must be a boolean".to_owned()))
-      .transpose()?
-      .unwrap_or(false);
+    let required = match definition.remove("required") {
+      None | Some(Value::Bool(false)) => None,
+      Some(Value::Bool(true)) => Some(RequiredMode::Strict),
+      Some(Value::String(value)) if value == "prompt" => Some(RequiredMode::Prompt),
+      Some(_) => return Err("'required' must be a boolean or 'prompt'".to_owned()),
+    };
+    let enum_values = definition.remove("enum").map(parse_enum_values).transpose()?;
+    let question = definition
+      .remove("question")
+      .map(|value| match value {
+        Value::String(question) if !question.trim().is_empty() => Ok(question),
+        Value::String(_) => Err("'question' must not be empty".to_owned()),
+        _ => Err("'question' must be a string".to_owned()),
+      })
+      .transpose()?;
 
-    if required {
+    if let Some(mode) = required {
       if definition.contains_key("value") || definition.contains_key("sh") {
         return Err("a required variable cannot define 'value' or 'sh'".to_owned());
       }
+      if question.is_some() && mode != RequiredMode::Prompt {
+        return Err("'question' requires 'required: prompt'".to_owned());
+      }
       return Ok(Self {
-        value: VariableValue::Required,
+        source: VariableSource::Required(mode),
         secret,
+        enum_values,
+        question,
       });
     }
 
-    let value = match (definition.remove("value"), definition.remove("sh")) {
-      (Some(value), None) => VariableValue::Value(value),
-      (None, Some(Value::String(command))) => VariableValue::Shell(command),
+    if enum_values.is_some() || question.is_some() {
+      return Err("'enum' and 'question' require a required variable".to_owned());
+    }
+
+    let source = match (definition.remove("value"), definition.remove("sh")) {
+      (Some(value), None) => VariableSource::Value(value),
+      (None, Some(Value::String(command))) => VariableSource::Shell(command),
       (None, Some(_)) => return Err("'sh' must be a string".to_owned()),
       _ => return Err("a variable definition must contain exactly one of 'value' or 'sh'".to_owned()),
     };
 
-    Ok(Self { value, secret })
+    Ok(Self {
+      source,
+      secret,
+      enum_values: None,
+      question: None,
+    })
   }
 
   /// Reconstructs the YAML-compatible representation used by Serde.
   fn configuration_value(&self) -> Value {
-    match (&self.value, self.secret) {
-      (VariableValue::Value(value), false) => value.clone(),
-      (VariableValue::Shell(command), false) => serde_json::json!({ "sh": command }),
-      (VariableValue::Value(value), true) => serde_json::json!({ "value": value, "secret": true }),
-      (VariableValue::Shell(command), true) => serde_json::json!({ "sh": command, "secret": true }),
-      (VariableValue::Required, false) => serde_json::json!({ "required": true }),
-      (VariableValue::Required, true) => serde_json::json!({ "required": true, "secret": true }),
+    match (&self.source, self.secret) {
+      (VariableSource::Value(value), false) => value.clone(),
+      (VariableSource::Shell(command), false) => serde_json::json!({ "sh": command }),
+      (VariableSource::Value(value), true) => serde_json::json!({ "value": value, "secret": true }),
+      (VariableSource::Shell(command), true) => serde_json::json!({ "sh": command, "secret": true }),
+      (VariableSource::Required(mode), secret) => {
+        let required = match mode {
+          RequiredMode::Strict => Value::Bool(true),
+          RequiredMode::Prompt => Value::String("prompt".to_owned()),
+        };
+        let mut definition = serde_json::Map::from_iter([("required".to_owned(), required)]);
+        if secret {
+          definition.insert("secret".to_owned(), Value::Bool(true));
+        }
+        if let Some(enum_values) = &self.enum_values {
+          definition.insert("enum".to_owned(), serde_json::json!(enum_values));
+        }
+        if let Some(question) = &self.question {
+          definition.insert("question".to_owned(), Value::String(question.clone()));
+        }
+        Value::Object(definition)
+      },
     }
   }
+}
+
+fn parse_enum_values(value: Value) -> Result<Vec<String>, String> {
+  let Value::Array(values) = value else {
+    return Err("'enum' must be a list of strings".to_owned());
+  };
+  if values.is_empty() {
+    return Err("'enum' must not be empty".to_owned());
+  }
+
+  let mut unique = HashSet::new();
+  let mut result = Vec::with_capacity(values.len());
+  for value in values {
+    let Value::String(value) = value else {
+      return Err("'enum' must contain only strings".to_owned());
+    };
+    if value.trim().is_empty() {
+      return Err("'enum' values must not be empty".to_owned());
+    }
+    if !unique.insert(value.clone()) {
+      return Err(format!("duplicated enum value '{value}'"));
+    }
+    result.push(value);
+  }
+
+  Ok(result)
 }
 
 impl Serialize for Variable {

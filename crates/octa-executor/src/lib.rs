@@ -38,7 +38,7 @@ use octa_octafile::{
 };
 pub use task::TaskNode;
 use task::{ConditionRuntime, ConditionState, NodeKind, PluginInvocation, TaskConfig};
-use vars::Vars;
+use vars::{VariableResolver, Vars};
 
 // Type aliases for better readability
 type DagNode = DAG<TaskNode>;
@@ -162,9 +162,11 @@ pub struct TaskGraphBuilder {
   dir: PathBuf,                              // Current user directory
   command_args: Vec<String>,                 // Additional task arguments from cli
   variable_overrides: Vec<(String, String)>, // Highest-priority runtime variable overrides
-  os_arch: String,                           // Operating system architecture
-  os_type: String,                           // Operating system type
-  defer_order: AtomicUsize,                  // Declaration order for deferred commands
+  // Optional input provider shared by the main graph and nested deferred plans.
+  variable_resolver: Option<Arc<dyn VariableResolver>>,
+  os_arch: String,          // Operating system architecture
+  os_type: String,          // Operating system type
+  defer_order: AtomicUsize, // Declaration order for deferred commands
   // Deferred actions are collected separately and attached to the DAG when the plan is complete.
   deferred: Mutex<HashMap<String, Arc<DeferredAction<TaskNode>>>>,
 }
@@ -182,6 +184,7 @@ impl TaskGraphBuilder {
       dir: current_dir,
       command_args: vec![],
       variable_overrides: Vec::new(),
+      variable_resolver: None,
       os_arch,
       os_type,
       defer_order: AtomicUsize::new(0),
@@ -192,6 +195,12 @@ impl TaskGraphBuilder {
   /// Adds ordered runtime variable overrides that take precedence over every configured layer.
   pub fn with_variable_overrides(mut self, variables: Vec<(String, String)>) -> Self {
     self.variable_overrides = variables;
+    self
+  }
+
+  /// Provides interactive values for variables declared with `required: prompt`.
+  pub fn with_variable_resolver(mut self, resolver: Arc<dyn VariableResolver>) -> Self {
+    self.variable_resolver = Some(resolver);
     self
   }
 
@@ -489,6 +498,7 @@ impl TaskGraphBuilder {
       dir: self.dir.clone(),
       command_args: self.command_args.clone(),
       variable_overrides: self.variable_overrides.clone(),
+      variable_resolver: self.variable_resolver.clone(),
       os_arch: self.os_arch.clone(),
       os_type: self.os_type.clone(),
       defer_order: AtomicUsize::new(0),
@@ -535,7 +545,7 @@ impl TaskGraphBuilder {
     context: &InvocationContext,
     command_condition: Option<PluginCommand>,
   ) -> ExecutorResult<ArcNode> {
-    let vars = self.collect_vars(cmd, context.vars.clone());
+    let vars = self.collect_vars(cmd, context.vars.clone())?;
     let envs = self.collect_envs(cmd, context.envs.clone(), &vars)?;
 
     let plugin = cmd.task.plugin.clone().map(plugin_invocation).transpose()?;
@@ -584,7 +594,7 @@ impl TaskGraphBuilder {
     command: &FindResult,
     mut request: GateRequest,
   ) -> ExecutorResult<(InvocationContext, ArcNode)> {
-    let vars = self.collect_vars(command, request.context.vars.clone());
+    let vars = self.collect_vars(command, request.context.vars.clone())?;
     let envs = self.collect_envs(command, request.context.envs.clone(), &vars)?;
     let state = Arc::new(ConditionState::default());
     let name = format!("{} condition for {}", request.phase.label(), command.name);
@@ -898,7 +908,7 @@ impl TaskGraphBuilder {
   }
 
   /// Collects variables from global, hierarchy and task levels
-  fn collect_vars(&self, cmd: &FindResult, execute_vars: Option<octa_octafile::Vars>) -> Vars {
+  fn collect_vars(&self, cmd: &FindResult, execute_vars: Option<octa_octafile::Vars>) -> ExecutorResult<Vars> {
     let mut vars = self.initialize_global_vars(cmd);
     let env_vars: HashMap<String, String> = env::vars().collect();
 
@@ -910,18 +920,18 @@ impl TaskGraphBuilder {
 
     vars.extend_with(&env_vars);
 
-    if self.variable_overrides.is_empty() {
-      return vars;
+    if !self.variable_overrides.is_empty() {
+      // Keep overrides in their own layer so their templates can consume every configured value,
+      // while declaration order remains meaningful between CLI options.
+      let mut overrides = Vars::with_parent(vars);
+      for (name, value) in &self.variable_overrides {
+        overrides.insert(name, value);
+      }
+      vars = overrides;
     }
 
-    // Keep overrides in their own layer so their templates can consume every configured value,
-    // while declaration order remains meaningful between CLI options.
-    let mut overrides = Vars::with_parent(vars);
-    for (name, value) in &self.variable_overrides {
-      overrides.insert(name, value);
-    }
-
-    overrides
+    vars.resolve_required(self.variable_resolver.as_deref())?;
+    Ok(vars)
   }
 
   fn initialize_global_vars(&self, cmd: &FindResult) -> Vars {

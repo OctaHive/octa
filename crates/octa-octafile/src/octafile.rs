@@ -2377,6 +2377,12 @@ tasks: {}
       API_TOKEN:
         required: true
         secret: true
+      ENVIRONMENT:
+        required: prompt
+        question: Select deployment environment
+        enum:
+          - development
+          - production
       "#,
     )
     .unwrap();
@@ -2386,6 +2392,16 @@ tasks: {}
     assert_eq!(vars["API_URL"].clone().into_value(), None);
     assert!(vars["API_TOKEN"].is_required());
     assert!(vars["API_TOKEN"].is_secret());
+    assert_eq!(vars["ENVIRONMENT"].required_mode(), Some(RequiredMode::Prompt));
+    assert_eq!(
+      vars["ENVIRONMENT"].clone().into_source(),
+      VariableSource::Required(RequiredMode::Prompt)
+    );
+    assert_eq!(
+      vars["ENVIRONMENT"].enum_values(),
+      Some(["development".to_owned(), "production".to_owned()].as_slice())
+    );
+    assert_eq!(vars["ENVIRONMENT"].question(), Some("Select deployment environment"));
 
     let serialized = serde_yml::to_string(&vars).unwrap();
     assert_eq!(serde_yml::from_str::<Vars>(&serialized).unwrap(), vars);
@@ -2410,6 +2426,15 @@ tasks: {}
       "required: true\n    value: fallback",
       "required: true\n    sh: echo fallback",
       "required: true\n    unknown: value",
+      "required: input",
+      "required: prompt\n    enum: []",
+      "required: prompt\n    enum: ['']",
+      "required: prompt\n    enum: ['   ']",
+      "required: prompt\n    enum: [development, development]",
+      "required: prompt\n    enum: [development, 1]",
+      "required: prompt\n    question: '   '",
+      "required: true\n    question: Select value",
+      "value: development\n    enum: [development, production]",
     ] {
       let yaml = format!("TOKEN:\n    {definition}\n");
       assert!(serde_yml::from_str::<Vars>(&yaml).is_err(), "accepted {definition}");
