@@ -72,6 +72,8 @@ lazy_static! {
 #[derive(Parser)]
 #[clap(author, version, about, bin_name("octa"), name("octa"), propagate_version(true))]
 pub(crate) struct Cli {
+  /// Tasks to run and optional variable overrides
+  #[arg(value_name = "TASK|NAME=VALUE")]
   pub commands: Option<Vec<String>>,
 
   #[arg(short, long)]
@@ -86,6 +88,10 @@ pub(crate) struct Cli {
 
   #[arg(short = 'e', long = "env-file", value_name = "PATH")]
   pub env_files: Vec<PathBuf>,
+
+  /// Override an Octafile variable with a string value
+  #[arg(long = "var", value_name = "NAME=VALUE", value_parser = parse_cli_var)]
+  pub vars: Vec<(String, String)>,
 
   #[arg(short, long, default_value_t = false)]
   pub parallel: bool,
@@ -148,6 +154,37 @@ fn parse_watch_interval(value: &str) -> Result<Duration, String> {
   value.parse::<WatchInterval>().map(WatchInterval::duration)
 }
 
+fn parse_cli_var(value: &str) -> Result<(String, String), String> {
+  let (name, value) = value
+    .split_once('=')
+    .ok_or_else(|| "variables must use NAME=VALUE format".to_owned())?;
+  if name.is_empty() || name.trim() != name {
+    return Err("variable name must not be empty or surrounded by whitespace".to_owned());
+  }
+
+  Ok((name.to_owned(), value.to_owned()))
+}
+
+fn extract_inline_vars(args: &mut Cli) -> OctaResult<()> {
+  let Some(items) = args.commands.take() else {
+    return Ok(());
+  };
+
+  let mut commands = Vec::with_capacity(items.len());
+  for item in items {
+    if item.contains('=') {
+      args
+        .vars
+        .push(parse_cli_var(&item).map_err(OctaError::InvalidVariable)?);
+    } else {
+      commands.push(item);
+    }
+  }
+
+  args.commands = (!commands.is_empty()).then_some(commands);
+  Ok(())
+}
+
 fn load_env_files(paths: &[PathBuf]) -> OctaResult<()> {
   if paths.is_empty() {
     let _ = dotenvy::dotenv();
@@ -174,6 +211,7 @@ struct ExecutionOptions {
   dry: bool,
   force: bool,
   failfast: bool,
+  vars: Vec<(String, String)>,
   task_args: Vec<String>,
 }
 
@@ -377,7 +415,7 @@ async fn build_execute_items(
   let mut watch_targets = Vec::new();
 
   for command in commands {
-    let builder = TaskGraphBuilder::new(context.plugin_manager.clone())?;
+    let builder = TaskGraphBuilder::new(context.plugin_manager.clone())?.with_variable_overrides(options.vars.clone());
     let dag = builder
       .build(
         Arc::clone(&context.octafile),
@@ -466,7 +504,9 @@ async fn execute_watch(
 
 pub async fn run() -> OctaResult<()> {
   // Parse command line arguments
-  let args = Cli::parse();
+  let mut args = Cli::parse();
+
+  extract_inline_vars(&mut args)?;
 
   if let Some(shell) = args.completions {
     let mut cmd = Cli::command();
@@ -502,8 +542,14 @@ pub async fn run() -> OctaResult<()> {
   }
 
   // Load octafile
-  let octafile =
-    Octafile::load_with_schemas_from(args.octafile, args.global, args.dir, validation_schemas, default_plugin)?;
+  let octafile = Octafile::load_with_schemas_and_vars_from(
+    args.octafile,
+    args.global,
+    args.dir,
+    validation_schemas,
+    default_plugin,
+    &args.vars,
+  )?;
 
   if args.dry {
     warn!("Octa run in dry mode");
@@ -557,6 +603,7 @@ pub async fn run() -> OctaResult<()> {
     dry: args.dry,
     force: args.force,
     failfast: args.failfast,
+    vars: args.vars,
     task_args: args.task_args,
   };
   let summary = Arc::new(Summary::new());
@@ -759,6 +806,7 @@ tasks:
         dry: false,
         force: false,
         failfast: false,
+        vars: Vec::new(),
         task_args: Vec::new(),
       };
       execute_watch(
@@ -812,6 +860,7 @@ tasks:
       dry: false,
       force: false,
       failfast: false,
+      vars: Vec::new(),
       task_args: Vec::new(),
     };
     let result = execute_watch(
@@ -840,6 +889,82 @@ tasks:
       cli.env_files,
       vec![PathBuf::from(".env.local"), PathBuf::from("config/test.env")]
     );
+  }
+
+  #[test]
+  fn test_cli_vars() {
+    let cli = Cli::parse_from([
+      "octa",
+      "--var",
+      "PROFILE=development",
+      "--var",
+      "TOKEN=a=b",
+      "--var",
+      "EMPTY=",
+      "build",
+    ]);
+
+    assert_eq!(
+      cli.vars,
+      vec![
+        ("PROFILE".to_owned(), "development".to_owned()),
+        ("TOKEN".to_owned(), "a=b".to_owned()),
+        ("EMPTY".to_owned(), String::new()),
+      ]
+    );
+
+    let cli = Cli::parse_from(["octa", "build", "--var", "PROFILE=production"]);
+    assert_eq!(cli.vars, vec![("PROFILE".to_owned(), "production".to_owned())]);
+  }
+
+  #[test]
+  fn test_extract_inline_vars() {
+    let mut cli = Cli::parse_from([
+      "octa",
+      "test",
+      "PROFILE=development",
+      "build",
+      "PROFILE=production",
+      "EMPTY=",
+      "--",
+      "--release",
+    ]);
+    extract_inline_vars(&mut cli).unwrap();
+
+    assert_eq!(cli.commands, Some(vec!["test".to_owned(), "build".to_owned()]));
+    assert_eq!(
+      cli.vars,
+      vec![
+        ("PROFILE".to_owned(), "development".to_owned()),
+        ("PROFILE".to_owned(), "production".to_owned()),
+        ("EMPTY".to_owned(), String::new()),
+      ]
+    );
+    assert_eq!(cli.task_args, vec!["--release"]);
+  }
+
+  #[test]
+  fn test_extract_inline_vars_without_commands() {
+    let mut cli = Cli::parse_from(["octa", "PROFILE=production"]);
+    extract_inline_vars(&mut cli).unwrap();
+
+    assert!(cli.commands.is_none());
+    assert_eq!(cli.vars, vec![("PROFILE".to_owned(), "production".to_owned())]);
+  }
+
+  #[test]
+  fn test_extract_inline_vars_rejects_invalid_assignment() {
+    let mut cli = Cli::parse_from(["octa", "=production", "build"]);
+    let result = extract_inline_vars(&mut cli);
+
+    assert!(matches!(result, Err(OctaError::InvalidVariable(_))));
+  }
+
+  #[test]
+  fn test_cli_rejects_invalid_vars() {
+    for value in ["PROFILE", "=development", " PROFILE=development"] {
+      assert!(Cli::try_parse_from(["octa", "--var", value, "build"]).is_err());
+    }
   }
 
   #[test]

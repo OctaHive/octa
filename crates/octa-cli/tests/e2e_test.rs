@@ -832,6 +832,58 @@ tasks:
 }
 
 #[test]
+fn test_inline_cli_variables() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+vars:
+  OCTA_INLINE_TEST_VALUE: file
+
+tasks:
+  default:
+    shell: echo "{{ DEFAULT_ONLY }}"
+
+  print:
+    shell: echo "{{ OCTA_INLINE_TEST_VALUE }}|{{ COMPOSED }}|{{ EMPTY }}|{{ WITH_EQUALS }}"
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd
+    .current_dir(tmp_dir.path())
+    .args([
+      "--var",
+      "OCTA_INLINE_TEST_VALUE=explicit",
+      "OCTA_INLINE_TEST_VALUE=first",
+      "print",
+      "OCTA_INLINE_TEST_VALUE=cli",
+      "COMPOSED={{ OCTA_INLINE_TEST_VALUE }}-suffix",
+      "EMPTY=",
+      "WITH_EQUALS=a=b",
+    ])
+    .env("OCTA_INLINE_TEST_VALUE", "environment")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+
+  cmd
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("cli|cli-suffix||a=b"));
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd
+    .current_dir(tmp_dir.path())
+    .arg("DEFAULT_ONLY=default-value")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+
+  cmd.assert().success().stdout(predicate::str::contains("default-value"));
+
+  Ok(())
+}
+
+#[test]
 fn test_file_option() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");

@@ -254,6 +254,31 @@ tasks:
 $ octa web -- publish
 ```
 
+# Providing variables from the CLI
+
+Add `NAME=VALUE` arguments to override Octafile variables for an invocation:
+
+```console
+octa build PROFILE=production VERSION=1.2.3
+```
+
+CLI variable values are strings and apply to every selected task, including watch reruns. They
+have higher priority than Octafile, task, invocation, and process-environment values. Variables may
+appear between task names, and the last value assigned to the same name wins. The value may contain
+additional `=` characters and may reference variables provided earlier on the command line:
+
+```console
+octa test publish CHANNEL=stable IMAGE='application:{{ CHANNEL }}=latest'
+```
+
+The explicit, repeatable `--var NAME=VALUE` option remains available when its intent should be
+unambiguous. Positional assignments take precedence when both forms set the same variable. Include
+path templates also use CLI overrides during Octafile loading. Arguments after `--` are passed to
+the task and are never interpreted as variables.
+
+Do not pass secrets through CLI variables: command-line arguments may be stored in shell history
+or visible to other processes. Use environment variables or an external secret manager instead.
+
 # Environment variables
 The env property is used to define environment variables that will be accessible to all tasks within the file. The value of the property 
 is a map of key-value pairs, where the key is the name of the environment variable, and the value is the value of the environment variable.

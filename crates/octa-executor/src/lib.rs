@@ -157,13 +157,14 @@ fn matches_platform(selector: &str, os_type: &str, os_arch: &str) -> bool {
 }
 
 pub struct TaskGraphBuilder {
-  plugin_manager: Arc<PluginManager>, // Plugin manager for check plugin commands
-  finder: Arc<OctaFinder>,            // Finder for search task in octafile
-  dir: PathBuf,                       // Current user directory
-  command_args: Vec<String>,          // Additional task arguments from cli
-  os_arch: String,                    // Operating system architecture
-  os_type: String,                    // Operating system type
-  defer_order: AtomicUsize,           // Declaration order for deferred commands
+  plugin_manager: Arc<PluginManager>,        // Plugin manager for check plugin commands
+  finder: Arc<OctaFinder>,                   // Finder for search task in octafile
+  dir: PathBuf,                              // Current user directory
+  command_args: Vec<String>,                 // Additional task arguments from cli
+  variable_overrides: Vec<(String, String)>, // Highest-priority runtime variable overrides
+  os_arch: String,                           // Operating system architecture
+  os_type: String,                           // Operating system type
+  defer_order: AtomicUsize,                  // Declaration order for deferred commands
   // Deferred actions are collected separately and attached to the DAG when the plan is complete.
   deferred: Mutex<HashMap<String, Arc<DeferredAction<TaskNode>>>>,
 }
@@ -180,11 +181,18 @@ impl TaskGraphBuilder {
       finder: Arc::new(OctaFinder::new()),
       dir: current_dir,
       command_args: vec![],
+      variable_overrides: Vec::new(),
       os_arch,
       os_type,
       defer_order: AtomicUsize::new(0),
       deferred: Mutex::new(HashMap::new()),
     })
+  }
+
+  /// Adds ordered runtime variable overrides that take precedence over every configured layer.
+  pub fn with_variable_overrides(mut self, variables: Vec<(String, String)>) -> Self {
+    self.variable_overrides = variables;
+    self
   }
 
   /// Builds a DAG (Directed Acyclic Graph) of tasks from the given Octafile
@@ -480,6 +488,7 @@ impl TaskGraphBuilder {
       finder: self.finder.clone(),
       dir: self.dir.clone(),
       command_args: self.command_args.clone(),
+      variable_overrides: self.variable_overrides.clone(),
       os_arch: self.os_arch.clone(),
       os_type: self.os_type.clone(),
       defer_order: AtomicUsize::new(0),
@@ -901,7 +910,18 @@ impl TaskGraphBuilder {
 
     vars.extend_with(&env_vars);
 
-    vars
+    if self.variable_overrides.is_empty() {
+      return vars;
+    }
+
+    // Keep overrides in their own layer so their templates can consume every configured value,
+    // while declaration order remains meaningful between CLI options.
+    let mut overrides = Vars::with_parent(vars);
+    for (name, value) in &self.variable_overrides {
+      overrides.insert(name, value);
+    }
+
+    overrides
   }
 
   fn initialize_global_vars(&self, cmd: &FindResult) -> Vars {
@@ -1203,6 +1223,7 @@ mod tests {
     let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
     let builder = TaskGraphBuilder::new(plugin_manager)?;
     assert!(builder.command_args.is_empty());
+    assert!(builder.variable_overrides.is_empty());
     assert!(builder.dir.exists());
     Ok(())
   }
@@ -1622,10 +1643,22 @@ mod tests {
     let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_string()], "shell")?;
     let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
     let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
-    let builder = TaskGraphBuilder::new(plugin_manager)?;
+    let builder = TaskGraphBuilder::new(plugin_manager)?.with_variable_overrides(vec![
+      ("GLOBAL".to_owned(), "override".to_owned()),
+      ("COMBINED".to_owned(), "{{ LOCAL }}-override".to_owned()),
+    ]);
     let dag = builder.build(octafile, "test", true, vec![]).await?;
 
     assert_eq!(dag.node_count(), 1);
+    let task = dag.nodes().iter().find(|task| task.name == "test").unwrap();
+    let mut vars = task.vars.clone();
+    vars.expand(true).await?;
+    assert_eq!(vars.get("GLOBAL").and_then(|value| value.as_str()), Some("override"));
+    assert_eq!(vars.get("LOCAL").and_then(|value| value.as_str()), Some("local"));
+    assert_eq!(
+      vars.get("COMBINED").and_then(|value| value.as_str()),
+      Some("local-override")
+    );
     Ok(())
   }
 

@@ -242,7 +242,7 @@ impl Octafile {
     default_plugin: impl Into<String>,
   ) -> OctafileResult<Arc<Self>> {
     let context = Context::from_keys(plugin_keys, default_plugin).map_err(OctafileError::PluginSchemaError)?;
-    Self::load_with_context(path, global, None, context)
+    Self::load_with_context(path, global, None, context, &[])
   }
 
   pub fn load_with_schemas(
@@ -263,7 +263,20 @@ impl Octafile {
     default_plugin: impl Into<String>,
   ) -> OctafileResult<Arc<Self>> {
     let context = Context::from_schemas(schemas, default_plugin).map_err(OctafileError::PluginSchemaError)?;
-    Self::load_with_context(path, global, search_dir, context)
+    Self::load_with_context(path, global, search_dir, context, &[])
+  }
+
+  /// Loads an Octafile with string variable overrides available to include path templates.
+  pub fn load_with_schemas_and_vars_from(
+    path: Option<PathBuf>,
+    global: bool,
+    search_dir: Option<PathBuf>,
+    schemas: PluginSchemas,
+    default_plugin: impl Into<String>,
+    variable_overrides: &[(String, String)],
+  ) -> OctafileResult<Arc<Self>> {
+    let context = Context::from_schemas(schemas, default_plugin).map_err(OctafileError::PluginSchemaError)?;
+    Self::load_with_context(path, global, search_dir, context, variable_overrides)
   }
 
   fn load_with_context(
@@ -271,6 +284,7 @@ impl Octafile {
     global: bool,
     search_dir: Option<PathBuf>,
     context: Context,
+    variable_overrides: &[(String, String)],
   ) -> OctafileResult<Arc<Self>> {
     let search_dir = match search_dir {
       Some(path) if path.is_absolute() => Some(path),
@@ -309,7 +323,7 @@ impl Octafile {
 
     let octafile = Arc::new(octafile);
     let _ = octafile._self.set(Arc::clone(&octafile));
-    Self::load_includes(Arc::clone(&octafile), &context)?;
+    Self::load_includes(Arc::clone(&octafile), &context, variable_overrides)?;
 
     Ok(octafile)
   }
@@ -489,7 +503,11 @@ impl Octafile {
   }
 
   /// Load including octafiles
-  fn load_includes(octafile: Arc<Octafile>, context: &Context) -> OctafileResult<()> {
+  fn load_includes(
+    octafile: Arc<Octafile>,
+    context: &Context,
+    variable_overrides: &[(String, String)],
+  ) -> OctafileResult<()> {
     let includes = match &octafile.includes {
       Some(includes) => includes,
       None => return Ok(()),
@@ -505,7 +523,7 @@ impl Octafile {
         IncludeInfo::Simple(path) => (path.as_str(), false),
         IncludeInfo::Complex(complex) => (complex.octafile.as_str(), complex.optional.unwrap_or(false)),
       };
-      let rendered_path = Self::render_include_path(&octafile, path_template)?;
+      let rendered_path = Self::render_include_path(&octafile, path_template, variable_overrides)?;
       let unresolved_path = octafile.dir.join(&rendered_path);
       let path = match unresolved_path.canonicalize() {
         Ok(path) => Octafile::find_octafile(Some(path))?
@@ -559,7 +577,7 @@ impl Octafile {
 
       // Recursively process nested includes
       if include_octafile.includes.is_some() {
-        Self::load_includes(Arc::clone(&include_octafile), &context)?;
+        Self::load_includes(Arc::clone(&include_octafile), &context, variable_overrides)?;
       }
 
       octafile
@@ -573,7 +591,11 @@ impl Octafile {
   }
 
   /// Resolves an include template before filesystem lookup using Go-compatible platform names.
-  fn render_include_path(octafile: &Octafile, path: &str) -> OctafileResult<String> {
+  fn render_include_path(
+    octafile: &Octafile,
+    path: &str,
+    variable_overrides: &[(String, String)],
+  ) -> OctafileResult<String> {
     let mut template_context = match &octafile.vars {
       Some(vars) => {
         // Secret values must not become filesystem paths, which are exposed by diagnostics and IO errors.
@@ -587,6 +609,10 @@ impl Octafile {
       None => Ok(TeraContext::new()),
     }
     .map_err(|error| OctafileError::IncludeTemplateError(path.to_owned(), error.to_string()))?;
+    // Runtime overrides are inserted after Octafile variables, while platform constants remain reserved.
+    for (name, value) in variable_overrides {
+      template_context.insert(name, value);
+    }
     template_context.insert("OS", go_os());
     template_context.insert("ARCH", go_arch());
 
@@ -1002,6 +1028,45 @@ tasks:
     let included = octafile.get_included("platform").unwrap().unwrap();
 
     assert!(included.tasks.contains_key("build"));
+  }
+
+  #[test]
+  fn runtime_variables_override_include_path_templates() {
+    let temp_dir = TempDir::new().unwrap();
+    let root_path = temp_dir.path().join("Octafile.yml");
+    fs::write(
+      &root_path,
+      r#"
+version: 1
+vars:
+  PROFILE: development
+includes:
+  profile: Taskfile.{{PROFILE}}.yml
+tasks: {}
+"#,
+    )
+    .unwrap();
+    fs::write(
+      temp_dir.path().join("Taskfile.production.yml"),
+      r#"
+version: 1
+tasks:
+  deploy: echo production
+"#,
+    )
+    .unwrap();
+
+    let schemas = PluginSchemas::from([("shell".to_owned(), None)]);
+    let variables = vec![("PROFILE".to_owned(), "production".to_owned())];
+    let octafile =
+      Octafile::load_with_schemas_and_vars_from(Some(root_path), false, None, schemas, "shell", &variables).unwrap();
+
+    assert!(octafile
+      .get_included("profile")
+      .unwrap()
+      .unwrap()
+      .tasks
+      .contains_key("deploy"));
   }
 
   #[test]
