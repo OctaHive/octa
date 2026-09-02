@@ -497,10 +497,7 @@ async fn test_task_timeout_stops_command_and_keeps_plugin_reusable() {
   let plugin_name = "octa_plugin_shell.exe";
   plugin_manager.start_plugin(plugin_name).await.unwrap();
 
-  #[cfg(not(windows))]
-  let long_command = "sleep 5";
-  #[cfg(windows)]
-  let long_command = "ping -n 5 127.0.0.1";
+  let long_command = "while true; do :; done";
   let timeout = serde_yml::from_str::<Timeout>("100ms").unwrap();
   let timed_task = TaskNode::new(
     TaskConfig::builder()

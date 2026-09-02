@@ -11,14 +11,18 @@ pub(crate) fn command(
   source: &str,
   dir: &Path,
   envs: HashMap<String, String>,
+  coreutils_path: &Path,
 ) -> anyhow::Result<tokio::process::Command> {
   let executable = env::current_exe().context("Failed to locate the shell plugin executable")?;
+  let path = command_path(&envs, coreutils_path)?;
   let mut command = tokio::process::Command::new(executable);
   command
     .arg(CHILD_MODE_ARG)
     .arg(source)
     .current_dir(dir)
     .envs(envs)
+    .env("PATH", path)
+    .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
     .kill_on_drop(true);
@@ -54,6 +58,36 @@ pub(crate) async fn run_child() -> anyhow::Result<Option<u8>> {
     .context("Failed to execute Brush command")?;
 
   Ok(Some(result.exit_code.into()))
+}
+
+fn command_path(envs: &HashMap<String, String>, coreutils_path: &Path) -> anyhow::Result<std::ffi::OsString> {
+  let configured = envs
+    .iter()
+    .find(|(name, _)| path_variable(name))
+    .map(|(_, value)| value.as_str());
+  let inherited = configured
+    .map(OsStr::new)
+    .map(OsStr::to_os_string)
+    .or_else(|| env::var_os("PATH"));
+  let paths = std::iter::once(coreutils_path.to_path_buf()).chain(
+    inherited
+      .as_deref()
+      .filter(|value| !value.is_empty())
+      .into_iter()
+      .flat_map(env::split_paths),
+  );
+
+  env::join_paths(paths).context("Failed to add bundled coreutils to PATH")
+}
+
+#[cfg(unix)]
+fn path_variable(name: &str) -> bool {
+  name == "PATH"
+}
+
+#[cfg(windows)]
+fn path_variable(name: &str) -> bool {
+  name.eq_ignore_ascii_case("PATH")
 }
 
 #[cfg(unix)]

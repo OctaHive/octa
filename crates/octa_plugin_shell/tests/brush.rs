@@ -102,3 +102,65 @@ async fn sources_a_bash_script() {
   assert_eq!(code, 0);
   assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
 }
+
+#[tokio::test]
+async fn isolates_command_input_from_the_plugin_protocol() {
+  let (manager, plugin_name) = plugin_manager();
+  manager.start_plugin(&plugin_name).await.unwrap();
+  let client = manager.get_client("shell").await.unwrap();
+  let execution = client
+    .start_execution(
+      request("if read value; then echo unexpected; else echo closed; fi"),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+  let (stdout, stderr, code) = tokio::time::timeout(Duration::from_secs(5), collect(execution))
+    .await
+    .expect("Brush command waited for plugin protocol input");
+  assert_eq!(stdout.trim(), "closed");
+  assert!(stderr.is_empty());
+  assert_eq!(code, 0);
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn executes_bundled_coreutils_without_system_commands() {
+  let directory = tempfile::tempdir().unwrap();
+  let large_input = vec![b'x'; 256 * 1024];
+  std::fs::write(directory.path().join("large.bin"), &large_input).unwrap();
+  let (manager, plugin_name) = plugin_manager();
+  manager.start_plugin(&plugin_name).await.unwrap();
+  let client = manager.get_client("shell").await.unwrap();
+  let mut command = request(
+    r#"cat large.bin | base64 > large.b64
+dir=$(mktemp -d)
+mkdir -p "$dir/nested"
+printf Octa > "$dir/source"
+cp "$dir/source" "$dir/copied"
+mv "$dir/copied" "$dir/moved"
+touch "$dir/touched"
+cat "$dir/moved"
+printf '\n'
+printf Octa | base64
+ls "$dir"
+sleep 0.01
+rm -r "$dir""#,
+  );
+  command.dir = directory.path().to_owned();
+  command.envs.insert("PATH".to_owned(), String::new());
+  let execution = client.start_execution(command, CancellationToken::new()).await.unwrap();
+
+  let (stdout, stderr, code) = tokio::time::timeout(Duration::from_secs(10), collect(execution))
+    .await
+    .expect("bundled coreutils pipeline timed out");
+  assert!(stdout.lines().any(|line| line == "Octa"));
+  assert!(stdout.lines().any(|line| line == "T2N0YQ=="));
+  assert!(stdout.lines().any(|line| line == "moved"));
+  assert!(stdout.lines().any(|line| line == "touched"));
+  assert!(stderr.is_empty(), "{stderr}");
+  assert_eq!(code, 0);
+  assert!(std::fs::metadata(directory.path().join("large.b64")).unwrap().len() > large_input.len() as u64);
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}

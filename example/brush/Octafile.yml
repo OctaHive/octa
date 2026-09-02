@@ -8,3 +8,12 @@ tasks:
 
   script:
     shell: source ./scripts/greet.sh
+
+  portable-utils:
+    shell: |
+      dir=$(mktemp -d)
+      printf 'portable\n' > "$dir/source.txt"
+      cp "$dir/source.txt" "$dir/copy.txt"
+      cat "$dir/copy.txt"
+      sleep 0.1
+      rm -r "$dir"

@@ -712,6 +712,10 @@ tasks:
     shell: source ./scripts/build.sh
 ```
 
+The shell plugin also bundles `base64`, `cat`, `cp`, `ls`, `mkdir`, `mktemp`, `mv`, `rm`, `sleep`,
+and `touch`. These commands do not need to be installed on the host, including on Windows. Other
+external commands are resolved through `PATH` as usual.
+
 ## Plugin task annotations
 
 A plugin schema key can be used as a YAML annotation on a task. The annotation selects the plugin,

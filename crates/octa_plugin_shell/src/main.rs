@@ -19,8 +19,19 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 mod brush;
+mod coreutils;
 
-struct ShellPlugin {}
+struct ShellPlugin {
+  coreutils: coreutils::Coreutils,
+}
+
+impl ShellPlugin {
+  fn new() -> anyhow::Result<Self> {
+    Ok(Self {
+      coreutils: coreutils::Coreutils::new()?,
+    })
+  }
+}
 
 fn plugin_schema() -> PluginSchema {
   PluginSchema {
@@ -90,7 +101,7 @@ impl Plugin for ShellPlugin {
       }
     });
 
-    let mut command = brush::command(&result, &dir, envs)?;
+    let mut command = brush::command(&result, &dir, envs, self.coreutils.path())?;
     let mut child = command.spawn()?;
 
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
@@ -234,11 +245,14 @@ impl Plugin for ShellPlugin {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<ExitCode> {
+  if let Some(exit_code) = coreutils::dispatch() {
+    return Ok(ExitCode::from(exit_code));
+  }
   if let Some(exit_code) = brush::run_child().await? {
     return Ok(ExitCode::from(exit_code));
   }
 
-  serve_plugin(ShellPlugin {}, plugin_schema()).await?;
+  serve_plugin(ShellPlugin::new()?, plugin_schema()).await?;
   Ok(ExitCode::SUCCESS)
 }
 
@@ -300,7 +314,7 @@ mod tests {
 
   #[tokio::test]
   async fn test_shell_plugin_version() {
-    let plugin = ShellPlugin {};
+    let plugin = ShellPlugin::new().unwrap();
     assert_eq!(plugin.version(), env!("CARGO_PKG_VERSION").to_string());
   }
 
@@ -319,7 +333,7 @@ mod tests {
   #[tokio::test]
   async fn test_dry_command() {
     let (writer, logger, dir) = setup_test().await;
-    let plugin = ShellPlugin {};
+    let plugin = ShellPlugin::new().unwrap();
     let cancel_token = CancellationToken::new();
 
     let result = plugin

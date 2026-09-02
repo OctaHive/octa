@@ -326,21 +326,9 @@ tasks:
 fn test_task_condition_phases_and_evaluation_frequency() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   fs::write(tmp_dir.path().join("condition.tpl"), "condition passed")?;
-  #[cfg(windows)]
-  let false_condition = "exit /B 1";
-  #[cfg(not(windows))]
   let false_condition = "false";
-  #[cfg(windows)]
-  let once_condition = "echo once>>once-checks.txt & exit /B 0";
-  #[cfg(not(windows))]
   let once_condition = "echo once >> once-checks.txt; true";
-  #[cfg(windows)]
-  let reference_condition = "echo reference>>reference-checks.txt & exit /B 0";
-  #[cfg(not(windows))]
   let reference_condition = "echo reference >> reference-checks.txt; true";
-  #[cfg(windows)]
-  let per_command_condition = "echo command>>command-checks.txt & if exist stop.txt (exit /B 1) else (exit /B 0)";
-  #[cfg(not(windows))]
   let per_command_condition = "echo command >> command-checks.txt; test ! -f stop.txt";
   let octafile = format!(
     r#"
@@ -445,13 +433,7 @@ tasks:
 #[test]
 fn test_command_execution_options() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
-  #[cfg(windows)]
-  let false_condition = "exit /B 1";
-  #[cfg(not(windows))]
   let false_condition = "false";
-  #[cfg(windows)]
-  let failing_command = "exit /B 7";
-  #[cfg(not(windows))]
   let failing_command = "exit 7";
   let octafile = format!(
     r#"
@@ -914,9 +896,6 @@ fn test_failed_task_does_not_commit_its_source_fingerprint() -> Result<(), Box<d
   let tmp_dir = TempDir::new()?;
   let runs = tmp_dir.path().join("runs.txt");
   fs::write(tmp_dir.path().join("source.txt"), "source")?;
-  #[cfg(windows)]
-  let failing_command = "echo run>>runs.txt && exit /b 1";
-  #[cfg(not(windows))]
   let failing_command = "echo run>>runs.txt && exit 1";
   fs::write(
     tmp_dir.path().join("Octafile.yml"),
@@ -953,9 +932,6 @@ fn test_skipped_task_does_not_commit_its_source_fingerprint() -> Result<(), Box<
   let tmp_dir = TempDir::new()?;
   let runs = tmp_dir.path().join("runs.txt");
   fs::write(tmp_dir.path().join("source.txt"), "source")?;
-  #[cfg(windows)]
-  let condition = "if exist enabled.txt (exit /b 0) else (exit /b 1)";
-  #[cfg(not(windows))]
   let condition = "test -f enabled.txt";
   fs::write(
     tmp_dir.path().join("Octafile.yml"),
@@ -999,9 +975,6 @@ tasks:
 fn test_command_condition_keeps_task_stale_until_all_commands_run() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   fs::write(tmp_dir.path().join("source.txt"), "source")?;
-  #[cfg(windows)]
-  let condition = "if exist enabled.txt (exit /b 0) else (exit /b 1)";
-  #[cfg(not(windows))]
   let condition = "test -f enabled.txt";
   fs::write(
     tmp_dir.path().join("Octafile.yml"),
@@ -1156,9 +1129,6 @@ fn test_up_to_date_parent_skips_nested_condition_gates_cleanly() -> Result<(), B
   let tmp_dir = TempDir::new()?;
   fs::write(tmp_dir.path().join("source.txt"), "source")?;
   fs::write(tmp_dir.path().join("enabled.txt"), "")?;
-  #[cfg(windows)]
-  let condition = "if exist enabled.txt (exit /b 0) else (exit /b 1)";
-  #[cfg(not(windows))]
   let condition = "test -f enabled.txt";
 
   fs::write(
@@ -1290,17 +1260,8 @@ fn test_dynamic_freshness_inputs_are_resolved_once_and_reused_by_commands() -> R
   fs::write(tmp_dir.path().join("dynamic-var.txt"), "one")?;
   fs::write(tmp_dir.path().join("dynamic-env.txt"), "env-one")?;
 
-  #[cfg(windows)]
-  let var_command = "echo var>>var-resolutions.txt && type dynamic-var.txt";
-  #[cfg(not(windows))]
-  let var_command = "echo var>>var-resolutions.txt && cat dynamic-var.txt";
-  #[cfg(windows)]
-  let env_command = "echo env>>env-resolutions.txt && type dynamic-env.txt";
-  #[cfg(not(windows))]
-  let env_command = "echo env>>env-resolutions.txt && cat dynamic-env.txt";
-  #[cfg(windows)]
-  let task_command = "echo {{ DYNAMIC_VAR }}-%DYNAMIC_ENV%>>runs.txt";
-  #[cfg(not(windows))]
+  let var_command = "echo var>>var-resolutions.txt && value=$(<dynamic-var.txt) && echo $value";
+  let env_command = "echo env>>env-resolutions.txt && value=$(<dynamic-env.txt) && echo $value";
   let task_command = "echo {{ DYNAMIC_VAR }}-$DYNAMIC_ENV>>runs.txt";
 
   fs::write(
@@ -1413,9 +1374,6 @@ fn test_freshness_identity_tracks_configuration_and_dotenv() -> Result<(), Box<d
   fs::write(tmp_dir.path().join(".env"), "FROM_DOTENV=one\n")?;
 
   let write_octafile = |value: &str, marker: &str| -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(windows)]
-    let shell = format!("echo {{{{ VALUE }}}}-%FROM_DOTENV%-{marker}>>runs.txt");
-    #[cfg(not(windows))]
     let shell = format!("echo {{{{ VALUE }}}}-$FROM_DOTENV-{marker}>>runs.txt");
     fs::write(
       tmp_dir.path().join("Octafile.yml"),
@@ -1900,7 +1858,7 @@ fn test_set_env() -> Result<(), Box<dyn std::error::Error>> {
 
         hello_windows:
           platforms: ['windows']
-          shell: echo %greeting%
+          shell: echo $greeting
 
         hello_linux_macos:
           platforms: ['macos', 'linux']
@@ -1948,7 +1906,7 @@ fn test_env_file() -> Result<(), Box<dyn std::error::Error>> {
 
         test_windows:
           platforms: ['windows']
-          shell: "echo %VAR1%"
+          shell: "echo $VAR1"
 
         test_linux_macos:
           platforms: ['macos', 'linux']
@@ -2054,13 +2012,7 @@ fn test_shell_backed_environment_values() -> Result<(), Box<dyn std::error::Erro
   fs::create_dir(&task_dir)?;
   fs::write(task_dir.join("value.txt"), "dynamic")?;
   fs::write(task_dir.join(".env.runtime"), "PREFIX=from-dotenv\n")?;
-  #[cfg(windows)]
-  let read_command = "type value.txt";
-  #[cfg(not(windows))]
-  let read_command = "cat value.txt";
-  #[cfg(windows)]
-  let env_command = "echo %PREFIX%";
-  #[cfg(not(windows))]
+  let read_command = "value=$(<value.txt); echo $value";
   let env_command = "echo $PREFIX";
   let octafile = format!(
     r#"
@@ -2157,13 +2109,7 @@ tasks:
 fn test_shell_environment_is_evaluated_once_per_execution() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   fs::create_dir(tmp_dir.path().join("nested"))?;
-  #[cfg(windows)]
-  let env_command = "echo call>>../calls.txt & echo value";
-  #[cfg(not(windows))]
   let env_command = "echo call >> ../calls.txt; echo value";
-  #[cfg(windows)]
-  let condition = "exit /B 0";
-  #[cfg(not(windows))]
   let condition = "true";
   let octafile = format!(
     r#"
@@ -2411,16 +2357,7 @@ fn test_parallel_execution() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn test_octafile_concurrency_limits_parallel_commands() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
-  #[cfg(windows)]
-  let delay = "ping -n 2 127.0.0.1 > nul";
-  #[cfg(not(windows))]
-  let delay = "sleep 0.2";
-  #[cfg(windows)]
-  let commands = [
-    format!(">>trace.txt echo A-start && {delay} && >>trace.txt echo A-end"),
-    format!(">>trace.txt echo B-start && {delay} && >>trace.txt echo B-end"),
-  ];
-  #[cfg(not(windows))]
+  let delay = "end=$((SECONDS + 1)); while (( SECONDS < end )); do :; done";
   let commands = [
     format!("echo A-start>>trace.txt && {delay} && echo A-end>>trace.txt"),
     format!("echo B-start>>trace.txt && {delay} && echo B-end>>trace.txt"),
@@ -2464,16 +2401,7 @@ tasks:
 #[test]
 fn test_parallel_commands_share_one_plugin_connection() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
-  #[cfg(windows)]
-  let delay = "ping -n 2 127.0.0.1 > nul";
-  #[cfg(not(windows))]
-  let delay = "sleep 0.2";
-  #[cfg(windows)]
-  let commands = [
-    format!(">>trace.txt echo A-start && {delay} && >>trace.txt echo A-end"),
-    format!(">>trace.txt echo B-start && {delay} && >>trace.txt echo B-end"),
-  ];
-  #[cfg(not(windows))]
+  let delay = "end=$((SECONDS + 1)); while (( SECONDS < end )); do :; done";
   let commands = [
     format!("echo A-start>>trace.txt && {delay} && echo A-end>>trace.txt"),
     format!("echo B-start>>trace.txt && {delay} && echo B-end>>trace.txt"),
