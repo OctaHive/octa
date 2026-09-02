@@ -2357,6 +2357,16 @@ fn test_octafile_concurrency_limits_parallel_commands() -> Result<(), Box<dyn st
   let delay = "ping -n 2 127.0.0.1 > nul";
   #[cfg(not(windows))]
   let delay = "sleep 0.2";
+  #[cfg(windows)]
+  let commands = [
+    format!(">>trace.txt echo A-start && {delay} && >>trace.txt echo A-end"),
+    format!(">>trace.txt echo B-start && {delay} && >>trace.txt echo B-end"),
+  ];
+  #[cfg(not(windows))]
+  let commands = [
+    format!("echo A-start>>trace.txt && {delay} && echo A-end>>trace.txt"),
+    format!("echo B-start>>trace.txt && {delay} && echo B-end>>trace.txt"),
+  ];
   fs::write(
     tmp_dir.path().join("Octafile.yml"),
     format!(
@@ -2367,9 +2377,11 @@ concurrency: 1
 tasks:
   limited:
     cmds:
-      - shell: echo A-start>>trace.txt && {delay} && echo A-end>>trace.txt
-      - shell: echo B-start>>trace.txt && {delay} && echo B-end>>trace.txt
+      - shell: "{first}"
+      - shell: "{second}"
 "#,
+      first = commands[0],
+      second = commands[1],
     ),
   )?;
 
