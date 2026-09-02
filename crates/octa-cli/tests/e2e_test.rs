@@ -2332,6 +2332,47 @@ fn test_parallel_execution() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_octafile_concurrency_limits_parallel_commands() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  #[cfg(windows)]
+  let delay = "ping -n 2 127.0.0.1 > nul";
+  #[cfg(not(windows))]
+  let delay = "sleep 0.2";
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    format!(
+      r#"
+version: 1
+concurrency: 1
+
+tasks:
+  limited:
+    cmds:
+      - shell: echo A-start>>trace.txt && {delay} && echo A-end>>trace.txt
+      - shell: echo B-start>>trace.txt && {delay} && echo B-end>>trace.txt
+"#,
+    ),
+  )?;
+
+  let mut command = Command::cargo_bin("octa")?;
+  command
+    .current_dir(tmp_dir.path())
+    .env("OCTA_TESTS", "")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+    .args(["--parallel", "limited"]);
+  command.assert().success();
+
+  let trace = fs::read_to_string(tmp_dir.path().join("trace.txt"))?;
+  let lines = trace.lines().collect::<Vec<_>>();
+  assert!(
+    lines == ["A-start", "A-end", "B-start", "B-end"] || lines == ["B-start", "B-end", "A-start", "A-end"],
+    "commands overlapped: {lines:?}"
+  );
+
+  Ok(())
+}
+
+#[test]
 fn test_list_tasks() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");

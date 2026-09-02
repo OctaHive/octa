@@ -1,6 +1,8 @@
 version: 1
+concurrency: 2
 
-# Run with: octa --concurrency 2 build
+# Run with: octa build
+# Override for one run with: octa --concurrency 4 build
 tasks:
   build:
     execute_mode: parallel

@@ -231,6 +231,10 @@ struct ExecutionContext {
   variable_resolver: Option<Arc<dyn VariableResolver>>,
 }
 
+fn concurrency_limiter(cli: Option<NonZeroUsize>, configured: Option<NonZeroUsize>) -> Option<Arc<Semaphore>> {
+  cli.or(configured).map(|limit| Arc::new(Semaphore::new(limit.get())))
+}
+
 struct TerminalVariableResolver {
   // Equivalent requirements reuse answers across dependencies, commands and watch rebuilds.
   values: Mutex<HashMap<VariablePrompt, String>>,
@@ -731,7 +735,7 @@ pub async fn run() -> OctaResult<()> {
     octafile: Arc::clone(&octafile),
     fingerprint: Arc::clone(&fingerprint),
     summary: summary.clone(),
-    concurrency: args.concurrency.map(|limit| Arc::new(Semaphore::new(limit.get()))),
+    concurrency: concurrency_limiter(args.concurrency, octafile.concurrency),
     variable_resolver,
   };
   let watch = args.watch || tasks_request_watch(&octafile, &commands);
@@ -834,6 +838,25 @@ mod tests {
     assert_eq!(cli.commands, Some(vec!["build".to_string()]));
 
     assert!(Cli::try_parse_from(["octa", "--concurrency", "0", "build"]).is_err());
+  }
+
+  #[test]
+  fn cli_concurrency_overrides_octafile_default() {
+    let configured = NonZeroUsize::new(2);
+    let cli = NonZeroUsize::new(4);
+
+    assert_eq!(
+      concurrency_limiter(None, None).map(|limit| limit.available_permits()),
+      None
+    );
+    assert_eq!(
+      concurrency_limiter(None, configured).map(|limit| limit.available_permits()),
+      Some(2)
+    );
+    assert_eq!(
+      concurrency_limiter(cli, configured).map(|limit| limit.available_permits()),
+      Some(4)
+    );
   }
 
   #[test]

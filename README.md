@@ -830,7 +830,21 @@ tasks:
 
 # Concurrency limit
 
-Use `--concurrency N` to limit the number of tasks running at the same time:
+Set a shared concurrency limit in the root Octafile:
+
+```yaml
+version: 1
+concurrency: 4
+
+tasks:
+  build:
+    execute_mode: parallel
+    cmds:
+      - task: frontend
+      - task: backend
+```
+
+Use `--concurrency N` to override the file default for one invocation:
 
 ```bash
 octa --parallel --concurrency 4 lint test build
@@ -838,7 +852,7 @@ octa --parallel --concurrency 4 lint test build
 
 The limit is shared by all selected commands and also applies to parallel task commands,
 dependencies, watch reruns, and deferred commands. Internal graph nodes do not consume a slot.
-Without this option, Octa does not impose an additional concurrency limit. The value must be
+Without either setting, Octa does not impose an additional concurrency limit. Both values must be
 greater than zero.
 
 # Command timeouts

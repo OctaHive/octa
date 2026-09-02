@@ -1,6 +1,7 @@
 use std::{
   collections::{HashMap, HashSet},
   env, fmt,
+  num::NonZeroUsize,
   path::{Path, PathBuf},
   str::FromStr,
   sync::{Arc, Mutex, OnceLock},
@@ -193,6 +194,9 @@ pub struct Octafile {
   // Stop parallel execution after the first failure
   pub failfast: Option<bool>,
 
+  // Maximum number of tasks that may execute concurrently
+  pub concurrency: Option<NonZeroUsize>,
+
   // Watch polling interval
   pub interval: Option<WatchInterval>,
 
@@ -243,6 +247,7 @@ impl fmt::Debug for Octafile {
       .field("run", &self.run)
       .field("source_strategy", &self.source_strategy)
       .field("failfast", &self.failfast)
+      .field("concurrency", &self.concurrency)
       .field("interval", &self.interval)
       .field("default_plugin", &self.default_plugin)
       .field("includes", &self.includes)
@@ -439,6 +444,9 @@ impl Octafile {
         },
         "failfast" => {
           octafile.failfast = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "concurrency" => {
+          octafile.concurrency = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
         },
         "interval" => {
           octafile.interval = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
@@ -1002,6 +1010,7 @@ mod tests {
       version: 1
       run: changed
       source_strategy: hash
+      concurrency: 4
       interval: 250ms
       tasks:
         test:
@@ -1014,6 +1023,7 @@ mod tests {
     assert_eq!(octafile.version, 1);
     assert_eq!(octafile.run, Some(AllowedRun::Changed));
     assert_eq!(octafile.source_strategy, Some(SourceStrategies::Hash));
+    assert_eq!(octafile.concurrency.map(|limit| limit.get()), Some(4));
     assert_eq!(octafile.interval.unwrap().duration(), Duration::from_millis(250));
     assert_eq!(octafile.tasks["test"].watch, Some(true));
     assert!(octafile.tasks.contains_key("test"));
@@ -1036,6 +1046,16 @@ mod tests {
     for strategy in ["''", "[]"] {
       let content = format!("version: 1\nsource_strategy: {strategy}\ntasks: {{}}\n");
       let (_temp_dir, file_path) = create_temp_octafile(&content, "invalid_octafile_source_strategy");
+
+      assert!(Octafile::load(Some(file_path), false, vec!["shell".to_string()], "shell").is_err());
+    }
+  }
+
+  #[test]
+  fn rejects_invalid_octafile_concurrency() {
+    for concurrency in ["0", "-1", "1.5", "many"] {
+      let content = format!("version: 1\nconcurrency: {concurrency}\ntasks: {{}}\n");
+      let (_temp_dir, file_path) = create_temp_octafile(&content, "invalid_octafile_concurrency");
 
       assert!(Octafile::load(Some(file_path), false, vec!["shell".to_string()], "shell").is_err());
     }
