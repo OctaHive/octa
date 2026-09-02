@@ -847,6 +847,637 @@ tasks:
 }
 
 #[test]
+fn test_output_controls_the_whole_task_freshness() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let source = tmp_dir.path().join("source.txt");
+  let ignored_source = tmp_dir.path().join("source.generated.txt");
+  let output = tmp_dir.path().join("artifact.txt");
+  let ignored_output = tmp_dir.path().join("artifact.debug.txt");
+  let first_runs = tmp_dir.path().join("first-runs.txt");
+  let last_runs = tmp_dir.path().join("last-runs.txt");
+  fs::write(&source, "initial")?;
+  fs::write(&ignored_source, "initial")?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  build:
+    sources:
+      - ./source*.txt
+      - "!./source.generated.txt"
+    output:
+      - ./artifact*.txt
+      - "!./artifact.debug.txt"
+    cmds:
+      - echo first>>first-runs.txt
+      - echo artifact>artifact.txt
+      - echo debug>artifact.debug.txt
+      - echo last>>last-runs.txt
+"#,
+  )?;
+
+  let run = || -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("build");
+    command.assert().success();
+    Ok(())
+  };
+
+  run()?;
+  fs::write(ignored_source, "ignored change")?;
+  fs::remove_file(ignored_output)?;
+  run()?;
+  assert_eq!(fs::read_to_string(&first_runs)?.lines().count(), 1);
+  assert_eq!(fs::read_to_string(&last_runs)?.lines().count(), 1);
+
+  fs::remove_file(&output)?;
+  run()?;
+  assert_eq!(fs::read_to_string(&first_runs)?.lines().count(), 2);
+  assert_eq!(fs::read_to_string(&last_runs)?.lines().count(), 2);
+
+  fs::write(source, "changed")?;
+  run()?;
+  assert_eq!(fs::read_to_string(&first_runs)?.lines().count(), 3);
+  assert_eq!(fs::read_to_string(&last_runs)?.lines().count(), 3);
+
+  Ok(())
+}
+
+#[test]
+fn test_failed_task_does_not_commit_its_source_fingerprint() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let runs = tmp_dir.path().join("runs.txt");
+  fs::write(tmp_dir.path().join("source.txt"), "source")?;
+  #[cfg(windows)]
+  let failing_command = "echo run>>runs.txt && exit /b 1";
+  #[cfg(not(windows))]
+  let failing_command = "echo run>>runs.txt && exit 1";
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    format!(
+      r#"
+version: 1
+
+tasks:
+  build:
+    sources:
+      - ./source.txt
+    output: []
+    shell: {failing_command}
+"#,
+    ),
+  )?;
+
+  for _ in 0..2 {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("build");
+    command.assert().failure();
+  }
+
+  assert_eq!(fs::read_to_string(runs)?.lines().count(), 2);
+  Ok(())
+}
+
+#[test]
+fn test_skipped_task_does_not_commit_its_source_fingerprint() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let runs = tmp_dir.path().join("runs.txt");
+  fs::write(tmp_dir.path().join("source.txt"), "source")?;
+  #[cfg(windows)]
+  let condition = "if exist enabled.txt (exit /b 0) else (exit /b 1)";
+  #[cfg(not(windows))]
+  let condition = "test -f enabled.txt";
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    format!(
+      r#"
+version: 1
+
+tasks:
+  build:
+    if: '{condition}'
+    sources:
+      - ./source.txt
+    output: []
+    shell: echo run>>runs.txt
+"#,
+    ),
+  )?;
+
+  let run = || -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("build");
+    command.assert().success();
+    Ok(())
+  };
+
+  run()?;
+  assert!(!runs.exists());
+
+  fs::write(tmp_dir.path().join("enabled.txt"), "")?;
+  run()?;
+  assert_eq!(fs::read_to_string(runs)?.lines().count(), 1);
+
+  Ok(())
+}
+
+#[test]
+fn test_command_condition_keeps_task_stale_until_all_commands_run() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join("source.txt"), "source")?;
+  #[cfg(windows)]
+  let condition = "if exist enabled.txt (exit /b 0) else (exit /b 1)";
+  #[cfg(not(windows))]
+  let condition = "test -f enabled.txt";
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    format!(
+      r#"
+version: 1
+
+tasks:
+  build:
+    sources:
+      - ./source.txt
+    output: []
+    cmds:
+      - echo always>>always-runs.txt
+      - shell: echo conditional>>conditional-runs.txt
+        if: '{condition}'
+"#,
+    ),
+  )?;
+
+  let run = || -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("build");
+    command.assert().success();
+    Ok(())
+  };
+
+  run()?;
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("always-runs.txt"))?
+      .lines()
+      .count(),
+    1
+  );
+  assert!(!tmp_dir.path().join("conditional-runs.txt").exists());
+
+  fs::write(tmp_dir.path().join("enabled.txt"), "")?;
+  run()?;
+  run()?;
+
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("always-runs.txt"))?
+      .lines()
+      .count(),
+    2
+  );
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("conditional-runs.txt"))?
+      .lines()
+      .count(),
+    1
+  );
+  Ok(())
+}
+
+#[test]
+fn test_freshness_distinguishes_inline_variable_values() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join("source.txt"), "source")?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  build:
+    sources:
+      - ./source.txt
+    output: []
+    shell: echo {{ VALUE }}>>runs.txt
+"#,
+  )?;
+
+  let run = |value: &str| -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .args(["build", &format!("VALUE={value}")]);
+    command.assert().success();
+    Ok(())
+  };
+
+  run("one")?;
+  run("two")?;
+  run("two")?;
+
+  assert_eq!(fs::read_to_string(tmp_dir.path().join("runs.txt"))?.lines().count(), 2);
+  Ok(())
+}
+
+#[test]
+fn test_referenced_task_freshness_is_independent_from_parent() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let child_runs = tmp_dir.path().join("child-runs.txt");
+  fs::write(tmp_dir.path().join("parent.txt"), "initial")?;
+  fs::write(tmp_dir.path().join("child.txt"), "initial")?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  parent:
+    sources: [parent.txt]
+    output: []
+    cmds:
+      - task: child
+
+  child:
+    sources: [child.txt]
+    output: [child.out]
+    cmds:
+      - echo child>>child-runs.txt
+      - echo artifact>child.out
+"#,
+  )?;
+
+  let run = || -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("parent");
+    command.assert().success();
+    Ok(())
+  };
+
+  run()?;
+  run()?;
+  assert_eq!(fs::read_to_string(&child_runs)?.lines().count(), 1);
+
+  fs::write(tmp_dir.path().join("child.txt"), "changed")?;
+  run()?;
+  assert_eq!(fs::read_to_string(&child_runs)?.lines().count(), 2);
+
+  fs::write(tmp_dir.path().join("parent.txt"), "changed")?;
+  run()?;
+  assert_eq!(fs::read_to_string(&child_runs)?.lines().count(), 2);
+
+  Ok(())
+}
+
+#[test]
+fn test_up_to_date_parent_skips_nested_condition_gates_cleanly() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join("source.txt"), "source")?;
+  fs::write(tmp_dir.path().join("enabled.txt"), "")?;
+  #[cfg(windows)]
+  let condition = "if exist enabled.txt (exit /b 0) else (exit /b 1)";
+  #[cfg(not(windows))]
+  let condition = "test -f enabled.txt";
+
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    format!(
+      r#"
+version: 1
+
+tasks:
+  parent:
+    sources: [source.txt]
+    output: []
+    cmds:
+      - task: child
+
+  child:
+    if: '{condition}'
+    sources: [source.txt]
+    output: []
+    shell: echo child>>runs.txt
+"#,
+    ),
+  )?;
+
+  for _ in 0..2 {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("parent");
+    command.assert().success();
+  }
+
+  assert_eq!(fs::read_to_string(tmp_dir.path().join("runs.txt"))?.lines().count(), 1);
+  Ok(())
+}
+
+#[test]
+fn test_nested_task_definition_invalidates_its_own_freshness() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  let runs = tmp_dir.path().join("runs.txt");
+  fs::write(tmp_dir.path().join("source.txt"), "source")?;
+  fs::write(tmp_dir.path().join("child-source.txt"), "child")?;
+
+  let write_octafile = |message: &str| -> Result<(), std::io::Error> {
+    fs::write(
+      tmp_dir.path().join("Octafile.yml"),
+      format!(
+        r#"
+version: 1
+
+tasks:
+  parent:
+    sources: [source.txt]
+    output: []
+    cmds:
+      - task: child
+
+  child:
+    sources: [child-source.txt]
+    output: []
+    shell: echo {message}>>runs.txt
+"#,
+      ),
+    )
+  };
+  let run = || -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("parent");
+    command.assert().success();
+    Ok(())
+  };
+
+  write_octafile("first")?;
+  run()?;
+  run()?;
+  assert_eq!(fs::read_to_string(&runs)?.lines().collect::<Vec<_>>(), ["first"]);
+
+  write_octafile("second")?;
+  run()?;
+  assert_eq!(
+    fs::read_to_string(&runs)?.lines().collect::<Vec<_>>(),
+    ["first", "second"]
+  );
+  Ok(())
+}
+
+#[test]
+fn test_unrelated_process_environment_does_not_invalidate_freshness() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join("source.txt"), "source")?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  build:
+    sources: [source.txt]
+    output: []
+    shell: echo run>>runs.txt
+"#,
+  )?;
+
+  for value in ["first", "second"] {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .env("OCTA_UNRELATED", value)
+      .arg("build");
+    command.assert().success();
+  }
+
+  assert_eq!(fs::read_to_string(tmp_dir.path().join("runs.txt"))?.lines().count(), 1);
+  Ok(())
+}
+
+#[test]
+fn test_dynamic_freshness_inputs_are_resolved_once_and_reused_by_commands() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join("source.txt"), "source")?;
+  fs::write(tmp_dir.path().join("dynamic-var.txt"), "one")?;
+  fs::write(tmp_dir.path().join("dynamic-env.txt"), "env-one")?;
+
+  #[cfg(windows)]
+  let var_command = "echo var>>var-resolutions.txt && type dynamic-var.txt";
+  #[cfg(not(windows))]
+  let var_command = "echo var>>var-resolutions.txt && cat dynamic-var.txt";
+  #[cfg(windows)]
+  let env_command = "echo env>>env-resolutions.txt && type dynamic-env.txt";
+  #[cfg(not(windows))]
+  let env_command = "echo env>>env-resolutions.txt && cat dynamic-env.txt";
+  #[cfg(windows)]
+  let task_command = "echo {{ DYNAMIC_VAR }}-%DYNAMIC_ENV%>>runs.txt";
+  #[cfg(not(windows))]
+  let task_command = "echo {{ DYNAMIC_VAR }}-$DYNAMIC_ENV>>runs.txt";
+
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    format!(
+      r#"
+version: 1
+
+vars:
+  DYNAMIC_VAR:
+    sh: '{var_command}'
+
+env:
+  DYNAMIC_ENV:
+    sh: '{env_command}'
+
+tasks:
+  build:
+    sources: [source.txt]
+    output: []
+    cmds:
+      - '{task_command}'
+      - '{task_command}'
+"#,
+    ),
+  )?;
+
+  let run = || -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("build");
+    command.assert().success();
+    Ok(())
+  };
+
+  run()?;
+  fs::write(tmp_dir.path().join("dynamic-var.txt"), "two")?;
+  fs::write(tmp_dir.path().join("dynamic-env.txt"), "env-two")?;
+  run()?;
+  run()?;
+
+  let runs = fs::read_to_string(tmp_dir.path().join("runs.txt"))?;
+  assert_eq!(runs.lines().count(), 4);
+  assert!(runs.lines().take(2).all(|line| line.contains("one-env-one")));
+  assert!(runs.lines().skip(2).all(|line| line.contains("two-env-two")));
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("var-resolutions.txt"))?
+      .lines()
+      .count(),
+    3
+  );
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("env-resolutions.txt"))?
+      .lines()
+      .count(),
+    3
+  );
+  Ok(())
+}
+
+#[test]
+fn test_parent_becomes_current_when_a_nested_task_is_already_current() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join("parent.txt"), "initial")?;
+  fs::write(tmp_dir.path().join("child.txt"), "initial")?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  parent:
+    sources: [parent.txt]
+    output: []
+    cmds:
+      - task: child
+
+  child:
+    sources: [child.txt]
+    output: [child.out]
+    shell: echo child>child.out
+"#,
+  )?;
+
+  let run = || -> Result<assert_cmd::assert::Assert, Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("parent");
+    Ok(command.assert().success())
+  };
+
+  run()?;
+  fs::write(tmp_dir.path().join("parent.txt"), "changed")?;
+  run()?.stdout(predicate::str::contains("Task child is up to date"));
+  run()?.stdout(predicate::str::contains("Task parent is up to date"));
+
+  Ok(())
+}
+
+#[test]
+fn test_freshness_identity_tracks_configuration_and_dotenv() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join("source.txt"), "source")?;
+  fs::write(tmp_dir.path().join(".env"), "FROM_DOTENV=one\n")?;
+
+  let write_octafile = |value: &str, marker: &str| -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    let shell = format!("echo {{{{ VALUE }}}}-%FROM_DOTENV%-{marker}>>runs.txt");
+    #[cfg(not(windows))]
+    let shell = format!("echo {{{{ VALUE }}}}-$FROM_DOTENV-{marker}>>runs.txt");
+    fs::write(
+      tmp_dir.path().join("Octafile.yml"),
+      format!(
+        r#"
+version: 1
+
+vars:
+  VALUE: {value}
+
+dotenv: [.env]
+
+tasks:
+  build:
+    sources: [source.txt]
+    output: []
+    shell: {shell}
+"#,
+      ),
+    )?;
+    Ok(())
+  };
+  let run = || -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_TESTS", "")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("build");
+    command.assert().success();
+    Ok(())
+  };
+  let run_count = || -> Result<usize, Box<dyn std::error::Error>> {
+    Ok(fs::read_to_string(tmp_dir.path().join("runs.txt"))?.lines().count())
+  };
+
+  write_octafile("one", "stable")?;
+  run()?;
+  run()?;
+  assert_eq!(run_count()?, 1);
+
+  write_octafile("two", "stable")?;
+  run()?;
+  assert_eq!(run_count()?, 2);
+
+  fs::write(tmp_dir.path().join(".env"), "FROM_DOTENV=two\n")?;
+  run()?;
+  assert_eq!(run_count()?, 3);
+
+  write_octafile("two", "changed")?;
+  run()?;
+  assert_eq!(run_count()?, 4);
+
+  write_octafile("one", "stable")?;
+  fs::write(tmp_dir.path().join(".env"), "FROM_DOTENV=one\n")?;
+  run()?;
+  assert_eq!(run_count()?, 5);
+
+  Ok(())
+}
+
+#[test]
 fn test_task_args() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");

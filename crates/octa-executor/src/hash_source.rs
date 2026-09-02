@@ -1,176 +1,121 @@
-use std::{fmt::Write, path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
-use sled::Db;
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 
-use crate::{error::ExecutorResult, task::SourceStrategy};
+use crate::{error::ExecutorResult, path_hash, source_strategy::SourceStrategy};
 
-pub struct HashSource {
-  fingerprint: Arc<Db>,
-}
-
-const HASH_PREFIX: &str = "hash";
-
-impl HashSource {
-  pub fn new(fingerprint: Arc<Db>) -> Self {
-    Self { fingerprint }
-  }
-
-  async fn calculate_file_hash(&self, path: PathBuf) -> ExecutorResult<String> {
-    let mut file = File::open(path).await?;
-    let mut buffer = [0u8; 1024];
-    let mut hasher = Sha256::new();
-
-    loop {
-      let bytes_read = file.read(&mut buffer).await?;
-
-      if bytes_read == 0 {
-        break;
-      }
-
-      hasher.update(&buffer[..bytes_read]);
-    }
-
-    let digest = hasher.finalize();
-    let mut hash = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-      write!(&mut hash, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-
-    Ok(hash)
-  }
-}
+pub struct HashSource;
 
 #[async_trait]
 impl SourceStrategy for HashSource {
-  async fn is_changed(&self, sources: Vec<PathBuf>) -> ExecutorResult<bool> {
-    let mut has_changes = false;
+  fn key(&self) -> &'static str {
+    "hash"
+  }
 
-    for path in sources {
-      let new_hash = self.calculate_file_hash(path.clone()).await?;
-      let path_str = path.display().to_string();
-
-      let key = format!("{}_{}", HASH_PREFIX, path_str);
-      if let Some(old_hash) = self.fingerprint.get(key.clone())? {
-        let old_hash_str = String::from_utf8_lossy(&old_hash);
-
-        if old_hash_str != new_hash {
-          has_changes = true;
-        }
-      } else {
-        has_changes = true;
-      }
-
-      self.fingerprint.insert(key, new_hash.as_bytes())?;
-    }
-
-    Ok(has_changes)
+  async fn fingerprint(&self, sources: &[PathBuf], cancel_token: &CancellationToken) -> ExecutorResult<Vec<u8>> {
+    let sources = sources.to_vec();
+    let cancel_token = cancel_token.clone();
+    Ok(
+      tokio::task::spawn_blocking(move || path_hash::content_fingerprint(&sources, &cancel_token))
+        .await??
+        .to_vec(),
+    )
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use tempfile::{NamedTempFile, TempDir};
+  use tempfile::TempDir;
 
-  #[tokio::test]
-  async fn test_no_sources() {
-    let db = sled::Config::new()
-      .temporary(true)
-      .open()
-      .expect("Failed to open in-memory Sled database");
-
-    let hash_source = HashSource::new(Arc::new(db));
-
-    assert!(!hash_source.is_changed(vec![]).await.unwrap());
+  async fn fingerprint(source: &HashSource, paths: &[PathBuf]) -> Vec<u8> {
+    source.fingerprint(paths, &CancellationToken::new()).await.unwrap()
   }
 
   #[tokio::test]
-  async fn test_calculate_file_hash() {
-    let db = Arc::new(
-      sled::Config::new()
-        .temporary(true)
-        .open()
-        .expect("Failed to open in-memory Sled database"),
-    );
+  async fn empty_sources_have_a_stable_fingerprint() {
+    let source = HashSource;
 
-    let temp_file = NamedTempFile::new().unwrap();
-    let hash_source = HashSource::new(Arc::clone(&db));
-
-    // First, make sure the file doesn't exist before checking the hash
-    assert!(hash_source
-      .calculate_file_hash(temp_file.path().to_path_buf())
-      .await
-      .is_ok());
-
-    let old_hash = hash_source
-      .calculate_file_hash(temp_file.path().to_path_buf())
-      .await
-      .unwrap();
-
-    std::fs::write(&temp_file, "test content").unwrap();
-
-    assert!(hash_source
-      .calculate_file_hash(temp_file.path().to_path_buf())
-      .await
-      .is_ok());
-
-    let new_hash = hash_source
-      .calculate_file_hash(temp_file.path().to_path_buf())
-      .await
-      .unwrap();
-
-    assert!(old_hash != new_hash);
+    assert_eq!(fingerprint(&source, &[]).await, fingerprint(&source, &[]).await);
   }
 
   #[tokio::test]
-  async fn test_changed_no_changes() {
-    let db = Arc::new(
-      sled::Config::new()
-        .temporary(true)
-        .open()
-        .expect("Failed to open in-memory Sled database"),
-    );
+  async fn cancelled_fingerprint_stops_before_reading_sources() {
+    let cancel_token = CancellationToken::new();
+    cancel_token.cancel();
 
-    let temp_dir = TempDir::new().unwrap();
-    let temp_file_path = temp_dir.path().join("test_file");
-    let timestamp_source = HashSource::new(db);
+    let result = HashSource.fingerprint(&[], &cancel_token).await;
 
-    std::fs::write(&temp_file_path, "initial content").unwrap();
-
-    assert!(timestamp_source.is_changed(vec![temp_file_path.clone()]).await.is_ok());
+    assert!(matches!(
+      result,
+      Err(crate::error::ExecutorError::IoError(error)) if error.kind() == std::io::ErrorKind::Interrupted
+    ));
   }
 
   #[tokio::test]
-  async fn test_changed_file_changes() {
-    let db = Arc::new(
-      sled::Config::new()
-        .temporary(true)
-        .open()
-        .expect("Failed to open in-memory Sled database"),
-    );
+  async fn content_and_path_changes_affect_the_fingerprint() {
+    let root = TempDir::new().unwrap();
+    let first = root.path().join("first.txt");
+    let second = root.path().join("second.txt");
+    std::fs::write(&first, "initial").unwrap();
+    std::fs::write(&second, "initial").unwrap();
+    let source = HashSource;
 
-    let temp_dir = TempDir::new().unwrap();
-    let temp_file_path = temp_dir.path().join("test_file");
-    let timestamp_source = HashSource::new(db);
+    let initial = fingerprint(&source, std::slice::from_ref(&first)).await;
+    std::fs::write(&first, "changed").unwrap();
+    let changed = fingerprint(&source, std::slice::from_ref(&first)).await;
+    let other_path = fingerprint(&source, std::slice::from_ref(&second)).await;
 
-    std::fs::write(&temp_file_path, "initial content").unwrap();
+    assert_ne!(initial, changed);
+    assert_ne!(changed, other_path);
+  }
 
-    let is_changed = timestamp_source.is_changed(vec![temp_file_path.clone()]).await.unwrap();
+  #[tokio::test]
+  async fn nested_directory_changes_affect_the_fingerprint() {
+    let root = TempDir::new().unwrap();
+    let nested = root.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let file = nested.join("source.txt");
+    std::fs::write(&file, "initial").unwrap();
+    let source = HashSource;
+    let paths = crate::source::collect(
+      &[root.path().to_string_lossy().into_owned()],
+      root.path(),
+      &CancellationToken::new(),
+    )
+    .unwrap();
+    let initial = fingerprint(&source, &paths).await;
 
-    assert!(is_changed);
+    std::fs::write(file, "changed").unwrap();
+    let paths = crate::source::collect(
+      &[root.path().to_string_lossy().into_owned()],
+      root.path(),
+      &CancellationToken::new(),
+    )
+    .unwrap();
 
-    let is_changed = timestamp_source.is_changed(vec![temp_file_path.clone()]).await.unwrap();
+    assert_ne!(initial, fingerprint(&source, &paths).await);
+  }
 
-    assert!(!is_changed);
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn retargeting_a_directory_symlink_changes_the_fingerprint() {
+    use std::os::unix::fs::symlink;
 
-    // Modify the test file and check if it is detected as a change
-    std::fs::write(&temp_file_path, "modified content").unwrap();
+    let root = TempDir::new().unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    let link = root.path().join("current");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    symlink(&first, &link).unwrap();
+    let source = HashSource;
+    let initial = fingerprint(&source, std::slice::from_ref(&link)).await;
 
-    let is_changed = timestamp_source.is_changed(vec![temp_file_path]).await.unwrap();
-    assert!(is_changed);
+    std::fs::remove_file(&link).unwrap();
+    symlink(&second, &link).unwrap();
+
+    assert_ne!(initial, fingerprint(&source, &[link]).await);
   }
 }

@@ -460,9 +460,28 @@ impl Vars {
     result
   }
 
+  /// Names explicitly declared by Octa configuration or invocation layers.
+  pub(crate) fn declared_names(&self) -> HashSet<String> {
+    self
+      .collect_context_chain()
+      .into_iter()
+      .flat_map(|layer| layer.values.into_keys().chain(layer.required_vars.into_keys()))
+      .collect()
+  }
+
   /// Names of values that plugins must redact from their diagnostic logs.
   pub(crate) fn secret_names(&self) -> Vec<String> {
     self.secrets.iter().cloned().collect()
+  }
+
+  /// Values that must be removed from diagnostics produced while resolving dependent data.
+  pub(crate) fn secret_redactions(&self) -> Vec<String> {
+    let values = self.to_merged_hashmap();
+    let mut redactions = Vec::new();
+    for value in self.secrets.iter().filter_map(|key| values.get(key)) {
+      collect_value_redactions(value, &mut redactions);
+    }
+    redactions
   }
 }
 

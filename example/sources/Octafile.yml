@@ -1,7 +1,18 @@
 version: 1
+source_strategy: hash
 
 tasks:
   build:
     sources:
       - ./src/*
     shell: echo Run build
+
+  bundle:
+    source_strategy: timestamp
+    sources:
+      - ./src/*
+      - "!./src/generated/*"
+    output:
+      - ./*.js
+      - "!./*.map.js"
+    shell: echo bundle > app.js

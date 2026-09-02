@@ -2,7 +2,7 @@ use std::{
   borrow::Cow,
   collections::HashMap,
   env,
-  fmt::{Display, Formatter},
+  fmt::{Debug, Display, Formatter},
   path::PathBuf,
   sync::Arc,
 };
@@ -14,19 +14,35 @@ use tracing::debug;
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
-  function::{format_tera_error, register_shell, ExecuteShell},
+  function::{format_tera_error, register_shell_with_redactions, ExecuteShell},
   vars::Vars,
 };
 
 type EnvContext = HashMap<String, EnvValue>;
 type ResolvedEnvContext = HashMap<String, String>;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Envs {
   context: EnvContext,       // Current environments
   parent: Option<Arc<Envs>>, // Link to parent environments
   dir: Option<PathBuf>,      // Directory used by shell-backed values in this context
   expanded: bool,            // Indicates that all inherited values have been expanded
+}
+
+// Environment values may contain secrets rendered from task variables. Debug output therefore
+// exposes only structural information, even though Envs itself does not own sensitivity metadata.
+impl Debug for Envs {
+  fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+    let mut keys = self.context.keys().collect::<Vec<_>>();
+    keys.sort_unstable();
+    formatter
+      .debug_struct("Envs")
+      .field("keys", &keys)
+      .field("parent", &self.parent)
+      .field("dir", &self.dir)
+      .field("expanded", &self.expanded)
+      .finish()
+  }
 }
 
 impl PartialEq for Envs {
@@ -109,6 +125,14 @@ impl Envs {
     EnvsIter::new(self.context.clone())
   }
 
+  pub(crate) fn to_merged_hashmap(&self) -> HashMap<String, EnvValue> {
+    let mut result = HashMap::new();
+    for (context, _) in self.collect_context_chain() {
+      result.extend(context);
+    }
+    result
+  }
+
   pub async fn expand(&mut self) -> ExecutorResult<()> {
     self.expand_with(&Vars::new(), false)
   }
@@ -187,7 +211,14 @@ impl Envs {
     // Template values receive inherited values and same-layer literals. Other same-layer
     // templates are deliberately excluded because HashMap declaration order is not stable.
     let mut tera = Tera::default();
-    let shell = register_shell(&mut tera, current_dir, available.clone(), dry);
+    let shell = register_shell_with_redactions(
+      &mut tera,
+      current_dir,
+      available.clone(),
+      dry,
+      vars.secret_redactions(),
+      false,
+    );
     let mut template_context: Context = vars.clone().into();
     template_context.extend(
       Context::from_serialize(&available)
@@ -227,7 +258,7 @@ impl Envs {
       .render_str(&val, template_context)
       .map_err(|error| ExecutorError::ValueExpandError(value.to_string(), format_tera_error(&error)))?;
 
-    debug!("Processing environment '{}' with value: '{}'", key, val);
+    debug!("Processing template environment '{}'", key);
     Ok(expand_environment_value(&val, context))
   }
 
@@ -242,12 +273,12 @@ impl Envs {
   ) -> ExecutorResult<String> {
     let command = tera
       .render_str(command, template_context)
-      .map_err(|error| ExecutorError::ValueExpandError(command.to_owned(), format_tera_error(&error)))?;
-    debug!("Processing shell-backed environment '{}': '{}'", key, command);
+      .map_err(|error| ExecutorError::ValueExpandError(key.to_owned(), format_tera_error(&error)))?;
+    debug!("Processing shell-backed environment '{}'", key);
 
     let value = shell
       .execute(&command)
-      .map_err(|error| ExecutorError::ValueExpandError(command, format_tera_error(&error)))?;
+      .map_err(|error| ExecutorError::ValueExpandError(key.to_owned(), format_tera_error(&error)))?;
     Ok(expand_environment_value(&value, context))
   }
 }
@@ -478,6 +509,16 @@ mod tests {
   }
 
   #[test]
+  fn debug_output_never_exposes_environment_values() {
+    let envs = Envs::with_value(HashMap::from([("TOKEN".to_owned(), "do-not-log".to_owned())]));
+
+    let debug = format!("{envs:?}");
+
+    assert!(debug.contains("TOKEN"));
+    assert!(!debug.contains("do-not-log"));
+  }
+
+  #[test]
   fn test_context_conversion() {
     let mut context = ResolvedEnvContext::new();
     context.insert("key".to_owned(), "value".to_owned());
@@ -608,6 +649,28 @@ mod tests {
 
     assert!(error.to_string().contains("status 7"));
     assert!(error.to_string().contains("failed"));
+  }
+
+  #[tokio::test]
+  async fn shell_errors_redact_secret_variable_values() {
+    let secret = "do-not-log-this-value";
+    let values: octa_octafile::Vars =
+      serde_yml::from_str(&format!("TOKEN:\n  value: {secret}\n  secret: true\n")).unwrap();
+    let mut vars = Vars::with_variables(values);
+    vars.expand(false).await.unwrap();
+    #[cfg(windows)]
+    let command = "echo {{ TOKEN }} 1>&2 & exit /B 7";
+    #[cfg(not(windows))]
+    let command = "echo {{ TOKEN }} >&2; exit 7";
+    let mut envs = Envs::with_value(HashMap::from([(
+      "VALUE".to_owned(),
+      EnvValue::Shell(octa_octafile::ShellValue { sh: command.to_owned() }),
+    )]));
+
+    let error = envs.expand_with(&vars, false).unwrap_err().to_string();
+
+    assert!(!error.contains(secret));
+    assert!(error.contains("*****"));
   }
 
   #[test]

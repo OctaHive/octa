@@ -1134,6 +1134,59 @@ $ ./octa build
 2024-12-22 16:59:08 [octa] All tasks completed successfully
 ```
 
+Use `output` to declare files or directories produced by the task. A missing output makes all
+commands owned by that task stale. Referenced tasks keep their own independent freshness checks:
+
+```yaml
+version: 1
+source_strategy: hash
+
+tasks:
+  build:
+    sources:
+      - ./src/**/*.rs
+      - "!./src/generated/**"
+      - ./Cargo.toml
+    output:
+      - ./target/release/*
+      - "!./target/release/*.map"
+    shell: cargo build --release
+```
+
+Set `source_strategy` at the Octafile level to provide the default for tasks declared in that file,
+or override it for one task:
+
+```yaml
+source_strategy: hash
+
+tasks:
+  build:
+    source_strategy: timestamp
+    sources: [./src/**/*]
+    output: [./dist/app]
+    shell: ./build.sh
+```
+
+With the default `hash` source strategy, Octa compares the source fingerprint and checks that every
+`output` pattern has at least one match. Output contents are not included in the hash. With
+`source_strategy: timestamp`, Octa also
+reruns the task when the newest source is newer than the oldest output. Output directories are
+inspected recursively, while parent directory timestamps are ignored when tracked descendants
+exist. Fingerprints are stored only after the main task body completes successfully, so failed and
+partially completed tasks are retried. Source and output paths are resolved from the root Octafile
+directory.
+
+Freshness identities include task configuration and resolved variables explicitly declared in
+Octafile or on the command line. Dynamic `sh` values are resolved once during the freshness check
+and the same values are reused by every command in that task invocation. Process environment
+variables remain available at runtime, but declare values that affect generated outputs in `vars`
+or `env` so they are tracked without making every unrelated environment change invalidate the task.
+
+Prefix a pattern with `!` to exclude its matches from `sources` or `output`. Patterns are applied
+in declaration order, so a later positive pattern can re-include a path. Quote exclusions in YAML
+to prevent `!` from being parsed as a tag. Use `\!` at the beginning for a literal path whose name
+starts with `!`.
+
 You can use glob patterns when specify source targets.
 
 To exclude files or directories matched by `sources`, create `.octaignore` files anywhere under the root
@@ -1153,8 +1206,8 @@ Patterns in nested `.octaignore` files override matching rules inherited from pa
 `.gitignore`, a file cannot be re-included if one of its parent directories is still ignored. Sources outside the
 root `Octafile` directory are not filtered by `.octaignore`.
 
-By default, Octa calculates file checksums, but you can switch it to track file modification 
-timestamps by setting the `source_strategy` parameter to `timestamp`.
+By default, Octa calculates file checksums, but you can switch it to track file modification
+timestamps by setting `source_strategy: timestamp` at either the Octafile or task level.
 
 By default, Octa stores all the necessary information for tracking sources in the `.octa` directory.
 You can override this directory by setting the `OCTA_CACHE_DIR` environment variable.

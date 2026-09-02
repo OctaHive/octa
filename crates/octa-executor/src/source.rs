@@ -2,25 +2,33 @@
 //!
 //! Ignore files are applied from the root Octafile directory down to the
 //! source file. Rules from deeper directories take precedence over rules from
-//! their parents, matching Git's ignore-file behavior.
+//! their parents, matching Git's ignore-file behavior. Inline include and
+//! exclude patterns are evaluated in declaration order before this filter.
 
 use std::{
-  collections::HashMap,
+  collections::{BTreeSet, HashMap},
+  fs,
   path::{Path, PathBuf},
+  time::SystemTime,
 };
 
-use glob::glob;
 use ignore::{
   gitignore::{Gitignore, GitignoreBuilder},
   Match,
 };
+use tokio_util::sync::CancellationToken;
 
-use crate::error::{ExecutorError, ExecutorResult};
+use crate::{error::ExecutorResult, path_pattern::PathPattern};
 
 const OCTAIGNORE_FILE: &str = ".octaignore";
 
 /// Expands source globs and removes paths excluded by applicable `.octaignore` files.
-pub(crate) fn collect(sources: &[String], root: &Path) -> ExecutorResult<Vec<PathBuf>> {
+pub(crate) fn collect(
+  sources: &[String],
+  root: &Path,
+  cancel_token: &CancellationToken,
+) -> ExecutorResult<Vec<PathBuf>> {
+  check_cancelled(cancel_token)?;
   let current_dir = dunce::canonicalize(std::env::current_dir()?)?;
   let root = if root.is_absolute() {
     root.to_path_buf()
@@ -28,19 +36,46 @@ pub(crate) fn collect(sources: &[String], root: &Path) -> ExecutorResult<Vec<Pat
     current_dir.join(root)
   };
   let root = dunce::canonicalize(root)?;
-  let mut filter = SourceFilter::new(root, current_dir);
-  let mut paths = Vec::new();
+  let mut filter = SourceFilter::new(root.clone(), current_dir);
+  let mut paths = BTreeSet::<PathBuf>::new();
 
   for source in sources {
-    for entry in glob(source)? {
-      let path = entry.map_err(ExecutorError::GlobError)?;
-      if !filter.is_ignored(&path)? {
-        paths.push(path);
+    check_cancelled(cancel_token)?;
+    let pattern = PathPattern::parse(source);
+    let matches = pattern.expand(&root, cancel_token, |path| {
+      filter.is_ignored(path).map(|ignored| !ignored)
+    })?;
+    if pattern.is_excluded() {
+      for path in matches {
+        paths.retain(|candidate| candidate != &path && !candidate.starts_with(&path));
       }
+    } else {
+      paths.extend(matches);
     }
   }
 
-  Ok(paths)
+  Ok(paths.into_iter().collect())
+}
+
+fn check_cancelled(cancel_token: &CancellationToken) -> ExecutorResult<()> {
+  if cancel_token.is_cancelled() {
+    return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "source collection cancelled").into());
+  }
+  Ok(())
+}
+
+pub(crate) fn newest_modified(
+  paths: &[PathBuf],
+  cancel_token: &CancellationToken,
+) -> ExecutorResult<Option<SystemTime>> {
+  check_cancelled(cancel_token)?;
+  let mut newest = None;
+  for path in paths {
+    check_cancelled(cancel_token)?;
+    let modified = fs::symlink_metadata(path)?.modified()?;
+    newest = Some(newest.map_or(modified, |current: SystemTime| current.max(modified)));
+  }
+  Ok(newest)
 }
 
 struct SourceFilter {
@@ -65,7 +100,12 @@ impl SourceFilter {
     } else {
       self.current_dir.join(path)
     };
-    let absolute_path = dunce::canonicalize(absolute_path)?;
+    // Resolve aliases in the parent path while preserving the final component when it is a
+    // symlink. Ignore patterns apply to the source name, not to its target.
+    let absolute_path = match (absolute_path.parent(), absolute_path.file_name()) {
+      (Some(parent), Some(name)) => dunce::canonicalize(parent)?.join(name),
+      _ => dunce::canonicalize(absolute_path)?,
+    };
 
     // Ignore files outside the root Octafile must not affect external sources.
     let Ok(relative_path) = absolute_path.strip_prefix(&self.root) else {
@@ -96,7 +136,8 @@ impl SourceFilter {
       }
     }
 
-    Ok(self.matches(&active_matchers, &absolute_path, path.is_dir()))
+    let is_dir = fs::symlink_metadata(path)?.file_type().is_dir();
+    Ok(self.matches(&active_matchers, &absolute_path, is_dir))
   }
 
   fn load_matcher(&mut self, directory: &Path) -> ExecutorResult<()> {
@@ -152,6 +193,10 @@ mod tests {
     path.to_string_lossy().replace('\\', "/")
   }
 
+  fn collect_sources(sources: &[String], root: &Path) -> ExecutorResult<Vec<PathBuf>> {
+    collect(sources, root, &CancellationToken::new())
+  }
+
   #[test]
   fn ignores_files_and_directory_contents() {
     let root = TempDir::new().unwrap();
@@ -164,7 +209,7 @@ mod tests {
     fs::write(root.path().join(OCTAIGNORE_FILE), "*.log\nsrc/generated/\n").unwrap();
 
     let sources = vec![format!("{}/**/*", glob_path(&src))];
-    let paths = collect(&sources, root.path()).unwrap();
+    let paths = collect_sources(&sources, root.path()).unwrap();
 
     assert_eq!(paths, vec![src.join("main.rs")]);
   }
@@ -179,7 +224,7 @@ mod tests {
     fs::write(root.path().join(OCTAIGNORE_FILE), "*.log\n!important.log\n").unwrap();
 
     let sources = vec![format!("{}/*.log", glob_path(&logs))];
-    let paths = collect(&sources, root.path()).unwrap();
+    let paths = collect_sources(&sources, root.path()).unwrap();
 
     assert_eq!(paths, vec![logs.join("important.log")]);
   }
@@ -196,7 +241,7 @@ mod tests {
     fs::write(src.join(OCTAIGNORE_FILE), "*.tmp\n").unwrap();
 
     let sources = vec![format!("{}/**/*.tmp", glob_path(root.path()))];
-    let paths = collect(&sources, root.path()).unwrap();
+    let paths = collect_sources(&sources, root.path()).unwrap();
 
     assert_eq!(paths, vec![tests.join("cache.tmp")]);
   }
@@ -216,7 +261,7 @@ mod tests {
       format!("{}/*.log", glob_path(root.path())),
       format!("{}/*.log", glob_path(&src)),
     ];
-    let paths = collect(&sources, root.path()).unwrap();
+    let paths = collect_sources(&sources, root.path()).unwrap();
 
     assert_eq!(paths, vec![src.join("important.log")]);
   }
@@ -231,7 +276,7 @@ mod tests {
     fs::write(generated.join(OCTAIGNORE_FILE), "!keep.rs\n").unwrap();
 
     let sources = vec![format!("{}/*.rs", glob_path(&generated))];
-    let paths = collect(&sources, root.path()).unwrap();
+    let paths = collect_sources(&sources, root.path()).unwrap();
 
     assert!(paths.is_empty());
   }
@@ -244,9 +289,27 @@ mod tests {
     fs::write(&external_file, "external").unwrap();
     fs::write(root.path().join(OCTAIGNORE_FILE), "*.txt\n").unwrap();
 
-    let paths = collect(&[glob_path(&external_file)], root.path()).unwrap();
+    let paths = collect_sources(&[glob_path(&external_file)], root.path()).unwrap();
 
     assert_eq!(paths, vec![external_file]);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn octaignore_matches_the_symlink_name_instead_of_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    let external = TempDir::new().unwrap();
+    let target = external.path().join("target.txt");
+    let link = root.path().join("ignored.txt");
+    fs::write(&target, "external").unwrap();
+    symlink(target, &link).unwrap();
+    fs::write(root.path().join(OCTAIGNORE_FILE), "ignored.txt\n").unwrap();
+
+    let paths = collect_sources(&[glob_path(&link)], root.path()).unwrap();
+
+    assert!(paths.is_empty());
   }
 
   #[test]
@@ -255,9 +318,21 @@ mod tests {
     let source = root.path().join("source.txt");
     fs::write(&source, "source").unwrap();
 
-    let paths = collect(&[glob_path(&source)], root.path()).unwrap();
+    let paths = collect_sources(&[glob_path(&source)], root.path()).unwrap();
 
     assert_eq!(paths, vec![source]);
+  }
+
+  #[test]
+  fn resolves_relative_patterns_from_project_root() {
+    let root = TempDir::new().unwrap();
+    let source_dir = root.path().join("src");
+    fs::create_dir(&source_dir).unwrap();
+    fs::write(source_dir.join("main.rs"), "source").unwrap();
+
+    let paths = collect_sources(&["src/*.rs".to_owned()], root.path()).unwrap();
+
+    assert_eq!(paths, vec![dunce::canonicalize(source_dir.join("main.rs")).unwrap()]);
   }
 
   #[test]
@@ -271,7 +346,7 @@ mod tests {
 
     let canonical_root = fs::canonicalize(root.path()).unwrap();
     let sources = vec![format!("{}/*.txt", glob_path(&src))];
-    let paths = collect(&sources, &canonical_root).unwrap();
+    let paths = collect_sources(&sources, &canonical_root).unwrap();
 
     assert_eq!(paths, vec![src.join("tracked.txt")]);
   }
@@ -281,8 +356,109 @@ mod tests {
     let root = TempDir::new().unwrap();
     let missing = root.path().join("missing").join("*.txt");
 
-    let paths = collect(&[glob_path(&missing)], root.path()).unwrap();
+    let paths = collect_sources(&[glob_path(&missing)], root.path()).unwrap();
 
     assert!(paths.is_empty());
+  }
+
+  #[test]
+  fn applies_inline_exclusions_in_declaration_order() {
+    let root = TempDir::new().unwrap();
+    let src = root.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("main.rs"), "main").unwrap();
+    fs::write(src.join("generated.rs"), "generated").unwrap();
+
+    let paths = collect_sources(
+      &[
+        "src/*.rs".to_owned(),
+        "!src/generated.rs".to_owned(),
+        "src/generated.rs".to_owned(),
+      ],
+      root.path(),
+    )
+    .unwrap();
+
+    assert_eq!(
+      paths,
+      vec![
+        dunce::canonicalize(src.join("generated.rs")).unwrap(),
+        dunce::canonicalize(src.join("main.rs")).unwrap(),
+      ]
+    );
+  }
+
+  #[test]
+  fn reincluding_a_directory_restores_its_descendants() {
+    let root = TempDir::new().unwrap();
+    let nested = root.path().join("src").join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let source = nested.join("main.rs");
+    fs::write(&source, "main").unwrap();
+
+    let paths = collect_sources(
+      &["src".to_owned(), "!src/nested/*".to_owned(), "src/nested".to_owned()],
+      root.path(),
+    )
+    .unwrap();
+
+    assert!(paths.contains(&dunce::canonicalize(source).unwrap()));
+  }
+
+  #[test]
+  fn supports_literal_paths_starting_with_bang() {
+    let root = TempDir::new().unwrap();
+    let source = root.path().join("!important.txt");
+    fs::write(&source, "important").unwrap();
+
+    let paths = collect_sources(&[r"\!important.txt".to_owned()], root.path()).unwrap();
+
+    assert_eq!(paths, vec![dunce::canonicalize(source).unwrap()]);
+  }
+
+  #[test]
+  fn directory_sources_include_nested_contents() {
+    let root = TempDir::new().unwrap();
+    let source_dir = root.path().join("src");
+    let nested = source_dir.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let source = nested.join("main.rs");
+    fs::write(&source, "fn main() {}").unwrap();
+
+    let paths = collect_sources(&[glob_path(&source_dir)], root.path()).unwrap();
+
+    assert_eq!(paths, vec![source_dir, nested, source]);
+  }
+
+  #[test]
+  fn excluding_a_directory_removes_its_descendants() {
+    let root = TempDir::new().unwrap();
+    let source_dir = root.path().join("src");
+    let generated = source_dir.join("generated");
+    fs::create_dir_all(&generated).unwrap();
+    let main = source_dir.join("main.rs");
+    fs::write(&main, "fn main() {}").unwrap();
+    fs::write(generated.join("bindings.rs"), "generated").unwrap();
+
+    let paths = collect_sources(
+      &[glob_path(&source_dir), format!("!{}", glob_path(&generated))],
+      root.path(),
+    )
+    .unwrap();
+
+    assert_eq!(paths, vec![source_dir, main]);
+  }
+
+  #[test]
+  fn newest_timestamp_check_honors_cancellation() {
+    let cancel_token = CancellationToken::new();
+    cancel_token.cancel();
+
+    let result = newest_modified(&[], &cancel_token);
+
+    assert!(matches!(
+      result,
+      Err(crate::error::ExecutorError::IoError(error)) if error.kind() == std::io::ErrorKind::Interrupted
+    ));
   }
 }

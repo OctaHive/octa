@@ -1,173 +1,121 @@
-use std::{path::PathBuf, sync::Arc, time::UNIX_EPOCH};
+use std::{path::PathBuf, time::UNIX_EPOCH};
+
+use async_trait::async_trait;
+use sha2::{Digest, Sha256};
+use tokio::fs::symlink_metadata;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
-  task::SourceStrategy,
+  path_hash,
+  source_strategy::SourceStrategy,
 };
-use async_trait::async_trait;
-use byteorder::{ByteOrder, LittleEndian};
-use sled::Db;
-use tokio::fs::metadata;
 
-const TIMESTAMP_PREFIX: &str = "hash";
-
-pub struct TimestampSource {
-  fingerprint: Arc<Db>,
-}
-
-impl TimestampSource {
-  pub fn new(fingerprint: Arc<Db>) -> Self {
-    Self { fingerprint }
-  }
-
-  async fn get_file_modify_time(&self, path: PathBuf) -> ExecutorResult<u64> {
-    match metadata(path).await {
-      Ok(metadata) => {
-        if let Ok(modified) = metadata.modified() {
-          match modified.duration_since(UNIX_EPOCH) {
-            Ok(duration) => Ok(duration.as_secs()),
-            Err(e) => Err(ExecutorError::CalculateDurationError(e)),
-          }
-        } else {
-          Ok(0)
-        }
-      },
-      Err(e) => Err(ExecutorError::IoError(e)),
-    }
-  }
-}
+pub struct TimestampSource;
 
 #[async_trait]
 impl SourceStrategy for TimestampSource {
-  async fn is_changed(&self, sources: Vec<PathBuf>) -> ExecutorResult<bool> {
-    let mut has_changes = false;
-
-    for path in sources {
-      let new_timestamp = self.get_file_modify_time(path.clone()).await?;
-      let path_str = path.display().to_string();
-
-      let key = format!("{}_{}", TIMESTAMP_PREFIX, path_str);
-      if let Some(old_timestamp) = self.fingerprint.get(key.clone())? {
-        let old_timestamp_str = LittleEndian::read_u64(&old_timestamp);
-        if old_timestamp_str != new_timestamp {
-          has_changes = true;
-        }
-      } else {
-        has_changes = true;
-      }
-
-      let mut buf = [0u8; 8];
-      LittleEndian::write_u64(&mut buf, new_timestamp);
-      self.fingerprint.insert(key, &buf)?;
-    }
-
-    Ok(has_changes)
+  fn key(&self) -> &'static str {
+    "timestamp"
   }
+
+  fn compare_output_timestamps(&self) -> bool {
+    true
+  }
+
+  async fn fingerprint(&self, sources: &[PathBuf], cancel_token: &CancellationToken) -> ExecutorResult<Vec<u8>> {
+    check_cancelled(cancel_token)?;
+    let mut hasher = Sha256::new();
+    for path in sources {
+      check_cancelled(cancel_token)?;
+      path_hash::update_path_identity(&mut hasher, path);
+
+      let modified = symlink_metadata(path).await?.modified()?;
+      let elapsed = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(ExecutorError::CalculateDurationError)?;
+      hasher.update(elapsed.as_secs().to_le_bytes());
+      hasher.update(elapsed.subsec_nanos().to_le_bytes());
+    }
+    Ok(hasher.finalize().to_vec())
+  }
+}
+
+fn check_cancelled(cancel_token: &CancellationToken) -> ExecutorResult<()> {
+  if cancel_token.is_cancelled() {
+    return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "source fingerprint cancelled").into());
+  }
+  Ok(())
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::time::SystemTime;
-  use tempfile::{NamedTempFile, TempDir};
+  use tempfile::TempDir;
 
-  #[tokio::test]
-  async fn test_no_sources() {
-    let db = sled::Config::new()
-      .temporary(true)
-      .open()
-      .expect("Failed to open in-memory Sled database");
-
-    let timestamp_source = TimestampSource::new(Arc::new(db));
-
-    assert!(!timestamp_source.is_changed(vec![]).await.unwrap());
+  async fn fingerprint(source: &TimestampSource, paths: &[PathBuf]) -> Vec<u8> {
+    source.fingerprint(paths, &CancellationToken::new()).await.unwrap()
   }
 
   #[tokio::test]
-  async fn test_get_file_modify_time() {
-    let db = Arc::new(
-      sled::Config::new()
-        .temporary(true)
-        .open()
-        .expect("Failed to open in-memory Sled database"),
-    );
+  async fn empty_sources_have_a_stable_fingerprint() {
+    let source = TimestampSource;
 
-    let temp_file = NamedTempFile::new().unwrap();
-
-    // First, make sure the file doesn't exist before checking the mod time
-    assert!(TimestampSource::new(Arc::clone(&db))
-      .get_file_modify_time(temp_file.path().to_path_buf())
-      .await
-      .is_ok());
-
-    let original_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
-    // Wait before change
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-    std::fs::write(&temp_file, "test content").unwrap();
-
-    assert!(TimestampSource::new(Arc::clone(&db))
-      .get_file_modify_time(temp_file.path().to_path_buf())
-      .await
-      .is_ok());
-
-    let new_timestamp = TimestampSource::new(Arc::clone(&db))
-      .get_file_modify_time(temp_file.path().to_path_buf())
-      .await
-      .unwrap();
-
-    assert!(original_timestamp < new_timestamp);
+    assert_eq!(fingerprint(&source, &[]).await, fingerprint(&source, &[]).await);
   }
 
   #[tokio::test]
-  async fn test_changed_no_changes() {
-    let db = Arc::new(
-      sled::Config::new()
-        .temporary(true)
-        .open()
-        .expect("Failed to open in-memory Sled database"),
-    );
+  async fn cancelled_fingerprint_stops_before_reading_sources() {
+    let cancel_token = CancellationToken::new();
+    cancel_token.cancel();
 
-    let temp_dir = TempDir::new().unwrap();
-    let temp_file_path = temp_dir.path().join("test_file");
-    let timestamp_source = TimestampSource::new(db);
+    let result = TimestampSource.fingerprint(&[], &cancel_token).await;
 
-    std::fs::write(&temp_file_path, "initial content").unwrap();
-
-    assert!(timestamp_source.is_changed(vec![temp_file_path.clone()]).await.is_ok());
+    assert!(matches!(
+      result,
+      Err(ExecutorError::IoError(error)) if error.kind() == std::io::ErrorKind::Interrupted
+    ));
   }
 
   #[tokio::test]
-  async fn test_changed_file_changes() {
-    let db = Arc::new(
-      sled::Config::new()
-        .temporary(true)
-        .open()
-        .expect("Failed to open in-memory Sled database"),
-    );
+  async fn modification_time_changes_the_fingerprint() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("source.txt");
+    std::fs::write(&path, "initial").unwrap();
+    let source = TimestampSource;
+    let initial = fingerprint(&source, std::slice::from_ref(&path)).await;
 
-    let temp_dir = TempDir::new().unwrap();
-    let temp_file_path = temp_dir.path().join("test_file");
-    let timestamp_source = TimestampSource::new(db);
+    tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+    std::fs::write(&path, "changed").unwrap();
 
-    std::fs::write(&temp_file_path, "initial content").unwrap();
+    assert_ne!(initial, fingerprint(&source, &[path]).await);
+  }
 
-    let is_changed = timestamp_source.is_changed(vec![temp_file_path.clone()]).await.unwrap();
+  #[tokio::test]
+  async fn nested_directory_changes_affect_the_fingerprint() {
+    let root = TempDir::new().unwrap();
+    let nested = root.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let file = nested.join("source.txt");
+    std::fs::write(&file, "initial").unwrap();
+    let source = TimestampSource;
+    let paths = crate::source::collect(
+      &[root.path().to_string_lossy().into_owned()],
+      root.path(),
+      &CancellationToken::new(),
+    )
+    .unwrap();
+    let initial = fingerprint(&source, &paths).await;
 
-    assert!(is_changed);
+    tokio::time::sleep(tokio::time::Duration::from_millis(1100)).await;
+    std::fs::write(file, "changed").unwrap();
+    let paths = crate::source::collect(
+      &[root.path().to_string_lossy().into_owned()],
+      root.path(),
+      &CancellationToken::new(),
+    )
+    .unwrap();
 
-    let is_changed = timestamp_source.is_changed(vec![temp_file_path.clone()]).await.unwrap();
-
-    assert!(!is_changed);
-
-    // Wait before change
-    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-    // Modify the test file and check if it is detected as a change
-    std::fs::write(&temp_file_path, "modified content").unwrap();
-
-    let is_changed = timestamp_source.is_changed(vec![temp_file_path]).await.unwrap();
-    assert!(is_changed);
+    assert_ne!(initial, fingerprint(&source, &paths).await);
   }
 }

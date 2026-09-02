@@ -1,6 +1,6 @@
 use std::time::SystemTimeError;
 
-use glob::{GlobError, PatternError};
+use glob::PatternError;
 use octa_dag::error::DAGError;
 use octa_octafile::OctafileError;
 use thiserror::Error;
@@ -49,14 +49,26 @@ pub enum ExecutorError {
   #[error("Failed to get or set fingerprint db")]
   OpenFingerprintDbError(#[from] sled::Error),
 
+  #[error("Freshness state is unavailable: {0}")]
+  FreshnessStateUnavailable(String),
+
+  #[error("Freshness state has already been published")]
+  FreshnessStateAlreadyPublished,
+
+  #[error("Failed to build freshness identity: {0}")]
+  FreshnessIdentityError(String),
+
+  #[error("No source strategy provider is registered for '{0}'")]
+  SourceStrategyUnavailable(String),
+
+  #[error("Missing mandatory task configuration field: {0}")]
+  TaskConfigFieldMissing(&'static str),
+
   #[error("Failed to calculate duration for time")]
   CalculateDurationError(#[from] SystemTimeError),
 
-  #[error("Failed to extend source path")]
+  #[error("Failed to expand file pattern")]
   ExtendSourceError(#[from] PatternError),
-
-  #[error("Failed to extend source path")]
-  GlobError(#[from] GlobError),
 
   #[error("Failed to load .octaignore: {0}")]
   OctaignoreError(#[from] ignore::Error),

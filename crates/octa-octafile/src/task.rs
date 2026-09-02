@@ -31,6 +31,7 @@ const RESERVED_PLUGIN_KEYS: &[&str] = &[
   "failfast",
   "timeout",
   "sources",
+  "output",
   "source_strategy",
   "watch",
   "if",
@@ -100,11 +101,11 @@ impl From<String> for ExecuteMode {
   }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceStrategies {
   Timestamp,
   Hash,
+  Custom(String),
 }
 
 impl From<String> for SourceStrategies {
@@ -112,8 +113,40 @@ impl From<String> for SourceStrategies {
     match value.as_str() {
       "timestamp" => SourceStrategies::Timestamp,
       "hash" => SourceStrategies::Hash,
-      _ => unimplemented!(),
+      _ => SourceStrategies::Custom(value),
     }
+  }
+}
+
+impl SourceStrategies {
+  pub fn as_str(&self) -> &str {
+    match self {
+      Self::Timestamp => "timestamp",
+      Self::Hash => "hash",
+      Self::Custom(value) => value,
+    }
+  }
+}
+
+impl Serialize for SourceStrategies {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    serializer.serialize_str(self.as_str())
+  }
+}
+
+impl<'de> Deserialize<'de> for SourceStrategies {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let value = String::deserialize(deserializer)?;
+    if value.trim().is_empty() {
+      return Err(serde::de::Error::custom("source strategy must not be empty"));
+    }
+    Ok(value.into())
   }
 }
 
@@ -524,7 +557,8 @@ pub struct Task {
   pub failfast: Option<bool>,                    // Cancel parallel work after the first failure
   pub timeout: Option<Timeout>,                  // Default timeout for task commands
   pub sources: Option<Vec<String>>,              // Sources for fingerprinting
-  pub source_strategy: Option<SourceStrategies>, // Strategy for compare sources
+  pub output: Option<Vec<String>>,               // Files produced by this task
+  pub source_strategy: Option<SourceStrategies>, // Strategy used to fingerprint sources
   pub watch: Option<bool>,                       // Watch sources and rerun the task
   pub condition: Option<TaskConditions>,         // Plugin conditions around dependency execution
   pub preconditions: Option<Vec<String>>,        // Commands to check should run command
@@ -604,6 +638,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "failfast" => task.failfast = map.next_value()?,
         "timeout" => task.timeout = map.next_value()?,
         "sources" => task.sources = map.next_value()?,
+        "output" => task.output = map.next_value()?,
         "source_strategy" => task.source_strategy = map.next_value()?,
         "watch" => task.watch = map.next_value()?,
         "if" => {
@@ -704,6 +739,17 @@ mod tests {
       SourceStrategies::Timestamp
     );
     assert_eq!(SourceStrategies::from("hash".to_owned()), SourceStrategies::Hash);
+    assert_eq!(
+      SourceStrategies::from("content-addressed".to_owned()),
+      SourceStrategies::Custom("content-addressed".to_owned())
+    );
+    assert_eq!(serde_yml::to_string(&SourceStrategies::Hash).unwrap().trim(), "hash");
+    assert_eq!(
+      serde_yml::to_string(&SourceStrategies::Custom("content-addressed".to_owned()))
+        .unwrap()
+        .trim(),
+      "content-addressed"
+    );
     assert_eq!(AllowedRun::from("once".to_owned()), AllowedRun::Once);
     assert_eq!(AllowedRun::from("always".to_owned()), AllowedRun::Always);
     assert_eq!(AllowedRun::from("changed".to_owned()), AllowedRun::Changed);

@@ -18,7 +18,6 @@ octa-plugin = { version = "0.2.1", path = "../octa-plugin" }
 octa-plugin-manager = { version = "0.2.1", path = "../octa-plugin-manager" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-byteorder = "1.5"
 dunce = "1.0.5"
 dotenvy = "0.15.7"
 indexmap = { workspace = true }

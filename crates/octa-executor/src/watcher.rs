@@ -2,17 +2,13 @@
 //!
 //! It builds a deterministic content snapshot from task source globs. Source
 //! collection is shared with regular fingerprinting, so `.octaignore` rules
-//! are applied consistently in both modes.
+//! are applied consistently in both modes. Filesystem traversal and hashing
+//! run on Tokio's blocking pool so large source trees do not stall async work.
 
-use std::{
-  fs::File,
-  io::{self, Read},
-  path::{Path, PathBuf},
-};
+use std::{io, path::PathBuf, sync::Arc};
+use tokio_util::sync::CancellationToken;
 
-use sha2::{Digest, Sha256};
-
-use crate::{error::ExecutorResult, source};
+use crate::{error::ExecutorResult, path_hash, source};
 
 /// Sources belonging to a task and the root used to resolve ignore rules.
 #[derive(Clone, Debug)]
@@ -37,20 +33,26 @@ struct SourceSnapshot([u8; 32]);
 
 /// Detects source changes by comparing snapshots captured between polls.
 pub struct SourceWatcher {
-  targets: Vec<WatchTarget>,
+  targets: Arc<[WatchTarget]>,
   snapshot: SourceSnapshot,
+  cancel_token: CancellationToken,
 }
 
 impl SourceWatcher {
   /// Captures the initial snapshot for the supplied targets.
-  pub fn new(targets: Vec<WatchTarget>) -> ExecutorResult<Self> {
-    let snapshot = SourceSnapshot::capture(&targets)?;
-    Ok(Self { targets, snapshot })
+  pub async fn new(targets: Vec<WatchTarget>, cancel_token: CancellationToken) -> ExecutorResult<Self> {
+    let targets = Arc::<[WatchTarget]>::from(targets);
+    let snapshot = capture(Arc::clone(&targets), cancel_token.clone()).await?;
+    Ok(Self {
+      targets,
+      snapshot,
+      cancel_token,
+    })
   }
 
   /// Returns `true` when the resolved source set or file contents have changed.
-  pub fn poll(&mut self) -> ExecutorResult<bool> {
-    let snapshot = match SourceSnapshot::capture(&self.targets) {
+  pub async fn poll(&mut self) -> ExecutorResult<bool> {
+    let snapshot = match capture(Arc::clone(&self.targets), self.cancel_token.clone()).await {
       Ok(snapshot) => snapshot,
       // A source can disappear after glob expansion but before it is opened.
       // Keep the previous snapshot and retry on the next poll; the deletion
@@ -69,54 +71,26 @@ impl SourceWatcher {
   }
 }
 
+async fn capture(targets: Arc<[WatchTarget]>, cancel_token: CancellationToken) -> ExecutorResult<SourceSnapshot> {
+  tokio::task::spawn_blocking(move || SourceSnapshot::capture(targets.as_ref(), &cancel_token)).await?
+}
+
 impl SourceSnapshot {
-  fn capture(targets: &[WatchTarget]) -> ExecutorResult<Self> {
+  fn capture(targets: &[WatchTarget], cancel_token: &CancellationToken) -> ExecutorResult<Self> {
     let mut paths = Vec::new();
     for target in targets {
-      paths.extend(source::collect(&target.sources, &target.root)?);
+      paths.extend(source::collect(&target.sources, &target.root, cancel_token)?);
     }
     paths.sort_unstable();
     paths.dedup();
 
-    let mut hasher = Sha256::new();
-    for path in paths {
-      hash_path(&mut hasher, &path)?;
-    }
-
-    Ok(Self(hasher.finalize().into()))
+    Ok(Self(path_hash::content_fingerprint(&paths, cancel_token)?))
   }
-}
-
-fn hash_path(hasher: &mut Sha256, path: &Path) -> ExecutorResult<()> {
-  let path_text = path.to_string_lossy();
-  // Length prefixes and entry type markers keep adjacent hash inputs from
-  // producing ambiguous byte sequences.
-  hasher.update((path_text.len() as u64).to_le_bytes());
-  hasher.update(path_text.as_bytes());
-
-  if path.is_dir() {
-    hasher.update([0]);
-    return Ok(());
-  }
-
-  hasher.update([1]);
-  let mut file = File::open(path)?;
-  hasher.update(file.metadata()?.len().to_le_bytes());
-  let mut buffer = [0; 8192];
-  loop {
-    let read = file.read(&mut buffer)?;
-    if read == 0 {
-      break;
-    }
-    hasher.update(&buffer[..read]);
-  }
-
-  Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-  use std::fs;
+  use std::{fs, path::Path};
 
   use tempfile::TempDir;
 
@@ -126,41 +100,81 @@ mod tests {
     path.to_string_lossy().replace('\\', "/")
   }
 
-  #[test]
-  fn detects_created_modified_and_removed_sources() {
+  #[tokio::test]
+  async fn detects_created_modified_and_removed_sources() {
     let root = TempDir::new().unwrap();
     let source_dir = root.path().join("src");
     fs::create_dir(&source_dir).unwrap();
     let target = WatchTarget::new(vec![format!("{}/*", glob_path(&source_dir))], root.path().to_path_buf());
-    let mut watcher = SourceWatcher::new(vec![target]).unwrap();
+    let mut watcher = SourceWatcher::new(vec![target], CancellationToken::new())
+      .await
+      .unwrap();
 
-    assert!(!watcher.poll().unwrap());
+    assert!(!watcher.poll().await.unwrap());
 
     let source = source_dir.join("main.rs");
     fs::write(&source, "first").unwrap();
-    assert!(watcher.poll().unwrap());
-    assert!(!watcher.poll().unwrap());
+    assert!(watcher.poll().await.unwrap());
+    assert!(!watcher.poll().await.unwrap());
 
     fs::write(&source, "second").unwrap();
-    assert!(watcher.poll().unwrap());
+    assert!(watcher.poll().await.unwrap());
 
     fs::remove_file(source).unwrap();
-    assert!(watcher.poll().unwrap());
+    assert!(watcher.poll().await.unwrap());
   }
 
-  #[test]
-  fn ignores_octaignore_matches() {
+  #[tokio::test]
+  async fn ignores_octaignore_matches() {
     let root = TempDir::new().unwrap();
     let source_dir = root.path().join("src");
     fs::create_dir(&source_dir).unwrap();
     fs::write(root.path().join(".octaignore"), "*.tmp\n").unwrap();
     let target = WatchTarget::new(vec![format!("{}/*", glob_path(&source_dir))], root.path().to_path_buf());
-    let mut watcher = SourceWatcher::new(vec![target]).unwrap();
+    let mut watcher = SourceWatcher::new(vec![target], CancellationToken::new())
+      .await
+      .unwrap();
 
     fs::write(source_dir.join("cache.tmp"), "ignored").unwrap();
-    assert!(!watcher.poll().unwrap());
+    assert!(!watcher.poll().await.unwrap());
 
     fs::write(source_dir.join("main.rs"), "tracked").unwrap();
-    assert!(watcher.poll().unwrap());
+    assert!(watcher.poll().await.unwrap());
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn detects_retargeted_directory_symlinks_without_following_them() {
+    use std::os::unix::fs::symlink;
+
+    let root = TempDir::new().unwrap();
+    let first = root.path().join("first");
+    let second = root.path().join("second");
+    let link = root.path().join("current");
+    fs::create_dir(&first).unwrap();
+    fs::create_dir(&second).unwrap();
+    symlink(&first, &link).unwrap();
+    let target = WatchTarget::new(vec![glob_path(&link)], root.path().to_path_buf());
+    let mut watcher = SourceWatcher::new(vec![target], CancellationToken::new())
+      .await
+      .unwrap();
+
+    fs::remove_file(&link).unwrap();
+    symlink(&second, link).unwrap();
+
+    assert!(watcher.poll().await.unwrap());
+  }
+
+  #[tokio::test]
+  async fn cancellation_interrupts_initial_snapshot() {
+    let cancel_token = CancellationToken::new();
+    cancel_token.cancel();
+
+    let result = SourceWatcher::new(Vec::new(), cancel_token).await;
+
+    assert!(matches!(
+      result,
+      Err(crate::error::ExecutorError::IoError(error)) if error.kind() == io::ErrorKind::Interrupted
+    ));
   }
 }

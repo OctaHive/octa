@@ -486,11 +486,7 @@ async fn build_execute_items(
       )
       .await?;
 
-    for node in dag.nodes() {
-      if let Some(sources) = &node.sources {
-        watch_targets.push(WatchTarget::new(sources.clone(), node.octafile_root.clone()));
-      }
-    }
+    watch_targets.extend(dag.nodes().iter().filter_map(|node| node.watch_target()));
 
     let executor = Executor::new(
       context.plugin_manager.clone(),
@@ -556,7 +552,11 @@ async fn execute_watch(
     return Err(OctaError::WatchSourcesMissing);
   }
 
-  let mut watcher = SourceWatcher::new(targets)?;
+  let mut watcher = tokio::select! {
+    biased;
+    _ = cancel_token.cancelled() => return Ok(()),
+    watcher = SourceWatcher::new(targets, cancel_token.clone()) => watcher?,
+  };
   if let Err(error) = execute_tasks(tasks, options.parallel, options.failfast, cancel_token.clone()).await {
     warn!("Task execution failed; waiting for source changes: {}", error);
   }
@@ -568,7 +568,12 @@ async fn execute_watch(
       _ = sleep(interval) => {},
     }
 
-    if watcher.poll()? {
+    let changed = tokio::select! {
+      biased;
+      _ = cancel_token.cancelled() => break,
+      changed = watcher.poll() => changed?,
+    };
+    if changed {
       info!("Sources changed; restarting tasks");
       let (tasks, _) = build_execute_items(&context, commands, options).await?;
 

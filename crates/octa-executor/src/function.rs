@@ -145,7 +145,8 @@ impl Filter for ExecuteShell {
 }
 
 /// Registers both shell template forms and returns the same runner for structured `sh` values.
-pub fn register_shell(
+#[cfg(test)]
+fn register_shell(
   tera: &mut tera::Tera,
   current_dir: &Path,
   environment: HashMap<String, String>,
@@ -155,7 +156,7 @@ pub fn register_shell(
 }
 
 /// Registers shell template helpers while redacting inherited secret values from diagnostics.
-pub fn register_shell_with_redactions(
+pub(crate) fn register_shell_with_redactions(
   tera: &mut tera::Tera,
   current_dir: &Path,
   environment: HashMap<String, String>,
