@@ -45,11 +45,9 @@ impl OutputState {
       check_cancelled(cancel_token)?;
       match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.is_dir() && non_leaf_directories.contains(&path) => continue,
-        Ok(metadata) => match metadata.modified() {
-          Ok(modified) => {
-            oldest_modified = Some(oldest_modified.map_or(modified, |oldest: SystemTime| oldest.min(modified)));
-          },
-          Err(error) => return Err(error.into()),
+        Ok(metadata) => {
+          let modified = metadata.modified()?;
+          oldest_modified = Some(oldest_modified.map_or(modified, |oldest: SystemTime| oldest.min(modified)));
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => missing = true,
         Err(error) => return Err(error.into()),
