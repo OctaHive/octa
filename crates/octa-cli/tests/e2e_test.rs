@@ -2394,7 +2394,7 @@ tasks:
   command.assert().success();
 
   let trace = fs::read_to_string(tmp_dir.path().join("trace.txt"))?;
-  let lines = trace.lines().collect::<Vec<_>>();
+  let lines = trace.lines().map(str::trim).collect::<Vec<_>>();
   assert!(
     lines == ["A-start", "A-end", "B-start", "B-end"] || lines == ["B-start", "B-end", "A-start", "A-end"],
     "commands overlapped: {lines:?}"
