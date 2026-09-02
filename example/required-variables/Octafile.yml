@@ -1,5 +1,11 @@
 version: 1
 
+vars:
+  DEPLOYMENT_ENVIRONMENTS:
+    - development
+    - staging
+    - production
+
 tasks:
   deploy:
     vars:
@@ -17,4 +23,12 @@ tasks:
           - development
           - staging
           - production
+    shell: echo "Deploying to {{ ENVIRONMENT }}"
+
+  select-shared-environment:
+    vars:
+      ENVIRONMENT:
+        required: prompt
+        question: Select deployment environment
+        enum: "{{ DEPLOYMENT_ENVIRONMENTS }}"
     shell: echo "Deploying to {{ ENVIRONMENT }}"

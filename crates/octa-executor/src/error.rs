@@ -116,6 +116,9 @@ pub enum ExecutorError {
   #[error("Required variable '{0}' must be one of: {1}")]
   RequiredVariableNotAllowed(String, String),
 
+  #[error("Failed to resolve enum for required variable '{0}': {1}")]
+  RequiredVariableEnumError(String, String),
+
   #[error("Interactive input is unavailable for required variable '{0}'; supply {0}=VALUE on the command line")]
   VariablePromptUnavailable(String),
 

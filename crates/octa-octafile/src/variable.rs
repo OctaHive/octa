@@ -8,7 +8,7 @@ use serde_json::Value;
 pub struct Variable {
   source: VariableSource,
   secret: bool,
-  enum_values: Option<Vec<String>>,
+  enum_source: Option<VariableEnum>,
   question: Option<String>,
 }
 
@@ -44,6 +44,13 @@ pub enum RequiredMode {
   Prompt,
 }
 
+/// Describes either literal choices or a variable reference resolved by the executor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VariableEnum {
+  Values(Vec<String>),
+  Template(String),
+}
+
 impl Variable {
   /// Returns whether diagnostics must redact the resolved variable value.
   pub fn is_secret(&self) -> bool {
@@ -63,9 +70,17 @@ impl Variable {
     }
   }
 
-  /// Returns the allowed values for a required variable.
+  /// Returns choices declared as a literal list rather than a template.
   pub fn enum_values(&self) -> Option<&[String]> {
-    self.enum_values.as_deref()
+    match &self.enum_source {
+      Some(VariableEnum::Values(values)) => Some(values),
+      _ => None,
+    }
+  }
+
+  /// Returns the enum definition resolved before required input is requested.
+  pub fn enum_source(&self) -> Option<&VariableEnum> {
+    self.enum_source.as_ref()
   }
 
   /// Returns the custom interactive question, when configured.
@@ -102,7 +117,7 @@ impl Variable {
       return Ok(Self {
         source: VariableSource::Value(value),
         secret: false,
-        enum_values: None,
+        enum_source: None,
         question: None,
       });
     };
@@ -117,7 +132,7 @@ impl Variable {
           return Ok(Self {
             source: VariableSource::Shell(command.clone()),
             secret: false,
-            enum_values: None,
+            enum_source: None,
             question: None,
           });
         }
@@ -125,7 +140,7 @@ impl Variable {
       return Ok(Self {
         source: VariableSource::Value(Value::Object(definition)),
         secret: false,
-        enum_values: None,
+        enum_source: None,
         question: None,
       });
     }
@@ -151,7 +166,7 @@ impl Variable {
       Some(Value::String(value)) if value == "prompt" => Some(RequiredMode::Prompt),
       Some(_) => return Err("'required' must be a boolean or 'prompt'".to_owned()),
     };
-    let enum_values = definition.remove("enum").map(parse_enum_values).transpose()?;
+    let enum_source = definition.remove("enum").map(parse_enum_source).transpose()?;
     let question = definition
       .remove("question")
       .map(|value| match value {
@@ -171,12 +186,12 @@ impl Variable {
       return Ok(Self {
         source: VariableSource::Required(mode),
         secret,
-        enum_values,
+        enum_source,
         question,
       });
     }
 
-    if enum_values.is_some() || question.is_some() {
+    if enum_source.is_some() || question.is_some() {
       return Err("'enum' and 'question' require a required variable".to_owned());
     }
 
@@ -190,7 +205,7 @@ impl Variable {
     Ok(Self {
       source,
       secret,
-      enum_values: None,
+      enum_source: None,
       question: None,
     })
   }
@@ -211,8 +226,12 @@ impl Variable {
         if secret {
           definition.insert("secret".to_owned(), Value::Bool(true));
         }
-        if let Some(enum_values) = &self.enum_values {
-          definition.insert("enum".to_owned(), serde_json::json!(enum_values));
+        if let Some(enum_source) = &self.enum_source {
+          let value = match enum_source {
+            VariableEnum::Values(values) => serde_json::json!(values),
+            VariableEnum::Template(template) => Value::String(template.clone()),
+          };
+          definition.insert("enum".to_owned(), value);
         }
         if let Some(question) = &self.question {
           definition.insert("question".to_owned(), Value::String(question.clone()));
@@ -223,9 +242,13 @@ impl Variable {
   }
 }
 
-fn parse_enum_values(value: Value) -> Result<Vec<String>, String> {
-  let Value::Array(values) = value else {
-    return Err("'enum' must be a list of strings".to_owned());
+fn parse_enum_source(value: Value) -> Result<VariableEnum, String> {
+  let values = match value {
+    Value::Array(values) => values,
+    Value::String(template) if template.contains("{{") && template.contains("}}") => {
+      return Ok(VariableEnum::Template(template));
+    },
+    _ => return Err("'enum' must be a list of strings or a template expression".to_owned()),
   };
   if values.is_empty() {
     return Err("'enum' must not be empty".to_owned());
@@ -246,7 +269,7 @@ fn parse_enum_values(value: Value) -> Result<Vec<String>, String> {
     result.push(value);
   }
 
-  Ok(result)
+  Ok(VariableEnum::Values(result))
 }
 
 impl Serialize for Variable {
@@ -297,6 +320,25 @@ mod tests {
     let variable = Variable::from_json(json!({ "required": true })).unwrap();
 
     assert_eq!(variable.template_value(), None);
+  }
+
+  #[test]
+  fn preserves_template_backed_enums() {
+    let variable = Variable::from_json(json!({
+      "required": "prompt",
+      "enum": "{{ ENVIRONMENTS }}"
+    }))
+    .unwrap();
+
+    assert_eq!(variable.enum_values(), None);
+    assert_eq!(
+      variable.enum_source(),
+      Some(&VariableEnum::Template("{{ ENVIRONMENTS }}".to_owned()))
+    );
+    assert_eq!(
+      variable.configuration_value(),
+      json!({ "required": "prompt", "enum": "{{ ENVIRONMENTS }}" })
+    );
   }
 
   #[test]

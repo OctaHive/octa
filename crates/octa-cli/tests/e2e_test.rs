@@ -1618,6 +1618,7 @@ vars:
   GLOBAL_REQUIRED:
     required: true
   DISPLAY: "configured-{{ GLOBAL_REQUIRED }}"
+  ENVIRONMENTS: [development, production]
 
 tasks:
   deploy:
@@ -1632,6 +1633,13 @@ tasks:
       ENVIRONMENT:
         required: prompt
         enum: [development, production]
+    shell: echo "{{ ENVIRONMENT }}"
+
+  select-dynamic-environment:
+    vars:
+      ENVIRONMENT:
+        required: prompt
+        enum: "{{ ENVIRONMENTS }}"
     shell: echo "{{ ENVIRONMENT }}"
 "#,
   )?;
@@ -1707,6 +1715,17 @@ tasks:
     .assert()
     .failure()
     .stderr(predicate::str::contains("must be one of: development, production"));
+
+  let mut dynamic = Command::cargo_bin("octa")?;
+  dynamic
+    .current_dir(tmp_dir.path())
+    .args(["select-dynamic-environment", "ENVIRONMENT=production"])
+    .env("GLOBAL_REQUIRED", "present")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  dynamic
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("production"));
 
   Ok(())
 }

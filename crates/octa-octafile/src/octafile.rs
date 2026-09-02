@@ -2553,6 +2553,26 @@ tasks: {}
   }
 
   #[test]
+  fn parses_required_variable_enum_reference() {
+    let vars: Vars = serde_yml::from_str(
+      r#"
+      ENVIRONMENTS: [development, production]
+      ENVIRONMENT:
+        required: prompt
+        enum: "{{ ENVIRONMENTS }}"
+      "#,
+    )
+    .unwrap();
+
+    assert_eq!(
+      vars["ENVIRONMENT"].enum_source(),
+      Some(&VariableEnum::Template("{{ ENVIRONMENTS }}".to_owned()))
+    );
+    let serialized = serde_yml::to_string(&vars).unwrap();
+    assert_eq!(serde_yml::from_str::<Vars>(&serialized).unwrap(), vars);
+  }
+
+  #[test]
   fn rejects_invalid_secret_variables_during_parsing() {
     for definition in [
       "value: hidden\n    sh: echo hidden\n    secret: true",

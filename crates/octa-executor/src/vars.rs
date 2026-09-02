@@ -8,7 +8,7 @@ use std::{
 
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
-use octa_octafile::{RequiredMode, VariableSource, Vars as OctafileVars};
+use octa_octafile::{RequiredMode, VariableEnum, VariableSource, Vars as OctafileVars};
 use octa_plugin::logger::collect_value_redactions;
 use regex::Regex;
 use serde::Serialize;
@@ -44,8 +44,18 @@ struct VariableLayer {
   dir: Option<PathBuf>,
 }
 
+/// Requirement metadata retained until its enum templates can see all variable layers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RequiredVar {
+  mode: RequiredMode,
+  secret: bool,
+  enum_source: Option<VariableEnum>,
+  question: Option<String>,
+}
+
+/// Requirement with concrete choices ready for validation or interactive input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedRequiredVar {
   mode: RequiredMode,
   secret: bool,
   enum_values: Option<Vec<String>>,
@@ -194,7 +204,7 @@ impl Vars {
     // Consume the typed parser representation directly so secret metadata is not lost in Serde.
     for (key, variable) in variables {
       let secret = variable.is_secret();
-      let enum_values = variable.enum_values().map(<[String]>::to_vec);
+      let enum_source = variable.enum_source().cloned();
       let question = variable.question().map(str::to_owned);
       let value = match variable.into_source() {
         VariableSource::Value(value) => value,
@@ -205,7 +215,7 @@ impl Vars {
             RequiredVar {
               mode,
               secret,
-              enum_values,
+              enum_source,
               question,
             },
           );
@@ -230,7 +240,7 @@ impl Vars {
   /// Resolves prompt-backed requirements while the execution plan is being built.
   pub(crate) fn resolve_required(&mut self, resolver: Option<&dyn VariableResolver>) -> ExecutorResult<()> {
     let contexts = self.collect_context_chain();
-    let required_vars = collect_required_vars(&contexts);
+    let required_vars = resolve_required_vars(&contexts, collect_required_vars(&contexts))?;
     let supplied = collect_supplied_required_vars(&contexts, &required_vars);
     let mut prompts = Vec::new();
 
@@ -321,7 +331,8 @@ impl Vars {
     tera: &mut Tera,
     dry: bool,
   ) -> ExecutorResult<ResolvedVars> {
-    let required_vars = collect_required_vars(&contexts);
+    let required_definitions = collect_required_vars(&contexts);
+    let required_vars = resolve_required_vars(&contexts, required_definitions.clone())?;
     let supplied_required_vars = collect_supplied_required_vars(&contexts, &required_vars);
     validate_required_vars(
       &required_vars,
@@ -382,7 +393,7 @@ impl Vars {
     Ok(ResolvedVars {
       values: accumulated,
       secrets,
-      required_vars,
+      required_vars: required_definitions,
     })
   }
 
@@ -499,9 +510,59 @@ fn collect_required_vars(contexts: &[VariableLayer]) -> IndexMap<String, Require
   required_vars
 }
 
+fn resolve_required_vars(
+  contexts: &[VariableLayer],
+  required_vars: IndexMap<String, RequiredVar>,
+) -> ExecutorResult<IndexMap<String, ResolvedRequiredVar>> {
+  let (values, mut secrets) = collect_enum_context(contexts);
+  secrets.extend(
+    required_vars
+      .iter()
+      .filter(|(_, required)| required.secret)
+      .map(|(name, _)| name.clone()),
+  );
+  required_vars
+    .into_iter()
+    .map(|(name, required)| {
+      let enum_values = required
+        .enum_source
+        .as_ref()
+        .map(|source| crate::variable_enum::resolve(&name, source, &values, &secrets))
+        .transpose()?;
+      Ok((
+        name,
+        ResolvedRequiredVar {
+          mode: required.mode,
+          secret: required.secret,
+          enum_values,
+          question: required.question,
+        },
+      ))
+    })
+    .collect()
+}
+
+fn collect_enum_context(contexts: &[VariableLayer]) -> (IndexMap<String, Value>, HashSet<String>) {
+  let mut values = IndexMap::new();
+  let mut secrets = HashSet::new();
+
+  for layer in contexts {
+    for (name, value) in &layer.values {
+      values.insert(name.clone(), value.clone());
+      if layer.secrets.contains(name) {
+        secrets.insert(name.clone());
+      } else {
+        secrets.remove(name);
+      }
+    }
+  }
+
+  (values, secrets)
+}
+
 fn collect_supplied_required_vars(
   contexts: &[VariableLayer],
-  required_vars: &IndexMap<String, RequiredVar>,
+  required_vars: &IndexMap<String, ResolvedRequiredVar>,
 ) -> IndexMap<String, SuppliedRequiredVar> {
   let mut supplied = IndexMap::new();
   for layer in contexts {
@@ -522,7 +583,7 @@ fn collect_supplied_required_vars(
 }
 
 fn validate_required_vars<'a>(
-  required_vars: &IndexMap<String, RequiredVar>,
+  required_vars: &IndexMap<String, ResolvedRequiredVar>,
   values: impl Iterator<Item = (&'a String, &'a Value)>,
 ) -> ExecutorResult<()> {
   let mut supplied = HashMap::new();
@@ -975,6 +1036,71 @@ mod tests {
         secret: true,
       }]
     );
+  }
+
+  #[test]
+  fn resolves_enum_from_another_variable() {
+    let configured: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      ENVIRONMENTS: [development, production]
+      ENVIRONMENT:
+        required: prompt
+        enum: "{{ ENVIRONMENTS }}"
+      "#,
+    )
+    .unwrap();
+    let resolver = FixedResolver::new("production");
+    let mut vars = Vars::with_variables(configured);
+
+    vars.resolve_required(Some(&resolver)).unwrap();
+
+    assert_eq!(vars.get("ENVIRONMENT"), Some(&json!("production")));
+    assert_eq!(
+      resolver.prompts.lock().unwrap()[0].enum_values,
+      Some(vec!["development".to_owned(), "production".to_owned()])
+    );
+  }
+
+  #[test]
+  fn expands_templates_in_literal_enum_options() {
+    let configured: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      DEFAULT_ENVIRONMENT: development
+      ENVIRONMENT:
+        required: prompt
+        enum: ["{{ DEFAULT_ENVIRONMENT }}", production]
+      "#,
+    )
+    .unwrap();
+    let resolver = FixedResolver::new("development");
+    let mut vars = Vars::with_variables(configured);
+
+    vars.resolve_required(Some(&resolver)).unwrap();
+
+    assert_eq!(
+      resolver.prompts.lock().unwrap()[0].enum_values,
+      Some(vec!["development".to_owned(), "production".to_owned()])
+    );
+  }
+
+  #[test]
+  fn rejects_enum_references_that_are_not_string_lists() {
+    let configured: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      ENVIRONMENTS: development
+      ENVIRONMENT:
+        required: prompt
+        enum: "{{ ENVIRONMENTS }}"
+      "#,
+    )
+    .unwrap();
+    let mut vars = Vars::with_variables(configured);
+
+    assert!(matches!(
+      vars.resolve_required(Some(&FixedResolver::new("development"))),
+      Err(ExecutorError::RequiredVariableEnumError(name, message))
+        if name == "ENVIRONMENT" && message == "value must be a list of strings"
+    ));
   }
 
   #[test]

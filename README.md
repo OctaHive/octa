@@ -554,6 +554,26 @@ hidden input. `required: true` remains strictly non-interactive. A prompt also f
 waiting for input when no terminal is attached or when `--non-interactive` is used, so CI runs cannot
 hang.
 
+The choices can also come from another variable. The referenced value must be a concrete list of
+strings; secret and shell-backed variables are intentionally unavailable because enum choices are
+shown in the terminal. Templates inside a literal or referenced list are expanded before the prompt:
+
+```yaml
+vars:
+  DEPLOYMENT_ENVIRONMENTS:
+    - development
+    - staging
+    - production
+
+tasks:
+  deploy:
+    vars:
+      ENVIRONMENT:
+        required: prompt
+        enum: "{{ DEPLOYMENT_ENVIRONMENTS }}"
+    shell: ./deploy.sh
+```
+
 Prompts are resolved while Octa builds the selected execution graph, before any command starts.
 Consequently, a reachable task may request its variables even when a later `if` condition skips it.
 

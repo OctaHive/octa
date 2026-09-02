@@ -18,6 +18,7 @@ pub mod task;
 mod task_context;
 mod task_identity;
 mod timestamp_source;
+mod variable_enum;
 pub mod vars;
 pub mod watcher;
 
