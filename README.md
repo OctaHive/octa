@@ -447,6 +447,20 @@ Use `sh:` when the command produces the complete value. The `shell` Tera filter 
 output is embedded in a larger template. The existing
 `{{ shell(command="git describe --tags") }}` function form remains supported.
 
+Any registered plugin can also produce a value during interpolation. Pass the plugin's task type
+as `key`; the value is validated against the schema advertised by that plugin before execution:
+
+```yaml
+env:
+  FROM_FUNCTION: '{{ plugin(key="tpl", value="Hello {{ NAME }}") }}'
+  FROM_FILTER: '{{ "Hello {{ NAME }}" | plugin(key="tpl") }}'
+```
+
+The `shell` function, filter, and `sh:` source select whichever plugin advertises the `shell`
+capability; they do not depend on its task type or executable name. The generic `plugin` forms make
+the same mechanism available to third-party task plugins. Plugin-backed interpolation is available
+in runtime variable and environment values, task directory templates, and preconditions.
+
 Shell-backed values run once for each task execution and are evaluated again when watch mode reruns
 the task. Octafile-level values run from their Octafile directory, while task-level environment
 values run from the effective task directory. They receive environment values and dotenv entries

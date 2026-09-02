@@ -2078,7 +2078,9 @@ tasks:
       FROM_SHELL:
         sh: "{env_command}"
       FROM_FILTER: '{{{{ "{read_command}" | shell }}}}'
-    tpl: "$FROM_VAR|$FROM_SHELL|$FROM_FILTER"
+      FROM_PLUGIN_FUNCTION: '{{{{ plugin(key="tpl", value="from-function") }}}}'
+      FROM_PLUGIN_FILTER: '{{{{ "from-filter" | plugin(key="tpl") }}}}'
+    tpl: "$FROM_VAR|$FROM_SHELL|$FROM_FILTER|$FROM_PLUGIN_FUNCTION|$FROM_PLUGIN_FILTER"
 "#
   );
   fs::write(tmp_dir.path().join("octafile.yml"), octafile)?;
@@ -2087,10 +2089,66 @@ tasks:
   cmd.current_dir(tmp_dir.path());
   cmd.arg("show");
   cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd.assert().success().stdout(predicate::str::contains(
+    "dynamic|from-dotenv|dynamic|from-function|from-filter",
+  ));
+
+  Ok(())
+}
+
+#[test]
+fn test_template_plugin_values_are_validated_at_runtime() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+tasks:
+  show:
+    env:
+      INVALID: '{{ 42 | plugin(key="tpl") }}'
+    tpl: "$INVALID"
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd.current_dir(tmp_dir.path());
+  cmd.arg("show");
+  cmd.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  cmd
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("Invalid parameters for plugin 'tpl'"));
+
+  Ok(())
+}
+
+#[test]
+fn test_plugin_helpers_are_available_in_runtime_task_templates() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+tasks:
+  show:
+    dir: '{{ plugin(key="tpl", value="nested") }}'
+    preconditions:
+      - '{{ plugin(key="tpl", value="true") }}'
+    shell: echo runtime-templates
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd
+    .current_dir(tmp_dir.path())
+    .arg("show")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
   cmd
     .assert()
     .success()
-    .stdout(predicate::str::contains("dynamic|from-dotenv|dynamic"));
+    .stdout(predicate::str::contains("runtime-templates"));
+  assert!(tmp_dir.path().join("nested").is_dir());
 
   Ok(())
 }
@@ -2399,6 +2457,58 @@ tasks:
     lines == ["A-start", "A-end", "B-start", "B-end"] || lines == ["B-start", "B-end", "A-start", "A-end"],
     "commands overlapped: {lines:?}"
   );
+
+  Ok(())
+}
+
+#[test]
+fn test_parallel_commands_share_one_plugin_connection() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  #[cfg(windows)]
+  let delay = "ping -n 2 127.0.0.1 > nul";
+  #[cfg(not(windows))]
+  let delay = "sleep 0.2";
+  #[cfg(windows)]
+  let commands = [
+    format!(">>trace.txt echo A-start && {delay} && >>trace.txt echo A-end"),
+    format!(">>trace.txt echo B-start && {delay} && >>trace.txt echo B-end"),
+  ];
+  #[cfg(not(windows))]
+  let commands = [
+    format!("echo A-start>>trace.txt && {delay} && echo A-end>>trace.txt"),
+    format!("echo B-start>>trace.txt && {delay} && echo B-end>>trace.txt"),
+  ];
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    format!(
+      r#"
+version: 1
+
+tasks:
+  parallel:
+    execute_mode: parallel
+    cmds:
+      - shell: "{first}"
+      - shell: "{second}"
+"#,
+      first = commands[0],
+      second = commands[1],
+    ),
+  )?;
+
+  let mut command = Command::cargo_bin("octa")?;
+  command
+    .current_dir(tmp_dir.path())
+    .env("OCTA_TESTS", "")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+    .arg("parallel");
+  command.assert().success();
+
+  let trace = fs::read_to_string(tmp_dir.path().join("trace.txt"))?;
+  let lines = trace.lines().map(str::trim).collect::<Vec<_>>();
+  assert_eq!(lines.len(), 4);
+  assert!(lines[..2].iter().all(|line| line.ends_with("-start")), "{lines:?}");
+  assert!(lines[2..].iter().all(|line| line.ends_with("-end")), "{lines:?}");
 
   Ok(())
 }

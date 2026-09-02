@@ -37,4 +37,6 @@ tasks:
       EXPORTED_COMMIT: "{{ COMMIT }}"
       CURRENT_BRANCH: '{{ "git branch --show-current" | shell }}'
       DESCRIBE: '{{ shell(command="git describe --tags --always") }}'
-    shell: echo ${EXPORTED_COMMIT} ${CURRENT_BRANCH} ${DESCRIBE}
+      PLUGIN_FUNCTION: '{{ plugin(key="tpl", value="from plugin function") }}'
+      PLUGIN_FILTER: '{{ "from plugin filter" | plugin(key="tpl") }}'
+    shell: echo ${EXPORTED_COMMIT} ${CURRENT_BRANCH} ${DESCRIBE} ${PLUGIN_FUNCTION} ${PLUGIN_FILTER}

@@ -22,6 +22,18 @@ pub enum ExecutorError {
   #[error("Missing plugin keys in task")]
   TaskParsedError,
 
+  #[error("No running plugin provides task type '{0}'")]
+  PluginUnavailable(String),
+
+  #[error("Invalid parameters for plugin '{0}': {1}")]
+  PluginValidationFailed(String, String),
+
+  #[error("Plugin '{key}' evaluation failed with status {code}: {stderr}")]
+  PluginEvaluationFailed { key: String, code: i32, stderr: String },
+
+  #[error("Plugin evaluation is unavailable while resolving '{0}'")]
+  PluginEvaluationUnavailable(String),
+
   #[error("Cycle detected in task dependencies")]
   CycleDetected,
 

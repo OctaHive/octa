@@ -12,6 +12,8 @@ pub struct Version {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Schema {
   pub key: String,
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub capabilities: Vec<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub validation_schema: Option<Map<String, Value>>,
 }
@@ -31,6 +33,9 @@ pub enum OctaCommand {
     /// The default keeps the wire protocol compatible with runners that predate secret variables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     secret_vars: Vec<String>,
+    /// Hides the complete plugin payload from diagnostics for secret-producing evaluations.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    redact_params: bool,
     dry: bool,
   },
   Cancel {
@@ -61,6 +66,7 @@ mod tests {
     let schema: Schema = serde_json::from_str(r#"{"key":"shell"}"#).unwrap();
 
     assert_eq!(schema.key, "shell");
+    assert!(schema.capabilities.is_empty());
     assert!(schema.validation_schema.is_none());
     assert_eq!(serde_json::to_string(&schema).unwrap(), r#"{"key":"shell"}"#);
   }
@@ -79,9 +85,15 @@ mod tests {
     )
     .unwrap();
 
-    let OctaCommand::Execute { secret_vars, .. } = command else {
+    let OctaCommand::Execute {
+      secret_vars,
+      redact_params,
+      ..
+    } = command
+    else {
       panic!("expected execute command");
     };
     assert!(secret_vars.is_empty());
+    assert!(!redact_params);
   }
 }

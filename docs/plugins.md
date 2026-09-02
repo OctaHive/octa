@@ -53,6 +53,7 @@ Plugin Schema response:
 | --- | --- | --- |
 | type | String | Plugin command type |
 | key | String | Plugin task key |
+| capabilities | Array | Optional generic capabilities implemented by the plugin |
 | validation_schema | Object | Optional JSON Schema for the plugin task value |
 
 Example:
@@ -62,6 +63,7 @@ Example:
   "type":"Schema",
   "payload":{
     "key": "shell",
+    "capabilities": ["shell"],
     "validation_schema": {
       "type": "string"
     }
@@ -73,6 +75,10 @@ Octa compiles `validation_schema` once when loading the plugins and validates ev
 annotation, and command before execution. An invalid plugin schema prevents the Octafile from being
 loaded. Omitting `validation_schema` keeps compatibility with older plugins: the task key is recognized,
 but the plugin-specific value is not validated.
+
+Capabilities describe behavior independently of a task key or executable name. The built-in shell
+plugin advertises `shell`, which is used by `sh:` values and the `shell` Tera function and filter.
+Octa rejects duplicate keys and capabilities so their resolution remains deterministic.
 
 This concludes the first stage of interaction with the plugin.
 
@@ -108,7 +114,14 @@ Octa rejects an annotation when no loaded plugin exposes the corresponding schem
 task attribute form, such as `shell: cargo build`, remains supported and is validated with the same
 schema.
 
-Next, Octa can send an arbitrary number of Execute commands, which the plugin processes and executes. Here is what the Execute commands look like:
+Next, Octa can send an arbitrary number of Execute commands, including concurrent commands over the
+same connection. The SDK starts each command independently and identifies all responses by the ID
+returned in `Started`; plugin implementations therefore must be safe to call concurrently. Here is
+what the Execute commands look like:
+
+Because `Execute` has no client-generated request ID, `Started` acknowledgements must be returned in
+the same order as the corresponding requests. After that acknowledgement, output and terminal
+responses from different command IDs may be interleaved freely.
 
 Octa Execute request:
 | Field | Type | Description |

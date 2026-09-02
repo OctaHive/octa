@@ -28,9 +28,13 @@ pub mod logger;
 pub mod protocol;
 pub mod socket;
 
+/// Capability used for values that execute a command and return its stdout.
+pub const SHELL_CAPABILITY: &str = "shell";
+
 #[derive(Clone)]
 pub struct PluginSchema {
   pub key: String,
+  pub capabilities: Vec<String>,
   pub validation_schema: Option<Map<String, Value>>,
 }
 
@@ -125,6 +129,7 @@ where
       envs,
       vars,
       secret_vars,
+      redact_params,
       dry,
     } => {
       let id = Uuid::new_v4().to_string();
@@ -132,6 +137,9 @@ where
       let mut redactions = Vec::new();
       for value in secret_vars.iter().filter_map(|name| vars.get(name)) {
         collect_value_redactions(value, &mut redactions);
+      }
+      if redact_params {
+        redactions.push(params.clone());
       }
       let command_logger = Arc::new(RedactingLogger::new(logger.clone(), redactions.clone()));
 
@@ -405,6 +413,7 @@ where
     Ok(OctaCommand::Schema) => {
       let schema_response = PluginResponse::Schema(Schema {
         key: schema.key,
+        capabilities: schema.capabilities,
         validation_schema: schema.validation_schema,
       });
       let response_json = serde_json::to_string(&schema_response)? + "\n";
@@ -662,6 +671,7 @@ mod tests {
       },
       vars: HashMap::new(),
       secret_vars: Vec::new(),
+      redact_params: false,
       dry: false,
     };
 
@@ -692,6 +702,53 @@ mod tests {
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
     assert!(!log_messages.is_empty());
+  }
+
+  #[tokio::test]
+  async fn secret_producer_payload_is_redacted_from_plugin_logs() {
+    let (reader, writer) = tokio::io::duplex(1024);
+    let writer = Arc::new(Mutex::new(writer));
+    let active_commands = Arc::new(Mutex::new(HashMap::new()));
+    let plugin = Arc::new(MockPlugin {
+      version: "1.0.0".to_string(),
+      execution_delay: None,
+      should_fail: false,
+      output_lines: Vec::new(),
+    });
+    let logger = Arc::new(MockLogger::new());
+    let secret = "secret-producing-payload";
+    let command = OctaCommand::Execute {
+      params: secret.to_owned(),
+      args: Vec::new(),
+      dir: PathBuf::from("."),
+      envs: HashMap::new(),
+      vars: HashMap::new(),
+      secret_vars: Vec::new(),
+      redact_params: true,
+      dry: false,
+    };
+
+    let response_handle = tokio::spawn(async move { read_responses(reader).await });
+    handle_command(
+      command,
+      writer,
+      active_commands,
+      plugin,
+      logger.clone(),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    response_handle.await.unwrap();
+
+    let messages = logger
+      .as_any()
+      .downcast_ref::<MockLogger>()
+      .unwrap()
+      .get_messages()
+      .await;
+    assert!(messages.iter().all(|message| !message.contains(secret)));
+    assert!(messages.iter().any(|message| message.contains("*****")));
   }
 
   #[tokio::test]
@@ -752,6 +809,7 @@ mod tests {
         envs: HashMap::new(),
         vars: HashMap::new(),
         secret_vars: Vec::new(),
+        redact_params: false,
         dry: false,
       },
       writer.clone(),
@@ -801,6 +859,7 @@ mod tests {
       envs: HashMap::new(),
       vars: HashMap::new(),
       secret_vars: Vec::new(),
+      redact_params: false,
       dry: false,
     };
 
@@ -852,6 +911,7 @@ mod tests {
       envs: HashMap::new(),
       vars: HashMap::new(),
       secret_vars: Vec::new(),
+      redact_params: false,
       dry: false,
     };
 
@@ -907,6 +967,7 @@ mod tests {
       envs: HashMap::new(),
       vars: HashMap::new(),
       secret_vars: Vec::new(),
+      redact_params: false,
       dry: false,
     };
 
@@ -1008,6 +1069,7 @@ mod tests {
       envs: HashMap::new(),
       vars: HashMap::new(),
       secret_vars: Vec::new(),
+      redact_params: false,
       dry: false,
     };
 
@@ -1062,6 +1124,7 @@ mod tests {
       envs,
       vars: HashMap::new(),
       secret_vars: Vec::new(),
+      redact_params: false,
       dry: false,
     };
 
@@ -1112,6 +1175,7 @@ mod tests {
       envs: HashMap::new(),
       vars: HashMap::new(),
       secret_vars: Vec::new(),
+      redact_params: false,
       dry: false,
     };
 
@@ -1177,6 +1241,7 @@ mod tests {
         envs: HashMap::new(),
         vars: HashMap::new(),
         secret_vars: Vec::new(),
+        redact_params: false,
         dry: false,
       };
 
@@ -1244,6 +1309,7 @@ mod tests {
 
     let schema = PluginSchema {
       key: "key".to_owned(),
+      capabilities: Vec::new(),
       validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
     };
 
@@ -1303,6 +1369,7 @@ mod tests {
       envs: HashMap::new(),
       vars: HashMap::new(),
       secret_vars: Vec::new(),
+      redact_params: false,
       dry: false,
     };
     let cmd_json = serde_json::to_string(&cmd_command).unwrap() + "\n";

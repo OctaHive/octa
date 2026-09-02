@@ -10,7 +10,7 @@ use tera::{Context, Tera, Value};
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
-  function::format_tera_error,
+  template::format_tera_error,
 };
 
 lazy_static! {

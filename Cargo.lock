@@ -1324,7 +1324,6 @@ dependencies = [
  "ignore",
  "indexmap",
  "lazy_static",
- "nix",
  "octa-dag",
  "octa-finder",
  "octa-octafile",
@@ -1347,7 +1346,6 @@ dependencies = [
  "tracing-test",
  "uuid",
  "whoami",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1427,6 +1425,7 @@ name = "octa-plugin-manager"
 version = "0.2.1"
 dependencies = [
  "interprocess",
+ "jsonschema",
  "nix",
  "octa-plugin",
  "semver",

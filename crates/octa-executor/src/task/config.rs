@@ -101,11 +101,16 @@ impl PluginInvocation {
     Self { key, value }
   }
 
+  #[cfg(test)]
   pub(super) fn command(&self) -> String {
     match &self.value {
       Value::String(command) => command.clone(),
       value => value.to_string(),
     }
+  }
+
+  pub(super) fn value(&self) -> Value {
+    self.value.clone()
   }
 }
 

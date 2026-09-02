@@ -41,10 +41,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 regex = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
-[target.'cfg(unix)'.dependencies]
-nix = "0.31"
 
 [dev-dependencies]
 tempfile = "3.27"

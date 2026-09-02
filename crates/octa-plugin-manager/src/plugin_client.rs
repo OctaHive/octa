@@ -1,11 +1,17 @@
-use std::{collections::HashMap, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+  collections::{HashMap, VecDeque},
+  io,
+  path::PathBuf,
+  sync::{Arc, Weak},
+  time::Duration,
+};
 
 use interprocess::local_socket::{tokio::Stream as TokioStream, traits::tokio::Stream as StreamTrait, Name};
 use semver::{Version as SemVersion, VersionReq};
 use serde_json::Value;
 use tokio::{
   io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
-  sync::{mpsc, Mutex},
+  sync::{mpsc, oneshot, Mutex},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -54,29 +60,85 @@ impl std::fmt::Display for PluginClientError {
       PluginClientError::Protocol(msg) => write!(f, "Protocol error: {}", msg),
       PluginClientError::ConnectionClosed => write!(f, "Connection closed"),
       PluginClientError::VersionMismatch => write!(f, "Version mismatch"),
-      PluginClientError::WriterClosed => write!(f, "Writter closed"),
+      PluginClientError::WriterClosed => write!(f, "Writer closed"),
     }
   }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PluginClient {
   inner: Arc<PluginClientInner>,
-  response_rx: mpsc::UnboundedReceiver<PluginResponse>,
-  shutdown_signal: Arc<CancellationToken>,
 }
 
 #[derive(Debug)]
 struct PluginClientInner {
   writer: Mutex<Option<WriteHalf<TokioStream>>>,
-  response_tx: mpsc::UnboundedSender<PluginResponse>,
+  control_rx: Mutex<mpsc::UnboundedReceiver<PluginResponse>>,
+  pending_starts: Mutex<VecDeque<oneshot::Sender<Result<PluginExecution, PluginClientError>>>>,
+  commands: Mutex<HashMap<String, mpsc::UnboundedSender<PluginResponse>>>,
+  shutdown_signal: CancellationToken,
 }
 
 impl Drop for PluginClient {
   fn drop(&mut self) {
-    // Signal shutdown in drop
-    self.shutdown_signal.cancel();
+    if Arc::strong_count(&self.inner) == 1 {
+      self.inner.shutdown_signal.cancel();
+    }
   }
+}
+
+#[derive(Debug)]
+pub struct PluginExecution {
+  id: String,
+  response_rx: mpsc::UnboundedReceiver<PluginResponse>,
+  client: PluginClient,
+}
+
+impl PluginExecution {
+  pub fn id(&self) -> &str {
+    &self.id
+  }
+
+  pub async fn receive_output(
+    &mut self,
+    cancel_token: &CancellationToken,
+  ) -> Result<Option<PluginResponse>, PluginClientError> {
+    tokio::select! {
+      response = self.response_rx.recv() => Ok(response),
+      _ = cancel_token.cancelled() => Err(PluginClientError::Protocol("Command cancelled".into())),
+    }
+  }
+
+  /// Sends cancellation and consumes this command's terminal response only.
+  pub async fn cancel_and_wait(&mut self) -> Result<(), PluginClientError> {
+    self.client.send(&OctaCommand::Cancel { id: self.id.clone() }).await?;
+
+    let wait = async {
+      loop {
+        match self.response_rx.recv().await {
+          Some(PluginResponse::ExitStatus { .. } | PluginResponse::Error { .. }) => return Ok(()),
+          Some(_) => {},
+          None => return Err(PluginClientError::ConnectionClosed),
+        }
+      }
+    };
+
+    tokio::time::timeout(Duration::from_secs(5), wait)
+      .await
+      .map_err(|_| PluginClientError::Protocol(format!("Timed out while cancelling command {}", self.id)))?
+  }
+}
+
+/// Complete payload required to start one plugin command.
+pub struct PluginExecutionRequest {
+  pub params: String,
+  pub dry: bool,
+  pub args: Vec<String>,
+  pub dir: PathBuf,
+  pub vars: HashMap<String, Value>,
+  pub envs: HashMap<String, String>,
+  pub secret_vars: Vec<String>,
+  pub redact_params: bool,
 }
 
 pub async fn connect_to_plugin(socket_path: &Name<'_>) -> io::Result<TokioStream> {
@@ -102,46 +164,60 @@ impl PluginClient {
     let stream = connect_to_plugin(socket_name).await.map_err(PluginClientError::Io)?;
     let (reader, writer) = tokio::io::split(stream);
 
-    let (response_tx, response_rx) = mpsc::unbounded_channel();
-    let shutdown_signal = Arc::new(CancellationToken::new());
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
 
     let inner = Arc::new(PluginClientInner {
       writer: Mutex::new(Some(writer)),
-      response_tx: response_tx.clone(),
+      control_rx: Mutex::new(control_rx),
+      pending_starts: Mutex::new(VecDeque::new()),
+      commands: Mutex::new(HashMap::new()),
+      shutdown_signal: CancellationToken::new(),
     });
 
-    // Start response handling task with the inner Arc
-    Self::start_response_handler(reader, Arc::clone(&inner), Arc::clone(&shutdown_signal));
+    Self::start_response_handler(
+      reader,
+      Arc::downgrade(&inner),
+      inner.shutdown_signal.clone(),
+      control_tx,
+    );
 
-    let client = Self {
-      inner,
-      response_rx,
-      shutdown_signal,
-    };
-
-    Ok(client)
+    Ok(Self { inner })
   }
 
-  pub async fn handshake(&mut self) -> Result<(), PluginClientError> {
+  async fn send(&self, command: &OctaCommand) -> Result<(), PluginClientError> {
+    let json = serde_json::to_string(command)? + "\n";
+    let mut writer = self.inner.writer.lock().await;
+    let writer = writer.as_mut().ok_or(PluginClientError::WriterClosed)?;
+    if let Err(error) = writer.write_all(json.as_bytes()).await {
+      if error.kind() == io::ErrorKind::BrokenPipe {
+        return Err(PluginClientError::ConnectionClosed);
+      }
+      return Err(error.into());
+    }
+    writer.flush().await?;
+    Ok(())
+  }
+
+  async fn receive_control(&self) -> Result<PluginResponse, PluginClientError> {
+    self
+      .inner
+      .control_rx
+      .lock()
+      .await
+      .recv()
+      .await
+      .ok_or(PluginClientError::ConnectionClosed)
+  }
+
+  pub async fn handshake(&self) -> Result<(), PluginClientError> {
     let hello = OctaCommand::Hello(Version {
       version: env!("CARGO_PKG_VERSION").to_string(),
       features: vec![],
     });
+    self.send(&hello).await?;
 
-    let hello_json = serde_json::to_string(&hello)? + "\n";
-
-    {
-      let mut writer_guard = self.inner.writer.lock().await;
-      if let Some(writer) = writer_guard.as_mut() {
-        writer.write_all(hello_json.as_bytes()).await?;
-        writer.flush().await?;
-      } else {
-        return Err(PluginClientError::WriterClosed);
-      }
-    }
-
-    match self.response_rx.recv().await {
-      Some(PluginResponse::Hello(version)) => {
+    match self.receive_control().await? {
+      PluginResponse::Hello(version) => {
         let octa_version = SemVersion::parse(env!("CARGO_PKG_VERSION")).unwrap();
         let req_version = VersionReq::parse(&version.version).unwrap();
 
@@ -151,202 +227,162 @@ impl PluginClient {
 
         Ok(())
       },
-      Some(PluginResponse::Error { message, .. }) => Err(PluginClientError::Protocol(message)),
-      Some(_) => Err(PluginClientError::Protocol("Unexpected response to Hello".into())),
-      None => Err(PluginClientError::ConnectionClosed),
+      PluginResponse::Error { message, .. } => Err(PluginClientError::Protocol(message)),
+      _ => Err(PluginClientError::Protocol("Unexpected response to Hello".into())),
     }
   }
 
-  pub async fn get_schema(&mut self) -> Result<Schema, PluginClientError> {
-    let schema = OctaCommand::Schema;
+  pub async fn get_schema(&self) -> Result<Schema, PluginClientError> {
+    self.send(&OctaCommand::Schema).await?;
 
-    let schema_json = serde_json::to_string(&schema)? + "\n";
-
-    {
-      let mut writer_guard = self.inner.writer.lock().await;
-      if let Some(writer) = writer_guard.as_mut() {
-        writer.write_all(schema_json.as_bytes()).await?;
-        writer.flush().await?;
-      } else {
-        return Err(PluginClientError::WriterClosed);
-      }
-    }
-
-    match self.response_rx.recv().await {
-      Some(PluginResponse::Schema(schema)) => Ok(schema),
-      Some(PluginResponse::Error { message, .. }) => Err(PluginClientError::Protocol(message)),
-      Some(_) => Err(PluginClientError::Protocol("Unexpected response to Hello".into())),
-      None => Err(PluginClientError::ConnectionClosed),
+    match self.receive_control().await? {
+      PluginResponse::Schema(schema) => Ok(schema),
+      PluginResponse::Error { message, .. } => Err(PluginClientError::Protocol(message)),
+      _ => Err(PluginClientError::Protocol("Unexpected response to Schema".into())),
     }
   }
 
   fn start_response_handler(
     reader: ReadHalf<TokioStream>,
-    inner: Arc<PluginClientInner>,
-    shutdown_signal: Arc<CancellationToken>,
+    inner: Weak<PluginClientInner>,
+    shutdown_signal: CancellationToken,
+    control_tx: mpsc::UnboundedSender<PluginResponse>,
   ) {
     tokio::spawn(async move {
       let mut reader = BufReader::new(reader);
       let mut buffer = String::new();
 
       loop {
-        // Check shutdown signal
-        if shutdown_signal.is_cancelled() {
-          break;
-        }
-
         buffer.clear();
-        match reader.read_line(&mut buffer).await {
-          Ok(0) => break, // Connection closed
+        let read = tokio::select! {
+          _ = shutdown_signal.cancelled() => break,
+          result = reader.read_line(&mut buffer) => result,
+        };
+        match read {
+          Ok(0) => break,
           Ok(_) => {
-            // Parse the response once and handle any parsing errors
-            match serde_json::from_str::<PluginResponse>(buffer.trim()) {
-              Ok(response) => {
-                let _ = inner.response_tx.send(response.clone());
-              },
-              Err(e) => {
-                // Create error response for invalid JSON
-                let error_response = PluginResponse::Error {
-                  id: "parse_error".to_string(),
-                  message: format!("Invalid JSON response: {}", e),
-                };
-                let _ = inner.response_tx.send(error_response.clone());
-              },
-            }
+            let response =
+              serde_json::from_str::<PluginResponse>(buffer.trim()).unwrap_or_else(|error| PluginResponse::Error {
+                id: "parse_error".to_string(),
+                message: format!("Invalid JSON response: {error}"),
+              });
+            let Some(inner) = inner.upgrade() else {
+              break;
+            };
+            Self::dispatch_response(&inner, &control_tx, response).await;
           },
           Err(_) => break,
         }
       }
+
+      if let Some(inner) = inner.upgrade() {
+        for pending in inner.pending_starts.lock().await.drain(..) {
+          let _ = pending.send(Err(PluginClientError::ConnectionClosed));
+        }
+        inner.commands.lock().await.clear();
+      }
     });
   }
 
-  #[allow(clippy::too_many_arguments)]
-  /// Executes a command without secret metadata for callers using the original client API.
-  pub async fn execute(
-    &mut self,
-    params: String,
-    dry: bool,
-    args: Vec<String>,
-    dir: PathBuf,
-    vars: HashMap<String, Value>,
-    envs: HashMap<String, String>,
-    cancel_token: CancellationToken,
-  ) -> Result<String, PluginClientError> {
-    self
-      .execute_with_secrets(params, dry, args, dir, vars, envs, Vec::new(), cancel_token)
-      .await
-  }
+  async fn dispatch_response(
+    inner: &Arc<PluginClientInner>,
+    control_tx: &mpsc::UnboundedSender<PluginResponse>,
+    response: PluginResponse,
+  ) {
+    if let PluginResponse::Started { id } = &response {
+      let Some(pending) = inner.pending_starts.lock().await.pop_front() else {
+        return;
+      };
+      let (response_tx, response_rx) = mpsc::unbounded_channel();
+      inner.commands.lock().await.insert(id.clone(), response_tx);
+      let execution = PluginExecution {
+        id: id.clone(),
+        response_rx,
+        client: PluginClient { inner: inner.clone() },
+      };
+      if let Err(Ok(mut execution)) = pending.send(Ok(execution)) {
+        tokio::spawn(async move {
+          let _ = execution.cancel_and_wait().await;
+        });
+      }
+      return;
+    }
 
-  #[allow(clippy::too_many_arguments)]
-  /// Executes a command and tells the plugin SDK which variable values require log redaction.
-  pub async fn execute_with_secrets(
-    &mut self,
-    params: String,
-    dry: bool,
-    args: Vec<String>,
-    dir: PathBuf,
-    vars: HashMap<String, Value>,
-    envs: HashMap<String, String>,
-    secret_vars: Vec<String>,
-    cancel_token: CancellationToken,
-  ) -> Result<String, PluginClientError> {
-    let cmd = OctaCommand::Execute {
-      params,
-      args,
-      dir,
-      envs,
-      vars,
-      secret_vars,
-      dry,
+    let (id, terminal) = match &response {
+      PluginResponse::Stdout { id, .. } | PluginResponse::Stderr { id, .. } => (Some(id.clone()), false),
+      PluginResponse::ExitStatus { id, .. } | PluginResponse::Error { id, .. } => (Some(id.clone()), true),
+      _ => (None, false),
     };
-
-    let cmd_json = serde_json::to_string(&cmd)? + "\n";
-    {
-      let mut writer_guard = self.inner.writer.lock().await;
-      if let Some(writer) = writer_guard.as_mut() {
-        // Handle write errors that might indicate connection closure
-        if let Err(e) = writer.write_all(cmd_json.as_bytes()).await {
-          if e.kind() == io::ErrorKind::BrokenPipe {
-            return Err(PluginClientError::ConnectionClosed);
-          }
-          return Err(e.into());
+    if let Some(id) = id {
+      let sender = {
+        let mut commands = inner.commands.lock().await;
+        if terminal {
+          commands.remove(&id)
+        } else {
+          commands.get(&id).cloned()
         }
-        writer.flush().await?;
-      } else {
-        return Err(PluginClientError::WriterClosed);
+      };
+      if let Some(sender) = sender {
+        let _ = sender.send(response);
+        return;
+      }
+
+      if let PluginResponse::Error { message, .. } = response {
+        if let Some(pending) = inner.pending_starts.lock().await.pop_front() {
+          let _ = pending.send(Err(PluginClientError::Protocol(message)));
+          return;
+        }
+        let _ = control_tx.send(PluginResponse::Error { id, message });
+        return;
       }
     }
 
-    tokio::select! {
-      response = self.response_rx.recv() => {
-        match response {
-          Some(PluginResponse::Started { id }) => Ok(id),
-          Some(PluginResponse::Error { message, .. }) => {
-            Err(PluginClientError::Protocol(message))
-          }
-          Some(resp) => Err(PluginClientError::Protocol(format!("Expected Started response, received {:?}", resp))),
-          None => Err(PluginClientError::ConnectionClosed),
-        }
-      }
-      _ = cancel_token.cancelled() => {
-        Err(PluginClientError::Protocol("Command cancelled".into()))
-      }
-    }
+    let _ = control_tx.send(response);
   }
 
-  pub async fn receive_output(
-    &mut self,
-    cancel_token: &CancellationToken,
-  ) -> Result<Option<PluginResponse>, PluginClientError> {
-    tokio::select! {
-      response = self.response_rx.recv() => Ok(response),
-      _ = cancel_token.cancelled() => {
-        Err(PluginClientError::Protocol("Command cancelled".into()))
-      }
-    }
-  }
-
-  /// Cancels one command and consumes its terminal response so the client remains reusable.
-  pub async fn cancel_and_wait(&mut self, id: &str) -> Result<(), PluginClientError> {
-    let command = OctaCommand::Cancel { id: id.to_owned() };
-    let command_json = serde_json::to_string(&command)? + "\n";
+  /// Starts a command and returns an independently routed response stream.
+  pub async fn start_execution(
+    &self,
+    request: PluginExecutionRequest,
+    cancel_token: CancellationToken,
+  ) -> Result<PluginExecution, PluginClientError> {
+    let cmd = OctaCommand::Execute {
+      params: request.params,
+      args: request.args,
+      dir: request.dir,
+      envs: request.envs,
+      vars: request.vars,
+      secret_vars: request.secret_vars,
+      redact_params: request.redact_params,
+      dry: request.dry,
+    };
+    let command_json = serde_json::to_string(&cmd)? + "\n";
+    let (started_tx, started_rx) = oneshot::channel();
     {
+      // Queue and wire order must match because the protocol assigns the id in Started.
       let mut writer = self.inner.writer.lock().await;
       let writer = writer.as_mut().ok_or(PluginClientError::WriterClosed)?;
+      self.inner.pending_starts.lock().await.push_back(started_tx);
       writer.write_all(command_json.as_bytes()).await?;
       writer.flush().await?;
     }
 
-    let wait_for_terminal_response =
-      async {
-        loop {
-          match self.response_rx.recv().await {
-            Some(
-              PluginResponse::ExitStatus { id: response_id, .. } | PluginResponse::Error { id: response_id, .. },
-            ) if response_id == id => return Ok(()),
-            Some(_) => {},
-            None => return Err(PluginClientError::ConnectionClosed),
-          }
-        }
-      };
-
-    tokio::time::timeout(Duration::from_secs(5), wait_for_terminal_response)
-      .await
-      .map_err(|_| PluginClientError::Protocol(format!("Timed out while cancelling command {id}")))?
+    tokio::select! {
+      result = started_rx => result.unwrap_or(Err(PluginClientError::ConnectionClosed)),
+      _ = cancel_token.cancelled() => Err(PluginClientError::Protocol("Command cancelled".into())),
+    }
   }
 
-  pub async fn shutdown(&mut self) -> Result<(), PluginClientError> {
-    if self.response_rx.is_closed() {
-      // Connection was already closed from server side
+  pub async fn shutdown(&self) -> Result<(), PluginClientError> {
+    let connection_closed = self.inner.control_rx.lock().await.is_closed();
+    if connection_closed {
       self.cleanup().await;
-
       return Ok(());
     }
 
     let cmd = OctaCommand::Shutdown;
     let cmd_json = serde_json::to_string(&cmd)? + "\n";
 
-    // Try to write shutdown command
     let write_result = {
       let mut writer_guard = self.inner.writer.lock().await;
       if let Some(writer) = writer_guard.as_mut() {
@@ -354,47 +390,36 @@ impl PluginClient {
         if res.is_ok() {
           let _ = writer.flush().await;
         }
-
         res
       } else {
         return Err(PluginClientError::WriterClosed);
       }
     };
 
-    if let Err(e) = write_result {
-      if e.kind() == std::io::ErrorKind::BrokenPipe {
-        // Connection was closed by server
+    if let Err(error) = write_result {
+      if error.kind() == io::ErrorKind::BrokenPipe {
         self.cleanup().await;
-
         return Ok(());
       }
-
-      // Process windows specific error
-      if let Some(error_code) = e.raw_os_error() {
-        if error_code == 233 {
-          return Ok(());
-        }
+      if error.raw_os_error() == Some(233) {
+        return Ok(());
       }
-
-      return Err(e.into());
+      return Err(error.into());
     }
 
-    match tokio::time::timeout(std::time::Duration::from_secs(5), self.response_rx.recv()).await {
-      Ok(Some(PluginResponse::Shutdown { .. })) => {
-        // Normal shutdown
+    match tokio::time::timeout(Duration::from_secs(5), self.receive_control()).await {
+      Ok(Ok(PluginResponse::Shutdown { .. })) => {
         self.cleanup().await;
-
         Ok(())
       },
-      Ok(Some(PluginResponse::Error { message, .. })) => Err(PluginClientError::Protocol(message)),
-      Ok(Some(_)) => Err(PluginClientError::Protocol("Expected Shutdown response".into())),
-      Ok(None) => {
-        // Channel closed without response
+      Ok(Ok(PluginResponse::Error { message, .. })) => Err(PluginClientError::Protocol(message)),
+      Ok(Ok(_)) => Err(PluginClientError::Protocol("Expected Shutdown response".into())),
+      Ok(Err(PluginClientError::ConnectionClosed)) => {
         self.cleanup().await;
         Err(PluginClientError::ConnectionClosed)
       },
+      Ok(Err(error)) => Err(error),
       Err(_) => {
-        // Timeout
         self.cleanup().await;
         Ok(())
       },
@@ -402,16 +427,13 @@ impl PluginClient {
   }
 
   async fn cleanup(&self) {
-    self.shutdown_signal.cancel();
+    self.inner.shutdown_signal.cancel();
 
-    // Wait while stop reader
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let mut writer_lock = self.inner.writer.lock().await;
-    if writer_lock.is_some() {
-      let _ = writer_lock.as_mut().unwrap().shutdown().await;
-      *writer_lock = None;
+    let mut writer = self.inner.writer.lock().await;
+    if let Some(writer) = writer.as_mut() {
+      let _ = writer.shutdown().await;
     }
+    *writer = None;
   }
 }
 
@@ -429,6 +451,26 @@ mod tests {
   use tokio::io::{AsyncWriteExt, BufReader};
 
   const TIMEOUT: Duration = Duration::from_secs(5);
+
+  fn execution_request(params: impl Into<String>) -> PluginExecutionRequest {
+    PluginExecutionRequest {
+      params: params.into(),
+      dry: false,
+      args: Vec::new(),
+      dir: PathBuf::from("."),
+      vars: HashMap::new(),
+      envs: HashMap::new(),
+      secret_vars: Vec::new(),
+      redact_params: false,
+    }
+  }
+
+  async fn write_response(writer: &Arc<Mutex<WriteHalf<TokioStream>>>, response: PluginResponse) {
+    let response = serde_json::to_string(&response).unwrap() + "\n";
+    let mut writer = writer.lock().await;
+    writer.write_all(response.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+  }
 
   struct TestServer {
     listener: Arc<interprocess::local_socket::tokio::Listener>,
@@ -544,17 +586,24 @@ mod tests {
         } else if buffer.contains("Schema") {
           Some(PluginResponse::Schema(Schema {
             key: "key".to_owned(),
+            capabilities: Vec::new(),
             validation_schema: None,
           }))
         } else if buffer.contains("Execute") {
-          Some(PluginResponse::Started {
-            id: "test-id".to_string(),
-          })
+          let id = if handle_type == "multiple" {
+            match serde_json::from_str::<OctaCommand>(&buffer).unwrap() {
+              OctaCommand::Execute { params, .. } => params,
+              _ => unreachable!(),
+            }
+          } else {
+            "test-id".to_owned()
+          };
+          Some(PluginResponse::Started { id })
         } else if buffer.contains("Cancel") {
-          Some(PluginResponse::ExitStatus {
-            id: "test-id".to_string(),
-            code: -1,
-          })
+          let OctaCommand::Cancel { id } = serde_json::from_str::<OctaCommand>(&buffer).unwrap() else {
+            unreachable!()
+          };
+          Some(PluginResponse::ExitStatus { id, code: -1 })
         } else if buffer.contains("Shutdown") {
           Some(PluginResponse::Shutdown {
             message: "Shutting down".to_string(),
@@ -586,7 +635,7 @@ mod tests {
     let mut server = TestServer::new().await;
     server.start("single".to_string()).await;
 
-    let mut client = tokio::time::timeout(TIMEOUT, PluginClient::connect(server.socket_name()))
+    let client = tokio::time::timeout(TIMEOUT, PluginClient::connect(server.socket_name()))
       .await
       .expect("Connection timeout")
       .expect("Failed to connect client");
@@ -608,30 +657,22 @@ mod tests {
     let mut server = TestServer::new().await;
     server.start("execute".to_string()).await;
 
-    let mut client = tokio::time::timeout(TIMEOUT, PluginClient::connect(server.socket_name()))
+    let client = tokio::time::timeout(TIMEOUT, PluginClient::connect(server.socket_name()))
       .await
       .expect("Connection timeout")
       .expect("Failed to connect client");
 
     client.handshake().await.expect("Handshake error");
 
-    let result = tokio::time::timeout(
+    let execution = tokio::time::timeout(
       TIMEOUT,
-      client.execute(
-        "test".to_string(),
-        false,
-        vec![],
-        PathBuf::from("."),
-        HashMap::new(),
-        HashMap::new(),
-        CancellationToken::new(),
-      ),
+      client.start_execution(execution_request("test"), CancellationToken::new()),
     )
     .await
     .expect("Execute timeout")
     .expect("Failed to execute command");
 
-    assert_eq!(result, "test-id");
+    assert_eq!(execution.id(), "test-id");
 
     client.shutdown().await.expect("Failed to shutdown client");
     drop(client);
@@ -654,22 +695,14 @@ mod tests {
     let mut server = TestServer::new().await;
     server.start("execute".to_string()).await;
 
-    let mut client = PluginClient::connect(server.socket_name()).await.unwrap();
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
     client.handshake().await.unwrap();
-    let id = client
-      .execute(
-        "test".to_string(),
-        false,
-        vec![],
-        PathBuf::from("."),
-        HashMap::new(),
-        HashMap::new(),
-        CancellationToken::new(),
-      )
+    let mut execution = client
+      .start_execution(execution_request("test"), CancellationToken::new())
       .await
       .unwrap();
 
-    client.cancel_and_wait(&id).await.unwrap();
+    execution.cancel_and_wait().await.unwrap();
     client.shutdown().await.unwrap();
     drop(client);
     let messages = server.stop().await;
@@ -682,7 +715,7 @@ mod tests {
     let mut server = TestServer::new().await;
     server.start("shutdown".to_string()).await;
 
-    let mut client = tokio::time::timeout(TIMEOUT, PluginClient::connect(server.socket_name()))
+    let client = tokio::time::timeout(TIMEOUT, PluginClient::connect(server.socket_name()))
       .await
       .expect("Connection timeout")
       .expect("Failed to connect client");
@@ -716,21 +749,13 @@ mod tests {
     let mut server = TestServer::new().await;
     server.start_invalid().await;
 
-    let mut client = PluginClient::connect(server.socket_name()).await.unwrap();
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
 
     client.handshake().await.expect("Handshake error");
 
     // Try to execute a command which should receive invalid JSON response
     let result = client
-      .execute(
-        "test".to_string(),
-        false,
-        vec![],
-        PathBuf::from("."),
-        HashMap::new(),
-        HashMap::new(),
-        CancellationToken::new(),
-      )
+      .start_execution(execution_request("test"), CancellationToken::new())
       .await;
 
     assert!(result.is_err(), "Execute should fail due to invalid response");
@@ -762,24 +787,15 @@ mod tests {
     let mut server = TestServer::new().await;
     server.start("multiple".to_string()).await;
 
-    let client = Arc::new(Mutex::new(PluginClient::connect(server.socket_name()).await.unwrap()));
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
 
     // Spawn multiple concurrent commands
     let handles: Vec<_> = (0..5)
       .map(|i| {
-        let client = Arc::clone(&client);
+        let client = client.clone();
         tokio::spawn(async move {
-          let mut client = client.lock().await;
           client
-            .execute(
-              format!("test{}", i),
-              false,
-              vec![],
-              PathBuf::from("."),
-              HashMap::new(),
-              HashMap::new(),
-              CancellationToken::new(),
-            )
+            .start_execution(execution_request(format!("test{i}")), CancellationToken::new())
             .await
         })
       })
@@ -791,11 +807,94 @@ mod tests {
       assert!(result.is_ok());
     }
 
-    let mut client = client.lock().await;
     client.shutdown().await.expect("Failed to shutdown client");
 
     let messages = server.stop().await;
     assert!(messages.len() > 5); // Hello + multiple Execute commands
+  }
+
+  #[tokio::test]
+  async fn routes_interleaved_outputs_to_their_commands() {
+    let server = TestServer::new().await;
+    let listener = Arc::clone(&server.listener);
+    let server_handle = tokio::spawn(async move {
+      let stream = listener.accept().await.unwrap();
+      let (reader, writer) = tokio::io::split(stream);
+      let mut reader = BufReader::new(reader);
+      let writer = Arc::new(Mutex::new(writer));
+      let mut line = String::new();
+
+      loop {
+        line.clear();
+        if reader.read_line(&mut line).await.unwrap() == 0 {
+          break;
+        }
+        match serde_json::from_str::<OctaCommand>(line.trim()).unwrap() {
+          OctaCommand::Hello(_) => {
+            write_response(
+              &writer,
+              PluginResponse::Hello(Version {
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                features: Vec::new(),
+              }),
+            )
+            .await;
+          },
+          OctaCommand::Execute { params, .. } => {
+            write_response(&writer, PluginResponse::Started { id: params.clone() }).await;
+            let writer = writer.clone();
+            tokio::spawn(async move {
+              let delay = if params == "first" { 80 } else { 10 };
+              tokio::time::sleep(Duration::from_millis(delay)).await;
+              write_response(
+                &writer,
+                PluginResponse::Stdout {
+                  id: params.clone(),
+                  line: format!("{params}-output"),
+                },
+              )
+              .await;
+              write_response(&writer, PluginResponse::ExitStatus { id: params, code: 0 }).await;
+            });
+          },
+          OctaCommand::Shutdown => {
+            write_response(
+              &writer,
+              PluginResponse::Shutdown {
+                message: "done".to_owned(),
+              },
+            )
+            .await;
+            break;
+          },
+          _ => {},
+        }
+      }
+    });
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let (first, second) = tokio::join!(
+      client.start_execution(execution_request("first"), CancellationToken::new()),
+      client.start_execution(execution_request("second"), CancellationToken::new())
+    );
+
+    async fn output(mut execution: PluginExecution) -> String {
+      loop {
+        match execution.receive_output(&CancellationToken::new()).await.unwrap() {
+          Some(PluginResponse::Stdout { line, .. }) => return line,
+          Some(_) => {},
+          None => panic!("command response stream closed"),
+        }
+      }
+    }
+
+    let (first, second) = tokio::join!(output(first.unwrap()), output(second.unwrap()));
+    assert_eq!(first, "first-output");
+    assert_eq!(second, "second-output");
+
+    client.shutdown().await.unwrap();
+    server_handle.await.unwrap();
   }
 
   #[tokio::test]
@@ -829,6 +928,7 @@ mod tests {
 
             let response = PluginResponse::Schema(Schema {
               key: "key".to_owned(),
+              capabilities: Vec::new(),
               validation_schema: None,
             });
             let response_json = serde_json::to_string(&response).unwrap() + "\n";
@@ -841,14 +941,14 @@ mod tests {
           if reader.read_line(&mut buffer).await.is_ok() {
             messages.push(buffer);
             // Just wait without responding
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            tokio::time::sleep(Duration::from_secs(6)).await;
           }
         }
       }
       messages
     }));
 
-    let mut client = PluginClient::connect(server.socket_name()).await.unwrap();
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
     client.handshake().await.expect("Handshake failed");
     client.get_schema().await.expect("Get schema failed");
 
@@ -891,7 +991,7 @@ mod tests {
       messages
     }));
 
-    let mut client = PluginClient::connect(server.socket_name()).await.unwrap();
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
     client.handshake().await.expect("Handshake failed");
 
     // Give some time for server to close connection
@@ -910,21 +1010,13 @@ mod tests {
     let mut server = TestServer::new().await;
     server.start("multiple".to_string()).await;
 
-    let mut client = PluginClient::connect(server.socket_name()).await.unwrap();
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
     client.handshake().await.expect("Handshake failed");
 
     // Execute multiple commands before shutdown
     for i in 0..3 {
       let result = client
-        .execute(
-          format!("test{}", i),
-          false,
-          vec![],
-          PathBuf::from("."),
-          HashMap::new(),
-          HashMap::new(),
-          CancellationToken::new(),
-        )
+        .start_execution(execution_request(format!("test{i}")), CancellationToken::new())
         .await;
       assert!(result.is_ok());
     }
@@ -980,7 +1072,7 @@ mod tests {
       messages
     }));
 
-    let mut client = PluginClient::connect(server.socket_name()).await.unwrap();
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
     client.handshake().await.expect("Handshake failed");
 
     // Shutdown should return error
@@ -996,16 +1088,16 @@ mod tests {
     let mut server = TestServer::new().await;
     server.start("shutdown".to_string()).await;
 
-    let mut client = PluginClient::connect(server.socket_name()).await.unwrap();
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
     client.handshake().await.expect("Handshake failed");
 
     // First shutdown
     let result1 = client.shutdown().await;
     assert!(result1.is_ok(), "First shutdown should succeed");
 
-    // Second shutdown should still succeed
+    // Shutdown is idempotent after the response dispatcher has stopped.
     let result2 = client.shutdown().await;
-    assert!(result2.is_err(), "Writter closed");
+    assert!(result2.is_ok());
 
     let messages = server.stop().await;
     assert!(messages.iter().any(|m| m.contains("Shutdown")));

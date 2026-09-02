@@ -4,19 +4,20 @@ pub mod envs;
 pub mod error;
 pub mod executor;
 mod freshness;
-mod function;
 mod graph;
 mod hash_source;
 mod output;
 mod path_hash;
 mod path_pattern;
 mod platform;
+mod plugin;
 mod source;
 mod source_strategy;
 pub mod summary;
 pub mod task;
 mod task_context;
 mod task_identity;
+mod template;
 mod timestamp_source;
 mod variable_enum;
 pub mod vars;
@@ -229,7 +230,7 @@ impl TaskGraphBuilder {
   /// # Arguments
   /// * `octafile` - Reference to the Octafile containing task definitions
   /// * `command` - Command to execute
-  /// * `run_parallel` - Whether tasks can run in parallel
+  /// * `run_parallel` - Whether the caller forces parallel execution
   /// * `command_args` - Additional command line arguments
   pub async fn build(
     mut self,
@@ -265,7 +266,7 @@ impl TaskGraphBuilder {
             entry_parents: Vec::new(),
             command_condition: None,
           },
-          Some(run_parallel),
+          run_parallel.then_some(true),
         )
         .await?;
     }

@@ -8,13 +8,16 @@ use std::{
 };
 
 use octa_octafile::EnvValue;
+use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tera::{Context, Tera};
+use tera::Context;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
-  function::{format_tera_error, register_shell_with_redactions, ExecuteShell},
+  plugin::{ManagerPluginEvaluator, PluginEvaluator, PluginExecutionContext, PluginTarget},
+  template::{PluginTemplateContext, TemplateRenderer},
   vars::Vars,
 };
 
@@ -134,17 +137,62 @@ impl Envs {
   }
 
   pub async fn expand(&mut self) -> ExecutorResult<()> {
-    self.expand_with(&Vars::new(), false)
+    self
+      .expand_with_evaluator_option(&Vars::new(), None, false, CancellationToken::new())
+      .await
   }
 
   /// Expands the complete environment hierarchy using the resolved task variables.
-  pub fn expand_with(&mut self, vars: &Vars, dry: bool) -> ExecutorResult<()> {
+  pub async fn expand_with(&mut self, vars: &Vars, dry: bool) -> ExecutorResult<()> {
+    self
+      .expand_with_evaluator_option(vars, None, dry, CancellationToken::new())
+      .await
+  }
+
+  /// Expands environment values whose templates or `sh` sources invoke registered plugins.
+  pub async fn expand_with_plugins(
+    &mut self,
+    vars: &Vars,
+    manager: Arc<PluginManager>,
+    dry: bool,
+  ) -> ExecutorResult<()> {
+    self
+      .expand_with_evaluator(
+        vars,
+        Arc::new(ManagerPluginEvaluator::new(manager)),
+        dry,
+        CancellationToken::new(),
+      )
+      .await
+  }
+
+  pub(crate) async fn expand_with_evaluator(
+    &mut self,
+    vars: &Vars,
+    evaluator: Arc<dyn PluginEvaluator>,
+    dry: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<()> {
+    self
+      .expand_with_evaluator_option(vars, Some(evaluator), dry, cancel_token)
+      .await
+  }
+
+  async fn expand_with_evaluator_option(
+    &mut self,
+    vars: &Vars,
+    evaluator: Option<Arc<dyn PluginEvaluator>>,
+    dry: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<()> {
     if self.expanded {
       return Ok(());
     }
 
     let contexts = self.collect_context_chain();
-    let processed_context = self.process_context_chain(contexts, vars, dry)?;
+    let processed_context = self
+      .process_context_chain(contexts, vars, evaluator, dry, cancel_token)
+      .await?;
     self.context = processed_context;
     self.expanded = true;
 
@@ -163,11 +211,13 @@ impl Envs {
     contexts.into_iter().rev().collect()
   }
 
-  fn process_context_chain(
+  async fn process_context_chain(
     &self,
     contexts: Vec<(EnvContext, Option<PathBuf>)>,
     vars: &Vars,
+    evaluator: Option<Arc<dyn PluginEvaluator>>,
     dry: bool,
+    cancel_token: CancellationToken,
   ) -> ExecutorResult<EnvContext> {
     let mut accumulated = EnvContext::new();
 
@@ -177,20 +227,33 @@ impl Envs {
         Some(dir) => dir,
         None => env::current_dir()?,
       };
-      let processed = self.process_single_context(context, &accumulated, vars, &current_dir, dry)?;
+      let processed = self
+        .process_single_context(
+          context,
+          &accumulated,
+          vars,
+          &current_dir,
+          evaluator.clone(),
+          dry,
+          cancel_token.clone(),
+        )
+        .await?;
       accumulated.extend(processed);
     }
 
     Ok(accumulated)
   }
 
-  fn process_single_context(
+  #[allow(clippy::too_many_arguments)]
+  async fn process_single_context(
     &self,
     context: EnvContext,
     parent: &EnvContext,
     vars: &Vars,
     current_dir: &std::path::Path,
+    evaluator: Option<Arc<dyn PluginEvaluator>>,
     dry: bool,
+    cancel_token: CancellationToken,
   ) -> ExecutorResult<EnvContext> {
     let mut processed = EnvContext::new();
     let parent = resolved_environment(parent);
@@ -208,31 +271,44 @@ impl Envs {
     let mut available = parent.clone();
     available.extend(resolved_environment(&processed));
 
+    if !context
+      .values()
+      .any(|value| matches!(value, EnvValue::Shell(_)) || value.as_str().is_some_and(is_template))
+    {
+      return Ok(processed);
+    }
+
     // Template values receive inherited values and same-layer literals. Other same-layer
     // templates are deliberately excluded because HashMap declaration order is not stable.
-    let mut tera = Tera::default();
-    let shell = register_shell_with_redactions(
-      &mut tera,
-      current_dir,
-      available.clone(),
-      dry,
-      vars.secret_redactions(),
-      false,
+    let plugin_context = PluginTemplateContext::new(
+      evaluator,
+      PluginExecutionContext {
+        dir: current_dir.to_path_buf(),
+        vars: vars.to_hashmap(),
+        envs: available.clone(),
+        secret_vars: vars.secret_names(),
+        dry,
+        redact_params: false,
+      },
+      cancel_token,
     );
     let mut template_context: Context = vars.clone().into();
     template_context.extend(
       Context::from_serialize(&available)
         .map_err(|error| ExecutorError::ValueExpandError("environment context".to_string(), error.to_string()))?,
     );
+    let renderer = TemplateRenderer::new(template_context, plugin_context);
 
     for (key, value) in context {
       let processed_value = match value {
         EnvValue::String(value) if is_template(&value) => {
-          Some(self.process_template_value(&key, &value, &available, &mut tera, &template_context)?)
+          Some(self.process_template_value(&key, &value, &available, &renderer).await?)
         },
-        EnvValue::Shell(shell_value) => {
-          Some(self.process_shell_value(&key, &shell_value.sh, &available, &mut tera, &template_context, &shell)?)
-        },
+        EnvValue::Shell(shell_value) => Some(
+          self
+            .process_shell_value(&key, &shell_value.sh, &available, &renderer)
+            .await?,
+        ),
         EnvValue::String(_) => None,
       };
 
@@ -244,41 +320,42 @@ impl Envs {
     Ok(processed)
   }
 
-  fn process_template_value(
+  async fn process_template_value(
     &self,
     key: &str,
     value: &str,
     context: &ResolvedEnvContext,
-    tera: &mut Tera,
-    template_context: &Context,
+    renderer: &TemplateRenderer,
   ) -> ExecutorResult<String> {
-    let mut val = value.trim().to_owned();
-
-    val = tera
-      .render_str(&val, template_context)
-      .map_err(|error| ExecutorError::ValueExpandError(value.to_string(), format_tera_error(&error)))?;
+    let val = renderer
+      .render(value.trim())
+      .await
+      .map_err(|error| ExecutorError::ValueExpandError(value.to_string(), error))?;
 
     debug!("Processing template environment '{}'", key);
     Ok(expand_environment_value(&val, context))
   }
 
-  fn process_shell_value(
+  async fn process_shell_value(
     &self,
     key: &str,
     command: &str,
     context: &ResolvedEnvContext,
-    tera: &mut Tera,
-    template_context: &Context,
-    shell: &ExecuteShell,
+    renderer: &TemplateRenderer,
   ) -> ExecutorResult<String> {
-    let command = tera
-      .render_str(command, template_context)
-      .map_err(|error| ExecutorError::ValueExpandError(key.to_owned(), format_tera_error(&error)))?;
+    let command = renderer
+      .render(command)
+      .await
+      .map_err(|error| ExecutorError::ValueExpandError(key.to_owned(), error))?;
     debug!("Processing shell-backed environment '{}'", key);
 
-    let value = shell
-      .execute(&command)
-      .map_err(|error| ExecutorError::ValueExpandError(key.to_owned(), format_tera_error(&error)))?;
+    let value = renderer
+      .evaluate(
+        PluginTarget::Capability(octa_plugin::SHELL_CAPABILITY.to_owned()),
+        serde_json::Value::String(command),
+      )
+      .await
+      .map_err(|error| ExecutorError::ValueExpandError(key.to_owned(), error.to_string()))?;
     Ok(expand_environment_value(&value, context))
   }
 }
@@ -410,6 +487,7 @@ mod tests {
   use tempfile::TempDir;
 
   use super::*;
+  use crate::plugin::SystemTestEvaluator;
 
   #[test]
   fn test_new_envs() {
@@ -571,8 +649,8 @@ mod tests {
     assert_eq!(envs.get("path"), Some(&env::var("PATH").unwrap()));
   }
 
-  #[test]
-  fn expands_vars_and_shell_commands() {
+  #[tokio::test]
+  async fn expands_vars_and_shell_commands() {
     let temp_dir = TempDir::new().unwrap();
     fs::write(temp_dir.path().join("value.txt"), "from-shell").unwrap();
     #[cfg(windows)]
@@ -605,7 +683,10 @@ mod tests {
     envs.set_dir(temp_dir.path());
     let vars = Vars::with_value(json!({ "VERSION": "1.2.3" }));
 
-    envs.expand_with(&vars, false).unwrap();
+    envs
+      .expand_with_evaluator(&vars, Arc::new(SystemTestEvaluator), false, CancellationToken::new())
+      .await
+      .unwrap();
 
     assert_eq!(envs.get("FROM_VAR"), Some(&"1.2.3".to_owned()));
     assert_eq!(envs.get("FROM_SHELL"), Some(&"from-shell".to_owned()));
@@ -613,8 +694,8 @@ mod tests {
     assert_eq!(envs.get("FROM_FILTER"), Some(&"prefix-from-shell".to_owned()));
   }
 
-  #[test]
-  fn dry_mode_does_not_execute_env_shell_commands() {
+  #[tokio::test]
+  async fn dry_mode_does_not_execute_env_shell_commands() {
     let temp_dir = TempDir::new().unwrap();
     let marker = temp_dir.path().join("marker.txt");
     #[cfg(windows)]
@@ -627,13 +708,13 @@ mod tests {
     )]));
     envs.set_dir(temp_dir.path());
 
-    envs.expand_with(&Vars::new(), true).unwrap();
+    envs.expand_with(&Vars::new(), true).await.unwrap();
 
     assert!(!marker.exists());
   }
 
-  #[test]
-  fn reports_failed_env_shell_commands() {
+  #[tokio::test]
+  async fn reports_failed_env_shell_commands() {
     let temp_dir = TempDir::new().unwrap();
     #[cfg(windows)]
     let command = "echo failed 1>&2 & exit /B 7";
@@ -645,7 +726,15 @@ mod tests {
     )]));
     envs.set_dir(temp_dir.path());
 
-    let error = envs.expand_with(&Vars::new(), false).unwrap_err();
+    let error = envs
+      .expand_with_evaluator(
+        &Vars::new(),
+        Arc::new(SystemTestEvaluator),
+        false,
+        CancellationToken::new(),
+      )
+      .await
+      .unwrap_err();
 
     assert!(error.to_string().contains("status 7"));
     assert!(error.to_string().contains("failed"));
@@ -667,7 +756,11 @@ mod tests {
       EnvValue::Shell(octa_octafile::ShellValue { sh: command.to_owned() }),
     )]));
 
-    let error = envs.expand_with(&vars, false).unwrap_err().to_string();
+    let error = envs
+      .expand_with_evaluator(&vars, Arc::new(SystemTestEvaluator), false, CancellationToken::new())
+      .await
+      .unwrap_err()
+      .to_string();
 
     assert!(!error.contains(secret));
     assert!(error.contains("*****"));

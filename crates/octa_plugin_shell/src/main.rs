@@ -7,8 +7,8 @@ use std::{path::PathBuf, process::Stdio, sync::Arc};
 use anyhow::Context;
 use async_trait::async_trait;
 use octa_plugin::logger::Logger;
-use octa_plugin::PluginSchema;
 use octa_plugin::{protocol::PluginResponse, serve_plugin, Plugin};
+use octa_plugin::{PluginSchema, SHELL_CAPABILITY};
 use serde_json::Value;
 use tera::{Context as TeraContext, Tera};
 use tokio::io::AsyncWrite;
@@ -23,6 +23,7 @@ struct ShellPlugin {}
 fn plugin_schema() -> PluginSchema {
   PluginSchema {
     key: "shell".to_owned(),
+    capabilities: vec![SHELL_CAPABILITY.to_owned()],
     validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
   }
 }
@@ -383,6 +384,7 @@ mod tests {
     let schema = plugin_schema();
 
     assert_eq!(schema.key, "shell");
+    assert_eq!(schema.capabilities, [SHELL_CAPABILITY]);
     assert_eq!(
       schema.validation_schema.unwrap().get("type"),
       Some(&Value::String("string".to_owned()))

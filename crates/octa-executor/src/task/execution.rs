@@ -59,114 +59,14 @@ impl TaskNode {
     }
   }
 
-  #[allow(clippy::too_many_arguments)]
-  async fn execute_plugin_command(
+  async fn interpolate_dir(
     &self,
-    plugin_manager: Arc<PluginManager>,
-    plugin_name: &str,
-    dry: bool,
-    command: String,
-    args: Vec<String>,
     dir: PathBuf,
-    vars: HashMap<String, Value>,
-    envs: HashMap<String, String>,
-    secret_vars: Vec<String>,
-    silent: bool,
+    vars: &Vars,
+    evaluator: Option<Arc<dyn PluginEvaluator>>,
+    dry: bool,
     cancel_token: CancellationToken,
-  ) -> io::Result<(i32, String, String)> {
-    let mut output = String::new();
-    let mut errors = String::new();
-    let mut exit_code = None;
-
-    let client = plugin_manager
-      .get_client(plugin_name)
-      .await
-      .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error.to_string()))?;
-    let mut client_guard = client.lock().await;
-    let client = client_guard.as_mut().ok_or_else(|| {
-      io::Error::new(
-        io::ErrorKind::NotConnected,
-        format!("Plugin '{plugin_name}' is not running"),
-      )
-    })?;
-
-    let mut needs_cleanup = false;
-    let result = async {
-      // Start command execution with cancellation support
-      let command_id = client
-        .execute_with_secrets(
-          command.clone(),
-          dry,
-          args,
-          dir,
-          vars,
-          envs,
-          secret_vars,
-          cancel_token.clone(),
-        )
-        .await
-        .map_err(io::Error::from)?;
-
-      // Process output until command completes
-      loop {
-        match client.receive_output(&cancel_token).await {
-          // Stdout/stderr belong to the invoked command and remain unchanged; secret metadata
-          // protects Octa and plugin diagnostics, not user-controlled command output.
-          Ok(Some(response)) => match response {
-            PluginResponse::Stdout { id, line } if id == command_id => {
-              if !silent {
-                println!("{}", line.trim());
-              }
-              output.push_str(line.trim());
-              output.push('\n');
-            },
-            PluginResponse::Stderr { id, line } if id == command_id => {
-              if !silent {
-                eprintln!("{}", line.trim());
-              }
-              errors.push_str(line.trim());
-              errors.push('\n');
-            },
-            PluginResponse::ExitStatus { id, code } if id == command_id => {
-              exit_code = Some(code);
-              break;
-            },
-            PluginResponse::Error { id, message } if id == command_id => {
-              return Err(io::Error::other(format!("Plugin error: {}", message)));
-            },
-            _ => {},
-          },
-          Ok(None) => {
-            return Err(io::Error::new(
-              io::ErrorKind::ConnectionAborted,
-              "Plugin connection closed unexpectedly",
-            ));
-          },
-          Err(e) => {
-            if cancel_token.is_cancelled() {
-              let _ = client.cancel_and_wait(&command_id).await;
-              return Err(io::Error::new(io::ErrorKind::Interrupted, "Command cancelled"));
-            }
-
-            needs_cleanup = true;
-            return Err(io::Error::from(e));
-          },
-        }
-      }
-
-      Ok((exit_code.unwrap_or(-1), output, errors))
-    }
-    .await;
-
-    // Perform cleanup if needed
-    if needs_cleanup {
-      let _ = client.shutdown().await;
-    }
-
-    result
-  }
-
-  async fn interpolate_dir(&self, dir: PathBuf, vars: &Vars) -> ExecutorResult<PathBuf> {
+  ) -> ExecutorResult<PathBuf> {
     let dir_str = dir.to_string_lossy();
 
     if !dir_str.contains("{{") || !dir_str.contains("}}") {
@@ -176,12 +76,27 @@ impl TaskNode {
     } else {
       debug!("Expanding directory path: {}", dir_str);
 
-      let mut tera = Tera::default();
       let context: Context = vars.clone().into();
-
-      let rendered = tera
-        .render_str(&dir_str, &context)
-        .map_err(|e| ExecutorError::ValueExpandError(dir_str.to_string(), e.to_string()))?;
+      let renderer = TemplateRenderer::new(
+        context,
+        PluginTemplateContext::new(
+          evaluator,
+          PluginExecutionContext {
+            // The rendered task directory does not exist yet, so helpers execute from its base.
+            dir: env::current_dir()?,
+            vars: vars.to_hashmap(),
+            envs: HashMap::new(),
+            secret_vars: vars.secret_names(),
+            dry,
+            redact_params: false,
+          },
+          cancel_token,
+        ),
+      );
+      let rendered = renderer
+        .render(dir_str.to_string())
+        .await
+        .map_err(|error| ExecutorError::ValueExpandError(dir_str.to_string(), error))?;
 
       debug!("Expanded path: {}", rendered);
 
@@ -189,8 +104,25 @@ impl TaskNode {
     }
   }
 
+  #[cfg(test)]
   pub(super) async fn prepare_dir_with_vars(&self, vars: &Vars, dry: bool) -> ExecutorResult<PathBuf> {
-    let dir = self.interpolate_dir(self.dir.clone(), vars).await?;
+    let dir = self
+      .interpolate_dir(self.dir.clone(), vars, None, dry, CancellationToken::new())
+      .await?;
+
+    self.ensure_dir(dir, dry).await
+  }
+
+  async fn prepare_runtime_dir(
+    &self,
+    vars: &Vars,
+    evaluator: Arc<dyn PluginEvaluator>,
+    dry: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<PathBuf> {
+    let dir = self
+      .interpolate_dir(self.dir.clone(), vars, Some(evaluator), dry, cancel_token)
+      .await?;
 
     self.ensure_dir(dir, dry).await
   }
@@ -215,7 +147,12 @@ impl TaskNode {
   }
 
   /// Resolves the values shared by conditions, cache checks, and the task command once.
-  async fn resolve_runtime_context(&self, dry: bool) -> ExecutorResult<RuntimeContext> {
+  async fn resolve_runtime_context(
+    &self,
+    evaluator: Arc<dyn PluginEvaluator>,
+    dry: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<RuntimeContext> {
     if let Some(context) = self.freshness_runtime.shared_runtime_context() {
       return Ok(context);
     }
@@ -236,18 +173,24 @@ impl TaskNode {
     };
 
     let mut vars = self.vars.clone();
-    vars.expand(dry).await?;
+    vars
+      .expand_with_evaluator(evaluator.clone(), dry, cancel_token.clone())
+      .await?;
 
     // A templated directory can only be created after its variables have been expanded.
     let dir = match prepared_dir {
       Some(dir) => dir,
-      None => self.prepare_dir_with_vars(&vars, dry).await?,
+      None => {
+        self
+          .prepare_runtime_dir(&vars, evaluator.clone(), dry, cancel_token.clone())
+          .await?
+      },
     };
 
     let mut envs = self.envs.clone();
     // Task-level shell-backed environment values must run from the final task directory.
     envs.set_dir(dir.clone());
-    envs.expand_with(&vars, dry)?;
+    envs.expand_with_evaluator(&vars, evaluator, dry, cancel_token).await?;
 
     Ok(RuntimeContext { vars, envs, dir })
   }
@@ -262,6 +205,7 @@ impl TaskNode {
   async fn execute_graph_action(
     &self,
     fingerprint: &Db,
+    evaluator: Arc<dyn PluginEvaluator>,
     dry: bool,
     force: bool,
     cancel_token: &CancellationToken,
@@ -281,7 +225,9 @@ impl TaskNode {
       // Barrier nodes only preserve graph ordering and carry no runtime payload.
       NodeAction::Barrier => Ok(Some(String::new())),
       NodeAction::FreshnessCheck { spec, state } => {
-        let runtime_context = self.resolve_runtime_context(dry).await?;
+        let runtime_context = self
+          .resolve_runtime_context(evaluator, dry, cancel_token.clone())
+          .await?;
         let outcome = spec
           .evaluate(
             fingerprint,
@@ -367,60 +313,83 @@ impl TaskNode {
       return Ok(true);
     }
 
-    let plugins = plugin_manager.get_schema_keys().await;
-
     let deps_res = self.deps_res.lock().await;
     let mut vars = vars.clone();
     vars.insert("deps_result", &*deps_res);
     drop(deps_res);
 
+    let invoker = PluginInvoker::new(plugin_manager);
     for condition in self.condition_runtime.conditions() {
-      let plugin_name = plugins.get(&condition.key).ok_or(ExecutorError::TaskParsedError)?;
-      match self
-        .execute_plugin_command(
-          plugin_manager.clone(),
-          plugin_name,
+      let request = PluginRequest {
+        target: crate::plugin::PluginTarget::Key(condition.key.clone()),
+        value: condition.value(),
+        args: vec![],
+        context: PluginExecutionContext {
+          dir: dir.to_path_buf(),
+          vars: vars.to_hashmap(),
+          envs: envs.clone().into(),
+          secret_vars: vars.secret_names(),
           dry,
-          condition.command(),
-          vec![],
-          dir.to_path_buf(),
-          vars.to_hashmap(),
-          envs.clone().into(),
-          vars.secret_names(),
-          true,
-          cancel_token.clone(),
-        )
-        .await
-      {
-        Ok((0, _, _)) => {},
+          redact_params: false,
+        },
+        silent: true,
+      };
+      match invoker.invoke(request, cancel_token.clone()).await {
+        Ok(output) if output.code == 0 => {},
         Ok(_) => return Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+        Err(ExecutorError::IoError(error)) if error.kind() == io::ErrorKind::Interrupted => {
           return Err(ExecutorError::TaskCancelled(self.name.clone()));
         },
-        Err(error) => return Err(error.into()),
+        Err(error) => return Err(error),
       }
     }
 
     Ok(true)
   }
 
-  async fn check_preconditions(&self, vars: &Vars) -> ExecutorResult<bool> {
-    let mut tera = Tera::default();
+  async fn check_preconditions(
+    &self,
+    evaluator: Arc<dyn PluginEvaluator>,
+    vars: &Vars,
+    envs: &Envs,
+    dir: &Path,
+    dry: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<bool> {
+    let Some(preconditions) = &self.preconditions else {
+      return Ok(true);
+    };
+
     let mut context: Context = vars.clone().into();
     // Add dependency results to template context
     let deps_res = self.deps_res.lock().await;
     context.insert("deps_result", &*deps_res);
+    drop(deps_res);
+    let renderer = TemplateRenderer::new(
+      context,
+      PluginTemplateContext::new(
+        Some(evaluator),
+        PluginExecutionContext {
+          dir: dir.to_path_buf(),
+          vars: vars.to_hashmap(),
+          envs: envs.clone().into(),
+          secret_vars: vars.secret_names(),
+          dry,
+          redact_params: false,
+        },
+        cancel_token,
+      ),
+    );
 
     let mut result = true;
 
-    if let Some(preconditions) = &self.preconditions {
-      for precondition in preconditions {
-        let rendered = tera
-          .render_str(precondition, &context)
-          .map_err(|e| ExecutorError::ValueExpandError(precondition.to_owned(), e.to_string()))?;
+    for precondition in preconditions {
+      let rendered = renderer
+        .render(precondition)
+        .await
+        .map_err(|error| ExecutorError::ValueExpandError(precondition.to_owned(), error))?;
 
-        result = result && (rendered.trim() == "true" || rendered.trim() == "True" || rendered.trim() == "1");
-      }
+      result = result && (rendered.trim() == "true" || rendered.trim() == "True" || rendered.trim() == "1");
     }
 
     Ok(result)
@@ -482,6 +451,8 @@ impl TaskNode {
     force: bool,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<String> {
+    let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::new(plugin_manager.clone()));
+
     if !self.condition_runtime.should_run(&self.name)? {
       if let NodeAction::FreshnessCheck { state, .. } = &self.action {
         state.publish_skipped()?;
@@ -490,13 +461,15 @@ impl TaskNode {
     }
 
     if let Some(result) = self
-      .execute_graph_action(&fingerprint, dry, force, &cancel_token)
+      .execute_graph_action(&fingerprint, evaluator.clone(), dry, force, &cancel_token)
       .await?
     {
       return Ok(result);
     }
 
-    let RuntimeContext { vars, envs, dir } = self.resolve_runtime_context(dry).await?;
+    let RuntimeContext { vars, envs, dir } = self
+      .resolve_runtime_context(evaluator.clone(), dry, cancel_token.clone())
+      .await?;
     let condition_passed = self
       .check_condition(plugin_manager.clone(), dry, cancel_token.clone(), &vars, &envs, &dir)
       .await?;
@@ -517,7 +490,11 @@ impl TaskNode {
       return Ok("".to_string());
     }
 
-    if !force && !self.check_preconditions(&vars).await? {
+    if !force
+      && !self
+        .check_preconditions(evaluator, &vars, &envs, &dir, dry, cancel_token.clone())
+        .await?
+    {
       self.log_info(format!("Task '{}' preconditions failed", self.name));
 
       return Err(ExecutorError::TaskCancelled(format!(
@@ -548,46 +525,50 @@ impl TaskNode {
       Self::commit_standalone_freshness(standalone_freshness.as_ref(), &fingerprint, dry)?;
       return Ok("".to_string());
     };
-    let plugins = plugin_manager.get_schema_keys().await;
-    let plugin_name = plugins.get(&plugin.key).ok_or(ExecutorError::TaskParsedError)?;
-
     let mut vars_with_deps_results = vars.clone();
     let deps_res = self.deps_res.lock().await;
     vars_with_deps_results.insert("deps_result", &*deps_res);
 
-    let result = match self
-      .execute_plugin_command(
-        plugin_manager,
-        plugin_name,
-        dry,
-        plugin.command(),
-        vec![],
+    let request = PluginRequest {
+      target: crate::plugin::PluginTarget::Key(plugin.key.clone()),
+      value: plugin.value(),
+      args: vec![],
+      context: PluginExecutionContext {
         dir,
-        vars_with_deps_results.to_hashmap(),
-        envs.into(),
-        vars_with_deps_results.secret_names(),
-        self.silent,
-        cancel_token.clone(),
-      )
+        vars: vars_with_deps_results.to_hashmap(),
+        envs: envs.into(),
+        secret_vars: vars_with_deps_results.secret_names(),
+        dry,
+        redact_params: false,
+      },
+      silent: self.silent,
+    };
+    let result = match PluginInvoker::new(plugin_manager)
+      .invoke(request, cancel_token.clone())
       .await
     {
-      Ok((code, stdout, stderr)) => {
-        if code != 0 && !cancel_token.is_cancelled() {
+      Ok(output) => {
+        if output.code != 0 && !cancel_token.is_cancelled() {
           if self.ignore_errors {
-            error!("Task {} failed but errors ignored. Error code: {}", self.name, code);
+            error!(
+              "Task {} failed but errors ignored. Error code: {}",
+              self.name, output.code
+            );
             Ok("".to_string())
           } else {
             Err(ExecutorError::TaskFailed(format!(
               "Task {} failed: {}",
-              self.name, stderr
+              self.name, output.stderr
             )))
           }
         } else {
-          self.update_cache(stdout.trim(), vars, &cache).await?;
-          Ok(stdout.trim().to_string())
+          self.update_cache(output.stdout.trim(), vars, &cache).await?;
+          Ok(output.stdout.trim().to_string())
         }
       },
-      Err(error) if error.kind() == io::ErrorKind::Interrupted => Err(ExecutorError::TaskCancelled(self.name.clone())),
+      Err(ExecutorError::IoError(error)) if error.kind() == io::ErrorKind::Interrupted => {
+        Err(ExecutorError::TaskCancelled(self.name.clone()))
+      },
       Err(error) => self.handle_execution_error(error),
     };
     if result.is_ok() {
@@ -597,12 +578,12 @@ impl TaskNode {
   }
 
   /// Handle execution errors
-  fn handle_execution_error(&self, error: io::Error) -> ExecutorResult<String> {
+  fn handle_execution_error(&self, error: ExecutorError) -> ExecutorResult<String> {
     if self.ignore_errors {
       error!("Task {} failed but errors ignored. Error: {}", self.name, error);
       Ok("".to_string())
     } else {
-      Err(ExecutorError::TaskFailed(error.to_string()))
+      Err(error)
     }
   }
 }

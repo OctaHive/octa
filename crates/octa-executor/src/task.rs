@@ -11,12 +11,11 @@ use std::{
 use async_trait::async_trait;
 use dunce::canonicalize;
 use indexmap::IndexMap;
-use octa_plugin::protocol::PluginResponse;
 use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Serialize;
 use serde_json::Value;
 use sled::Db;
-use tera::{Context, Tera};
+use tera::Context;
 use tokio::{sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, enabled, error, info, Level};
@@ -28,7 +27,9 @@ use crate::{
   envs::Envs,
   error::{ExecutorError, ExecutorResult},
   freshness::{FreshnessConfig, FreshnessIdentity, FreshnessOutcome, FreshnessSpec, FreshnessState, RuntimeContext},
+  plugin::{ManagerPluginEvaluator, PluginEvaluator, PluginExecutionContext, PluginInvoker, PluginRequest},
   source_strategy::{SourceStrategyHandle, SourceStrategyRegistry},
+  template::{PluginTemplateContext, TemplateRenderer},
   vars::Vars,
   watcher::WatchTarget,
 };

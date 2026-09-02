@@ -13,7 +13,7 @@ use clap_complete::aot::{generate, Generator, Shell};
 use dialoguer::{Input, Password, Select};
 use lazy_static::lazy_static;
 use logger::{ChronoLocal, OctaFormatter};
-use octa_plugin::protocol::Schema;
+use octa_plugin::{protocol::Schema, SHELL_CAPABILITY};
 use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Deserialize;
 use tokio::task::JoinSet;
@@ -402,7 +402,7 @@ async fn initialize_plugins(
   Ok((plugin_manager, plugin_keys))
 }
 
-/// Resolves the task-type key used for short commands from configuration or the built-in shell plugin.
+/// Resolves the task-type key used for short commands from configuration or the shell capability.
 fn resolve_default_plugin(configured: Option<String>, schemas: &HashMap<String, Schema>) -> OctaResult<String> {
   if let Some(key) = configured {
     if schemas.values().any(|schema| schema.key == key) {
@@ -415,9 +415,17 @@ fn resolve_default_plugin(configured: Option<String>, schemas: &HashMap<String, 
   }
 
   schemas
-    .get(SHELL_PLUGIN_NAME)
+    .values()
+    .find(|schema| {
+      schema
+        .capabilities
+        .iter()
+        .any(|capability| capability == SHELL_CAPABILITY)
+    })
+    // Plugins built against the previous protocol did not advertise capabilities.
+    .or_else(|| schemas.get(SHELL_PLUGIN_NAME))
     .map(|schema| schema.key.clone())
-    .ok_or_else(|| OctaError::PluginStartError("built-in shell plugin did not provide a schema".to_string()))
+    .ok_or_else(|| OctaError::PluginStartError("no plugin provides the shell capability".to_string()))
 }
 
 /// Executes tasks either in parallel or sequentially
@@ -1181,9 +1189,10 @@ tasks:
   fn test_resolve_default_plugin_uses_configured_task_type() {
     let schemas = HashMap::from([
       (
-        SHELL_PLUGIN_NAME.to_string(),
+        "custom-shell-executable".to_string(),
         Schema {
           key: "shell-command".to_string(),
+          capabilities: vec![SHELL_CAPABILITY.to_owned()],
           validation_schema: None,
         },
       ),
@@ -1191,6 +1200,7 @@ tasks:
         "custom".to_string(),
         Schema {
           key: "docker".to_string(),
+          capabilities: Vec::new(),
           validation_schema: None,
         },
       ),
@@ -1202,6 +1212,16 @@ tasks:
       "docker"
     );
     assert!(resolve_default_plugin(Some("missing".to_string()), &schemas).is_err());
+
+    let legacy = HashMap::from([(
+      SHELL_PLUGIN_NAME.to_owned(),
+      Schema {
+        key: "legacy-shell".to_owned(),
+        capabilities: Vec::new(),
+        validation_schema: None,
+      },
+    )]);
+    assert_eq!(resolve_default_plugin(None, &legacy).unwrap(), "legacy-shell");
   }
 
   #[test]

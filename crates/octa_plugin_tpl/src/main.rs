@@ -30,6 +30,7 @@ struct TemplateFile {
 fn plugin_schema() -> PluginSchema {
   PluginSchema {
     key: "tpl".to_owned(),
+    capabilities: Vec::new(),
     validation_schema: serde_json::json!({
       "oneOf": [
         { "type": "string" },
@@ -205,6 +206,7 @@ mod tests {
     let schema = plugin_schema();
 
     assert_eq!(schema.key, "tpl");
+    assert!(schema.capabilities.is_empty());
     assert_eq!(schema.validation_schema.unwrap()["oneOf"].as_array().unwrap().len(), 2);
   }
 

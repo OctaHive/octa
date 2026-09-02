@@ -9,15 +9,17 @@ use std::{
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use octa_octafile::{RequiredMode, VariableEnum, VariableSource, Vars as OctafileVars};
-use octa_plugin::logger::collect_value_redactions;
+use octa_plugin_manager::plugin_manager::PluginManager;
 use regex::Regex;
 use serde::Serialize;
-use tera::{Context, Tera, Value};
+use tera::{Context, Value};
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
-  function::{format_tera_error, register_shell_with_redactions, ExecuteShell},
+  plugin::{ManagerPluginEvaluator, PluginEvaluator, PluginExecutionContext, PluginTarget},
+  template::{PluginTemplateContext, TemplateRenderer},
 };
 
 lazy_static! {
@@ -290,14 +292,47 @@ impl Vars {
   }
 
   pub async fn expand(&mut self, dry: bool) -> ExecutorResult<()> {
-    let mut tera = Tera::default();
+    self
+      .expand_with_evaluator_option(None, dry, CancellationToken::new())
+      .await
+  }
 
+  /// Expands variables whose templates or `sh` sources invoke registered plugins.
+  pub async fn expand_with_plugins(&mut self, manager: Arc<PluginManager>, dry: bool) -> ExecutorResult<()> {
+    self
+      .expand_with_evaluator(
+        Arc::new(ManagerPluginEvaluator::new(manager)),
+        dry,
+        CancellationToken::new(),
+      )
+      .await
+  }
+
+  pub(crate) async fn expand_with_evaluator(
+    &mut self,
+    evaluator: Arc<dyn PluginEvaluator>,
+    dry: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<()> {
+    self
+      .expand_with_evaluator_option(Some(evaluator), dry, cancel_token)
+      .await
+  }
+
+  async fn expand_with_evaluator_option(
+    &mut self,
+    evaluator: Option<Arc<dyn PluginEvaluator>>,
+    dry: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<()> {
     if self.expanded {
       return Ok(());
     }
 
     let contexts = self.collect_context_chain();
-    let resolved = self.process_context_chain(contexts, &mut tera, dry).await?;
+    let resolved = self
+      .process_context_chain(contexts, evaluator, dry, cancel_token)
+      .await?;
     self.values = resolved.values;
     self.secrets = resolved.secrets;
     self.required_vars = resolved.required_vars;
@@ -328,8 +363,9 @@ impl Vars {
   async fn process_context_chain(
     &self,
     contexts: Vec<VariableLayer>,
-    tera: &mut Tera,
+    evaluator: Option<Arc<dyn PluginEvaluator>>,
     dry: bool,
+    cancel_token: CancellationToken,
   ) -> ExecutorResult<ResolvedVars> {
     let required_definitions = collect_required_vars(&contexts);
     let required_vars = resolve_required_vars(&contexts, required_definitions.clone())?;
@@ -370,16 +406,39 @@ impl Vars {
           continue;
         }
         let secret = layer_secrets.contains(&key);
+
+        // Literal values need neither a Tera instance nor a plugin execution context.
+        if shell_command(&value).is_none() && !value_contains_template(&value) {
+          accumulated.insert(key.clone(), value);
+          if secret {
+            secrets.insert(key);
+          } else {
+            secrets.remove(&key);
+          }
+          continue;
+        }
+
         let template_context = Context::from_serialize(&accumulated).map_err(|error| {
           ExecutorError::VariableExpandError(key.clone(), format!("failed to build template context: {error}"))
         })?;
         let environment = values_as_environment(&accumulated);
-        let redactions = secret_values(&accumulated, &secrets);
-        // Secret producers hide their complete command; other producers redact inherited secrets.
-        let shell = register_shell_with_redactions(tera, &current_dir, environment, dry, redactions, secret);
-        let processed = self
-          .process_template_value(&key, &value, &template_context, tera, &shell, secret)
-          .await?;
+        let plugin_context = PluginTemplateContext::new(
+          evaluator.clone(),
+          PluginExecutionContext {
+            dir: current_dir.clone(),
+            vars: accumulated
+              .iter()
+              .map(|(key, value)| (key.clone(), value.clone()))
+              .collect(),
+            envs: environment,
+            secret_vars: secrets.iter().cloned().collect(),
+            dry,
+            redact_params: secret,
+          },
+          cancel_token.clone(),
+        );
+        let renderer = TemplateRenderer::new(template_context, plugin_context);
+        let processed = self.process_template_value(&key, &value, &renderer, secret).await?;
 
         accumulated.insert(key.clone(), processed);
         if secret {
@@ -401,24 +460,27 @@ impl Vars {
     &self,
     key: &str,
     value: &Value,
-    context: &Context,
-    tera: &mut Tera,
-    shell: &ExecuteShell,
+    renderer: &TemplateRenderer,
     secret: bool,
   ) -> ExecutorResult<Value> {
     if let Some(command) = shell_command(value) {
-      let command = tera
-        .render_str(command, context)
-        .map_err(|error| variable_error(key, format_tera_error(&error), secret))?;
+      let command = renderer
+        .render(command)
+        .await
+        .map_err(|error| variable_error(key, error, secret))?;
       if secret {
         debug!("Processing secret shell-backed variable '{}'", key);
       } else {
         debug!("Processing shell-backed variable '{}': '{}'", key, command);
       }
-      return shell
-        .execute(&command)
+      return renderer
+        .evaluate(
+          PluginTarget::Capability(octa_plugin::SHELL_CAPABILITY.to_owned()),
+          Value::String(command),
+        )
+        .await
         .map(Value::String)
-        .map_err(|error| variable_error(key, format_tera_error(&error), secret));
+        .map_err(|error| variable_error(key, error.to_string(), secret));
     }
 
     let val = match value {
@@ -435,9 +497,10 @@ impl Vars {
     } else {
       debug!("Processing template variable '{}' with value: '{}'", key, val);
     }
-    let res = tera
-      .render_str(&val, context)
-      .map_err(|error| variable_error(key, format_tera_error(&error), secret))?;
+    let res = renderer
+      .render(val)
+      .await
+      .map_err(|error| variable_error(key, error, secret))?;
     let res = res.trim_matches('"').to_owned(); // remove extra quotes in value
 
     let val = match serde_json::from_str(&res) {
@@ -483,16 +546,6 @@ impl Vars {
   /// Names of values that plugins must redact from their diagnostic logs.
   pub(crate) fn secret_names(&self) -> Vec<String> {
     self.secrets.iter().cloned().collect()
-  }
-
-  /// Values that must be removed from diagnostics produced while resolving dependent data.
-  pub(crate) fn secret_redactions(&self) -> Vec<String> {
-    let values = self.to_merged_hashmap();
-    let mut redactions = Vec::new();
-    for value in self.secrets.iter().filter_map(|key| values.get(key)) {
-      collect_value_redactions(value, &mut redactions);
-    }
-    redactions
   }
 }
 
@@ -677,15 +730,6 @@ fn variable_error(key: &str, message: String, secret: bool) -> ExecutorError {
   }
 }
 
-/// Collects resolved values whose names are marked secret in the current flattened scope.
-fn secret_values(values: &IndexMap<String, Value>, secrets: &HashSet<String>) -> Vec<String> {
-  let mut redactions = Vec::new();
-  for value in secrets.iter().filter_map(|key| values.get(key)) {
-    collect_value_redactions(value, &mut redactions);
-  }
-  redactions
-}
-
 impl Display for Vars {
   fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
     writeln!(f, "[")?;
@@ -760,6 +804,14 @@ mod tests {
   use super::*;
   use serde_json::json;
   use tempfile::TempDir;
+
+  use crate::plugin::SystemTestEvaluator;
+
+  async fn expand_with_system(vars: &mut Vars) -> ExecutorResult<()> {
+    vars
+      .expand_with_evaluator(Arc::new(SystemTestEvaluator), false, CancellationToken::new())
+      .await
+  }
 
   struct FixedResolver {
     value: String,
@@ -945,6 +997,23 @@ mod tests {
 
     assert_eq!(vars.get("MESSAGE"), Some(&Value::String("Hello World".to_owned())));
     assert_eq!(vars.get("COMPLETE"), Some(&Value::String("Hello World!".to_owned())));
+  }
+
+  #[tokio::test]
+  async fn expands_templates_nested_in_structured_values() {
+    let values: octa_octafile::Vars = serde_yml::from_str(
+      r#"
+      NAME: Octa
+      CONFIG:
+        nested: "Hello {{ NAME }}"
+      "#,
+    )
+    .unwrap();
+    let mut vars = Vars::with_variables(values);
+
+    vars.expand(true).await.unwrap();
+
+    assert_eq!(vars.get("CONFIG"), Some(&json!({ "nested": "Hello Octa" })));
   }
 
   #[tokio::test]
@@ -1290,7 +1359,7 @@ mod tests {
     let mut vars = Vars::with_variables(values);
     vars.set_dir(temp_dir.path());
 
-    vars.expand(false).await.unwrap();
+    expand_with_system(&mut vars).await.unwrap();
 
     assert_eq!(vars.get("TOKEN"), Some(&Value::String("shell-secret".to_owned())));
     assert_eq!(vars.get("DISPLAY"), Some(&Value::String("shell-secret".to_owned())));
@@ -1320,7 +1389,7 @@ mod tests {
       serde_yml::from_str(&format!("TOKEN:\n  sh: '{command}'\n  secret: true\n")).unwrap();
     let mut vars = Vars::with_variables(values);
 
-    let error = vars.expand(false).await.unwrap_err().to_string();
+    let error = expand_with_system(&mut vars).await.unwrap_err().to_string();
 
     assert!(error.contains("TOKEN"));
     assert!(!error.contains("literal-secret"));
@@ -1338,7 +1407,7 @@ mod tests {
     .unwrap();
     let mut vars = Vars::with_variables(values);
 
-    let error = vars.expand(false).await.unwrap_err().to_string();
+    let error = expand_with_system(&mut vars).await.unwrap_err().to_string();
 
     assert!(error.contains("CHECK"));
     assert!(!error.contains("literal-secret"));
@@ -1358,7 +1427,7 @@ mod tests {
     }));
     vars.set_dir(temp_dir.path());
 
-    vars.expand(false).await.unwrap();
+    expand_with_system(&mut vars).await.unwrap();
 
     assert_eq!(vars.get("STRUCTURED"), Some(&Value::String("dynamic".to_owned())));
     assert_eq!(vars.get("FILTERED"), Some(&Value::String("prefix-dynamic".to_owned())));

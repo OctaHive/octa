@@ -1,7 +1,12 @@
 use octa_plugin::protocol::Schema;
 use octa_plugin::socket::{interpret_local_socket_name, make_local_socket_name};
 use std::ffi::OsString;
-use std::{collections::HashMap, path::PathBuf, process::Stdio, sync::Arc};
+use std::{
+  collections::{HashMap, HashSet},
+  path::PathBuf,
+  process::Stdio,
+  sync::{Arc, Mutex as StdMutex},
+};
 use thiserror::Error;
 use tokio::io::{self, AsyncReadExt};
 use tokio::process::Command;
@@ -23,11 +28,11 @@ pub enum PluginManagerError {
   #[error("Plugin not found: {0}")]
   PluginNotFound(String),
 
-  #[error("Plugin client not found: {0}")]
-  PluginClientNotFound(String),
-
   #[error("Plugin already running: {0}")]
   PluginAlreadyRunning(String),
+
+  #[error("Plugin selector already registered: {0}")]
+  PluginSelectorAlreadyRegistered(String),
 
   #[error("Failed to start plugin: {0}")]
   StartError(String),
@@ -53,13 +58,105 @@ type Result<T> = std::result::Result<T, PluginManagerError>;
 struct PluginInstance {
   process: Child,
   socket_path: OsString,
-  client: Arc<Mutex<Option<PluginClient>>>,
+  client: PluginClient,
+}
+
+struct StartupReservation {
+  names: Arc<StdMutex<HashSet<String>>>,
+  name: String,
+}
+
+impl Drop for StartupReservation {
+  fn drop(&mut self) {
+    if let Ok(mut names) = self.names.lock() {
+      names.remove(&self.name);
+    }
+  }
+}
+
+#[derive(Clone)]
+pub struct PluginRegistration {
+  plugin_name: String,
+  schema: Schema,
+  validator: Option<Arc<jsonschema::Validator>>,
+}
+
+impl PluginRegistration {
+  fn new(plugin_name: String, schema: Schema) -> std::result::Result<Self, String> {
+    let validator = schema
+      .validation_schema
+      .clone()
+      .map(|schema| jsonschema::validator_for(&serde_json::Value::Object(schema)).map(Arc::new))
+      .transpose()
+      .map_err(|error| error.to_string())?;
+    Ok(Self {
+      plugin_name,
+      schema,
+      validator,
+    })
+  }
+
+  pub fn plugin_name(&self) -> &str {
+    &self.plugin_name
+  }
+
+  pub fn validate(&self, value: &serde_json::Value) -> std::result::Result<(), String> {
+    let Some(validator) = &self.validator else {
+      return Ok(());
+    };
+    let errors = validator
+      .iter_errors(value)
+      .map(|error| error.to_string())
+      .collect::<Vec<_>>();
+    if errors.is_empty() {
+      Ok(())
+    } else {
+      Err(errors.join("; "))
+    }
+  }
+}
+
+#[derive(Default)]
+struct PluginRegistry {
+  keys: HashMap<String, PluginRegistration>,
+  capabilities: HashMap<String, PluginRegistration>,
+}
+
+impl PluginRegistry {
+  fn register(&mut self, registration: PluginRegistration) -> Result<()> {
+    let schema = &registration.schema;
+    if schema.key.is_empty() || self.keys.contains_key(&schema.key) {
+      return Err(PluginManagerError::PluginSelectorAlreadyRegistered(schema.key.clone()));
+    }
+    let mut capabilities = HashSet::new();
+    for capability in &schema.capabilities {
+      if capability.is_empty() || !capabilities.insert(capability) || self.capabilities.contains_key(capability) {
+        return Err(PluginManagerError::PluginSelectorAlreadyRegistered(capability.clone()));
+      }
+    }
+
+    self.keys.insert(schema.key.clone(), registration.clone());
+    for capability in &schema.capabilities {
+      self.capabilities.insert(capability.clone(), registration.clone());
+    }
+    Ok(())
+  }
+
+  fn remove_plugin(&mut self, plugin_name: &str) {
+    self
+      .keys
+      .retain(|_, registration| registration.plugin_name != plugin_name);
+    self
+      .capabilities
+      .retain(|_, registration| registration.plugin_name != plugin_name);
+  }
 }
 
 pub struct PluginManager {
   plugins_dir: PathBuf,
   active_plugins: Arc<Mutex<HashMap<String, PluginInstance>>>,
-  plugins_schema: Arc<Mutex<HashMap<String, Schema>>>,
+  plugin_registry: Arc<Mutex<PluginRegistry>>,
+  starting_plugins: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl PluginManager {
@@ -67,13 +164,28 @@ impl PluginManager {
     Self {
       plugins_dir: plugins_dir.into(),
       active_plugins: Arc::new(Mutex::new(HashMap::new())),
-      plugins_schema: Arc::new(Mutex::new(HashMap::new())),
+      plugin_registry: Arc::new(Mutex::new(PluginRegistry::default())),
+      starting_plugins: Arc::new(StdMutex::new(HashSet::new())),
     }
   }
 
   /// Generate a unique socket path for a plugin
   fn generate_socket_path(&self) -> OsString {
     make_local_socket_name(&Uuid::new_v4().simple().to_string())
+  }
+
+  fn reserve_start(&self, plugin_name: &str) -> Result<StartupReservation> {
+    let mut names = self
+      .starting_plugins
+      .lock()
+      .map_err(|error| PluginManagerError::StartError(error.to_string()))?;
+    if !names.insert(plugin_name.to_owned()) {
+      return Err(PluginManagerError::PluginAlreadyRunning(plugin_name.to_owned()));
+    }
+    Ok(StartupReservation {
+      names: self.starting_plugins.clone(),
+      name: plugin_name.to_owned(),
+    })
   }
 
   async fn read_stream_to_string<R>(mut stream: R) -> io::Result<String>
@@ -126,9 +238,9 @@ impl PluginManager {
       .map(|stem| stem.strip_prefix("octa_plugin_").map(|s| s.to_owned()).unwrap_or(stem))
       .unwrap_or_else(|| "(unknown)".into());
 
-    let mut active_plugins = self.active_plugins.lock().await;
+    let _reservation = self.reserve_start(&plugin_name)?;
 
-    if active_plugins.contains_key(&plugin_name.clone()) {
+    if self.active_plugins.lock().await.contains_key(&plugin_name) {
       return Err(PluginManagerError::PluginAlreadyRunning(plugin_name.to_string()));
     }
 
@@ -161,7 +273,7 @@ impl PluginManager {
     let stderr_handle = tokio::spawn(Self::read_stream_to_string(stderr));
 
     let startup = timeout(PLUGIN_START_TIMEOUT, async {
-      let mut client = PluginClient::connect(&socket_name)
+      let client = PluginClient::connect(&socket_name)
         .await
         .map_err(|error| PluginManagerError::ConnectionError(error.to_string()))?;
       client
@@ -191,36 +303,53 @@ impl PluginManager {
       },
     };
 
-    let client = Arc::new(Mutex::new(Some(client)));
+    let registration = match PluginRegistration::new(plugin_name.clone(), schema.clone()) {
+      Ok(registration) => registration,
+      Err(error) => {
+        drop(client);
+        Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
+        return Err(PluginManagerError::StartError(format!(
+          "invalid plugin schema: {error}"
+        )));
+      },
+    };
+    if let Err(error) = self.plugin_registry.lock().await.register(registration) {
+      drop(client);
+      Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
+      return Err(error);
+    }
 
-    active_plugins.insert(
+    self.active_plugins.lock().await.insert(
       plugin_name.clone(),
       PluginInstance {
         process,
         socket_path,
-        client: client.clone(),
+        client,
       },
     );
-
-    {
-      let mut schemas = self.plugins_schema.lock().await;
-      schemas.insert(plugin_name, schema.clone());
-    }
-
-    drop(active_plugins);
 
     Ok(schema)
   }
 
   pub async fn get_schema_keys(&self) -> HashMap<String, String> {
-    let mut result = HashMap::new();
-    let schemas = self.plugins_schema.lock().await;
+    self
+      .plugin_registry
+      .lock()
+      .await
+      .keys
+      .iter()
+      .map(|(key, registration)| (key.clone(), registration.plugin_name.clone()))
+      .collect()
+  }
 
-    for (plugin_name, schema) in schemas.iter() {
-      result.insert(schema.key.clone(), plugin_name.clone());
-    }
+  /// Resolves a task type in constant time and shares its compiled validator.
+  pub async fn resolve_key(&self, key: &str) -> Option<PluginRegistration> {
+    self.plugin_registry.lock().await.keys.get(key).cloned()
+  }
 
-    result
+  /// Resolves an execution capability independently of a plugin's task key.
+  pub async fn resolve_capability(&self, capability: &str) -> Option<PluginRegistration> {
+    self.plugin_registry.lock().await.capabilities.get(capability).cloned()
   }
 
   /// Platform-specific command setup for Unix
@@ -268,12 +397,12 @@ impl PluginManager {
     }
   }
 
-  /// Get a reference to a plugin client
-  pub async fn get_client(&self, plugin_name: &str) -> Result<Arc<Mutex<Option<PluginClient>>>> {
+  /// Clones a connected client without holding the manager lifecycle lock during execution.
+  pub async fn get_client(&self, plugin_name: &str) -> Result<PluginClient> {
     let active_plugins = self.active_plugins.lock().await;
 
     if let Some(instance) = active_plugins.get(plugin_name) {
-      Ok(Arc::clone(&instance.client))
+      Ok(instance.client.clone())
     } else {
       Err(PluginManagerError::PluginNotFound(plugin_name.to_string()))
     }
@@ -286,29 +415,17 @@ impl PluginManager {
       .remove(plugin_name)
       .ok_or_else(|| PluginManagerError::PluginNotFound(plugin_name.to_string()))?;
 
-    let mut schemas = self.plugins_schema.lock().await;
-    schemas.remove(plugin_name);
-    drop(schemas);
+    let mut registry = self.plugin_registry.lock().await;
+    registry.remove_plugin(plugin_name);
+    drop(registry);
     drop(active_plugins);
 
     // Handle the client shutdown
-    let shutdown_result = {
-      // TODO: add timeout to shutdown plugin
-      let mut client_guard = instance.client.lock().await;
-      if let Some(client) = client_guard.as_mut() {
-        let res = client
-          .shutdown()
-          .await
-          .map_err(|e| PluginManagerError::ConnectionError(e.to_string()));
-
-        // Drop client to awoid panic in library
-        *client_guard = None;
-
-        res
-      } else {
-        Err(PluginManagerError::PluginClientNotFound(plugin_name.to_string()))
-      }
-    };
+    let shutdown_result = instance
+      .client
+      .shutdown()
+      .await
+      .map_err(|error| PluginManagerError::ConnectionError(error.to_string()));
 
     match tokio::time::timeout(Duration::from_secs(1), instance.process.wait()).await {
       Ok(Ok(_)) => {},
@@ -390,6 +507,7 @@ mod tests {
   use std::collections::HashSet;
 
   use super::*;
+  use crate::plugin_client::PluginExecutionRequest;
   use octa_plugin::protocol::PluginResponse;
   use tempfile::TempDir;
   use tokio::fs;
@@ -427,6 +545,54 @@ mod tests {
       .collect::<HashSet<_>>();
 
     assert_eq!(paths.len(), 1_000);
+  }
+
+  #[test]
+  fn plugin_registry_rejects_duplicate_keys_and_capabilities() {
+    let registration = |plugin: &str, key: &str, capabilities: &[&str]| {
+      PluginRegistration::new(
+        plugin.to_owned(),
+        Schema {
+          key: key.to_owned(),
+          capabilities: capabilities.iter().map(|value| (*value).to_owned()).collect(),
+          validation_schema: None,
+        },
+      )
+      .unwrap()
+    };
+    let mut registry = PluginRegistry::default();
+
+    registry.register(registration("first", "first", &["shell"])).unwrap();
+    assert_eq!(registry.capabilities["shell"].plugin_name(), "first");
+    assert!(matches!(
+      registry.register(registration("second", "first", &[])),
+      Err(PluginManagerError::PluginSelectorAlreadyRegistered(value)) if value == "first"
+    ));
+    assert!(matches!(
+      registry.register(registration("second", "second", &["shell"])),
+      Err(PluginManagerError::PluginSelectorAlreadyRegistered(value)) if value == "shell"
+    ));
+  }
+
+  #[test]
+  fn plugin_validation_schema_is_compiled_once() {
+    let registration = PluginRegistration::new(
+      "plugin".to_owned(),
+      Schema {
+        key: "key".to_owned(),
+        capabilities: Vec::new(),
+        validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+      },
+    )
+    .unwrap();
+
+    registration.validate(&serde_json::json!("valid")).unwrap();
+    let cloned = registration.clone();
+    assert!(registration.validate(&serde_json::json!(1)).is_err());
+    assert!(Arc::ptr_eq(
+      registration.validator.as_ref().unwrap(),
+      cloned.validator.as_ref().unwrap()
+    ));
   }
 
   #[tokio::test]
@@ -486,31 +652,33 @@ mod tests {
       Ok(client) => client,
       Err(e) => return println!("Can't get client, Err: {}", e),
     };
-    let mut client_guard = client.lock().await;
-    let client = client_guard.as_mut().unwrap();
 
     // Execute command
     let cancel_token = CancellationToken::new();
-    let execution_id = client
-      .execute(
-        "test".to_string(),
-        false,
-        vec![],
-        PathBuf::from("."),
-        HashMap::new(),
-        HashMap::new(),
+    let mut execution = client
+      .start_execution(
+        PluginExecutionRequest {
+          params: "test".to_owned(),
+          dry: false,
+          args: Vec::new(),
+          dir: PathBuf::from("."),
+          vars: HashMap::new(),
+          envs: HashMap::new(),
+          secret_vars: Vec::new(),
+          redact_params: false,
+        },
         cancel_token.clone(),
       )
       .await
       .unwrap();
 
-    assert_eq!(execution_id, "test-execution-id");
+    assert_eq!(execution.id(), "test-execution-id");
 
     // Receive output
     let mut received_stdout = false;
     let mut received_exit = false;
 
-    while let Ok(Some(response)) = client.receive_output(&cancel_token).await {
+    while let Ok(Some(response)) = execution.receive_output(&cancel_token).await {
       match response {
         PluginResponse::Stdout { id, line } => {
           assert_eq!(id, "test-execution-id");
@@ -638,23 +806,24 @@ mod tests {
 
   #[cfg(unix)]
   #[tokio::test]
-  async fn test_list_multiple_plugins() {
-    let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+  async fn test_starts_and_lists_multiple_plugins_in_parallel() {
+    let source = std::fs::read_to_string(PathBuf::from("../../plugins/test.py")).unwrap();
+    let plugins_dir = TempDir::new().unwrap();
+    let setup = TestSetup::new(plugins_dir.path().to_path_buf(), "test_1.py").await;
+    let plugin_names = ["test_1.py", "test_2.py", "test_3.py"];
 
-    // Start same plugin multiple times with different names
-    // In real scenario, you'd have different plugins
-    let plugin_names = vec!["test_1.py", "test_2.py", "test_3.py"];
-
-    for name in &plugin_names {
-      let _ = std::fs::remove_file(setup.plugin_path.parent().unwrap().join(name));
+    for (index, name) in plugin_names.iter().enumerate() {
+      let plugin = source.replace(r#""key": "key""#, &format!(r#""key": "key-{index}""#));
+      std::fs::write(plugins_dir.path().join(name), plugin).unwrap();
     }
-
-    // Create symbolic links to the test plugin with different names
-    for name in &plugin_names {
-      std::os::unix::fs::symlink(&setup.plugin_path, setup.plugin_path.parent().unwrap().join(name)).unwrap();
-      setup.plugin_manager.start_plugin(name).await.unwrap();
-    }
+    let starts = tokio::join!(
+      setup.plugin_manager.start_plugin(plugin_names[0]),
+      setup.plugin_manager.start_plugin(plugin_names[1]),
+      setup.plugin_manager.start_plugin(plugin_names[2]),
+    );
+    assert!(starts.0.is_ok());
+    assert!(starts.1.is_ok());
+    assert!(starts.2.is_ok());
 
     // Check list
     let mut plugins = setup.plugin_manager.list_active_plugins().await;
@@ -664,10 +833,7 @@ mod tests {
 
     assert_eq!(plugins, vec!["test_1", "test_2", "test_3"]);
 
-    // Cleanup symbolic links
-    for name in &plugin_names {
-      let _ = std::fs::remove_file(setup.plugin_path.parent().unwrap().join(name));
-    }
+    assert!(setup.plugin_manager.shutdown_all().await.iter().all(Result::is_ok));
   }
 
   #[tokio::test]
