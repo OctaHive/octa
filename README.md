@@ -676,9 +676,11 @@ task:
 ```
 
 ## Task command
-Each task can have commands that will be executed in the command line (defaults to cmd in 
-Windows and bash in Unix/Mac). There are two ways to set commands in a task: `shell` and `cmds`. 
-The cmds variant allows you to set multiple commands, which will be executed in sequence.
+Each task can have commands that will be executed by the built-in shell plugin. It uses
+[Brush](https://github.com/reubeno/brush), so the same Bash/POSIX-compatible syntax works on
+Windows, Linux, and macOS without requiring Bash to be installed. There are two ways to set
+commands in a task: `shell` and `cmds`. The `cmds` variant allows you to set multiple commands,
+which will be executed in sequence.
 
 ```yaml
 version: 1
@@ -691,7 +693,23 @@ tasks:
     cmds:
       - echo Hello Alice!
       - echo Hello Bob!
+
+  bash-syntax:
+    shell: |
+      names=(Alice Bob)
+      for name in "${names[@]}"; do
+        echo "Hello ${name}!"
+      done
     
+```
+
+Commands run in isolated Brush child processes, preserving cancellation and task timeout behavior.
+Bash scripts can be sourced directly, including on Windows:
+
+```yaml
+tasks:
+  build:
+    shell: source ./scripts/build.sh
 ```
 
 ## Plugin task annotations

@@ -1,0 +1,10 @@
+version: 1
+
+tasks:
+  inline:
+    shell: |
+      names=(Octa Brush)
+      printf '%s\n' "${names[*]}"
+
+  script:
+    shell: source ./scripts/greet.sh

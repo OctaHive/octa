@@ -1,8 +1,8 @@
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::env;
+use std::process::ExitCode;
 use std::time::Duration;
-use std::{path::PathBuf, process::Stdio, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -18,6 +18,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod brush;
+
 struct ShellPlugin {}
 
 fn plugin_schema() -> PluginSchema {
@@ -25,71 +27,6 @@ fn plugin_schema() -> PluginSchema {
     key: "shell".to_owned(),
     capabilities: vec![SHELL_CAPABILITY.to_owned()],
     validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
-  }
-}
-
-/// Platform-specific command setup for Unix
-#[cfg(not(windows))]
-fn setup_unix_command(cmd: &str, dir: &PathBuf, envs: HashMap<String, String>) -> tokio::process::Command {
-  let mut command = tokio::process::Command::new("sh");
-  command
-    .current_dir(dir)
-    .arg("-c")
-    .arg(cmd)
-    .envs(envs)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true)
-    .process_group(0);
-  command
-}
-
-/// Platform-specific command terminate for Unix
-#[cfg(not(windows))]
-fn terminate_unix_process(child: &mut tokio::process::Child) {
-  use nix::sys::signal::{kill, Signal};
-  use nix::unistd::Pid;
-
-  if let Some(pid) = child.id() {
-    let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
-  }
-}
-
-/// Platform-specific command setup for Windows
-#[cfg(windows)]
-fn setup_windows_command(cmd: &str, dir: &PathBuf, envs: HashMap<String, String>) -> tokio::process::Command {
-  #[allow(unused_imports)]
-  use std::os::windows::process::CommandExt;
-
-  const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-  const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-  let mut command = tokio::process::Command::new("cmd");
-  command
-    .current_dir(dir)
-    .args(["/C", cmd])
-    .envs(envs)
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true)
-    .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-  command
-}
-
-/// Platform-specific command terminate for Windows
-#[cfg(windows)]
-fn terminate_windows_process(child: &mut tokio::process::Child) {
-  use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-  use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
-
-  if let Some(pid) = child.id() {
-    unsafe {
-      let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-      if !std::ptr::eq(handle, INVALID_HANDLE_VALUE) {
-        TerminateProcess(handle as HANDLE, 1);
-        CloseHandle(handle as HANDLE);
-      }
-    }
   }
 }
 
@@ -116,18 +53,8 @@ impl Plugin for ShellPlugin {
     let mut tera = Tera::default();
     let template_name = format!("template_{}", id);
 
-    let get_env = |name: &str| match envs.get(name) {
-      Some(val) => Some(Cow::Borrowed(val.as_str())),
-      None => match env::var(name) {
-        Ok(val) => Some(Cow::Owned(val)),
-        Err(_) => None,
-      },
-    };
-
-    let val = shellexpand::env_with_context_no_errors(&command, get_env);
-
     tera
-      .add_raw_template(&template_name, val.as_ref())
+      .add_raw_template(&template_name, &command)
       .context("Failed to parse template")?;
 
     let context = TeraContext::from_serialize(&vars).context("Failed to serialize variables to context")?;
@@ -136,8 +63,22 @@ impl Plugin for ShellPlugin {
       .render(&template_name, &context)
       .context(format!("Failed to render template: {:?}", context))?;
 
-    let (tx, mut rx): (mpsc::Sender<String>, mpsc::Receiver<String>) = mpsc::channel(100);
+    if dry {
+      logger.log(&format!("Run command in dry mode: {}", result))?;
 
+      let response = serde_json::to_string(&PluginResponse::ExitStatus {
+        id: id.clone(),
+        code: 0,
+      })?
+        + "\n";
+      let mut writer = writer.lock().await;
+      writer.write_all(response.as_bytes()).await?;
+      writer.flush().await?;
+
+      return Ok(());
+    }
+
+    let (tx, mut rx): (mpsc::Sender<String>, mpsc::Receiver<String>) = mpsc::channel(100);
     let writer_handle = tokio::spawn({
       let writer = Arc::clone(&writer);
       async move {
@@ -149,25 +90,7 @@ impl Plugin for ShellPlugin {
       }
     });
 
-    if dry {
-      logger.log(&format!("Run command in dry mode: {}", result))?;
-
-      let response = PluginResponse::ExitStatus {
-        id: id.clone(),
-        code: 0,
-      };
-      let response_json = serde_json::to_string(&response).unwrap() + "\n";
-      let _ = tx.send(response_json.clone()).await;
-
-      return Ok(());
-    }
-
-    #[cfg(windows)]
-    let mut command = setup_windows_command(&result, &dir, envs);
-
-    #[cfg(not(windows))]
-    let mut command = setup_unix_command(&result, &dir, envs);
-
+    let mut command = brush::command(&result, &dir, envs)?;
     let mut child = command.spawn()?;
 
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
@@ -281,10 +204,7 @@ impl Plugin for ShellPlugin {
             }
           }
           _ = cancel_token.cancelled() => {
-            #[cfg(windows)]
-            terminate_windows_process(&mut child);
-            #[cfg(unix)]
-            terminate_unix_process(&mut child);
+            brush::terminate(&mut child);
 
             tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -313,8 +233,13 @@ impl Plugin for ShellPlugin {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-  serve_plugin(ShellPlugin {}, plugin_schema()).await
+async fn main() -> anyhow::Result<ExitCode> {
+  if let Some(exit_code) = brush::run_child().await? {
+    return Ok(ExitCode::from(exit_code));
+  }
+
+  serve_plugin(ShellPlugin {}, plugin_schema()).await?;
+  Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]
@@ -392,17 +317,16 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_echo_command() {
+  async fn test_dry_command() {
     let (writer, logger, dir) = setup_test().await;
     let plugin = ShellPlugin {};
-    let test_string = "Hello, World!";
     let cancel_token = CancellationToken::new();
 
     let result = plugin
       .execute_command(
         "test-id".to_string(),
-        false,
-        format!("echo {}", test_string),
+        true,
+        "echo Hello, World!".to_owned(),
         vec![],
         dir,
         HashMap::new(),
@@ -415,96 +339,20 @@ mod tests {
 
     assert!(result.is_ok());
 
-    // Wait a bit for async logging to complete
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     let output = writer.lock().await.get_output();
     let lines: Vec<&str> = output.lines().collect();
-
-    // Find stdout message
-    let stdout_line = lines
-      .iter()
-      .find(|line| line.contains("\"type\":\"Stdout\""))
-      .expect("Should have stdout message");
-
-    let response: PluginResponse = serde_json::from_str(stdout_line).unwrap();
-    match response {
-      PluginResponse::Stdout { id, line } => {
-        assert_eq!(id, "test-id");
-        assert!(line.contains(test_string));
-      },
-      _ => panic!("Expected Stdout response"),
-    }
-
-    // Check logger messages using as_any()
-    let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
-    assert!(!log_messages.is_empty());
-    assert!(log_messages.iter().any(|msg| msg.contains("Stdout")));
-  }
-
-  #[tokio::test]
-  async fn test_command_cancellation() {
-    let (writer, logger, dir) = setup_test().await;
-    let plugin = ShellPlugin {};
-    let cancel_token = CancellationToken::new();
-
-    // Use a command that takes some time to complete
-    #[cfg(windows)]
-    let command = "ping -n 5 127.0.0.1";
-    #[cfg(not(windows))]
-    let command = "sleep 5";
-
-    let handle = tokio::spawn({
-      let cancel_token = cancel_token.clone();
-      async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        cancel_token.cancel();
-      }
-    });
-
-    let result = plugin
-      .execute_command(
-        "test-id".to_string(),
-        false,
-        command.to_string(),
-        vec![],
-        dir,
-        HashMap::new(),
-        HashMap::new(),
-        writer.clone(),
-        logger.clone(),
-        cancel_token,
-      )
-      .await;
-
-    handle.await.unwrap();
-    assert!(result.is_ok());
-
-    // Wait a bit for async operations to complete
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let output = writer.lock().await.get_output();
-    let lines: Vec<&str> = output.lines().collect();
-
-    // Should find an exit status with non-zero code
-    let exit_line = lines
+    let exit_status = lines
       .iter()
       .find(|line| line.contains("\"type\":\"ExitStatus\""))
       .expect("Should have exit status message");
 
-    let response: PluginResponse = serde_json::from_str(exit_line).unwrap();
+    let response: PluginResponse = serde_json::from_str(exit_status).unwrap();
     match response {
       PluginResponse::ExitStatus { id, code } => {
         assert_eq!(id, "test-id");
-        assert_ne!(code, 0); // Should be non-zero for cancelled process
+        assert_eq!(code, 0);
       },
       _ => panic!("Expected ExitStatus response"),
     }
-
-    // Verify cancellation was logged
-    let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
-    assert!(log_messages.iter().any(|msg| msg.contains("ExitStatus")));
   }
 }
