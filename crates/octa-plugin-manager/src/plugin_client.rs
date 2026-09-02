@@ -392,16 +392,13 @@ impl PluginClient {
         }
         res
       } else {
-        return Err(PluginClientError::WriterClosed);
+        return Ok(());
       }
     };
 
     if let Err(error) = write_result {
-      if error.kind() == io::ErrorKind::BrokenPipe {
+      if is_connection_closed(&error) {
         self.cleanup().await;
-        return Ok(());
-      }
-      if error.raw_os_error() == Some(233) {
         return Ok(());
       }
       return Err(error.into());
@@ -416,7 +413,7 @@ impl PluginClient {
       Ok(Ok(_)) => Err(PluginClientError::Protocol("Expected Shutdown response".into())),
       Ok(Err(PluginClientError::ConnectionClosed)) => {
         self.cleanup().await;
-        Err(PluginClientError::ConnectionClosed)
+        Ok(())
       },
       Ok(Err(error)) => Err(error),
       Err(_) => {
@@ -435,6 +432,17 @@ impl PluginClient {
     }
     *writer = None;
   }
+}
+
+fn is_connection_closed(error: &io::Error) -> bool {
+  matches!(
+    error.kind(),
+    io::ErrorKind::BrokenPipe
+      | io::ErrorKind::ConnectionReset
+      | io::ErrorKind::ConnectionAborted
+      | io::ErrorKind::NotConnected
+      | io::ErrorKind::UnexpectedEof
+  ) || error.raw_os_error() == Some(233)
 }
 
 #[cfg(test)]
