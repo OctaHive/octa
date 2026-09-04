@@ -2062,7 +2062,7 @@ dependencies = [
 
 [[package]]
 name = "octa-cli"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "assert_cmd",
  "chrono",
@@ -2094,7 +2094,7 @@ dependencies = [
 
 [[package]]
 name = "octa-dag"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2109,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "octa-executor"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2147,7 +2147,7 @@ dependencies = [
 
 [[package]]
 name = "octa-finder"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "octa-octafile",
@@ -2163,7 +2163,7 @@ dependencies = [
 
 [[package]]
 name = "octa-monorepo"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "globset",
  "ignore",
@@ -2177,7 +2177,7 @@ dependencies = [
 
 [[package]]
 name = "octa-octafile"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "octa-plugin"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2219,7 +2219,7 @@ dependencies = [
 
 [[package]]
 name = "octa-plugin-manager"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "interprocess",
  "jsonschema",
@@ -2238,7 +2238,7 @@ dependencies = [
 
 [[package]]
 name = "octa_plugin_shell"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "octa_plugin_tpl"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",

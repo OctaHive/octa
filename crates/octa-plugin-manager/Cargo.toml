@@ -1,7 +1,7 @@
 [package]
 name = "octa-plugin-manager"
 description = "Plugin common"
-version = "0.2.1"
+version = "0.3.0"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -14,7 +14,7 @@ include = ["src/"]
 interprocess = { git = "https://github.com/federico-terzi/interprocess", features = [
   "tokio",
 ] }
-octa-plugin = { version = "0.2.1", path = "../octa-plugin" }
+octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
 semver = "1.0.28"
 serde = { workspace = true }
 serde_json = { workspace = true }

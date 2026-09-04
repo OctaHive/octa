@@ -1,7 +1,7 @@
 [package]
 name = "octa_plugin_shell"
 description = "Plugin for run shell commands"
-version = "0.2.1"
+version = "0.3.0"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -31,7 +31,7 @@ brush-coreutils-builtins = { version = "0.1.0", features = [
   "coreutils.sleep",
   "coreutils.touch",
 ] }
-octa-plugin = { version = "0.2.1", path = "../octa-plugin" }
+octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
 futures-util = "0.3.34"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -45,4 +45,4 @@ windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 nix = "0.31"
 
 [dev-dependencies]
-octa-plugin-manager = { version = "0.2.1", path = "../octa-plugin-manager" }
+octa-plugin-manager = { version = "0.3.0", path = "../octa-plugin-manager" }
