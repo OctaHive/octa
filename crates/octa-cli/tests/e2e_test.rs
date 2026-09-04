@@ -2505,6 +2505,62 @@ fn test_list_tasks() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_internal_include_hides_tasks_but_allows_task_references() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+includes:
+  helpers:
+    octafile: Helpers.yml
+    internal: true
+tasks:
+  build:
+    cmds:
+      - task: helpers:prepare
+      - echo build
+"#,
+  )?;
+  fs::write(
+    tmp_dir.path().join("Helpers.yml"),
+    r#"
+version: 1
+tasks:
+  prepare: echo prepare
+"#,
+  )?;
+
+  let command = || -> Result<Command, Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(tmp_dir.path())
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+    Ok(command)
+  };
+
+  command()?
+    .arg("--list-tasks")
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("build"))
+    .stdout(predicate::str::contains("helpers:prepare").not());
+  command()?
+    .arg("helpers:prepare")
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("Command not found: helpers:prepare"));
+  command()?
+    .arg("build")
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("prepare"))
+    .stdout(predicate::str::contains("build"));
+
+  Ok(())
+}
+
+#[test]
 fn test_clean_cache() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new().unwrap();
   let package_root = env::current_dir().unwrap().join("../../plugins");

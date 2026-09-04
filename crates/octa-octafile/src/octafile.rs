@@ -697,6 +697,12 @@ impl Octafile {
                 None => Some(vars),
               };
             }
+
+            if inc_info.internal.unwrap_or(false) {
+              for task in t.tasks.values_mut() {
+                task.internal = Some(true);
+              }
+            }
           }
 
           t
@@ -1153,6 +1159,44 @@ mod tests {
 
     // Test hierarchy
     assert_eq!(child.hierarchy_path(), vec!["child".to_string()]);
+  }
+
+  #[test]
+  fn internal_include_marks_every_declared_task_internal() {
+    let temp_dir = TempDir::new().unwrap();
+    let root_path = temp_dir.path().join("Octafile.yml");
+    let child_path = temp_dir.path().join("Child.yml");
+    fs::write(
+      &root_path,
+      r#"
+version: 1
+includes:
+  helpers:
+    octafile: Child.yml
+    internal: true
+tasks:
+  build: echo build
+"#,
+    )
+    .unwrap();
+    fs::write(
+      child_path,
+      r#"
+version: 1
+tasks:
+  prepare: echo prepare
+  explicitly-public:
+    internal: false
+    shell: echo public
+"#,
+    )
+    .unwrap();
+
+    let root = Octafile::load(Some(root_path), false, vec!["shell".to_owned()], "shell").unwrap();
+    let helpers = root.get_included("helpers").unwrap().unwrap();
+
+    assert_eq!(root.tasks["build"].internal, None);
+    assert!(helpers.tasks.values().all(|task| task.internal == Some(true)));
   }
 
   #[test]

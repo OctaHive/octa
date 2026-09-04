@@ -16,6 +16,8 @@ pub enum IncludeInfo {
 pub struct ComplexIncludeInfo {
   pub octafile: String,
   pub optional: Option<bool>,
+  /// Hides every task declared by the included Octafile from direct CLI execution.
+  pub internal: Option<bool>,
   pub dir: Option<PathBuf>,
   pub vars: Option<Vars>,
 }

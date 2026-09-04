@@ -277,6 +277,27 @@ includes:
       BUILD_IMAGE: debian
 ```
 
+##### internal
+
+Set `internal: true` on an include to hide every task declared by that Octafile from direct CLI execution and task listings. These tasks remain available to dependencies and task references. Nested includes configure their visibility independently.
+
+```yaml
+version: 1
+
+includes:
+  helpers:
+    octafile: ./helpers/Octafile.yml
+    internal: true
+
+tasks:
+  build:
+    cmds:
+      - task: helpers:prepare
+      - cargo build
+```
+
+See [`example/internal-include`](example/internal-include) for a runnable example.
+
 # Providing arguments to task
 If you want to pass arguments to the invoked tasks, you can specify them after `--`. The passed arguments will be available to the commands 
 through the `COMMAND_ARGS` variable.

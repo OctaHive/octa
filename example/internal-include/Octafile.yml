@@ -1,0 +1,12 @@
+version: 1
+
+includes:
+  helpers:
+    octafile: ./helpers/Octafile.yml
+    internal: true
+
+tasks:
+  build:
+    cmds:
+      - task: helpers:prepare
+      - echo Build finished
