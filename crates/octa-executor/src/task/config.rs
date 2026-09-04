@@ -218,6 +218,7 @@ pub struct TaskConfig {
   pub(super) freshness_runtime: FreshnessRuntime, // Task-level source and output state
   pub preconditions: Option<Vec<String>>,         // Task preconditions
   pub timeout: Option<Timeout>,                   // Maximum task execution time
+  pub(super) output_scope: Option<ConsoleScope>,
 
   // State management
   pub(super) action: NodeAction,
@@ -253,6 +254,7 @@ pub struct TaskConfigBuilder {
   freshness_runtime: FreshnessRuntime,
   pub preconditions: Option<Vec<String>>,
   pub timeout: Option<Timeout>,
+  output_scope: Option<ConsoleScope>,
 
   action: NodeAction,
   plugin: Option<PluginInvocation>,
@@ -306,6 +308,11 @@ impl TaskConfigBuilder {
 
   pub fn timeout(mut self, timeout: Option<Timeout>) -> Self {
     self.timeout = timeout;
+    self
+  }
+
+  pub(crate) fn output_scope(mut self, output_scope: Option<ConsoleScope>) -> Self {
+    self.output_scope = output_scope;
     self
   }
 
@@ -408,6 +415,7 @@ impl TaskConfigBuilder {
       freshness_runtime: self.freshness_runtime,
       preconditions: self.preconditions,
       timeout: self.timeout,
+      output_scope: self.output_scope,
       action: self.action,
       plugin: self.plugin,
     })

@@ -1,9 +1,5 @@
-use humanize_duration::prelude::DurationExt;
-use humanize_duration::Truncate;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-
-use tracing::info;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskSummaryItem {
@@ -15,6 +11,12 @@ pub struct TaskSummaryItem {
 pub struct Summary {
   tasks: Mutex<Vec<TaskSummaryItem>>,
   total: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryReport {
+  pub tasks: Vec<TaskSummaryItem>,
+  pub total: Duration,
 }
 
 impl Default for Summary {
@@ -36,22 +38,18 @@ impl Summary {
     tasks.push(item)
   }
 
-  pub async fn print(&self) {
-    let tasks = self.tasks.lock().await;
-    info!("================== Time Summary ==================");
-    for item in tasks.iter() {
-      let human = item.duration.human(Truncate::Millis);
-      info!(" \"{}\": {}", item.name, human);
+  /// Returns presentation-neutral timing data for the selected console renderer.
+  pub async fn report(&self) -> SummaryReport {
+    SummaryReport {
+      tasks: self.tasks.lock().await.clone(),
+      total: self.total.elapsed(),
     }
-    info!(" Total time: {}", self.total.elapsed().human(Truncate::Millis));
-    info!("==================================================");
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use tracing_test::traced_test;
 
   #[tokio::test]
   async fn test_new() {
@@ -85,9 +83,8 @@ mod tests {
     assert!(tasks.len() == 2);
   }
 
-  #[traced_test]
   #[tokio::test]
-  async fn test_print() {
+  async fn test_report() {
     let summary = Summary::new();
     let duration1 = Duration::from_millis(200);
     let item1 = TaskSummaryItem {
@@ -102,11 +99,10 @@ mod tests {
     };
     summary.add(item2.clone()).await;
 
-    summary.print().await;
+    let report = summary.report().await;
+    let later_report = summary.report().await;
 
-    assert!(logs_contain("================== Time Summary =================="));
-    assert!(logs_contain("\"task1\": 200ms"));
-    assert!(logs_contain("\"task2\": 350ms"));
-    assert!(logs_contain("=================================================="));
+    assert_eq!(report.tasks, vec![item1, item2]);
+    assert!(later_report.total >= report.total);
   }
 }

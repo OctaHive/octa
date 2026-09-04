@@ -884,6 +884,60 @@ tasks:
       - task: next
 ```
 
+# Output modes
+
+Octa streams task output as it arrives by default. When concurrently running tasks make that
+output difficult to read, `group` mode buffers each task invocation and prints its complete output
+as one contiguous block after the task finishes:
+
+```bash
+octa --parallel --output group build test
+```
+
+Use `--output interleaved` to select the default streaming behavior explicitly. Grouping applies
+only to task-scoped output; run-level diagnostics remain visible immediately.
+
+`prefixed` mode keeps output live and identifies every command line with its task name:
+
+```bash
+octa --parallel --output prefixed build test
+```
+
+Use `prefix` on a task when a shorter or more meaningful label is needed:
+
+```yaml
+tasks:
+  deploy:
+    prefix: production
+    shell: ./deploy.sh
+```
+
+The command output is rendered as `[production] ...`. Raw interactive output is passed through
+unchanged so prefixes cannot corrupt terminal protocols.
+
+Use `on-error` when successful task output should stay quiet but failed or cancelled task output
+must remain available for diagnostics:
+
+```bash
+octa --output on-error test
+```
+
+This mode buffers line-oriented output per task invocation and discards it after a successful run.
+Raw interactive output remains live because delaying it could break the terminal protocol.
+
+## CI annotations
+
+When `GITHUB_ACTIONS=true`, Octa automatically emits a GitHub Actions error annotation if the
+invocation fails. Detection can also be controlled explicitly:
+
+```bash
+octa --ci github test
+octa --ci none test
+```
+
+Annotations complement the selected output mode and do not reinterpret ordinary command output or
+`stderr` as an Octa error.
+
 # Concurrency limit
 
 Set a shared concurrency limit in the root Octafile:

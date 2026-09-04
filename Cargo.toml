@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates/octa-cli",
+  "crates/octa-output",
   "crates/octa-monorepo",
   "crates/octa-octafile",
   "crates/octa-dag",

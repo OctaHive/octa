@@ -211,7 +211,7 @@ impl PluginManager {
     socket_path: &OsString,
     stdout_handle: JoinHandle<io::Result<String>>,
     stderr_handle: JoinHandle<io::Result<String>>,
-  ) {
+  ) -> String {
     let _ = process.start_kill();
     let _ = timeout(PROCESS_STOP_TIMEOUT, process.wait()).await;
     let _ = tokio::fs::remove_file(socket_path).await;
@@ -221,11 +221,27 @@ impl PluginManager {
       Self::collect_startup_output(stderr_handle)
     );
 
+    let mut diagnostics = String::new();
     if !stdout.is_empty() {
-      println!("Plugin stdout: {stdout}");
+      diagnostics.push_str(&format!("\nPlugin stdout: {stdout}"));
     }
     if !stderr.is_empty() {
-      println!("Plugin stderr: {stderr}");
+      diagnostics.push_str(&format!("\nPlugin stderr: {stderr}"));
+    }
+    diagnostics
+  }
+
+  fn with_startup_diagnostics(error: PluginManagerError, diagnostics: String) -> PluginManagerError {
+    if diagnostics.is_empty() {
+      return error;
+    }
+
+    match error {
+      PluginManagerError::StartError(message) => PluginManagerError::StartError(format!("{message}{diagnostics}")),
+      PluginManagerError::ConnectionError(message) => {
+        PluginManagerError::ConnectionError(format!("{message}{diagnostics}"))
+      },
+      error => error,
     }
   }
 
@@ -292,13 +308,14 @@ impl PluginManager {
     let (client, schema) = match startup {
       Ok(Ok(result)) => result,
       Ok(Err(error)) => {
-        Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
-        return Err(error);
+        let diagnostics = Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
+        return Err(Self::with_startup_diagnostics(error, diagnostics));
       },
       Err(_) => {
-        Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
-        return Err(PluginManagerError::ConnectionError(
-          "Plugin startup timeout".to_string(),
+        let diagnostics = Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
+        return Err(Self::with_startup_diagnostics(
+          PluginManagerError::ConnectionError("Plugin startup timeout".to_string()),
+          diagnostics,
         ));
       },
     };
@@ -307,15 +324,16 @@ impl PluginManager {
       Ok(registration) => registration,
       Err(error) => {
         drop(client);
-        Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
-        return Err(PluginManagerError::StartError(format!(
-          "invalid plugin schema: {error}"
-        )));
+        let diagnostics = Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
+        return Err(Self::with_startup_diagnostics(
+          PluginManagerError::StartError(format!("invalid plugin schema: {error}")),
+          diagnostics,
+        ));
       },
     };
     if let Err(error) = self.plugin_registry.lock().await.register(registration) {
       drop(client);
-      Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
+      let _ = Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
       return Err(error);
     }
 
@@ -442,7 +460,11 @@ impl PluginManager {
           Ok(_) => {
             let _ = tokio::fs::remove_file(&instance.socket_path).await;
           },
-          Err(e) => eprintln!("Failed to kill process: {}", e),
+          Err(error) => {
+            return Err(PluginManagerError::ShutdownError(format!(
+              "Failed to kill process: {error}"
+            )));
+          },
         }
       },
     }
@@ -545,6 +567,35 @@ mod tests {
       .collect::<HashSet<_>>();
 
     assert_eq!(paths.len(), 1_000);
+  }
+
+  #[test]
+  fn startup_diagnostics_are_returned_without_changing_error_kind() {
+    let error = PluginManager::with_startup_diagnostics(
+      PluginManagerError::ConnectionError("connection closed".to_owned()),
+      "\nPlugin stderr: crash details".to_owned(),
+    );
+
+    assert!(matches!(
+      error,
+      PluginManagerError::ConnectionError(message)
+        if message == "connection closed\nPlugin stderr: crash details"
+    ));
+
+    let error = PluginManager::with_startup_diagnostics(
+      PluginManagerError::StartError("invalid handshake".to_owned()),
+      "\nPlugin stdout: details".to_owned(),
+    );
+    assert!(matches!(
+      error,
+      PluginManagerError::StartError(message) if message == "invalid handshake\nPlugin stdout: details"
+    ));
+
+    let error = PluginManager::with_startup_diagnostics(
+      PluginManagerError::PluginNotFound("missing".to_owned()),
+      "\nPlugin stderr: ignored".to_owned(),
+    );
+    assert!(matches!(error, PluginManagerError::PluginNotFound(name) if name == "missing"));
   }
 
   #[test]
@@ -1008,6 +1059,8 @@ time.sleep(10)  # Simulate a hanging plugin
       &crashing_plugin,
       r#"
 import sys
+print("startup stdout", flush=True)
+print("startup stderr", file=sys.stderr, flush=True)
 sys.exit(1)  # Crash immediately
       "#,
     )
@@ -1030,6 +1083,11 @@ sys.exit(1)  # Crash immediately
       .start_plugin(crashing_plugin.file_name().unwrap().to_str().unwrap())
       .await;
 
-    assert!(matches!(result, Err(PluginManagerError::ConnectionError(_))));
+    assert!(matches!(
+      result,
+      Err(PluginManagerError::ConnectionError(message))
+        if message.contains("Plugin stdout: startup stdout")
+          && message.contains("Plugin stderr: startup stderr")
+    ));
   }
 }

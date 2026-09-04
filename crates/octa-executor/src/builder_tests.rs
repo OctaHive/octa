@@ -2,11 +2,12 @@ use super::*;
 
 use octa_dag::Identifiable;
 use octa_octafile::Octafile;
-use std::fs;
+use std::{fs, io, sync::Mutex as StdMutex};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 use crate::vars::VariablePrompt;
+use octa_output::{Console, ConsoleRecord, ConsoleRenderer, ExecutionEvent};
 
 struct TestVariableResolver;
 
@@ -109,6 +110,158 @@ async fn test_build_simple_task() -> ExecutorResult<()> {
   let tasks: Vec<String> = dag.nodes().iter().map(|n| n.name.clone()).collect();
 
   assert!(tasks.contains(&"test".to_owned()));
+  Ok(())
+}
+
+#[tokio::test]
+async fn command_nodes_share_an_ordered_invocation_scope() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let content = r#"
+      version: 1
+      tasks:
+        build:
+          prefix: compiler
+          cmds:
+            - echo one
+            - echo two
+        test: echo test
+    "#;
+  let octafile_path = temp_dir.path().join("Octafile.yml");
+  fs::write(&octafile_path, content)?;
+
+  let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_string()], "shell")?;
+  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+  let allocator = Arc::new(ConsoleScopeAllocator::default());
+  let build = TaskGraphBuilder::new(plugin_manager.clone())?
+    .with_scope_allocator(allocator.clone())
+    .build(octafile.clone(), "build", false, vec![])
+    .await?;
+  let test = TaskGraphBuilder::new(plugin_manager)?
+    .with_scope_allocator(allocator)
+    .build(octafile, "test", false, vec![])
+    .await?;
+
+  let build_scopes = build
+    .nodes()
+    .iter()
+    .filter_map(|node| node.output_scope())
+    .collect::<Vec<_>>();
+  let test_scope = test.nodes().iter().next().unwrap().output_scope().unwrap();
+  assert_eq!(build_scopes.len(), 2);
+  assert!(build_scopes.iter().all(|scope| scope.id() == 0));
+  assert!(build_scopes.iter().all(|scope| scope.label() == "build"));
+  assert!(build_scopes.iter().all(|scope| scope.prefix() == "compiler"));
+  assert_eq!(test_scope.id(), 1);
+  assert_eq!(test_scope.label(), "test");
+  assert_eq!(test_scope.prefix(), "test");
+
+  Ok(())
+}
+
+#[derive(Clone)]
+struct RecordingRenderer(Arc<StdMutex<Vec<ConsoleRecord>>>);
+
+impl ConsoleRenderer for RecordingRenderer {
+  fn render(&mut self, entry: &octa_output::ConsoleEntry) -> io::Result<()> {
+    self.0.lock().unwrap().push(entry.record().clone());
+    Ok(())
+  }
+}
+
+#[tokio::test]
+async fn nested_and_deferred_invocations_close_every_declared_scope() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  fs::write(
+    temp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+tasks:
+  cleanup: echo cleanup
+  child: echo child
+  parent:
+    cmds:
+      - task: child
+      - defer:
+          task: cleanup
+      - echo parent
+"#,
+  )?;
+  let octafile = Octafile::load(
+    Some(temp_dir.path().join("Octafile.yml")),
+    false,
+    vec!["shell".to_owned()],
+    "shell",
+  )?;
+  let project_root = env!("CARGO_MANIFEST_DIR");
+  let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../plugins")));
+  #[cfg(not(windows))]
+  let plugin_name = "octa_plugin_shell";
+  #[cfg(windows)]
+  let plugin_name = "octa_plugin_shell.exe";
+  plugin_manager.start_plugin(plugin_name).await.unwrap();
+  let allocator = Arc::new(ConsoleScopeAllocator::default());
+  let events = Arc::new(StdMutex::new(Vec::new()));
+  let console = Arc::new(Console::new(RecordingRenderer(events.clone())));
+  let plan = TaskGraphBuilder::new(plugin_manager.clone())?
+    .with_scope_allocator(allocator)
+    .build(octafile, "parent", false, Vec::new())
+    .await?;
+  let executor = Executor::new(
+    plugin_manager.clone(),
+    plan,
+    crate::executor::ExecutorConfig {
+      silent: false,
+      console,
+      ..crate::executor::ExecutorConfig::default()
+    },
+    None,
+    Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+    false,
+    false,
+    None,
+  )?;
+
+  executor.execute(CancellationToken::new(), "parent").await?;
+
+  {
+    let events = events.lock().unwrap();
+    let declared = events
+      .iter()
+      .filter_map(|event| match event {
+        ConsoleRecord::Execution(ExecutionEvent::ScopeDeclared { scope, .. }) => {
+          Some((scope.id(), scope.label().to_owned()))
+        },
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    let started = events
+      .iter()
+      .filter_map(|event| match event {
+        ConsoleRecord::Execution(ExecutionEvent::ScopeStarted { scope, .. }) => {
+          Some((scope.id(), scope.label().to_owned()))
+        },
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    let mut finished = events
+      .iter()
+      .filter_map(|event| match event {
+        ConsoleRecord::Execution(ExecutionEvent::ScopeFinished { scope, .. }) => Some(scope.id()),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    let mut declared_ids = declared.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    declared_ids.sort_unstable();
+    finished.sort_unstable();
+    assert_eq!(finished, declared_ids);
+    assert!(started.iter().all(|entry| declared.contains(entry)));
+    assert!(started.iter().any(|(_, label)| label == "parent"));
+    assert!(started.iter().any(|(_, label)| label == "child"));
+    assert!(started.iter().any(|(_, label)| label == "cleanup"));
+  }
+  plugin_manager.shutdown_all().await;
+
   Ok(())
 }
 
