@@ -50,7 +50,7 @@ impl RawTerminalBridge {
   }
 
   pub(crate) async fn shutdown(&mut self) {
-    let tasks = self.tasks.drain(..).collect::<Vec<_>>();
+    let tasks = std::mem::take(&mut self.tasks);
     for task in &tasks {
       task.abort();
     }
