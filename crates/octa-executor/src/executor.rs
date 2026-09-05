@@ -166,6 +166,7 @@ pub struct Executor<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Sen
   scope_tracker: Arc<ConsoleScopeTracker>,
   interactive_tracker: Arc<InteractiveScopeTracker>,
   run_id: u64,
+  deferred_exit_code: Option<i32>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -234,6 +235,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       scope_tracker,
       interactive_tracker,
       run_id,
+      deferred_exit_code: None,
     })
   }
 
@@ -266,8 +268,9 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       return Err(error);
     }
     let result = self.execute_plan(cancel_token).await;
+    let deferred_exit_code = result.as_ref().err().and_then(ExecutorError::command_exit_code);
     self.interactive_tracker.finish_remaining().await;
-    self.run_deferred().await;
+    self.run_deferred(deferred_exit_code).await;
 
     let mut status = match &result {
       Ok(_) => self.scope_tracker.successful_run_status().await,
@@ -328,7 +331,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     mpsc::channel(self.state.dag.node_count())
   }
 
-  async fn run_deferred(&self) {
+  async fn run_deferred(&self, exit_code: Option<i32>) {
     let completed_tasks = self.state.completed_tasks.lock().await.clone();
     let mut deferred = self
       .deferred
@@ -362,6 +365,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
           run_id: self.run_id,
           dry: self.state.dry,
           force: self.state.force,
+          deferred_exit_code: exit_code,
         },
         self.config.concurrency.clone(),
         self.config.runtime_coordinator.clone(),
@@ -448,6 +452,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       run_id: self.run_id,
       completed_tasks: self.state.completed_tasks.clone(),
       deferred: self.deferred.clone(),
+      deferred_exit_code: self.deferred_exit_code,
     };
 
     let plugin_manager = Arc::clone(&self.plugin_manager);
@@ -581,6 +586,7 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   run_id: u64,
   completed_tasks: Arc<Mutex<HashSet<String>>>,
   deferred: Arc<HashMap<String, Arc<DeferredAction<T>>>>,
+  deferred_exit_code: Option<i32>,
 }
 
 struct TaskExecutor<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clone + 'static> {
@@ -658,6 +664,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
           run_id: self.context.run_id,
           dry: self.context.dry,
           force: self.context.force,
+          deferred_exit_code: self.context.deferred_exit_code,
         },
         self.context.concurrency.clone(),
         self.context.runtime_coordinator.clone(),
@@ -676,6 +683,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
             run_id: self.context.run_id,
             dry: self.context.dry,
             force: self.context.force,
+            deferred_exit_code: self.context.deferred_exit_code,
           },
           self.cancel_token.clone(),
         )
@@ -857,9 +865,10 @@ async fn execute_deferred_action<
     run_id,
     dry,
     force,
+    deferred_exit_code,
   } = runtime;
   // A fresh token lets cleanup continue even when cancellation stopped the main plan.
-  let executor = Executor::new(
+  let mut executor = Executor::new(
     plugin_manager,
     action.plan.clone(),
     ExecutorConfig {
@@ -876,6 +885,7 @@ async fn execute_deferred_action<
     force,
     None,
   )?;
+  executor.deferred_exit_code = deferred_exit_code;
 
   Box::pin(executor.execute(CancellationToken::new(), &action.command))
     .await
@@ -1217,7 +1227,7 @@ mod tests {
     )
     .unwrap();
 
-    executor.run_deferred().await;
+    executor.run_deferred(None).await;
 
     assert!(events.lock().unwrap().iter().any(|event| matches!(
       event,

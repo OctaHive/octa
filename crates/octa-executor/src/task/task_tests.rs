@@ -79,6 +79,7 @@ fn runtime(
     run_id: 1,
     dry: false,
     force: false,
+    deferred_exit_code: None,
   }
 }
 
@@ -370,6 +371,7 @@ async fn plugin_stdout_and_stderr_are_routed_as_structured_events() {
     run_id: 7,
     dry: false,
     force: false,
+    deferred_exit_code: None,
   };
 
   task.execute(runtime, CancellationToken::new()).await.unwrap();
@@ -523,7 +525,10 @@ async fn test_error_handling() {
       CancellationToken::new(),
     )
     .await;
-  assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
+  assert!(matches!(
+    result,
+    Err(ExecutorError::CommandFailed { task, code, .. }) if task == "error_task" && code != 0
+  ));
   plugin_manager.shutdown_all().await;
 }
 
@@ -580,6 +585,7 @@ async fn missing_plugin_errors_can_be_propagated_or_ignored() {
           run_id: 7,
           dry: false,
           force: false,
+          deferred_exit_code: None,
         },
         CancellationToken::new(),
       )

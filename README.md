@@ -1204,6 +1204,19 @@ tasks:
 Deferred command failures are logged but do not replace the result of the main task. If the main task fails,
 it remains failed after cleanup finishes.
 
+When a command finishes with a non-zero status, its numeric exit code is available to registered deferred
+commands as the `EXIT_CODE` template variable. The variable is also propagated through a deferred task
+reference. It is intentionally undefined after successful execution, matching go-task's behavior:
+
+```yaml
+tasks:
+  build:
+    cmds:
+      - defer: >-
+          echo "{% if EXIT_CODE is defined %}build failed with {{ EXIT_CODE }}{% else %}build succeeded{% endif %}"
+      - shell: ./build.sh
+```
+
 # Platform specific tasks and commands
 
 If you want to restrict tasks or individual commands to particular operating systems and architectures,

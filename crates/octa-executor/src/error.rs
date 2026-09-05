@@ -61,8 +61,8 @@ pub enum ExecutorError {
   #[error("Template render error: {0}")]
   TemplateRenderError(String),
 
-  #[error("Command execution failed: {0}")]
-  CommandFailed(String),
+  #[error("Task {task} failed with exit code {code}: {stderr}")]
+  CommandFailed { task: String, code: i32, stderr: String },
 
   #[error("Failed to get or set fingerprint db")]
   OpenFingerprintDbError(#[from] sled::Error),
@@ -148,4 +148,45 @@ pub enum ExecutorError {
 
   #[error("Lock error: {0}")]
   LockError(String),
+}
+
+impl ExecutorError {
+  /// Returns the process exit code when this error originated from a completed command.
+  pub(crate) fn command_exit_code(&self) -> Option<i32> {
+    match self {
+      Self::CommandFailed { code, .. } | Self::PluginEvaluationFailed { code, .. } if *code != 0 => Some(*code),
+      _ => None,
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn exposes_only_nonzero_process_exit_codes() {
+    assert_eq!(
+      ExecutorError::CommandFailed {
+        task: "build".to_owned(),
+        code: 17,
+        stderr: String::new(),
+      }
+      .command_exit_code(),
+      Some(17)
+    );
+    assert_eq!(
+      ExecutorError::PluginEvaluationFailed {
+        key: "shell".to_owned(),
+        code: 0,
+        stderr: String::new(),
+      }
+      .command_exit_code(),
+      None
+    );
+    assert_eq!(
+      ExecutorError::TaskCancelled("build".to_owned()).command_exit_code(),
+      None
+    );
+  }
 }
