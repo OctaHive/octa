@@ -1,3 +1,5 @@
+mod console_scope_tracker;
+mod console_target;
 mod dotenv;
 /// Module for building and managing task execution graphs
 pub mod envs;
@@ -38,7 +40,7 @@ use std::{
 
 use envs::Envs;
 use octa_plugin_manager::plugin_manager::PluginManager;
-use tracing::{debug, info};
+use tracing::debug;
 use uuid::Uuid;
 
 use error::{ExecutorError, ExecutorResult};
@@ -51,6 +53,7 @@ use octa_octafile::{
   AllowedRun, CommandOptions, CommandPayload, ConditionEvaluation, Deps, EnvValue, ExecuteMode, Octafile,
   PluginCommand, SourceStrategies, Task, TaskCommand,
 };
+use octa_output::{ConsoleScope, ConsoleScopeAllocator};
 use source_strategy::SourceStrategyRegistry;
 pub use source_strategy::{SourceMethod, SourceStrategy};
 pub use task::TaskNode;
@@ -76,6 +79,7 @@ struct InvocationContext {
   envs: Option<octa_octafile::Envs>,
   conditions: ConditionScope,
   freshness: Option<Arc<FreshnessState>>,
+  output_scope: Option<ConsoleScope>,
 }
 
 impl InvocationContext {
@@ -91,6 +95,7 @@ impl InvocationContext {
       envs,
       conditions,
       freshness: None,
+      output_scope: None,
     }
   }
 
@@ -112,6 +117,7 @@ impl InvocationContext {
       // decision across this boundary would hide changes to the child's sources,
       // outputs, dotenv files, and dynamic variables.
       freshness: None,
+      output_scope: None,
     }
   }
 }
@@ -175,6 +181,8 @@ pub struct TaskGraphBuilder {
   // Optional input provider shared by the main graph and nested deferred plans.
   variable_resolver: Option<Arc<dyn VariableResolver>>,
   source_strategies: SourceStrategyRegistry,
+  scope_allocator: Arc<ConsoleScopeAllocator>,
+  scopes: Mutex<Vec<ConsoleScope>>,
   os_arch: String,          // Operating system architecture
   os_type: String,          // Operating system type
   defer_order: AtomicUsize, // Declaration order for deferred commands
@@ -197,6 +205,8 @@ impl TaskGraphBuilder {
       variable_overrides: Vec::new(),
       variable_resolver: None,
       source_strategies: SourceStrategyRegistry::default(),
+      scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
+      scopes: Mutex::new(Vec::new()),
       os_arch,
       os_type,
       defer_order: AtomicUsize::new(0),
@@ -213,6 +223,12 @@ impl TaskGraphBuilder {
   /// Provides interactive values for variables declared with `required: prompt`.
   pub fn with_variable_resolver(mut self, resolver: Arc<dyn VariableResolver>) -> Self {
     self.variable_resolver = Some(resolver);
+    self
+  }
+
+  /// Shares ordered output-scope allocation with every plan built for one CLI run.
+  pub fn with_scope_allocator(mut self, allocator: Arc<ConsoleScopeAllocator>) -> Self {
+    self.scope_allocator = allocator;
     self
   }
 
@@ -239,7 +255,7 @@ impl TaskGraphBuilder {
     run_parallel: bool,
     command_args: Vec<String>,
   ) -> ExecutorResult<ExecutionPlan<TaskNode>> {
-    info!(
+    debug!(
       "Building DAG for command {} with provided args {:?}",
       command, command_args
     );
@@ -281,6 +297,10 @@ impl TaskGraphBuilder {
       .deferred
       .into_inner()
       .map_err(|error| ExecutorError::LockError(error.to_string()))?;
-    Ok(ExecutionPlan::new(dag, deferred))
+    let scopes = self
+      .scopes
+      .into_inner()
+      .map_err(|error| ExecutorError::LockError(error.to_string()))?;
+    Ok(ExecutionPlan::new(dag, deferred, scopes))
   }
 }

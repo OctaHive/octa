@@ -246,6 +246,30 @@ fn test_run_simple_task() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_summary_is_printed_after_execution() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    "version: 1\ntasks:\n  build:\n    shell: echo built\n",
+  )?;
+
+  let mut command = Command::cargo_bin("octa")?;
+  command
+    .current_dir(tmp_dir.path())
+    .args(["--summary", "build"])
+    .env("OCTA_CACHE_DIR", tmp_dir.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  command
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("Time Summary"))
+    .stdout(predicate::str::contains("build"))
+    .stdout(predicate::str::contains("Total time"));
+
+  Ok(())
+}
+
+#[test]
 fn test_global_default_plugin_for_short_commands() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   fs::write(tmp_dir.path().join("config.yml"), "default_plugin: tpl\n")?;
@@ -2350,6 +2374,159 @@ fn test_parallel_execution() -> Result<(), Box<dyn std::error::Error>> {
     .stdout(predicate::str::contains("task1"))
     .stdout(predicate::str::contains("task2"))
     .stdout(predicate::str::contains("task3"));
+
+  Ok(())
+}
+
+#[test]
+fn test_grouped_output_is_flushed_by_completed_task() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  slow:
+    shell: |
+      echo slow-start
+      touch slow-started
+      while [ ! -f fast-finished ]; do sleep 0.01; done
+      sleep 1
+      echo slow-end
+  fast:
+    shell: |
+      while [ ! -f slow-started ]; do sleep 0.01; done
+      echo fast-output
+      touch fast-finished
+"#,
+  )?;
+
+  let mut command = Command::cargo_bin("octa")?;
+  command
+    .current_dir(tmp_dir.path())
+    .args(["--parallel", "--output", "group", "slow", "fast"])
+    .env("OCTA_CACHE_DIR", tmp_dir.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  let output = command.output()?;
+  assert!(
+    output.status.success(),
+    "stdout:\n{}\nstderr:\n{}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
+
+  let stdout = String::from_utf8(output.stdout)?;
+  let task_output = stdout
+    .lines()
+    .filter(|line| matches!(*line, "slow-start" | "slow-end" | "fast-output"))
+    .collect::<Vec<_>>();
+  assert_eq!(task_output, ["fast-output", "slow-start", "slow-end"]);
+
+  Ok(())
+}
+
+#[test]
+fn test_prefixed_output_uses_task_name_and_custom_prefix() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  build: echo compiled
+  deploy:
+    prefix: production
+    shell: echo released >&2
+"#,
+  )?;
+
+  let mut command = Command::cargo_bin("octa")?;
+  command
+    .current_dir(tmp_dir.path())
+    .args(["--parallel", "--output", "prefixed", "build", "deploy"])
+    .env("OCTA_CACHE_DIR", tmp_dir.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+
+  command
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("[build] compiled"))
+    .stderr(predicate::str::contains("[production] released"));
+
+  Ok(())
+}
+
+#[test]
+fn test_on_error_output_discards_success_and_replays_failure() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  success: echo hidden-output
+  failure: echo visible-output && exit 1
+"#,
+  )?;
+
+  let run = |task: &str| -> Result<std::process::Output, Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    let output = command
+      .current_dir(tmp_dir.path())
+      .args(["--output", "on-error", "--ci", "none", task])
+      .env("OCTA_CACHE_DIR", tmp_dir.path().join("cache"))
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .output()?;
+    Ok(output)
+  };
+
+  let success = run("success")?;
+  assert!(success.status.success());
+  assert!(!String::from_utf8(success.stdout)?.contains("hidden-output"));
+
+  let failure = run("failure")?;
+  assert!(!failure.status.success());
+  assert!(String::from_utf8(failure.stdout)?.contains("visible-output"));
+
+  Ok(())
+}
+
+#[test]
+fn test_github_actions_detection_emits_an_annotation_and_can_be_disabled() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    "version: 1\ntasks:\n  failure: exit 1\n",
+  )?;
+
+  let mut command = Command::cargo_bin("octa")?;
+  command
+    .current_dir(tmp_dir.path())
+    .arg("failure")
+    .env("GITHUB_ACTIONS", "true")
+    .env("OCTA_CACHE_DIR", tmp_dir.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+
+  command
+    .assert()
+    .failure()
+    .stdout(predicate::str::contains("::error title=Octa failed::"));
+
+  let mut disabled = Command::cargo_bin("octa")?;
+  disabled
+    .current_dir(tmp_dir.path())
+    .args(["--ci", "none", "failure"])
+    .env("GITHUB_ACTIONS", "true")
+    .env("OCTA_CACHE_DIR", tmp_dir.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+
+  disabled
+    .assert()
+    .failure()
+    .stdout(predicate::str::contains("::error").not());
 
   Ok(())
 }

@@ -13,6 +13,7 @@ use std::{
 use futures::future::join_all;
 use indexmap::IndexMap;
 use octa_dag::{Identifiable, DAG};
+use octa_output::{Console, ConsoleLevel, ConsoleScope, ConsoleStatus, ExecutionEvent};
 use octa_plugin_manager::plugin_manager::PluginManager;
 use sled::Db;
 use tokio::{
@@ -22,12 +23,13 @@ use tokio::{
   time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info};
+use tracing::{debug, info_span, Instrument};
 
 use crate::{
+  console_scope_tracker::ConsoleScopeTracker,
   error::{ExecutorError, ExecutorResult},
   summary::{Summary, TaskSummaryItem},
-  task::{CacheItem, Executable, TaskItem},
+  task::{CacheItem, Executable, TaskItem, TaskOutcome, TaskRuntime},
 };
 
 // Add shutdown timeout constant
@@ -55,6 +57,9 @@ pub struct ExecutionPlan<T: Eq + Hash + Identifiable> {
 
   /// Cleanup actions indexed by the ID of their corresponding barrier node.
   deferred: HashMap<String, Arc<DeferredAction<T>>>,
+
+  /// Invocation scopes declared while expanding this plan.
+  scopes: Vec<ConsoleScope>,
 }
 
 /// A cleanup action attached to an internal barrier in the main task graph.
@@ -74,8 +79,8 @@ pub(crate) struct DeferredAction<T: Eq + Hash + Identifiable> {
 }
 
 impl<T: Eq + Hash + Identifiable> ExecutionPlan<T> {
-  pub(crate) fn new(dag: DAG<T>, deferred: HashMap<String, Arc<DeferredAction<T>>>) -> Self {
-    Self { dag, deferred }
+  pub(crate) fn new(dag: DAG<T>, deferred: HashMap<String, Arc<DeferredAction<T>>>, scopes: Vec<ConsoleScope>) -> Self {
+    Self { dag, deferred, scopes }
   }
 }
 
@@ -85,6 +90,7 @@ impl<T: Eq + Hash + Identifiable> From<DAG<T>> for ExecutionPlan<T> {
     Self {
       dag,
       deferred: HashMap::new(),
+      scopes: Vec::new(),
     }
   }
 }
@@ -106,6 +112,10 @@ pub struct ExecutorConfig {
   pub failfast: bool,
   /// Shared limiter for executable work; graph barriers do not consume permits.
   pub concurrency: Option<Arc<Semaphore>>,
+  /// Presentation sink shared by the top-level and deferred execution plans.
+  pub console: Arc<Console>,
+  /// Existing run identity inherited by nested deferred plans.
+  pub run_id: Option<u64>,
 }
 
 impl Default for ExecutorConfig {
@@ -114,6 +124,8 @@ impl Default for ExecutorConfig {
       silent: true,
       failfast: false,
       concurrency: None,
+      console: Arc::new(Console::default()),
+      run_id: None,
     }
   }
 }
@@ -140,6 +152,8 @@ pub struct Executor<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Sen
   config: ExecutorConfig,
   finished: CancellationToken,
   plugin_manager: Arc<PluginManager>,
+  scope_tracker: Arc<ConsoleScopeTracker>,
+  run_id: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -157,6 +171,18 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
   ) -> ExecutorResult<Self> {
     let plan = plan.into();
     let dag = plan.dag;
+    let node_scopes = dag
+      .nodes()
+      .iter()
+      .filter_map(|node| node.output_scope())
+      .collect::<Vec<_>>();
+    let run_id = config.run_id.unwrap_or_else(|| config.console.allocate_run_id());
+    let scope_tracker = Arc::new(ConsoleScopeTracker::new(
+      config.console.clone(),
+      run_id,
+      plan.scopes,
+      node_scopes,
+    ));
     let in_degree = dag.nodes().iter().map(|n| (n.id().clone(), 0)).collect();
 
     let cache = match cache {
@@ -184,13 +210,75 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       config,
       finished: CancellationToken::new(),
       plugin_manager,
+      scope_tracker,
+      run_id,
     })
   }
 
   /// Executes all tasks in the DAG
   pub async fn execute(&self, cancel_token: CancellationToken, command: &str) -> ExecutorResult<Vec<String>> {
-    self.log_info(&format!("Starting execution plan for command {}", command));
+    if !self.config.silent {
+      self
+        .config
+        .console
+        .event(ExecutionEvent::RunStarted {
+          run_id: self.run_id,
+          command: command.to_owned(),
+        })
+        .await?;
+    }
+    if let Err(error) = self.scope_tracker.declare().await {
+      let error = ExecutorError::from(error);
+      let _ = self.scope_tracker.finish_remaining(ConsoleStatus::Failed).await;
+      if !self.config.silent {
+        let _ = self
+          .config
+          .console
+          .event(ExecutionEvent::RunFinished {
+            run_id: self.run_id,
+            command: command.to_owned(),
+            status: ConsoleStatus::Failed,
+          })
+          .await;
+      }
+      return Err(error);
+    }
+    let result = self.execute_plan(cancel_token).await;
+    self.run_deferred().await;
 
+    let mut status = match &result {
+      Ok(_) => self.scope_tracker.successful_run_status().await,
+      Err(ExecutorError::TaskCancelled(_)) => ConsoleStatus::Cancelled,
+      Err(_) => ConsoleStatus::Failed,
+    };
+    let finish_result = self.scope_tracker.finish_remaining(status).await;
+    if finish_result.is_err() {
+      status = ConsoleStatus::Failed;
+    }
+    let run_result = if self.config.silent {
+      Ok(())
+    } else {
+      self
+        .config
+        .console
+        .event(ExecutionEvent::RunFinished {
+          run_id: self.run_id,
+          command: command.to_owned(),
+          status,
+        })
+        .await
+    };
+    match result {
+      Err(error) => Err(error),
+      Ok(values) => {
+        finish_result?;
+        run_result?;
+        Ok(values)
+      },
+    }
+  }
+
+  async fn execute_plan(&self, cancel_token: CancellationToken) -> ExecutorResult<Vec<String>> {
     self.initialize_execution().await?;
     let (tx, rx) = self.create_task_channel();
     let mut handles = Vec::with_capacity(self.state.dag.node_count());
@@ -200,16 +288,13 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
 
     self.schedule_initial_tasks(&tx).await?;
 
-    let result = match self.process_tasks(execution_token.clone(), rx, &tx, &mut handles).await {
+    match self.process_tasks(execution_token.clone(), rx, &tx, &mut handles).await {
       Ok(_) => self.handle_completion(cancel_token, handles).await,
       Err(error) => {
         execution_token.cancel();
         Err(error)
       },
-    };
-
-    self.run_deferred().await;
-    result
+    }
   }
 
   async fn initialize_execution(&self) -> ExecutorResult<()> {
@@ -246,16 +331,28 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
 
       if let Err(error) = execute_deferred_action(
         action,
-        self.plugin_manager.clone(),
-        self.state.cache.clone(),
-        self.state.fingerprint.clone(),
-        self.state.dry,
-        self.state.force,
+        TaskRuntime {
+          plugin_manager: self.plugin_manager.clone(),
+          cache: self.state.cache.clone(),
+          fingerprint: self.state.fingerprint.clone(),
+          console: self.config.console.clone(),
+          run_id: self.run_id,
+          dry: self.state.dry,
+          force: self.state.force,
+        },
         self.config.concurrency.clone(),
       )
       .await
       {
-        error!("Deferred command failed: {}", error);
+        let _ = self
+          .config
+          .console
+          .run_message(
+            self.run_id,
+            ConsoleLevel::Error,
+            format!("Deferred command failed: {error}"),
+          )
+          .await;
       }
     }
   }
@@ -320,17 +417,26 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       force: self.state.force,
       failfast: self.config.failfast,
       concurrency: self.config.concurrency.clone(),
+      console: self.config.console.clone(),
+      scope_tracker: self.scope_tracker.clone(),
+      run_id: self.run_id,
       completed_tasks: self.state.completed_tasks.clone(),
       deferred: self.deferred.clone(),
     };
 
     let plugin_manager = Arc::clone(&self.plugin_manager);
 
-    tokio::spawn(async move {
-      TaskExecutor::new(executor_state, task, tx, cancel_token, plugin_manager)
-        .execute()
-        .await
-    })
+    let run_id = executor_state.run_id;
+    // Runtime tracing diagnostics inherit the same correlation id carried by
+    // structured task output without coupling the executor to a tracing layer.
+    tokio::spawn(
+      async move {
+        TaskExecutor::new(executor_state, task, tx, cancel_token, plugin_manager)
+          .execute()
+          .await
+      }
+      .instrument(info_span!("task_execution", run_id)),
+    )
   }
 
   /// Schedules tasks with no dependencies
@@ -381,40 +487,52 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       return Err(error);
     }
 
-    self.log_info("All tasks completed successfully");
-
     Ok(results)
   }
 
   async fn shutdown(&self, handles: Vec<JoinHandle<ExecutorResult<String>>>) -> ExecutorResult<Vec<String>> {
-    self.log_info("Initiating graceful shutdown");
+    self.log_info("Initiating graceful shutdown").await?;
 
     match timeout(SHUTDOWN_TIMEOUT, join_all(handles)).await {
-      Ok(results) => self.handle_shutdown_results(results),
+      Ok(results) => self.handle_shutdown_results(results).await,
       Err(_) => {
-        error!("Shutdown timeout exceeded, forcing shutdown");
+        let _ = self.log_error("Shutdown timeout exceeded, forcing shutdown").await;
         Err(ExecutorError::ShutdownTimeout)
       },
     }
   }
 
-  fn handle_shutdown_results(
+  async fn handle_shutdown_results(
     &self,
     results: Vec<Result<ExecutorResult<String>, tokio::task::JoinError>>,
   ) -> ExecutorResult<Vec<String>> {
     for result in results {
       if let Err(e) = result.map_err(ExecutorError::JoinError)? {
-        error!("Task failed during shutdown: {}", e);
+        self.log_error(&format!("Task failed during shutdown: {e}")).await?;
       }
     }
-    self.log_info("Graceful shutdown completed");
+    self.log_info("Graceful shutdown completed").await?;
     Ok(vec![])
   }
 
-  fn log_info(&self, message: &str) {
+  async fn log_info(&self, message: &str) -> ExecutorResult<()> {
     if !self.config.silent {
-      info!("{}", message);
+      self
+        .config
+        .console
+        .run_message(self.run_id, ConsoleLevel::Info, message)
+        .await?;
     }
+    Ok(())
+  }
+
+  async fn log_error(&self, message: &str) -> ExecutorResult<()> {
+    self
+      .config
+      .console
+      .run_message(self.run_id, ConsoleLevel::Error, message)
+      .await?;
+    Ok(())
   }
 }
 
@@ -430,6 +548,9 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   force: bool,
   failfast: bool,
   concurrency: Option<Arc<Semaphore>>,
+  console: Arc<Console>,
+  scope_tracker: Arc<ConsoleScopeTracker>,
+  run_id: u64,
   completed_tasks: Arc<Mutex<HashSet<String>>>,
   deferred: Arc<HashMap<String, Arc<DeferredAction<T>>>>,
 }
@@ -463,10 +584,20 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
     let task_name = self.task.id();
     debug!("Executing task: {}", task_name);
 
+    if let Some(scope) = self.task.output_scope() {
+      if let Err(error) = self.context.scope_tracker.start(&scope).await {
+        let result = self.handle_error(error.into()).await;
+        return self.complete_scope(result).await;
+      }
+    }
+
     // Barriers do not consume capacity. Hidden executable nodes such as conditions do.
     let _permit = match self.acquire_permit().await {
       Ok(permit) => permit,
-      Err(error) => return self.handle_error(error).await,
+      Err(error) => {
+        let result = self.handle_error(error).await;
+        return self.complete_scope(result).await;
+      },
     };
     let start_time = SystemTime::now();
     let deferred = self.context.deferred.get(&task_name).cloned();
@@ -474,36 +605,82 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
       // The graph node is only an ordering barrier; its actual work lives in the nested plan.
       execute_deferred_action(
         action.clone(),
-        self.plugin_manager.clone(),
-        self.context.cache.clone(),
-        self.context.fingerprint.clone(),
-        self.context.dry,
-        self.context.force,
+        TaskRuntime {
+          plugin_manager: self.plugin_manager.clone(),
+          cache: self.context.cache.clone(),
+          fingerprint: self.context.fingerprint.clone(),
+          console: self.context.console.clone(),
+          run_id: self.context.run_id,
+          dry: self.context.dry,
+          force: self.context.force,
+        },
         self.context.concurrency.clone(),
       )
       .await
+      .map(TaskOutcome::success)
     } else {
       self
         .task
         .execute(
-          self.plugin_manager.clone(),
-          self.context.cache.clone(),
-          self.context.fingerprint.clone(),
-          self.context.dry,
-          self.context.force,
+          TaskRuntime {
+            plugin_manager: self.plugin_manager.clone(),
+            cache: self.context.cache.clone(),
+            fingerprint: self.context.fingerprint.clone(),
+            console: self.context.console.clone(),
+            run_id: self.context.run_id,
+            dry: self.context.dry,
+            force: self.context.force,
+          },
           self.cancel_token.clone(),
         )
         .await
     };
 
-    match result {
-      Ok(output) => self.handle_success(output, start_time).await,
+    let result = match result {
+      Ok(outcome) => {
+        let status = outcome.status();
+        self
+          .handle_success(outcome.into_output(), status, start_time)
+          .await
+          .map(|output| TaskOutcome::new(output, status))
+      },
       Err(error) if deferred.is_some() => {
         // Cleanup failures are reported without replacing the main task result.
-        error!("Deferred command failed: {}", error);
-        self.handle_success(String::new(), start_time).await
+        let _ = self
+          .context
+          .console
+          .run_message(
+            self.context.run_id,
+            ConsoleLevel::Error,
+            format!("Deferred command failed: {error}"),
+          )
+          .await;
+        self
+          .handle_success(String::new(), ConsoleStatus::Success, start_time)
+          .await
+          .map(TaskOutcome::success)
       },
       Err(e) => self.handle_error(e).await,
+    };
+    self.complete_scope(result).await
+  }
+
+  async fn complete_scope(&self, result: ExecutorResult<TaskOutcome>) -> ExecutorResult<String> {
+    let Some(scope) = self.task.output_scope() else {
+      return result.map(TaskOutcome::into_output);
+    };
+    let status = match &result {
+      Ok(outcome) => outcome.status(),
+      Err(ExecutorError::TaskCancelled(_)) => ConsoleStatus::Cancelled,
+      Err(_) => ConsoleStatus::Failed,
+    };
+    let completion = self.context.scope_tracker.complete(&scope, status).await;
+    match result {
+      Err(error) => Err(error),
+      Ok(outcome) => {
+        completion?;
+        Ok(outcome.into_output())
+      },
     }
   }
 
@@ -524,13 +701,18 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
     }
   }
 
-  async fn handle_success(&self, output: String, start_time: SystemTime) -> ExecutorResult<String> {
+  async fn handle_success(
+    &self,
+    output: String,
+    status: ConsoleStatus,
+    start_time: SystemTime,
+  ) -> ExecutorResult<String> {
     if self.cancel_token.is_cancelled() {
       debug!("Task {} cancelled during execution", self.task.id());
       return Ok(String::from(""));
     }
 
-    if !self.task.is_internal() {
+    if status == ConsoleStatus::Success && !self.task.is_internal() {
       if let Ok(elapsed) = start_time.elapsed() {
         self
           .context
@@ -549,8 +731,24 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
     self.process_task_success(output).await
   }
 
-  async fn handle_error(&self, error: ExecutorError) -> ExecutorResult<String> {
-    error!("Task {} failed: {}", self.task.name(), error);
+  async fn handle_error(&self, error: ExecutorError) -> ExecutorResult<TaskOutcome> {
+    let message = format!("Task {} failed: {error}", self.task.name());
+    let _ = match self.task.output_scope() {
+      Some(scope) => {
+        self
+          .context
+          .console
+          .run_message_at(self.context.run_id, scope, ConsoleLevel::Error, message)
+          .await
+      },
+      None => {
+        self
+          .context
+          .console
+          .run_message(self.context.run_id, ConsoleLevel::Error, message)
+          .await
+      },
+    };
     // `finished` prevents new dependants from being scheduled. The execution token additionally
     // interrupts siblings that were already running when fail-fast behavior is requested.
     if self.context.failfast || self.task.failfast() {
@@ -601,13 +799,18 @@ async fn execute_deferred_action<
   T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clone + 'static,
 >(
   action: Arc<DeferredAction<T>>,
-  plugin_manager: Arc<PluginManager>,
-  cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-  fingerprint: Arc<Db>,
-  dry: bool,
-  force: bool,
+  runtime: TaskRuntime,
   concurrency: Option<Arc<Semaphore>>,
 ) -> ExecutorResult<String> {
+  let TaskRuntime {
+    plugin_manager,
+    cache,
+    fingerprint,
+    console,
+    run_id,
+    dry,
+    force,
+  } = runtime;
   // A fresh token lets cleanup continue even when cancellation stopped the main plan.
   let executor = Executor::new(
     plugin_manager,
@@ -616,6 +819,8 @@ async fn execute_deferred_action<
       silent: true,
       failfast: false,
       concurrency,
+      console,
+      run_id: Some(run_id),
     },
     Some(cache),
     fingerprint,
@@ -634,7 +839,10 @@ mod tests {
   use std::{
     collections::HashMap,
     hash::{Hash, Hasher},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+      atomic::{AtomicBool, AtomicUsize, Ordering},
+      Mutex as StdMutex,
+    },
   };
 
   use async_trait::async_trait;
@@ -643,6 +851,7 @@ mod tests {
 
   use super::*;
   use crate::task::RunMode;
+  use octa_output::{ConsoleDiagnostic, ConsoleRecord};
 
   #[derive(Clone)]
   struct TestTask {
@@ -650,10 +859,13 @@ mod tests {
     internal: bool,
     requires_permit: bool,
     fails: bool,
+    cancelled: bool,
+    skipped: bool,
     failfast: bool,
     completed: Arc<AtomicBool>,
     running: Option<Arc<AtomicUsize>>,
     maximum_running: Option<Arc<AtomicUsize>>,
+    output_scope: Option<ConsoleScope>,
   }
 
   struct RunningTaskGuard(Arc<AtomicUsize>);
@@ -709,19 +921,15 @@ mod tests {
     fn requires_concurrency_permit(&self) -> bool {
       self.requires_permit
     }
+
+    fn output_scope(&self) -> Option<ConsoleScope> {
+      self.output_scope.clone()
+    }
   }
 
   #[async_trait]
   impl Executable<TestTask> for TestTask {
-    async fn execute(
-      &self,
-      _plugin_manager: Arc<PluginManager>,
-      _cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-      _fingerprint: Arc<Db>,
-      _dry: bool,
-      _force: bool,
-      cancel_token: CancellationToken,
-    ) -> ExecutorResult<String> {
+    async fn execute(&self, _runtime: TaskRuntime, cancel_token: CancellationToken) -> ExecutorResult<TaskOutcome> {
       let _running_guard = self.running.as_ref().map(|running| {
         let running_count = running.fetch_add(1, Ordering::SeqCst) + 1;
         self
@@ -737,10 +945,18 @@ mod tests {
         return Err(ExecutorError::TaskFailed(self.id.clone()));
       }
 
+      if self.cancelled {
+        return Err(ExecutorError::TaskCancelled(self.id.clone()));
+      }
+
+      if self.skipped {
+        return Ok(TaskOutcome::skipped(self.id.clone()));
+      }
+
       select! {
         _ = sleep(Duration::from_millis(150)) => {
           self.completed.store(true, Ordering::SeqCst);
-          Ok(self.id.clone())
+          Ok(TaskOutcome::success(self.id.clone()))
         },
         _ = cancel_token.cancelled() => Err(ExecutorError::TaskCancelled(self.id.clone())),
       }
@@ -757,10 +973,25 @@ mod tests {
       internal: false,
       requires_permit: true,
       fails: false,
+      cancelled: false,
+      skipped: false,
       failfast: false,
       completed: Arc::new(AtomicBool::new(false)),
       running: None,
       maximum_running: None,
+      output_scope: None,
+    }
+  }
+
+  #[derive(Clone)]
+  struct RecordingRenderer {
+    events: Arc<StdMutex<Vec<ConsoleRecord>>>,
+  }
+
+  impl octa_output::ConsoleRenderer for RecordingRenderer {
+    fn render(&mut self, entry: &octa_output::ConsoleEntry) -> std::io::Result<()> {
+      self.events.lock().unwrap().push(entry.record().clone());
+      Ok(())
     }
   }
 
@@ -777,6 +1008,221 @@ mod tests {
       None,
     )
     .unwrap()
+  }
+
+  #[tokio::test]
+  async fn emits_complete_scope_lifecycle_for_success_skip_and_failure() {
+    for (fails, skipped, expected) in [
+      (false, false, ConsoleStatus::Success),
+      (false, true, ConsoleStatus::Skipped),
+      (true, false, ConsoleStatus::Failed),
+    ] {
+      let allocator = octa_output::ConsoleScopeAllocator::default();
+      let scope = allocator.scope("task");
+      let mut task = test_task("task");
+      task.fails = fails;
+      task.skipped = skipped;
+      task.output_scope = Some(scope.clone());
+      let mut dag = DAG::new();
+      dag.add_node(Arc::new(task));
+      let events = Arc::new(StdMutex::new(Vec::new()));
+      let console = Arc::new(Console::new(RecordingRenderer { events: events.clone() }));
+      let plugin_dir = TempDir::new().unwrap();
+      let summary = Arc::new(Summary::new());
+      let plan = ExecutionPlan::new(dag, HashMap::new(), vec![scope.clone()]);
+      let executor = Executor::new(
+        Arc::new(PluginManager::new(plugin_dir.path())),
+        plan,
+        ExecutorConfig {
+          silent: false,
+          console,
+          run_id: Some(7),
+          ..ExecutorConfig::default()
+        },
+        None,
+        Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+        false,
+        false,
+        Some(summary.clone()),
+      )
+      .unwrap();
+
+      let result = executor.execute(CancellationToken::new(), "task").await;
+      assert_eq!(result.is_err(), fails);
+      {
+        let events = events.lock().unwrap();
+        assert!(events.contains(&ConsoleRecord::Execution(ExecutionEvent::ScopeStarted {
+          run_id: 7,
+          scope: scope.clone(),
+        })));
+        assert!(
+          events.contains(&ConsoleRecord::Execution(ExecutionEvent::ScopeFinished {
+            run_id: 7,
+            scope,
+            status: expected,
+          }))
+        );
+        assert!(events.contains(&ConsoleRecord::Execution(ExecutionEvent::RunFinished {
+          run_id: 7,
+          command: "task".to_owned(),
+          status: expected,
+        })));
+      }
+      assert_eq!(
+        summary.report().await.tasks.len(),
+        usize::from(expected == ConsoleStatus::Success)
+      );
+    }
+  }
+
+  struct RejectFirstScope(AtomicBool);
+
+  impl octa_output::ConsoleRenderer for RejectFirstScope {
+    fn render(&mut self, entry: &octa_output::ConsoleEntry) -> std::io::Result<()> {
+      if matches!(
+        entry.record(),
+        ConsoleRecord::Execution(ExecutionEvent::ScopeDeclared { .. })
+      ) && !self.0.swap(true, Ordering::SeqCst)
+      {
+        return Err(std::io::Error::other("scope start failed"));
+      }
+      Ok(())
+    }
+  }
+
+  #[tokio::test]
+  async fn renderer_failure_before_dag_start_does_not_run_deferred_actions() {
+    let completed = Arc::new(AtomicBool::new(false));
+    let deferred_task = {
+      let mut task = test_task("cleanup");
+      task.completed = completed.clone();
+      Arc::new(task)
+    };
+    let mut deferred_dag = DAG::new();
+    deferred_dag.add_node(deferred_task);
+    let action = Arc::new(DeferredAction {
+      command: "cleanup".to_owned(),
+      plan: ExecutionPlan::new(deferred_dag, HashMap::new(), Vec::new()),
+      order: 0,
+      registered_after: Vec::new(),
+    });
+
+    let allocator = octa_output::ConsoleScopeAllocator::default();
+    let scope = allocator.scope("main");
+    let mut barrier = test_task("barrier");
+    barrier.output_scope = Some(scope.clone());
+    let mut dag = DAG::new();
+    dag.add_node(Arc::new(barrier));
+    let plan = ExecutionPlan::new(dag, HashMap::from([("barrier".to_owned(), action)]), vec![scope]);
+    let plugin_dir = TempDir::new().unwrap();
+    let executor = Executor::new(
+      Arc::new(PluginManager::new(plugin_dir.path())),
+      plan,
+      ExecutorConfig {
+        console: Arc::new(Console::new(RejectFirstScope(AtomicBool::new(false)))),
+        silent: false,
+        ..ExecutorConfig::default()
+      },
+      None,
+      Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      false,
+      false,
+      None,
+    )
+    .unwrap();
+
+    assert!(executor.execute(CancellationToken::new(), "main").await.is_err());
+    assert!(!completed.load(Ordering::SeqCst));
+  }
+
+  #[tokio::test]
+  async fn deferred_cleanup_failures_are_reported_without_replacing_the_main_result() {
+    let mut cleanup = test_task("cleanup");
+    cleanup.fails = true;
+    let mut cleanup_dag = DAG::new();
+    cleanup_dag.add_node(Arc::new(cleanup));
+    let action = Arc::new(DeferredAction {
+      command: "cleanup".to_owned(),
+      plan: ExecutionPlan::new(cleanup_dag, HashMap::new(), Vec::new()),
+      order: 0,
+      registered_after: Vec::new(),
+    });
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let console = Arc::new(Console::new(RecordingRenderer { events: events.clone() }));
+    let executor = Executor::new(
+      Arc::new(PluginManager::new(TempDir::new().unwrap().path())),
+      ExecutionPlan::new(
+        DAG::new(),
+        HashMap::from([("cleanup-barrier".to_owned(), action)]),
+        Vec::new(),
+      ),
+      ExecutorConfig {
+        console,
+        silent: false,
+        ..ExecutorConfig::default()
+      },
+      None,
+      Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      false,
+      false,
+      None,
+    )
+    .unwrap();
+
+    executor.run_deferred().await;
+
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+      event,
+      ConsoleRecord::Diagnostic(ConsoleDiagnostic {
+        level: ConsoleLevel::Error,
+        message,
+        ..
+      }) if message.contains("Deferred command failed")
+    )));
+  }
+
+  #[tokio::test]
+  async fn cancellation_is_reflected_in_scope_and_run_events() {
+    let allocator = octa_output::ConsoleScopeAllocator::default();
+    let scope = allocator.scope("build");
+    let mut task = test_task("build");
+    task.cancelled = true;
+    task.output_scope = Some(scope.clone());
+    let mut dag = DAG::new();
+    dag.add_node(Arc::new(task));
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let console = Arc::new(Console::new(RecordingRenderer { events: events.clone() }));
+    let executor = Executor::new(
+      Arc::new(PluginManager::new(TempDir::new().unwrap().path())),
+      ExecutionPlan::new(dag, HashMap::new(), vec![scope.clone()]),
+      ExecutorConfig {
+        console,
+        silent: false,
+        ..ExecutorConfig::default()
+      },
+      None,
+      Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      false,
+      false,
+      None,
+    )
+    .unwrap();
+    let result = executor.execute(CancellationToken::new(), "build").await;
+
+    assert!(matches!(result, Err(ExecutorError::TaskCancelled(_))));
+    let events = events.lock().unwrap();
+    assert!(
+      events.contains(&ConsoleRecord::Execution(ExecutionEvent::ScopeFinished {
+        run_id: executor.run_id,
+        scope,
+        status: ConsoleStatus::Cancelled,
+      }))
+    );
+    assert!(events.contains(&ConsoleRecord::Execution(ExecutionEvent::RunFinished {
+      run_id: executor.run_id,
+      command: "build".to_owned(),
+      status: ConsoleStatus::Cancelled,
+    })));
   }
 
   async fn execute_parallel_failure(

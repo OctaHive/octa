@@ -17,6 +17,7 @@ pub type PluginSchemas = HashMap<String, Option<serde_json::Map<String, serde_js
 const RESERVED_PLUGIN_KEYS: &[&str] = &[
   "dir",
   "desc",
+  "prefix",
   "vars",
   "env",
   "dotenv",
@@ -545,6 +546,7 @@ pub struct Task {
   pub dotenv: Option<Vec<String>>,               // Environment files applied to this task
   pub dir: Option<PathBuf>,                      // Working directory for the task
   pub desc: Option<String>,                      // Task description
+  pub prefix: Option<String>,                    // Label used by prefixed output
   pub vars: Option<Vars>,                        // Task-specific variables
   pub cmds: Option<Vec<TaskCommand>>,            // List of commands
   pub internal: Option<bool>,                    // Show command in list of available commands
@@ -618,6 +620,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
       match key.as_str() {
         "dir" => task.dir = map.next_value()?,
         "desc" => task.desc = map.next_value()?,
+        "prefix" => task.prefix = map.next_value()?,
         "vars" => task.vars = map.next_value()?,
         "env" => task.env = map.next_value()?,
         "dotenv" => task.dotenv = map.next_value()?,
@@ -815,5 +818,12 @@ mod tests {
 
     let error = parse_task(&context, "cmds: [echo one]\nshell: echo two").unwrap_err();
     assert!(error.contains("a task cannot define both 'cmds' and a plugin task type"));
+  }
+
+  #[test]
+  fn parses_a_custom_output_prefix() {
+    let task = parse_task(&context(), "prefix: api\nshell: echo ready").unwrap();
+
+    assert_eq!(task.prefix.as_deref(), Some("api"));
   }
 }
