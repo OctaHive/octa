@@ -3,6 +3,9 @@ use std::{io, io::IsTerminal, time::Duration};
 use octa_plugin_manager::plugin_client::PluginTerminalInput;
 use tokio::task::JoinHandle;
 
+#[cfg(windows)]
+const DEFAULT_CURSOR_POSITION_RESPONSE: &[u8] = b"\x1b[1;1R";
+
 /// Bridges the host terminal to a command-scoped plugin protocol stream.
 pub(crate) struct RawTerminalBridge {
   input: PluginTerminalInput,
@@ -15,6 +18,16 @@ impl RawTerminalBridge {
     let terminal_mode = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if terminal_mode {
       crossterm::terminal::enable_raw_mode()?;
+    }
+
+    #[cfg(windows)]
+    if !terminal_mode {
+      // portable-pty creates ConPTY with PSEUDOCONSOLE_INHERIT_CURSOR. When
+      // stdout is not a terminal, answer its cursor query on the host's behalf.
+      input
+        .write(DEFAULT_CURSOR_POSITION_RESPONSE.to_vec())
+        .await
+        .map_err(io::Error::from)?;
     }
 
     let mut tasks = Vec::new();
@@ -119,7 +132,7 @@ async fn forward_input(input: PluginTerminalInput, terminal_mode: bool) -> io::R
 }
 
 #[cfg(not(unix))]
-async fn forward_input(input: PluginTerminalInput, _terminal_mode: bool) -> io::Result<()> {
+async fn forward_input(input: PluginTerminalInput, terminal_mode: bool) -> io::Result<()> {
   use tokio::io::AsyncReadExt;
 
   let mut stdin = tokio::io::stdin();
@@ -131,7 +144,11 @@ async fn forward_input(input: PluginTerminalInput, _terminal_mode: bool) -> io::
       Err(error) => return Err(error),
     }
   }
-  input.close().await.map_err(io::Error::from)
+  if terminal_mode {
+    input.close().await.map_err(io::Error::from)
+  } else {
+    Ok(())
+  }
 }
 
 impl Drop for RawTerminalBridge {
