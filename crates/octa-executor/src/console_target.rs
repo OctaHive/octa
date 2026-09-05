@@ -43,6 +43,9 @@ impl ConsoleTarget {
     if matches!(stream, ConsoleStream::Stdout) && self.silence.hides_stdout()
       || matches!(stream, ConsoleStream::Stderr) && self.silence.hides_stderr()
     {
+      if let Some(scope) = &self.scope {
+        self.console.update_progress(scope.clone(), line).await?;
+      }
       return Ok(());
     }
     self
@@ -124,12 +127,24 @@ mod tests {
   use super::*;
 
   #[derive(Clone, Default)]
-  struct Recording(Arc<Mutex<Vec<ConsoleRecord>>>);
+  struct Recording {
+    records: Arc<Mutex<Vec<ConsoleRecord>>>,
+    progress: Arc<Mutex<Vec<(ConsoleScope, String)>>>,
+  }
 
   impl ConsoleRenderer for Recording {
     fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
-      self.0.lock().unwrap().push(entry.record().clone());
+      self.records.lock().unwrap().push(entry.record().clone());
       Ok(())
+    }
+
+    fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
+      self.progress.lock().unwrap().push((scope.clone(), message.to_owned()));
+      Ok(())
+    }
+
+    fn supports_progress_updates(&self) -> bool {
+      true
     }
   }
 
@@ -163,7 +178,30 @@ mod tests {
     assert!(!stdout_hidden.hides(ConsoleStream::Stderr));
     assert!(!stderr_hidden.hides(ConsoleStream::Stdout));
     assert!(stderr_hidden.hides(ConsoleStream::Stderr));
-    assert_eq!(records.0.lock().unwrap().len(), 2);
+    assert_eq!(records.records.lock().unwrap().len(), 2);
+  }
+
+  #[tokio::test]
+  async fn hidden_streams_update_progress_without_emitting_output_records() {
+    let records = Recording::default();
+    let console = Arc::new(Console::new(records.clone()));
+    let scope = ConsoleScopeAllocator::default().scope("task");
+    let target = ConsoleTarget::with_silence(console, 7, Some(scope.clone()), Silence::All);
+
+    target
+      .line("command", ConsoleStream::Stdout, "compiling".to_owned())
+      .await
+      .unwrap();
+    target
+      .line("command", ConsoleStream::Stderr, "linking".to_owned())
+      .await
+      .unwrap();
+
+    assert_eq!(
+      *records.progress.lock().unwrap(),
+      [(scope.clone(), "compiling".to_owned()), (scope, "linking".to_owned())]
+    );
+    assert!(records.records.lock().unwrap().is_empty());
   }
 
   #[tokio::test]

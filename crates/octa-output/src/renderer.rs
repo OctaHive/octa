@@ -12,9 +12,24 @@ pub trait ConsoleRenderer: Send + 'static {
     Ok(())
   }
 
+  /// Whether this renderer currently has time-based work for [`Self::tick`].
+  fn wants_tick(&self) -> bool {
+    false
+  }
+
   /// Updates an adaptive renderer after the execution plan has been built.
   fn set_parallel(&mut self, _parallel: bool) -> io::Result<()> {
     Ok(())
+  }
+
+  /// Updates presentation-only progress without creating a runtime output record.
+  fn update_progress(&mut self, _scope: &ConsoleScope, _message: &str) -> io::Result<()> {
+    Ok(())
+  }
+
+  /// Whether hidden stdout can affect this renderer's presentation.
+  fn supports_progress_updates(&self) -> bool {
+    false
   }
 
   /// Suspends terminal UI before an exclusive PTY session starts.
@@ -42,8 +57,20 @@ impl<R: ConsoleRenderer + ?Sized> ConsoleRenderer for Box<R> {
     (**self).tick()
   }
 
+  fn wants_tick(&self) -> bool {
+    (**self).wants_tick()
+  }
+
   fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
     (**self).set_parallel(parallel)
+  }
+
+  fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
+    (**self).update_progress(scope, message)
+  }
+
+  fn supports_progress_updates(&self) -> bool {
+    (**self).supports_progress_updates()
   }
 
   fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {

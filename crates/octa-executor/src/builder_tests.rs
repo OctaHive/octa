@@ -218,7 +218,6 @@ tasks:
       - task: child
       - defer:
           task: cleanup
-      - echo parent
 "#,
   )?;
   let octafile = Octafile::load(

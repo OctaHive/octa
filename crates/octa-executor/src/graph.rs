@@ -81,6 +81,22 @@ impl TaskGraphBuilder {
       return self.add_freshness_commit(dag, command, &context, freshness, vec![task]);
     };
 
+    let lifecycle_scope = if commands
+      .iter()
+      .any(|command| matches!(command.payload, CommandPayload::Task(_)))
+    {
+      context.output_scope.clone()
+    } else {
+      None
+    };
+    let parents = if let Some(scope) = &lifecycle_scope {
+      let start = self.create_scope_barrier(dag, format!("Start task scope {}", command.name), scope.clone())?;
+      Self::connect_parents(dag, &parents, &start)?;
+      vec![start]
+    } else {
+      parents
+    };
+
     let run_parallel = run_parallel.unwrap_or(matches!(command.task.execute_mode, Some(ExecuteMode::Parallel)));
     let mut sequential_parent = None;
     let mut parallel_terminals = Vec::new();
@@ -172,7 +188,16 @@ impl TaskGraphBuilder {
       .into_iter()
       .collect();
 
-    self.attach_deferred_nodes(dag, deferred_nodes, predecessors)
+    let terminal = self.attach_deferred_nodes(dag, deferred_nodes, predecessors)?;
+    let Some(scope) = lifecycle_scope else {
+      return Ok(terminal);
+    };
+    let Some(terminal) = terminal else {
+      return Ok(None);
+    };
+    let finish = self.create_scope_barrier(dag, format!("Finish task scope {}", command.name), scope)?;
+    dag.add_dependency(&terminal, &finish)?;
+    Ok(Some(finish))
   }
 
   fn add_freshness_gate(
@@ -893,6 +918,24 @@ impl TaskGraphBuilder {
     dag.add_node(arc_task.clone());
 
     Ok(arc_task)
+  }
+
+  fn create_scope_barrier(
+    &self,
+    dag: &mut DagNode,
+    name: String,
+    output_scope: ConsoleScope,
+  ) -> ExecutorResult<ArcNode> {
+    let task = TaskConfig::builder()
+      .id(Uuid::new_v4())
+      .name(name.clone())
+      .dep_name(name)
+      .output_scope(Some(output_scope))
+      .action(NodeAction::Barrier)
+      .build()?;
+    let task = Arc::new(TaskNode::new(task));
+    dag.add_node(task.clone());
+    Ok(task)
   }
 
   pub(super) fn validate_dag(&self, dag: &DagNode, command: &str) -> ExecutorResult<()> {

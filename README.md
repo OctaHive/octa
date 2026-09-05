@@ -1060,6 +1060,13 @@ than blocking other commands sharing the plugin connection.
 extended task-reference/dependency levels where applicable. CLI/environment overrides are
 `--quiet`/`TASK_QUIET` and `--silent[=stdout|stderr]`/`TASK_SILENT`.
 
+With `replacing`, a fully silent task still keeps its progress row. It starts with `running`, then
+uses the latest non-empty stdout or stderr line as its progress text without emitting that line as
+normal command output. Without `silent`, stdout and stderr remain visible in full above the live panel
+while their latest non-empty line also updates the task's progress text. Scoped informational messages
+are absorbed by the progress UI; structured warnings and errors remain visible. Each declared task owns
+one stable row; completed rows remain in declaration order until the whole run finishes.
+
 For example, this keeps prefixed compiler output but hides Octa's own lifecycle messages:
 
 ```bash

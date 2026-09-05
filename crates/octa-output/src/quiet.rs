@@ -33,8 +33,20 @@ impl<R: ConsoleRenderer> ConsoleRenderer for QuietRenderer<R> {
     self.renderer.tick()
   }
 
+  fn wants_tick(&self) -> bool {
+    self.renderer.wants_tick()
+  }
+
   fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
     self.renderer.set_parallel(parallel)
+  }
+
+  fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
+    self.renderer.update_progress(scope, message)
+  }
+
+  fn supports_progress_updates(&self) -> bool {
+    self.renderer.supports_progress_updates()
   }
 
   fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
@@ -79,6 +91,10 @@ mod tests {
       Ok(())
     }
 
+    fn supports_progress_updates(&self) -> bool {
+      true
+    }
+
     fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
       self.raw.push(("begin", scope.clone()));
       Ok(())
@@ -112,6 +128,7 @@ mod tests {
 
     let scope = ConsoleScopeAllocator::default().scope("raw");
     assert!(renderer.supports_raw_terminal());
+    assert!(renderer.supports_progress_updates());
     renderer.tick().unwrap();
     renderer.set_parallel(true).unwrap();
     renderer.begin_raw(&scope).unwrap();

@@ -153,8 +153,20 @@ impl<R: ConsoleRenderer> ConsoleRenderer for GroupRenderer<R> {
     self.0.renderer.tick()
   }
 
+  fn wants_tick(&self) -> bool {
+    self.0.renderer.wants_tick()
+  }
+
   fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
     self.0.renderer.set_parallel(parallel)
+  }
+
+  fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
+    self.0.renderer.update_progress(scope, message)
+  }
+
+  fn supports_progress_updates(&self) -> bool {
+    self.0.renderer.supports_progress_updates()
   }
 
   fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
@@ -189,8 +201,20 @@ impl<R: ConsoleRenderer> ConsoleRenderer for OnErrorRenderer<R> {
     self.0.renderer.tick()
   }
 
+  fn wants_tick(&self) -> bool {
+    self.0.renderer.wants_tick()
+  }
+
   fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
     self.0.renderer.set_parallel(parallel)
+  }
+
+  fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
+    self.0.renderer.update_progress(scope, message)
+  }
+
+  fn supports_progress_updates(&self) -> bool {
+    self.0.renderer.supports_progress_updates()
   }
 
   fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {

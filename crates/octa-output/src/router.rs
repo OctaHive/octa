@@ -100,6 +100,13 @@ impl OutputRouterRenderer {
 
 impl ConsoleRenderer for OutputRouterRenderer {
   fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
+    if matches!(
+      entry.record(),
+      ConsoleRecord::Execution(ExecutionEvent::RunFinished { .. })
+    ) && self.replacing.has_progress()
+    {
+      return self.replacing.render(entry);
+    }
     let mode = self.effective_mode(self.selected_mode(record_scope(entry.record())));
     if mode == RenderMode::Replacing {
       return self.replacing.render(entry);
@@ -130,9 +137,24 @@ impl ConsoleRenderer for OutputRouterRenderer {
     Ok(())
   }
 
+  fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
+    let mode = self.effective_mode(self.selected_mode(Some(scope)));
+    if mode == RenderMode::Replacing {
+      self.replacing.update_progress(scope, message)
+    } else {
+      Ok(())
+    }
+  }
+
+  fn supports_progress_updates(&self) -> bool {
+    self.progress_enabled
+      && self.default_mode != RenderMode::Json
+      && (!self.force_default || self.default_mode == RenderMode::Replacing)
+  }
+
   fn tick(&mut self) -> io::Result<()> {
     let mut first_error = self.replacing.tick().err();
-    for renderer in self.renderers.values_mut() {
+    for renderer in self.renderers.values_mut().filter(|renderer| renderer.wants_tick()) {
       let result = if self.replacing.has_progress() {
         self.replacing.tick_external(&mut **renderer)
       } else {
@@ -255,6 +277,7 @@ mod tests {
       adaptive_default: false,
       force_default: false,
     });
+    assert!(router.supports_progress_updates());
 
     router
       .render(&event(ExecutionEvent::ScopeDeclared {
@@ -298,6 +321,7 @@ mod tests {
     });
     assert_eq!(router.selected_mode(Some(&scope)), RenderMode::Json);
     assert!(!router.supports_raw_terminal());
+    assert!(!router.supports_progress_updates());
 
     let forced = OutputRouterRenderer::new(OutputRouterConfig {
       default_mode: RenderMode::Prefixed,
@@ -310,6 +334,7 @@ mod tests {
     });
     assert_eq!(forced.selected_mode(Some(&scope)), RenderMode::Prefixed);
     assert!(forced.supports_raw_terminal());
+    assert!(!forced.supports_progress_updates());
   }
 
   #[test]

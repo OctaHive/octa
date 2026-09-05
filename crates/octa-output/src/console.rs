@@ -30,6 +30,11 @@ enum WriterRequest {
     parallel: bool,
     completed: oneshot::Sender<io::Result<()>>,
   },
+  UpdateProgress {
+    scope: ConsoleScope,
+    message: String,
+    completed: oneshot::Sender<io::Result<()>>,
+  },
   BeginRaw {
     scope: ConsoleScope,
     completed: oneshot::Sender<io::Result<()>>,
@@ -139,11 +144,13 @@ pub struct Console {
   raw_ticks_paused: Arc<AtomicBool>,
   dropped_diagnostics: AtomicU64,
   raw_terminal_supported: bool,
+  progress_updates_supported: bool,
 }
 
 impl Console {
   pub fn new(renderer: impl ConsoleRenderer) -> Self {
     let raw_terminal_supported = renderer.supports_raw_terminal();
+    let progress_updates_supported = renderer.supports_progress_updates();
     let (sender, receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
     let background_error = Arc::new(StdMutex::new(None));
     let raw_ticks_paused = Arc::new(AtomicBool::new(false));
@@ -168,6 +175,7 @@ impl Console {
       raw_ticks_paused,
       dropped_diagnostics: AtomicU64::new(0),
       raw_terminal_supported,
+      progress_updates_supported,
     }
   }
 
@@ -428,6 +436,33 @@ impl Console {
     }
   }
 
+  /// Sends a presentation-only progress update in the same order as runtime records.
+  pub async fn update_progress(&self, scope: ConsoleScope, message: impl Into<String>) -> io::Result<()> {
+    if !self.progress_updates_supported {
+      return Ok(());
+    }
+    let _guard = self.render_lock.lock().await;
+    let (completed, result) = oneshot::channel();
+    self
+      .writer
+      .send(WriterRequest::UpdateProgress {
+        scope,
+        message: message.into(),
+        completed,
+      })
+      .await?;
+    let render_result = result.await.map_err(|_| writer_closed())?;
+    match self.writer.take_background_error() {
+      Some(error) => {
+        if let Err(current) = render_result {
+          store_background_error(&self.writer.background_error, current);
+        }
+        Err(error)
+      },
+      None => render_result,
+    }
+  }
+
   async fn writer_barrier(&self) -> io::Result<()> {
     let (completed, result) = oneshot::channel();
     self.writer.send(WriterRequest::Barrier(completed)).await?;
@@ -551,6 +586,16 @@ fn render_loop(
           store_background_error(&background_error, error);
         }
       },
+      WriterRequest::UpdateProgress {
+        scope,
+        message,
+        completed,
+      } => {
+        let result = renderer.update_progress(&scope, &message);
+        if let Err(Err(error)) = completed.send(result) {
+          store_background_error(&background_error, error);
+        }
+      },
       WriterRequest::Barrier(completed) => {
         let _ = completed.send(());
       },
@@ -600,6 +645,7 @@ mod tests {
     records: StdMutex<Vec<ConsoleRecord>>,
     sequences: StdMutex<Vec<u64>>,
     threads: StdMutex<Vec<thread::ThreadId>>,
+    progress: StdMutex<Vec<(ConsoleScope, String)>>,
   }
 
   impl ConsoleRenderer for Arc<RecordingRenderer> {
@@ -608,6 +654,15 @@ mod tests {
       self.sequences.lock().unwrap().push(entry.sequence());
       self.threads.lock().unwrap().push(thread::current().id());
       Ok(())
+    }
+
+    fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
+      self.progress.lock().unwrap().push((scope.clone(), message.to_owned()));
+      Ok(())
+    }
+
+    fn supports_progress_updates(&self) -> bool {
+      true
     }
   }
 
@@ -683,6 +738,17 @@ mod tests {
       &renderer.records.lock().unwrap()[0],
       ConsoleRecord::Execution(ExecutionEvent::Output { scope: None, .. })
     ));
+  }
+
+  #[tokio::test]
+  async fn progress_updates_use_the_writer_without_becoming_records() {
+    let (console, renderer) = recording_console();
+    let scope = ConsoleScopeAllocator::default().scope("build");
+
+    console.update_progress(scope.clone(), "compiling").await.unwrap();
+
+    assert_eq!(*renderer.progress.lock().unwrap(), [(scope, "compiling".to_owned())]);
+    assert!(renderer.records.lock().unwrap().is_empty());
   }
 
   #[tokio::test]

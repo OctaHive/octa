@@ -12,6 +12,7 @@ include = ["src/"]
 
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde"] }
+console = { workspace = true }
 base64 = { workspace = true }
 humanize-duration = "0.0.7"
 indicatif = { workspace = true }
@@ -24,3 +25,4 @@ regex = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+indicatif = { workspace = true, features = ["in_memory"] }

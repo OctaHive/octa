@@ -31,14 +31,16 @@ struct ShellPlugin {
 
 struct PtyChildGuard {
   child: Arc<StdMutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+  #[cfg(unix)]
   process_group: Option<i32>,
   running: bool,
 }
 
 impl PtyChildGuard {
-  fn new(child: Box<dyn portable_pty::Child + Send + Sync>, process_group: Option<i32>) -> Self {
+  fn new(child: Box<dyn portable_pty::Child + Send + Sync>, #[cfg(unix)] process_group: Option<i32>) -> Self {
     Self {
       child: Arc::new(StdMutex::new(child)),
+      #[cfg(unix)]
       process_group,
       running: true,
     }
@@ -132,14 +134,13 @@ async fn execute_raw_pty(
   let pair = native_pty_system().openpty(size)?;
   #[cfg(unix)]
   let process_group = pair.master.process_group_leader();
+  let spawned = pair
+    .slave
+    .spawn_command(brush::pty_command(&command, &dir, envs, coreutils_path)?)?;
+  #[cfg(unix)]
+  let mut child = PtyChildGuard::new(spawned, process_group);
   #[cfg(not(unix))]
-  let process_group = None;
-  let mut child = PtyChildGuard::new(
-    pair
-      .slave
-      .spawn_command(brush::pty_command(&command, &dir, envs, coreutils_path)?)?,
-    process_group,
-  );
+  let mut child = PtyChildGuard::new(spawned);
   drop(pair.slave);
 
   let mut reader = pair.master.try_clone_reader()?;

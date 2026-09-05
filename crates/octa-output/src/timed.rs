@@ -89,6 +89,10 @@ impl<R: ConsoleRenderer> ConsoleRenderer for TimedRenderer<R> {
     self.renderer.tick()
   }
 
+  fn wants_tick(&self) -> bool {
+    !self.pending.is_empty()
+  }
+
   fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
     self.pending.remove(scope);
     self.renderer.begin_raw(scope)
@@ -104,6 +108,14 @@ impl<R: ConsoleRenderer> ConsoleRenderer for TimedRenderer<R> {
 
   fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
     self.renderer.set_parallel(parallel)
+  }
+
+  fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
+    self.renderer.update_progress(scope, message)
+  }
+
+  fn supports_progress_updates(&self) -> bool {
+    self.renderer.supports_progress_updates()
   }
 }
 
@@ -162,9 +174,12 @@ mod tests {
   fn tick_emits_a_line_that_remains_current_for_one_second() {
     let scope = ConsoleScopeAllocator::default().scope("build");
     let mut renderer = TimedRenderer::new(Recording::default());
+    assert!(!renderer.wants_tick());
     renderer.render(&line(scope.clone(), "compiling")).unwrap();
+    assert!(renderer.wants_tick());
     renderer.pending.get_mut(&scope).unwrap().since = Instant::now() - VISIBILITY_THRESHOLD;
     renderer.tick().unwrap();
+    assert!(!renderer.wants_tick());
     assert!(matches!(
       renderer.renderer.0.as_slice(),
       [ConsoleRecord::Execution(ExecutionEvent::Output {

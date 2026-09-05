@@ -90,8 +90,20 @@ impl<R: ConsoleRenderer> ConsoleRenderer for KeepOrderRenderer<R> {
     self.renderer.tick()
   }
 
+  fn wants_tick(&self) -> bool {
+    self.renderer.wants_tick()
+  }
+
   fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
     self.renderer.set_parallel(parallel)
+  }
+
+  fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
+    self.renderer.update_progress(scope, message)
+  }
+
+  fn supports_progress_updates(&self) -> bool {
+    self.renderer.supports_progress_updates()
   }
 
   fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
