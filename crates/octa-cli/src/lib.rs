@@ -12,7 +12,7 @@ use clap::{CommandFactory, Parser};
 use clap_complete::aot::{generate, Generator, Shell};
 use dialoguer::{Input, Password, Select};
 use lazy_static::lazy_static;
-use logger::{ChronoLocal, OctaFormatter};
+pub use logger::ConsoleLayer;
 use octa_plugin::{protocol::Schema, SHELL_CAPABILITY};
 use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Deserialize;
@@ -20,12 +20,7 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Duration};
 use tokio::{signal, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
-use tracing_subscriber::{
-  fmt::{self, format::FmtSpan},
-  prelude::*,
-  EnvFilter,
-};
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 use error::{OctaError, OctaResult};
 use octa_executor::{
@@ -37,9 +32,12 @@ use octa_executor::{
 };
 use octa_finder::OctaFinder;
 use octa_octafile::{Octafile, SyntheticInclude, WatchInterval};
+use octa_output::{CliDocument, Console, ConsoleLevel, ConsoleScopeAllocator, SummaryItem, TaskListItem};
+use presentation::{terminal_console, CiMode, OutputMode};
 
 mod error;
 mod logger;
+mod presentation;
 
 const SHELL_PLUGIN_NAME: &str = "shell";
 const TEMPLATE_PLUGIN_NAME: &str = "tpl";
@@ -47,6 +45,11 @@ const BUILTIN_PLUGIN_NAMES: [&str; 2] = [SHELL_PLUGIN_NAME, TEMPLATE_PLUGIN_NAME
 const DEFAULT_TASK: &str = "default";
 const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_millis(100);
+
+enum DiagnosticsSetup {
+  Install,
+  Inherit,
+}
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,6 +100,14 @@ pub(crate) struct Cli {
 
   #[arg(short, long, default_value_t = false)]
   pub parallel: bool,
+
+  /// Control how concurrent task output is presented
+  #[arg(long, value_enum, default_value_t)]
+  output: OutputMode,
+
+  /// Emit annotations understood by the selected CI provider
+  #[arg(long, value_enum, default_value_t)]
+  ci: CiMode,
 
   /// Maximum number of tasks that may run at the same time
   #[arg(long, value_name = "N")]
@@ -151,9 +162,11 @@ pub(crate) struct Cli {
   task_args: Vec<String>,
 }
 
-fn generate_completions<G: Generator>(gen: G, cmd: &mut clap::Command) {
+fn generate_completions<G: Generator>(gen: G, cmd: &mut clap::Command) -> String {
   let bin_name = cmd.get_name().to_string();
-  generate(gen, cmd, bin_name, &mut io::stdout());
+  let mut output = Vec::new();
+  generate(gen, cmd, bin_name, &mut output);
+  String::from_utf8(output).expect("clap generated non-UTF-8 completions")
 }
 
 fn parse_watch_interval(value: &str) -> Result<Duration, String> {
@@ -229,6 +242,8 @@ struct ExecutionContext {
   summary: Arc<Summary>,
   concurrency: Option<Arc<Semaphore>>,
   variable_resolver: Option<Arc<dyn VariableResolver>>,
+  console: Arc<Console>,
+  scope_allocator: Arc<ConsoleScopeAllocator>,
 }
 
 fn concurrency_limiter(cli: Option<NonZeroUsize>, configured: Option<NonZeroUsize>) -> Option<Arc<Semaphore>> {
@@ -286,7 +301,7 @@ impl VariableResolver for TerminalVariableResolver {
 }
 
 /// Sets up signal handling for graceful shutdown
-async fn setup_signal_handling(cancel_token: CancellationToken) {
+async fn setup_signal_handling(cancel_token: CancellationToken, console: Arc<Console>) {
   tokio::spawn(async move {
     let ctrl_c = async {
       signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
@@ -305,19 +320,19 @@ async fn setup_signal_handling(cancel_token: CancellationToken) {
 
     tokio::select! {
         _ = ctrl_c => {
-            info!("Received Ctrl-C, shutting down...");
+            let _ = console.message(ConsoleLevel::Info, "Received Ctrl-C, shutting down...").await;
             cancel_token.cancel()
         },
         _ = terminate => {
-            info!("Received terminate, shutting down...");
+            let _ = console.message(ConsoleLevel::Info, "Received terminate, shutting down...").await;
             cancel_token.cancel()
         },
     }
   });
 }
 
-/// Sets up logging based on verbosity and test environment
-fn setup_logging(verbose: bool) -> OctaResult<()> {
+/// Routes internal diagnostics through the selected output renderer.
+fn setup_logging(console: &Arc<Console>, verbose: bool) -> OctaResult<()> {
   let filter_layer = EnvFilter::try_from_default_env()
     .or_else(|_| {
       if verbose {
@@ -328,30 +343,11 @@ fn setup_logging(verbose: bool) -> OctaResult<()> {
     })
     .unwrap();
 
-  let pretty_print = env::var("OCTA_TESTS").is_err();
-  if pretty_print {
-    let fmt_layer = fmt::layer()
-      .compact()
-      .with_timer(ChronoLocal)
-      .with_file(false)
-      .with_line_number(false)
-      .with_span_events(FmtSpan::CLOSE)
-      .event_format(OctaFormatter);
-
-    tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
-  } else {
-    let fmt_layer = fmt::layer()
-      .compact()
-      .with_file(false)
-      .with_level(false)
-      .without_time()
-      .with_target(false)
-      .with_line_number(false)
-      .with_span_events(FmtSpan::CLOSE);
-
-    tracing_subscriber::registry().with(filter_layer).with(fmt_layer).init();
-  }
-  Ok(())
+  tracing_subscriber::registry()
+    .with(filter_layer)
+    .with(ConsoleLayer::new(console))
+    .try_init()
+    .map_err(|error| OctaError::Runtime(format!("failed to initialize diagnostics: {error}")))
 }
 
 /// Initializes plugin manager and loads plugins
@@ -400,6 +396,14 @@ async fn initialize_plugins(
   }
 
   Ok((plugin_manager, plugin_keys))
+}
+
+async fn shutdown_plugins(plugin_manager: &PluginManager, console: &Console) {
+  for error in plugin_manager.shutdown_all().await.into_iter().filter_map(Result::err) {
+    let _ = console
+      .message(ConsoleLevel::Error, format!("Failed to shut down plugin: {error}"))
+      .await;
+  }
 }
 
 /// Resolves the task-type key used for short commands from configuration or the shell capability.
@@ -484,8 +488,19 @@ async fn build_execute_items(
   let mut watch_targets = Vec::new();
 
   for command in commands {
-    let mut builder =
-      TaskGraphBuilder::new(context.plugin_manager.clone())?.with_variable_overrides(options.vars.clone());
+    context
+      .console
+      .message(
+        ConsoleLevel::Info,
+        format!(
+          "Building DAG for command {} with provided args {:?}",
+          command, options.task_args
+        ),
+      )
+      .await?;
+    let mut builder = TaskGraphBuilder::new(context.plugin_manager.clone())?
+      .with_scope_allocator(context.scope_allocator.clone())
+      .with_variable_overrides(options.vars.clone());
     if let Some(resolver) = &context.variable_resolver {
       builder = builder.with_variable_resolver(resolver.clone());
     }
@@ -507,6 +522,8 @@ async fn build_execute_items(
         silent: false,
         failfast: options.failfast,
         concurrency: context.concurrency.clone(),
+        console: context.console.clone(),
+        run_id: None,
       },
       None,
       Arc::clone(&context.fingerprint),
@@ -570,10 +587,19 @@ async fn execute_watch(
     watcher = SourceWatcher::new(targets, cancel_token.clone()) => watcher?,
   };
   if let Err(error) = execute_tasks(tasks, options.parallel, options.failfast, cancel_token.clone()).await {
-    warn!("Task execution failed; waiting for source changes: {}", error);
+    context
+      .console
+      .message(
+        ConsoleLevel::Warn,
+        format!("Task execution failed; waiting for source changes: {error}"),
+      )
+      .await?;
   }
 
-  info!("Watching sources for changes");
+  context
+    .console
+    .message(ConsoleLevel::Info, "Watching sources for changes")
+    .await?;
   loop {
     tokio::select! {
       _ = cancel_token.cancelled() => break,
@@ -586,11 +612,20 @@ async fn execute_watch(
       changed = watcher.poll() => changed?,
     };
     if changed {
-      info!("Sources changed; restarting tasks");
+      context
+        .console
+        .message(ConsoleLevel::Info, "Sources changed; restarting tasks")
+        .await?;
       let (tasks, _) = build_execute_items(&context, commands, options).await?;
 
       if let Err(error) = execute_tasks(tasks, options.parallel, options.failfast, cancel_token.clone()).await {
-        warn!("Task execution failed; waiting for source changes: {}", error);
+        context
+          .console
+          .message(
+            ConsoleLevel::Warn,
+            format!("Task execution failed; waiting for source changes: {error}"),
+          )
+          .await?;
       }
     }
   }
@@ -599,19 +634,64 @@ async fn execute_watch(
 }
 
 pub async fn run() -> OctaResult<()> {
-  // Parse command line arguments
-  let mut args = Cli::parse();
+  let args = Cli::parse();
+  run_with_console_and_diagnostics(terminal_console(args.output, args.ci), args).await
+}
 
+/// Runs the CLI and reports its terminal error through the same output pipeline.
+pub async fn run_and_report() -> bool {
+  let args = Cli::parse();
+  let console = terminal_console(args.output, args.ci);
+  match run_with_console_and_diagnostics(console.clone(), args).await {
+    Ok(()) => true,
+    Err(error) => {
+      let _ = console
+        .document(CliDocument::Failure {
+          message: error.to_string(),
+        })
+        .await;
+      false
+    },
+  }
+}
+
+/// Runs the CLI with an injected renderer and leaves the process-global tracing subscriber untouched.
+///
+/// Embedders that want tracing diagnostics in this console can install [`ConsoleLayer`]
+/// in their existing subscriber. The injected renderer controls presentation, including grouping.
+/// The standalone binary installs its tracing layer and selects a renderer from the CLI options.
+pub async fn run_with_console(console: Arc<Console>) -> OctaResult<()> {
+  run_with_console_and_mode(console, DiagnosticsSetup::Inherit, Cli::parse()).await
+}
+
+async fn run_with_console_and_diagnostics(console: Arc<Console>, args: Cli) -> OctaResult<()> {
+  run_with_console_and_mode(console, DiagnosticsSetup::Install, args).await
+}
+
+async fn run_with_console_and_mode(console: Arc<Console>, diagnostics: DiagnosticsSetup, args: Cli) -> OctaResult<()> {
+  let result = run_with_console_mode(console.clone(), diagnostics, args).await;
+  let drain_result = console.drain().await;
+
+  match result {
+    Err(error) => Err(error),
+    Ok(()) => drain_result.map_err(Into::into),
+  }
+}
+
+async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSetup, mut args: Cli) -> OctaResult<()> {
   extract_inline_vars(&mut args)?;
 
   if let Some(shell) = args.completions {
     let mut cmd = Cli::command();
-    generate_completions(shell, &mut cmd);
+    let text = generate_completions(shell, &mut cmd);
+    console.document(CliDocument::Completion { text }).await?;
     return Ok(());
   }
 
   load_env_files(&args.env_files)?;
-  setup_logging(args.verbose)?;
+  if matches!(diagnostics, DiagnosticsSetup::Install) {
+    setup_logging(&console, args.verbose)?;
+  }
 
   let plugins_dir = std::env::var("OCTA_PLUGINS_DIR").unwrap_or_else(|_| "plugins".to_string());
   let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
@@ -641,7 +721,7 @@ pub async fn run() -> OctaResult<()> {
   if args.clean_cache {
     fingerprint.clear()?;
     octa_monorepo::clear_cache(&fingerprint)?;
-    plugin_manager.shutdown_all().await;
+    shutdown_plugins(&plugin_manager, &console).await;
     return Ok(());
   }
 
@@ -666,11 +746,16 @@ pub async fn run() -> OctaResult<()> {
     })
     .collect::<Vec<_>>();
   if !synthetic_includes.is_empty() {
-    info!(
-      "Loaded {} monorepo projects{}",
-      synthetic_includes.len(),
-      if monorepo.cache_hit { " from cache" } else { "" }
-    );
+    console
+      .message(
+        ConsoleLevel::Info,
+        format!(
+          "Loaded {} monorepo projects{}",
+          synthetic_includes.len(),
+          if monorepo.cache_hit { " from cache" } else { "" }
+        ),
+      )
+      .await?;
   }
 
   let octafile = Octafile::load_with_schemas_vars_and_includes_from(
@@ -684,11 +769,11 @@ pub async fn run() -> OctaResult<()> {
   )?;
 
   if args.dry {
-    warn!("Octa run in dry mode");
+    console.message(ConsoleLevel::Warn, "Octa run in dry mode").await?;
   }
 
   let cancel_token = CancellationToken::new();
-  setup_signal_handling(cancel_token.clone()).await;
+  setup_signal_handling(cancel_token.clone(), console.clone()).await;
 
   if args.list_tasks || args.search.is_some() {
     let finder = OctaFinder::new();
@@ -699,13 +784,12 @@ pub async fn run() -> OctaResult<()> {
     let filtered = commands.into_iter().filter(|cmd| !cmd.task.internal.unwrap_or(false));
     let found_commands: Vec<(String, Option<String>)> = filtered.map(|c| (c.name.clone(), c.task.desc)).collect();
 
-    for (name, description) in found_commands.into_iter().rev() {
-      if let Some(description) = description {
-        println!("{}: {}", name, description);
-      } else {
-        println!("{}", name);
-      }
-    }
+    let tasks = found_commands
+      .into_iter()
+      .rev()
+      .map(|(name, description)| TaskListItem { name, description })
+      .collect();
+    console.document(CliDocument::TaskList { tasks }).await?;
 
     return Ok(());
   }
@@ -720,8 +804,12 @@ pub async fn run() -> OctaResult<()> {
       .find_by_path(Arc::clone(&octafile), &commands[0])
       .is_empty()
   {
-    Cli::command().print_help().unwrap();
-    println!();
+    let help = Cli::command().render_help().to_string();
+    console
+      .document(CliDocument::Help {
+        text: format!("{help}\n"),
+      })
+      .await?;
 
     return Ok(());
   }
@@ -745,6 +833,8 @@ pub async fn run() -> OctaResult<()> {
     summary: summary.clone(),
     concurrency: concurrency_limiter(args.concurrency, octafile.concurrency),
     variable_resolver,
+    console,
+    scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
   };
   let watch = args.watch || tasks_request_watch(&octafile, &commands);
 
@@ -771,10 +861,24 @@ pub async fn run() -> OctaResult<()> {
   }
 
   if args.summary {
-    summary.print().await;
+    let report = summary.report().await;
+    execution_context
+      .console
+      .document(CliDocument::Summary {
+        tasks: report
+          .tasks
+          .into_iter()
+          .map(|item| SummaryItem {
+            name: item.name,
+            duration: item.duration,
+          })
+          .collect(),
+        total: report.total,
+      })
+      .await?;
   }
 
-  plugin_manager.shutdown_all().await;
+  shutdown_plugins(&plugin_manager, &execution_context.console).await;
 
   Ok(())
 }
@@ -782,10 +886,22 @@ pub async fn run() -> OctaResult<()> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use octa_output::{ConsoleDiagnostic, ConsoleEntry, ConsoleRecord};
   use std::fs::{self, File};
   use std::io::Write;
   use std::path::PathBuf;
+  use std::sync::Mutex as StdMutex;
   use tempfile::TempDir;
+
+  #[derive(Clone)]
+  struct RecordingRenderer(Arc<StdMutex<Vec<ConsoleRecord>>>);
+
+  impl octa_output::ConsoleRenderer for RecordingRenderer {
+    fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
+      self.0.lock().unwrap().push(entry.record().clone());
+      Ok(())
+    }
+  }
 
   fn create_test_config(dir: &TempDir, content: &str) -> PathBuf {
     let config_path = dir.path().join("config.yml");
@@ -819,6 +935,30 @@ mod tests {
           .map(|content| content.lines().count())
           .unwrap_or_default();
         if lines >= expected {
+          break;
+        }
+        sleep(Duration::from_millis(25)).await;
+      }
+    })
+    .await
+    .unwrap();
+  }
+
+  async fn wait_for_message(events: &StdMutex<Vec<ConsoleRecord>>, text: &str, expected: usize) {
+    timeout(Duration::from_secs(5), async {
+      loop {
+        let count = events
+          .lock()
+          .unwrap()
+          .iter()
+          .filter(|record| {
+            matches!(
+              record,
+              ConsoleRecord::Diagnostic(ConsoleDiagnostic { message, .. }) if message.contains(text)
+            )
+          })
+          .count();
+        if count >= expected {
           break;
         }
         sleep(Duration::from_millis(25)).await;
@@ -1017,6 +1157,8 @@ tasks:
           summary: Arc::new(Summary::new()),
           concurrency: None,
           variable_resolver: None,
+          console: Arc::new(Console::default()),
+          scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
         },
         &commands,
         &options,
@@ -1072,6 +1214,8 @@ tasks:
         summary: Arc::new(Summary::new()),
         concurrency: None,
         variable_resolver: None,
+        console: Arc::new(Console::default()),
+        scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
       },
       &["build".to_string()],
       &options,
@@ -1081,6 +1225,90 @@ tasks:
     .await;
 
     assert!(matches!(result, Err(OctaError::WatchSourcesMissing)));
+  }
+
+  #[tokio::test]
+  async fn watch_reports_failures_before_and_after_source_changes() {
+    let temp_dir = TempDir::new().unwrap();
+    let source = temp_dir.path().join("source.txt");
+    fs::write(&source, "initial").unwrap();
+    fs::write(
+      temp_dir.path().join("Octafile.yml"),
+      format!(
+        r#"
+version: 1
+tasks:
+  build:
+    sources:
+      - "{}"
+    shell: exit 1
+"#,
+        glob_path(&source),
+      ),
+    )
+    .unwrap();
+
+    let plugin_manager = Arc::new(PluginManager::new(test_plugins_dir()));
+    let (plugin_manager, schemas) = initialize_plugins(plugin_manager, Vec::new()).await.unwrap();
+    let octafile = Octafile::load(
+      Some(temp_dir.path().join("Octafile.yml")),
+      false,
+      schemas.values().map(|schema| schema.key.clone()).collect(),
+      "shell",
+    )
+    .unwrap();
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let console = Arc::new(Console::new(RecordingRenderer(events.clone())));
+    let cancel_token = CancellationToken::new();
+    let watch_cancel_token = cancel_token.clone();
+    let watch_plugin_manager = plugin_manager.clone();
+    let commands = vec!["build".to_owned()];
+    let handle = tokio::spawn(async move {
+      execute_watch(
+        ExecutionContext {
+          plugin_manager: watch_plugin_manager,
+          octafile,
+          fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+          summary: Arc::new(Summary::new()),
+          concurrency: None,
+          variable_resolver: None,
+          console,
+          scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
+        },
+        &commands,
+        &ExecutionOptions {
+          parallel: false,
+          dry: false,
+          force: false,
+          failfast: false,
+          vars: Vec::new(),
+          task_args: Vec::new(),
+        },
+        Duration::from_millis(25),
+        watch_cancel_token,
+      )
+      .await
+    });
+
+    wait_for_message(&events, "Task execution failed", 1).await;
+    let initial_failures = events
+      .lock()
+      .unwrap()
+      .iter()
+      .filter(|record| {
+        matches!(
+          record,
+          ConsoleRecord::Diagnostic(ConsoleDiagnostic { message, .. }) if message.contains("Task execution failed")
+        )
+      })
+      .count();
+    fs::write(&source, "changed").unwrap();
+    wait_for_message(&events, "Sources changed; restarting tasks", 1).await;
+    wait_for_message(&events, "Task execution failed", initial_failures + 1).await;
+    cancel_token.cancel();
+
+    handle.await.unwrap().unwrap();
+    plugin_manager.shutdown_all().await;
   }
 
   #[test]
@@ -1248,6 +1476,32 @@ tasks:
   }
 
   #[test]
+  fn test_cli_output_mode() {
+    let default = Cli::parse_from(["octa", "build"]);
+    assert_eq!(default.output, OutputMode::Interleaved);
+
+    let grouped = Cli::parse_from(["octa", "--output", "group", "build"]);
+    assert_eq!(grouped.output, OutputMode::Group);
+
+    let prefixed = Cli::parse_from(["octa", "--output", "prefixed", "build"]);
+    assert_eq!(prefixed.output, OutputMode::Prefixed);
+
+    let on_error = Cli::parse_from(["octa", "--output", "on-error", "build"]);
+    assert_eq!(on_error.output, OutputMode::OnError);
+
+    assert!(Cli::try_parse_from(["octa", "--output", "unknown", "build"]).is_err());
+  }
+
+  #[test]
+  fn test_cli_ci_mode() {
+    let default = Cli::parse_from(["octa", "build"]);
+    assert_eq!(default.ci, CiMode::Auto);
+
+    let github = Cli::parse_from(["octa", "--ci", "github", "build"]);
+    assert_eq!(github.ci, CiMode::Github);
+  }
+
+  #[test]
   fn test_cli_dry_run() {
     let cli = Cli::parse_from(["octa", "--dry", "build"]);
     assert!(cli.dry);
@@ -1263,6 +1517,9 @@ tasks:
   fn test_cli_completions() {
     let cli = Cli::parse_from(["octa", "--completions", "bash"]);
     assert_eq!(cli.completions, Some(Shell::Bash));
+
+    let generated = generate_completions(Shell::Bash, &mut Cli::command());
+    assert!(generated.contains("_octa"));
   }
 
   #[test]

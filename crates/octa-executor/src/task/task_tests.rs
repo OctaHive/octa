@@ -1,5 +1,5 @@
 use super::*;
-use std::{fs, time::Duration};
+use std::{fs, sync::Mutex as StdMutex, time::Duration};
 use tempfile::TempDir;
 
 struct ConstantSourceStrategy;
@@ -17,6 +17,32 @@ impl SourceStrategy for ConstantSourceStrategy {
 
 fn plugin(key: &str, value: impl Into<Value>) -> Option<PluginInvocation> {
   Some(PluginInvocation::new(key.to_owned(), value.into()))
+}
+
+struct UnscopedTaskItem;
+
+impl TaskItem for UnscopedTaskItem {
+  fn run_mode(&self) -> RunMode {
+    RunMode::Always
+  }
+
+  fn failfast(&self) -> bool {
+    false
+  }
+
+  fn requires_concurrency_permit(&self) -> bool {
+    true
+  }
+}
+
+#[test]
+fn task_items_are_unscoped_by_default() {
+  let task = UnscopedTaskItem;
+
+  assert_eq!(task.run_mode(), RunMode::Always);
+  assert!(!task.failfast());
+  assert!(task.requires_concurrency_permit());
+  assert_eq!(task.output_scope(), None);
 }
 
 // Helper function to create a test TaskNode
@@ -38,6 +64,32 @@ fn create_test_task(name: &str, cmd: Option<&str>, tpl: Option<String>, run_mode
     .unwrap();
 
   TaskNode::new(task_config)
+}
+
+fn runtime(
+  plugin_manager: Arc<PluginManager>,
+  cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
+  fingerprint: Arc<Db>,
+) -> TaskRuntime {
+  TaskRuntime {
+    plugin_manager,
+    cache,
+    fingerprint,
+    console: Arc::new(Console::default()),
+    run_id: 1,
+    dry: false,
+    force: false,
+  }
+}
+
+#[derive(Clone)]
+struct RecordingRenderer(Arc<StdMutex<Vec<octa_output::ConsoleRecord>>>);
+
+impl octa_output::ConsoleRenderer for RecordingRenderer {
+  fn render(&mut self, entry: &octa_output::ConsoleEntry) -> io::Result<()> {
+    self.0.lock().unwrap().push(entry.record().clone());
+    Ok(())
+  }
 }
 
 async fn prepare_dir(task: &TaskNode, dry: bool) -> ExecutorResult<PathBuf> {
@@ -132,16 +184,17 @@ async fn standalone_task_config_preserves_source_freshness() {
   let database = sled::Config::new().temporary(true).open().unwrap();
   let vars = Vars::new();
   let envs = Envs::new();
+  let output = ConsoleTarget::new(Arc::new(Console::default()), 7, None);
 
   let first = task
-    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new())
+    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new(), &output)
     .await
     .unwrap()
     .unwrap();
   assert!(first.should_run());
   first.commit(&database).unwrap();
   assert!(!task
-    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new())
+    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new(), &output)
     .await
     .unwrap()
     .unwrap()
@@ -149,7 +202,7 @@ async fn standalone_task_config_preserves_source_freshness() {
 
   fs::write(source, "changed").unwrap();
   assert!(task
-    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new())
+    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new(), &output)
     .await
     .unwrap()
     .unwrap()
@@ -179,9 +232,10 @@ async fn standalone_task_uses_an_injected_source_strategy() {
   let database = sled::Config::new().temporary(true).open().unwrap();
   let vars = Vars::new();
   let envs = Envs::new();
+  let output = ConsoleTarget::new(Arc::new(Console::default()), 7, None);
 
   let first = task
-    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new())
+    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new(), &output)
     .await
     .unwrap()
     .unwrap();
@@ -189,7 +243,7 @@ async fn standalone_task_uses_an_injected_source_strategy() {
   fs::write(source, "changed").unwrap();
 
   assert!(!task
-    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new())
+    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new(), &output)
     .await
     .unwrap()
     .unwrap()
@@ -276,16 +330,73 @@ async fn test_basic_command_execution() {
 
   let result = task
     .execute(
-      plugin_manager.clone(),
-      cache,
-      fingerprint,
-      false,
-      false,
+      runtime(plugin_manager.clone(), cache, fingerprint),
       CancellationToken::new(),
     )
     .await
     .unwrap();
-  assert_eq!(result.trim(), "hello world");
+  assert_eq!(result.output().trim(), "hello world");
+  plugin_manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn plugin_stdout_and_stderr_are_routed_as_structured_events() {
+  let scope = octa_output::ConsoleScopeAllocator::default().scope("output");
+  let task = TaskNode::new(
+    TaskConfig::builder()
+      .id("output")
+      .name("output")
+      .dep_name("output")
+      .dir(".")
+      .output_scope(Some(scope.clone()))
+      .plugin(plugin("shell", "echo stdout && echo stderr 1>&2"))
+      .build()
+      .unwrap(),
+  );
+  let project_root = env!("CARGO_MANIFEST_DIR");
+  let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../plugins")));
+  #[cfg(not(windows))]
+  let plugin_name = "octa_plugin_shell";
+  #[cfg(windows)]
+  let plugin_name = "octa_plugin_shell.exe";
+  plugin_manager.start_plugin(plugin_name).await.unwrap();
+  let events = Arc::new(StdMutex::new(Vec::new()));
+  let console = Arc::new(Console::new(RecordingRenderer(events.clone())));
+  let runtime = TaskRuntime {
+    plugin_manager: plugin_manager.clone(),
+    cache: Arc::new(Mutex::new(IndexMap::new())),
+    fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+    console,
+    run_id: 7,
+    dry: false,
+    force: false,
+  };
+
+  task.execute(runtime, CancellationToken::new()).await.unwrap();
+
+  {
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+      event,
+      octa_output::ConsoleRecord::Execution(octa_output::ExecutionEvent::Output {
+        run_id: 7,
+        scope: event_scope,
+        stream: octa_output::ConsoleStream::Stdout,
+        payload: octa_output::ConsolePayload::Line(line),
+        ..
+      }) if event_scope.as_ref() == Some(&scope) && line == "stdout"
+    )));
+    assert!(events.iter().any(|event| matches!(
+      event,
+      octa_output::ConsoleRecord::Execution(octa_output::ExecutionEvent::Output {
+        run_id: 7,
+        scope: event_scope,
+        stream: octa_output::ConsoleStream::Stderr,
+        payload: octa_output::ConsolePayload::Line(line),
+        ..
+      }) if event_scope.as_ref() == Some(&scope) && line == "stderr"
+    )));
+  }
   plugin_manager.shutdown_all().await;
 }
 
@@ -324,16 +435,12 @@ async fn test_template_rendering() {
 
   let result = task
     .execute(
-      plugin_manager.clone(),
-      cache,
-      fingerprint,
-      false,
-      false,
+      runtime(plugin_manager.clone(), cache, fingerprint),
       CancellationToken::new(),
     )
     .await
     .unwrap();
-  assert_eq!(result, "Hello world!");
+  assert_eq!(result.output(), "Hello world!");
   plugin_manager.shutdown_all().await;
 }
 
@@ -364,30 +471,24 @@ async fn test_cache_behavior() {
   // First execution
   let result1 = task
     .execute(
-      plugin_manager.clone(),
-      cache.clone(),
-      fingerprint.clone(),
-      false,
-      false,
+      runtime(plugin_manager.clone(), cache.clone(), fingerprint.clone()),
       CancellationToken::new(),
     )
     .await
     .unwrap();
-  assert_eq!(result1.trim(), "cached result");
+  assert_eq!(result1.output().trim(), "cached result");
 
   // Second execution should return cached result
   let result2 = task
     .execute(
-      plugin_manager.clone(),
-      cache.clone(),
-      fingerprint.clone(),
-      false,
-      false,
+      runtime(plugin_manager.clone(), cache.clone(), fingerprint.clone()),
       CancellationToken::new(),
     )
     .await
     .unwrap();
-  assert_eq!(result1, result2);
+  assert_eq!(result1.output(), result2.output());
+  assert_eq!(result1.status(), octa_output::ConsoleStatus::Success);
+  assert_eq!(result2.status(), octa_output::ConsoleStatus::Skipped);
   plugin_manager.shutdown_all().await;
 }
 
@@ -418,16 +519,87 @@ async fn test_error_handling() {
 
   let result = task
     .execute(
-      plugin_manager.clone(),
-      cache,
-      fingerprint,
-      false,
-      false,
+      runtime(plugin_manager.clone(), cache, fingerprint),
       CancellationToken::new(),
     )
     .await;
   assert!(matches!(result, Err(ExecutorError::TaskFailed(_))));
   plugin_manager.shutdown_all().await;
+}
+
+#[tokio::test]
+async fn failed_precondition_cancels_the_task_before_plugin_execution() {
+  let task = TaskNode::new(
+    TaskConfig::builder()
+      .id("guarded")
+      .name("guarded")
+      .dep_name("guarded")
+      .dir(".")
+      .preconditions(Some(vec!["false".to_owned()]))
+      .plugin(plugin("missing", "must not run"))
+      .build()
+      .unwrap(),
+  );
+  let plugin_manager = Arc::new(PluginManager::new(TempDir::new().unwrap().path()));
+  let result = task
+    .execute(
+      runtime(
+        plugin_manager,
+        Arc::new(Mutex::new(IndexMap::new())),
+        Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      ),
+      CancellationToken::new(),
+    )
+    .await;
+
+  assert!(matches!(result, Err(ExecutorError::TaskCancelled(message)) if message.contains("preconditions failed")));
+}
+
+#[tokio::test]
+async fn missing_plugin_errors_can_be_propagated_or_ignored() {
+  for ignore_errors in [false, true] {
+    let task = TaskNode::new(
+      TaskConfig::builder()
+        .id("missing-plugin")
+        .name("missing-plugin")
+        .dep_name("missing-plugin")
+        .dir(".")
+        .plugin(plugin("missing", "value"))
+        .ignore_errors(Some(ignore_errors))
+        .build()
+        .unwrap(),
+    );
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let result = task
+      .execute(
+        TaskRuntime {
+          plugin_manager: Arc::new(PluginManager::new(TempDir::new().unwrap().path())),
+          cache: Arc::new(Mutex::new(IndexMap::new())),
+          fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+          console: Arc::new(Console::new(RecordingRenderer(events.clone()))),
+          run_id: 7,
+          dry: false,
+          force: false,
+        },
+        CancellationToken::new(),
+      )
+      .await;
+
+    if ignore_errors {
+      assert_eq!(result.unwrap().output(), "");
+      assert!(events.lock().unwrap().iter().any(|event| matches!(
+        event,
+        octa_output::ConsoleRecord::Diagnostic(octa_output::ConsoleDiagnostic {
+          run_id: Some(7),
+          level: octa_output::ConsoleLevel::Error,
+          message,
+          ..
+        }) if message.contains("failed but errors ignored")
+      )));
+    } else {
+      assert!(result.is_err());
+    }
+  }
 }
 
 #[tokio::test]
@@ -477,7 +649,7 @@ async fn test_task_cancellation() {
   });
 
   let result = task
-    .execute(plugin_manager.clone(), cache, fingerprint, false, false, cancel_token)
+    .execute(runtime(plugin_manager.clone(), cache, fingerprint), cancel_token)
     .await;
   assert!(matches!(result, Err(ExecutorError::TaskCancelled(_))));
 
@@ -513,11 +685,7 @@ async fn test_task_timeout_stops_command_and_keeps_plugin_reusable() {
 
   let result = timed_task
     .execute(
-      plugin_manager.clone(),
-      cache.clone(),
-      db.clone(),
-      false,
-      false,
+      runtime(plugin_manager.clone(), cache.clone(), db.clone()),
       CancellationToken::new(),
     )
     .await;
@@ -534,17 +702,10 @@ async fn test_task_timeout_stops_command_and_keeps_plugin_reusable() {
       .unwrap(),
   );
   let result = next_task
-    .execute(
-      plugin_manager.clone(),
-      cache,
-      db,
-      false,
-      false,
-      CancellationToken::new(),
-    )
+    .execute(runtime(plugin_manager.clone(), cache, db), CancellationToken::new())
     .await;
 
-  assert_eq!(result.unwrap(), "reusable");
+  assert_eq!(result.unwrap().output(), "reusable");
   plugin_manager.shutdown_all().await;
 }
 
@@ -587,16 +748,12 @@ async fn test_ignore_errors() {
 
   let result = task
     .execute(
-      plugin_manager.clone(),
-      cache,
-      fingerprint,
-      false,
-      false,
+      runtime(plugin_manager.clone(), cache, fingerprint),
       CancellationToken::new(),
     )
     .await;
   assert!(result.is_ok());
-  assert_eq!(result.unwrap(), "");
+  assert_eq!(result.unwrap().output(), "");
   plugin_manager.shutdown_all().await;
 }
 
@@ -634,15 +791,11 @@ async fn test_dependency_results() {
 
   let result = task
     .execute(
-      plugin_manager.clone(),
-      cache,
-      fingerprint,
-      false,
-      false,
+      runtime(plugin_manager.clone(), cache, fingerprint),
       CancellationToken::new(),
     )
     .await
     .unwrap();
-  assert_eq!(result, "Result: dep_output");
+  assert_eq!(result.output(), "Result: dep_output");
   plugin_manager.shutdown_all().await;
 }

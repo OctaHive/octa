@@ -3,6 +3,7 @@
 use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
+use octa_output::ConsoleStream;
 use octa_plugin::{
   logger::{collect_value_redactions, redact},
   protocol::PluginResponse,
@@ -12,7 +13,10 @@ use octa_plugin_manager::plugin_manager::PluginManager;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{ExecutorError, ExecutorResult};
+use crate::{
+  console_target::ConsoleTarget,
+  error::{ExecutorError, ExecutorResult},
+};
 
 #[derive(Clone)]
 pub(crate) enum PluginTarget {
@@ -38,7 +42,7 @@ pub(crate) struct PluginRequest {
   pub value: Value,
   pub args: Vec<String>,
   pub context: PluginExecutionContext,
-  pub silent: bool,
+  pub output: Option<ConsoleTarget>,
 }
 
 /// Data inherited by every plugin invocation, regardless of where it originated.
@@ -129,17 +133,19 @@ impl PluginInvoker {
       match execution.receive_output(&cancel_token).await {
         Ok(Some(response)) => match response {
           PluginResponse::Stdout { id, line } if id == command_id => {
-            if !request.silent {
-              println!("{}", line.trim());
+            let line = without_line_ending(&line);
+            if let Some(target) = &request.output {
+              target.line(&command_id, ConsoleStream::Stdout, line.to_owned()).await?;
             }
-            output.stdout.push_str(line.trim());
+            output.stdout.push_str(line);
             output.stdout.push('\n');
           },
           PluginResponse::Stderr { id, line } if id == command_id => {
-            if !request.silent {
-              eprintln!("{}", line.trim());
+            let line = without_line_ending(&line);
+            if let Some(target) = &request.output {
+              target.line(&command_id, ConsoleStream::Stderr, line.to_owned()).await?;
             }
-            output.stderr.push_str(line.trim());
+            output.stderr.push_str(line);
             output.stderr.push('\n');
           },
           PluginResponse::ExitStatus { id, code } if id == command_id => {
@@ -171,6 +177,11 @@ impl PluginInvoker {
       }
     }
   }
+}
+
+fn without_line_ending(line: &str) -> &str {
+  let line = line.strip_suffix('\n').unwrap_or(line);
+  line.strip_suffix('\r').unwrap_or(line)
 }
 
 /// Runtime context shared by structured plugin values and Terra plugin helpers.
@@ -220,7 +231,7 @@ impl PluginEvaluator for ManagerPluginEvaluator {
           value: request.value,
           args: Vec::new(),
           context: request.context,
-          silent: true,
+          output: None,
         },
         cancel_token,
       )
@@ -291,5 +302,17 @@ impl PluginEvaluator for SystemTestEvaluator {
       code: output.status.code().unwrap_or(-1),
       stderr: redact(&String::from_utf8_lossy(&output.stderr), &redactions),
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::without_line_ending;
+
+  #[test]
+  fn removes_protocol_line_endings_without_trimming_output() {
+    assert_eq!(without_line_ending("  value  \r\n"), "  value  ");
+    assert_eq!(without_line_ending("  value  "), "  value  ");
+    assert_eq!(without_line_ending("\n"), "");
   }
 }

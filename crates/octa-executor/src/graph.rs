@@ -17,9 +17,18 @@ impl TaskGraphBuilder {
     &self,
     dag: &mut DagNode,
     command: &FindResult,
-    request: InvocationRequest,
+    mut request: InvocationRequest,
     run_parallel: Option<bool>,
   ) -> ExecutorResult<Option<ArcNode>> {
+    let scope = self
+      .scope_allocator
+      .scope_with_prefix(command.name.clone(), command.task.prefix.clone());
+    self
+      .scopes
+      .lock()
+      .map_err(|error| ExecutorError::LockError(error.to_string()))?
+      .push(scope.clone());
+    request.context.output_scope = Some(scope);
     let prepared = self.prepare_invocation(dag, command, request).await?;
     self
       .build_task_body(dag, command, prepared.context, prepared.parents, run_parallel)
@@ -192,6 +201,7 @@ impl TaskGraphBuilder {
         context.conditions.runtime_context.clone(),
       ))
       .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
+      .output_scope(context.output_scope.clone())
       .silent(Some(true))
       .failfast(command.task.failfast.or(command.octafile.failfast))
       .action(NodeAction::FreshnessCheck {
@@ -227,6 +237,7 @@ impl TaskGraphBuilder {
       .name(name.clone())
       .dep_name(command.name.clone())
       .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
+      .output_scope(context.output_scope.clone())
       .silent(Some(true))
       .failfast(command.task.failfast.or(command.octafile.failfast))
       .action(NodeAction::FreshnessCommit(state))
@@ -322,7 +333,11 @@ impl TaskGraphBuilder {
       .deferred
       .into_inner()
       .map_err(|error| ExecutorError::LockError(error.to_string()))?;
-    let plan = ExecutionPlan::new(deferred_dag, deferred);
+    let scopes = nested_builder
+      .scopes
+      .into_inner()
+      .map_err(|error| ExecutorError::LockError(error.to_string()))?;
+    let plan = ExecutionPlan::new(deferred_dag, deferred, scopes);
 
     // The barrier node preserves ordering in the main DAG. Its executable payload is stored
     // in `DeferredAction`, not in `TaskNode`.
@@ -362,6 +377,8 @@ impl TaskGraphBuilder {
       variable_overrides: self.variable_overrides.clone(),
       variable_resolver: self.variable_resolver.clone(),
       source_strategies: self.source_strategies.clone(),
+      scope_allocator: self.scope_allocator.clone(),
+      scopes: Mutex::new(Vec::new()),
       os_arch: self.os_arch.clone(),
       os_type: self.os_type.clone(),
       defer_order: AtomicUsize::new(0),
@@ -432,6 +449,7 @@ impl TaskGraphBuilder {
       .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
       .preconditions(cmd.task.preconditions.clone())
       .timeout(cmd.task.timeout)
+      .output_scope(context.output_scope.clone())
       .silent(cmd.task.silent)
       .failfast(cmd.task.failfast.or(cmd.octafile.failfast))
       .ignore_errors(cmd.task.ignore_error)
@@ -441,7 +459,6 @@ impl TaskGraphBuilder {
     let task = TaskNode::new(task_config.build()?);
     let arc_task = Arc::new(task);
 
-    // Добавить созданную ноду в граф
     dag.add_node(arc_task.clone());
 
     Ok(arc_task)
@@ -471,6 +488,7 @@ impl TaskGraphBuilder {
         request.context.conditions.guards.clone(),
       ))
       .freshness_runtime(FreshnessRuntime::guarded(request.context.freshness.clone()))
+      .output_scope(request.context.output_scope.clone())
       .timeout(command.task.timeout)
       .silent(Some(true))
       .failfast(command.task.failfast.or(command.octafile.failfast))

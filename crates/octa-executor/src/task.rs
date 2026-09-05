@@ -18,12 +18,14 @@ use sled::Db;
 use tera::Context;
 use tokio::{sync::Mutex, time};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, enabled, error, info, Level};
+use tracing::{debug, enabled, Level};
 
 use octa_dag::Identifiable;
 use octa_octafile::{AllowedRun, Timeout};
+use octa_output::{Console, ConsoleLevel, ConsoleScope, ConsoleStatus};
 
 use crate::{
+  console_target::ConsoleTarget,
   envs::Envs,
   error::{ExecutorError, ExecutorResult},
   freshness::{FreshnessConfig, FreshnessIdentity, FreshnessOutcome, FreshnessSpec, FreshnessState, RuntimeContext},
@@ -34,18 +36,67 @@ use crate::{
   watcher::WatchTarget,
 };
 
-/// Core traits and types
+/// Services and execution settings shared by every node in one executor.
+#[derive(Clone)]
+pub struct TaskRuntime {
+  /// Registry and live connections used to invoke task plugins.
+  pub plugin_manager: Arc<PluginManager>,
+  /// Per-execution cache shared by nodes in the graph.
+  pub cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
+  /// Persistent source and output fingerprints.
+  pub fingerprint: Arc<Db>,
+  /// Destination for command output events.
+  pub console: Arc<Console>,
+  /// Identifier shared by all events emitted for this execution.
+  pub run_id: u64,
+  /// Whether plugins should describe work without changing the filesystem.
+  pub dry: bool,
+  /// Whether freshness checks should be bypassed.
+  pub force: bool,
+}
+
+/// Result of one DAG node, including whether it performed work or was skipped.
+#[derive(Debug, Eq, PartialEq)]
+pub struct TaskOutcome {
+  output: String,
+  status: ConsoleStatus,
+}
+
+impl TaskOutcome {
+  pub(crate) fn new(output: String, status: ConsoleStatus) -> Self {
+    Self { output, status }
+  }
+
+  pub fn success(output: impl Into<String>) -> Self {
+    Self {
+      output: output.into(),
+      status: ConsoleStatus::Success,
+    }
+  }
+
+  pub fn skipped(output: impl Into<String>) -> Self {
+    Self {
+      output: output.into(),
+      status: ConsoleStatus::Skipped,
+    }
+  }
+
+  pub fn status(&self) -> ConsoleStatus {
+    self.status
+  }
+
+  pub fn output(&self) -> &str {
+    &self.output
+  }
+
+  pub fn into_output(self) -> String {
+    self.output
+  }
+}
+
 #[async_trait]
 pub trait Executable<T> {
-  async fn execute(
-    &self,
-    plugin_manager: Arc<PluginManager>,
-    cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    fingerprint: Arc<Db>,
-    dry: bool,
-    force: bool,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String>;
+  async fn execute(&self, runtime: TaskRuntime, cancel_token: CancellationToken) -> ExecutorResult<TaskOutcome>;
   async fn set_result(&self, task_name: String, res: String);
   async fn bypass_result(&self, result: HashMap<String, String>);
 }
@@ -56,6 +107,11 @@ pub trait TaskItem {
   fn run_mode(&self) -> RunMode;
   fn failfast(&self) -> bool;
   fn requires_concurrency_permit(&self) -> bool;
+
+  /// Associates executable output with its logical task invocation when available.
+  fn output_scope(&self) -> Option<ConsoleScope> {
+    None
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -102,6 +158,7 @@ pub struct TaskNode {
   freshness_runtime: FreshnessRuntime,    // Task-level source and output state
   pub preconditions: Option<Vec<String>>, // Task run preconditions
   pub timeout: Option<Timeout>,           // Maximum task execution time
+  output_scope: Option<ConsoleScope>,
 
   // State management
   pub deps_res: Arc<Mutex<HashMap<String, String>>>, // Dependencies results
@@ -158,6 +215,10 @@ impl TaskItem for TaskNode {
 
   fn requires_concurrency_permit(&self) -> bool {
     !matches!(self.action, NodeAction::Barrier | NodeAction::FreshnessCommit(_))
+  }
+
+  fn output_scope(&self) -> Option<ConsoleScope> {
+    self.output_scope.clone()
   }
 }
 

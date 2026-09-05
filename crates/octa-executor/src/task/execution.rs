@@ -22,6 +22,7 @@ impl TaskNode {
       freshness_runtime: config.freshness_runtime,
       preconditions: config.preconditions,
       timeout: config.timeout,
+      output_scope: config.output_scope,
       plugin: config.plugin,
     }
   }
@@ -34,6 +35,11 @@ impl TaskNode {
       .iter()
       .map(PluginInvocation::command)
       .collect()
+  }
+
+  #[cfg(test)]
+  pub(crate) fn output_scope(&self) -> Option<&ConsoleScope> {
+    self.output_scope.as_ref()
   }
 
   pub fn watch_target(&self) -> Option<WatchTarget> {
@@ -195,10 +201,11 @@ impl TaskNode {
     Ok(RuntimeContext { vars, envs, dir })
   }
 
-  fn log_info(&self, message: String) {
+  async fn log_info(&self, output: &ConsoleTarget, message: String) -> ExecutorResult<()> {
     if self.action.is_command() {
-      info!("{}", message);
+      output.message(ConsoleLevel::Info, message).await?;
     }
+    Ok(())
   }
 
   /// Executes graph-only actions before entering the plugin command path.
@@ -206,10 +213,11 @@ impl TaskNode {
     &self,
     fingerprint: &Db,
     evaluator: Arc<dyn PluginEvaluator>,
+    output: &ConsoleTarget,
     dry: bool,
     force: bool,
     cancel_token: &CancellationToken,
-  ) -> ExecutorResult<Option<String>> {
+  ) -> ExecutorResult<Option<TaskOutcome>> {
     if !self.freshness_runtime.should_run()? {
       // A skipped condition gate must still publish a result so descendants do not observe an
       // unevaluated gate when an ancestor freshness check suppresses the whole invocation.
@@ -217,13 +225,13 @@ impl TaskNode {
       if let NodeAction::FreshnessCheck { state, .. } = &self.action {
         state.publish_skipped()?;
       }
-      return Ok(Some(String::new()));
+      return Ok(Some(TaskOutcome::skipped(String::new())));
     }
 
     match &self.action {
       NodeAction::Command | NodeAction::Condition => Ok(None),
       // Barrier nodes only preserve graph ordering and carry no runtime payload.
-      NodeAction::Barrier => Ok(Some(String::new())),
+      NodeAction::Barrier => Ok(Some(TaskOutcome::success(String::new()))),
       NodeAction::FreshnessCheck { spec, state } => {
         let runtime_context = self
           .resolve_runtime_context(evaluator, dry, cancel_token.clone())
@@ -240,15 +248,21 @@ impl TaskNode {
         let should_run = outcome.should_run();
         state.publish(outcome, runtime_context)?;
         if !should_run {
-          info!("Task {} is up to date", self.dep_name);
+          output
+            .message(ConsoleLevel::Info, format!("Task {} is up to date", self.dep_name))
+            .await?;
         }
-        Ok(Some(String::new()))
+        Ok(Some(if should_run {
+          TaskOutcome::success(String::new())
+        } else {
+          TaskOutcome::skipped(String::new())
+        }))
       },
       NodeAction::FreshnessCommit(state) => {
         if !dry {
           state.commit(fingerprint)?;
         }
-        Ok(Some(String::new()))
+        Ok(Some(TaskOutcome::success(String::new())))
       },
     }
   }
@@ -260,6 +274,7 @@ impl TaskNode {
     vars: &Vars,
     envs: &Envs,
     cancel_token: &CancellationToken,
+    output: &ConsoleTarget,
   ) -> ExecutorResult<Option<FreshnessOutcome>> {
     if !self.action.is_command() || self.freshness_runtime.is_managed() {
       return Ok(None);
@@ -279,7 +294,9 @@ impl TaskNode {
     let spec = freshness.spec(identity);
     let outcome = spec.evaluate(fingerprint, force, vars, envs, cancel_token).await?;
     if !outcome.should_run() {
-      self.log_info(format!("Task {} is up to date", self.dep_name));
+      self
+        .log_info(output, format!("Task {} is up to date", self.dep_name))
+        .await?;
     }
     Ok(Some(outcome))
   }
@@ -332,7 +349,7 @@ impl TaskNode {
           dry,
           redact_params: false,
         },
-        silent: true,
+        output: None,
       };
       match invoker.invoke(request, cancel_token.clone()).await {
         Ok(output) if output.code == 0 => {},
@@ -442,26 +459,35 @@ impl TaskNode {
   }
 
   /// Executes the task without applying its timeout wrapper.
-  async fn execute_inner(
-    &self,
-    plugin_manager: Arc<PluginManager>,
-    cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    fingerprint: Arc<Db>,
-    dry: bool,
-    force: bool,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
+  async fn execute_inner(&self, runtime: TaskRuntime, cancel_token: CancellationToken) -> ExecutorResult<TaskOutcome> {
+    let TaskRuntime {
+      plugin_manager,
+      cache,
+      fingerprint,
+      console,
+      run_id,
+      dry,
+      force,
+    } = runtime;
+    let console_target = ConsoleTarget::new(console, run_id, self.output_scope.clone());
     let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::new(plugin_manager.clone()));
 
     if !self.condition_runtime.should_run(&self.name)? {
       if let NodeAction::FreshnessCheck { state, .. } = &self.action {
         state.publish_skipped()?;
       }
-      return Ok(String::new());
+      return Ok(TaskOutcome::skipped(String::new()));
     }
 
     if let Some(result) = self
-      .execute_graph_action(&fingerprint, evaluator.clone(), dry, force, &cancel_token)
+      .execute_graph_action(
+        &fingerprint,
+        evaluator.clone(),
+        &console_target,
+        dry,
+        force,
+        &cancel_token,
+      )
       .await?
     {
       return Ok(result);
@@ -483,11 +509,13 @@ impl TaskNode {
     );
     if !condition_passed {
       self.freshness_runtime.mark_condition_skipped();
-      self.log_info(format!(
-        "Task '{}' skipped because its condition was not met",
-        self.name
-      ));
-      return Ok("".to_string());
+      self
+        .log_info(
+          &console_target,
+          format!("Task '{}' skipped because its condition was not met", self.name),
+        )
+        .await?;
+      return Ok(TaskOutcome::skipped(String::new()));
     }
 
     if !force
@@ -495,7 +523,9 @@ impl TaskNode {
         .check_preconditions(evaluator, &vars, &envs, &dir, dry, cancel_token.clone())
         .await?
     {
-      self.log_info(format!("Task '{}' preconditions failed", self.name));
+      self
+        .log_info(&console_target, format!("Task '{}' preconditions failed", self.name))
+        .await?;
 
       return Err(ExecutorError::TaskCancelled(format!(
         "Task '{}' preconditions failed",
@@ -504,26 +534,28 @@ impl TaskNode {
     }
 
     let standalone_freshness = self
-      .standalone_freshness(&fingerprint, force, &vars, &envs, &cancel_token)
+      .standalone_freshness(&fingerprint, force, &vars, &envs, &cancel_token, &console_target)
       .await?;
     if standalone_freshness
       .as_ref()
       .is_some_and(|outcome| !outcome.should_run())
     {
-      return Ok(String::new());
+      return Ok(TaskOutcome::skipped(String::new()));
     }
 
     if let Some(cached) = self.check_cache(&vars, &cache).await? {
       Self::commit_standalone_freshness(standalone_freshness.as_ref(), &fingerprint, dry)?;
-      return Ok(cached);
+      return Ok(TaskOutcome::skipped(cached));
     }
 
-    self.log_info(format!("Starting task {}", self.name));
+    self
+      .log_info(&console_target, format!("Starting task {}", self.name))
+      .await?;
     self.debug_log_dependencies().await;
 
     let Some(plugin) = &self.plugin else {
       Self::commit_standalone_freshness(standalone_freshness.as_ref(), &fingerprint, dry)?;
-      return Ok("".to_string());
+      return Ok(TaskOutcome::success(String::new()));
     };
     let mut vars_with_deps_results = vars.clone();
     let deps_res = self.deps_res.lock().await;
@@ -541,7 +573,7 @@ impl TaskNode {
         dry,
         redact_params: false,
       },
-      silent: self.silent,
+      output: (!self.silent).then(|| console_target.clone()),
     };
     let result = match PluginInvoker::new(plugin_manager)
       .invoke(request, cancel_token.clone())
@@ -550,10 +582,15 @@ impl TaskNode {
       Ok(output) => {
         if output.code != 0 && !cancel_token.is_cancelled() {
           if self.ignore_errors {
-            error!(
-              "Task {} failed but errors ignored. Error code: {}",
-              self.name, output.code
-            );
+            console_target
+              .message(
+                ConsoleLevel::Error,
+                format!(
+                  "Task {} failed but errors ignored. Error code: {}",
+                  self.name, output.code
+                ),
+              )
+              .await?;
             Ok("".to_string())
           } else {
             Err(ExecutorError::TaskFailed(format!(
@@ -569,18 +606,23 @@ impl TaskNode {
       Err(ExecutorError::IoError(error)) if error.kind() == io::ErrorKind::Interrupted => {
         Err(ExecutorError::TaskCancelled(self.name.clone()))
       },
-      Err(error) => self.handle_execution_error(error),
+      Err(error) => self.handle_execution_error(&console_target, error).await,
     };
     if result.is_ok() {
       Self::commit_standalone_freshness(standalone_freshness.as_ref(), &fingerprint, dry)?;
     }
-    result
+    result.map(TaskOutcome::success)
   }
 
   /// Handle execution errors
-  fn handle_execution_error(&self, error: ExecutorError) -> ExecutorResult<String> {
+  async fn handle_execution_error(&self, output: &ConsoleTarget, error: ExecutorError) -> ExecutorResult<String> {
     if self.ignore_errors {
-      error!("Task {} failed but errors ignored. Error: {}", self.name, error);
+      output
+        .message(
+          ConsoleLevel::Error,
+          format!("Task {} failed but errors ignored. Error: {error}", self.name),
+        )
+        .await?;
       Ok("".to_string())
     } else {
       Err(error)
@@ -603,24 +645,15 @@ impl Executable<TaskNode> for TaskNode {
   }
 
   /// Executes the task and returns the result
-  async fn execute(
-    &self,
-    plugin_manager: Arc<PluginManager>,
-    cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-    fingerprint: Arc<Db>,
-    dry: bool,
-    force: bool,
-    cancel_token: CancellationToken,
-  ) -> ExecutorResult<String> {
+  async fn execute(&self, runtime: TaskRuntime, cancel_token: CancellationToken) -> ExecutorResult<TaskOutcome> {
     let Some(timeout) = self.timeout else {
-      return self
-        .execute_inner(plugin_manager, cache, fingerprint, dry, force, cancel_token)
-        .await;
+      return self.execute_inner(runtime, cancel_token).await;
     };
 
     // A child token limits cancellation to this command while preserving the caller's token.
     let command_token = cancel_token.child_token();
-    let execution = self.execute_inner(plugin_manager, cache, fingerprint, dry, force, command_token.clone());
+    let output = ConsoleTarget::new(runtime.console.clone(), runtime.run_id, self.output_scope.clone());
+    let execution = self.execute_inner(runtime, command_token.clone());
     tokio::pin!(execution);
 
     tokio::select! {
@@ -634,8 +667,13 @@ impl Executable<TaskNode> for TaskNode {
           timeout: timeout.to_string(),
         };
         if self.ignore_errors {
-          error!("Task {} failed but errors ignored. Error: {}", self.name, error);
-          Ok(String::new())
+          output
+            .message(
+              ConsoleLevel::Error,
+              format!("Task {} failed but errors ignored. Error: {error}", self.name),
+            )
+            .await?;
+          Ok(TaskOutcome::success(String::new()))
         } else {
           Err(error)
         }

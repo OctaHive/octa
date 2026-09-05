@@ -1,0 +1,21 @@
+[package]
+name = "octa-output"
+description = "Structured output and rendering for Octa"
+version = "0.3.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+include = ["src/"]
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+humanize-duration = "0.0.7"
+nu-ansi-term = "0.50.3"
+serde = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
