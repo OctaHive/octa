@@ -256,6 +256,9 @@ mod tests {
   struct RecordingRenderer {
     records: Vec<ConsoleRecord>,
     fail_once: bool,
+    ticks: usize,
+    parallel: Option<bool>,
+    raw: Vec<(&'static str, ConsoleScope)>,
   }
 
   impl ConsoleRenderer for RecordingRenderer {
@@ -267,6 +270,30 @@ mod tests {
       } else {
         Ok(())
       }
+    }
+
+    fn supports_raw_terminal(&self) -> bool {
+      true
+    }
+
+    fn tick(&mut self) -> io::Result<()> {
+      self.ticks += 1;
+      Ok(())
+    }
+
+    fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
+      self.parallel = Some(parallel);
+      Ok(())
+    }
+
+    fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+      self.raw.push(("begin", scope.clone()));
+      Ok(())
+    }
+
+    fn end_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+      self.raw.push(("end", scope.clone()));
+      Ok(())
     }
   }
 
@@ -398,6 +425,7 @@ mod tests {
     let mut renderer = GroupRenderer::new(RecordingRenderer {
       records: Vec::new(),
       fail_once: true,
+      ..RecordingRenderer::default()
     });
 
     renderer.render(&started(scope.clone())).unwrap();
@@ -538,5 +566,31 @@ mod tests {
     renderer.render(&finished(scope, ConsoleStatus::Success)).unwrap();
 
     assert_eq!(renderer.0.renderer.records.len(), 4);
+  }
+
+  #[test]
+  fn wrappers_delegate_capabilities_ticks_parallel_and_raw_lifecycle() {
+    let scope = ConsoleScopeAllocator::default().scope("interactive");
+    let mut group = GroupRenderer::with_templates(RecordingRenderer::default(), None, None, true);
+    assert!(group.supports_raw_terminal());
+    group.tick().unwrap();
+    group.set_parallel(true).unwrap();
+    group.begin_raw(&scope).unwrap();
+    // Starting the same raw scope twice is idempotent at the buffering layer.
+    group.begin_raw(&scope).unwrap();
+    group.end_raw(&scope).unwrap();
+    assert_eq!(group.0.renderer.ticks, 1);
+    assert_eq!(group.0.renderer.parallel, Some(true));
+    assert_eq!(group.0.renderer.raw, [("begin", scope.clone()), ("end", scope.clone())]);
+
+    let mut on_error = OnErrorRenderer::new(RecordingRenderer::default());
+    assert!(on_error.supports_raw_terminal());
+    on_error.tick().unwrap();
+    on_error.set_parallel(false).unwrap();
+    on_error.begin_raw(&scope).unwrap();
+    on_error.end_raw(&scope).unwrap();
+    assert_eq!(on_error.0.renderer.ticks, 1);
+    assert_eq!(on_error.0.renderer.parallel, Some(false));
+    assert_eq!(on_error.0.renderer.raw, [("begin", scope.clone()), ("end", scope)]);
   }
 }

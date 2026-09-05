@@ -188,6 +188,11 @@ fn record_scope(record: &ConsoleRecord) -> Option<&ConsoleScope> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::{ConsoleLevel, ConsolePayload, ConsoleScopeAllocator, ConsoleStatus, ConsoleStream};
+
+  fn event(event: ExecutionEvent) -> ConsoleEntry {
+    ConsoleEntry::new(ConsoleRecord::Execution(event))
+  }
 
   fn router(adaptive_default: bool) -> OutputRouterRenderer {
     OutputRouterRenderer::new(OutputRouterConfig {
@@ -215,5 +220,109 @@ mod tests {
     let mut router = router(false);
     router.set_parallel(true).unwrap();
     assert_eq!(router.default_mode, RenderMode::Interleaved);
+  }
+
+  #[test]
+  fn replacing_falls_back_to_prefixed_when_progress_is_disabled() {
+    let scope = ConsoleScopeAllocator::default().scope("build");
+    scope.set_render_mode(Some(RenderMode::Replacing));
+    let mut router = router(false);
+
+    assert_eq!(router.effective_mode(RenderMode::Replacing), RenderMode::Prefixed);
+    router
+      .render(&event(ExecutionEvent::Output {
+        run_id: 1,
+        scope: Some(scope),
+        command_id: "build".to_owned(),
+        stream: ConsoleStream::Stdout,
+        payload: ConsolePayload::Line("compiled".to_owned()),
+      }))
+      .unwrap();
+  }
+
+  #[test]
+  fn active_progress_suspends_other_modes_and_raw_lifecycle() {
+    let allocator = ConsoleScopeAllocator::default();
+    let progress_scope = allocator.scope("build");
+    progress_scope.set_render_mode(Some(RenderMode::Replacing));
+    let plain_scope = allocator.scope("plain");
+    let mut router = OutputRouterRenderer::new(OutputRouterConfig {
+      default_mode: RenderMode::Interleaved,
+      group_begin: None,
+      group_end: None,
+      group_error_only: false,
+      progress_enabled: true,
+      adaptive_default: false,
+      force_default: false,
+    });
+
+    router
+      .render(&event(ExecutionEvent::ScopeDeclared {
+        run_id: 1,
+        scope: progress_scope.clone(),
+      }))
+      .unwrap();
+    router
+      .render(&event(ExecutionEvent::Output {
+        run_id: 1,
+        scope: Some(plain_scope.clone()),
+        command_id: "plain".to_owned(),
+        stream: ConsoleStream::Stderr,
+        payload: ConsolePayload::Line("warning".to_owned()),
+      }))
+      .unwrap();
+    router.tick().unwrap();
+    router.begin_raw(&plain_scope).unwrap();
+    router.end_raw(&plain_scope).unwrap();
+    router
+      .render(&event(ExecutionEvent::ScopeFinished {
+        run_id: 1,
+        scope: progress_scope,
+        status: ConsoleStatus::Success,
+      }))
+      .unwrap();
+  }
+
+  #[test]
+  fn json_forces_machine_output_and_disables_raw_terminal() {
+    let scope = ConsoleScopeAllocator::default().scope("task");
+    scope.set_render_mode(Some(RenderMode::Group));
+    let router = OutputRouterRenderer::new(OutputRouterConfig {
+      default_mode: RenderMode::Json,
+      group_begin: None,
+      group_end: None,
+      group_error_only: false,
+      progress_enabled: false,
+      adaptive_default: false,
+      force_default: false,
+    });
+    assert_eq!(router.selected_mode(Some(&scope)), RenderMode::Json);
+    assert!(!router.supports_raw_terminal());
+
+    let forced = OutputRouterRenderer::new(OutputRouterConfig {
+      default_mode: RenderMode::Prefixed,
+      group_begin: None,
+      group_end: None,
+      group_error_only: false,
+      progress_enabled: false,
+      adaptive_default: false,
+      force_default: true,
+    });
+    assert_eq!(forced.selected_mode(Some(&scope)), RenderMode::Prefixed);
+    assert!(forced.supports_raw_terminal());
+  }
+
+  #[test]
+  fn unscoped_records_use_the_default_mode() {
+    let mut router = router(false);
+    let diagnostic = ConsoleEntry::new(ConsoleRecord::Diagnostic(crate::ConsoleDiagnostic {
+      run_id: None,
+      scope: None,
+      level: ConsoleLevel::Warn,
+      message: "warning".to_owned(),
+      location: None,
+    }));
+    router.render(&diagnostic).unwrap();
+    assert_eq!(record_scope(diagnostic.record()), None);
   }
 }

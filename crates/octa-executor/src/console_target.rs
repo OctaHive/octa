@@ -114,3 +114,66 @@ impl ConsoleTarget {
     }
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use std::sync::Mutex;
+
+  use octa_output::{ConsoleEntry, ConsoleRecord, ConsoleRenderer, ConsoleScopeAllocator};
+
+  use super::*;
+
+  #[derive(Clone, Default)]
+  struct Recording(Arc<Mutex<Vec<ConsoleRecord>>>);
+
+  impl ConsoleRenderer for Recording {
+    fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
+      self.0.lock().unwrap().push(entry.record().clone());
+      Ok(())
+    }
+  }
+
+  #[tokio::test]
+  async fn routes_bytes_and_honors_per_stream_silence() {
+    let records = Recording::default();
+    let console = Arc::new(Console::new(records.clone()));
+    let scope = ConsoleScopeAllocator::default().scope("task");
+    let stdout_hidden = ConsoleTarget::with_silence(console.clone(), 7, Some(scope.clone()), Silence::Stdout);
+    let stderr_hidden = ConsoleTarget::with_silence(console.clone(), 7, Some(scope.clone()), Silence::Stderr);
+
+    stdout_hidden
+      .bytes("command", ConsoleStream::Stdout, b"hidden".to_vec())
+      .await
+      .unwrap();
+    stdout_hidden
+      .bytes("command", ConsoleStream::Stderr, b"stderr".to_vec())
+      .await
+      .unwrap();
+    stderr_hidden
+      .bytes("command", ConsoleStream::Stdout, b"stdout".to_vec())
+      .await
+      .unwrap();
+    stderr_hidden
+      .bytes("command", ConsoleStream::Stderr, b"hidden".to_vec())
+      .await
+      .unwrap();
+    console.drain().await.unwrap();
+
+    assert!(stdout_hidden.hides(ConsoleStream::Stdout));
+    assert!(!stdout_hidden.hides(ConsoleStream::Stderr));
+    assert!(!stderr_hidden.hides(ConsoleStream::Stdout));
+    assert!(stderr_hidden.hides(ConsoleStream::Stderr));
+    assert_eq!(records.0.lock().unwrap().len(), 2);
+  }
+
+  #[tokio::test]
+  async fn starts_raw_only_for_scoped_targets() {
+    let console = Arc::new(Console::default());
+    let unscoped = ConsoleTarget::new(console.clone(), 1, None);
+    assert!(unscoped.begin_raw("command").await.unwrap().is_none());
+
+    let scope = ConsoleScopeAllocator::default().scope("raw");
+    let scoped = ConsoleTarget::new(console, 1, Some(scope));
+    assert!(scoped.begin_raw("command").await.unwrap().is_some());
+  }
+}

@@ -136,19 +136,71 @@ mod tests {
 
   #[test]
   fn spills_large_output_and_replays_it_losslessly() {
-    let record = ConsoleRecord::Execution(ExecutionEvent::Output {
+    let small = ConsoleRecord::Execution(ExecutionEvent::Output {
+      run_id: 1,
+      scope: None,
+      command_id: "small".to_owned(),
+      stream: ConsoleStream::Stdout,
+      payload: ConsolePayload::Bytes(vec![1, 2, 3]),
+    });
+    let large = ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 1,
       scope: None,
       command_id: "large".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::Line("x".repeat(MEMORY_LIMIT + 1)),
     });
+    let tail = ConsoleRecord::Execution(ExecutionEvent::Output {
+      run_id: 1,
+      scope: None,
+      command_id: "tail".to_owned(),
+      stream: ConsoleStream::Stdout,
+      payload: ConsolePayload::RawBytes(vec![4, 5, 6]),
+    });
     let mut spool = EntrySpool::default();
-    spool.push(ConsoleEntry::new(record.clone())).unwrap();
+    spool.push(ConsoleEntry::new(small.clone())).unwrap();
+    spool.push(ConsoleEntry::new(large.clone())).unwrap();
     assert!(matches!(&spool, EntrySpool::Disk(_)));
+    spool.push(ConsoleEntry::new(tail.clone())).unwrap();
 
     let mut renderer = Recording::default();
     spool.render_into(&mut renderer).unwrap();
-    assert_eq!(renderer.0, [record]);
+    assert_eq!(renderer.0, [small, large, tail]);
+  }
+
+  #[test]
+  fn estimates_dynamic_memory_for_each_record_shape() {
+    use crate::{CliDocument, ConsoleDiagnostic, ConsoleLevel, ConsoleScopeAllocator, ConsoleStatus};
+
+    let scope = ConsoleScopeAllocator::default().scope("scope");
+    let records = [
+      ConsoleRecord::Execution(ExecutionEvent::RunStarted {
+        run_id: 1,
+        command: "command".to_owned(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::RunFinished {
+        run_id: 1,
+        command: "command".to_owned(),
+        status: ConsoleStatus::Success,
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::ScopeStarted {
+        run_id: 1,
+        scope: scope.clone(),
+      }),
+      ConsoleRecord::Diagnostic(ConsoleDiagnostic {
+        run_id: Some(1),
+        scope: Some(scope),
+        level: ConsoleLevel::Warn,
+        message: "warning".to_owned(),
+        location: None,
+      }),
+      ConsoleRecord::Document(CliDocument::Help {
+        text: "document".to_owned(),
+      }),
+    ];
+
+    for record in records {
+      assert!(estimated_memory(&ConsoleEntry::new(record)) >= mem::size_of::<ConsoleEntry>());
+    }
   }
 }

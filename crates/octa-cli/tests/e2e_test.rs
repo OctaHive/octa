@@ -513,15 +513,22 @@ tasks:
         platforms: [unsupported]
       - shell: echo work>>success.txt
 
+  success_status:
+    cmds:
+      - defer: 'echo "{% if EXIT_CODE is defined %}set{% else %}unset{% endif %}">success-status.txt'
+      - shell: exit 0
+
   failure:
     cmds:
       - defer:
           task: cleanup
+          vars:
+            CODE: "{{ EXIT_CODE }}"
       - shell: echo work>>failure.txt
-      - shell: exit 1
+      - shell: exit 23
 
   cleanup:
-    shell: echo cleanup>>failure.txt
+    shell: echo cleanup-{{ CODE }}>>failure.txt
 
   late_defer:
     cmds:
@@ -590,12 +597,18 @@ tasks:
     vec!["work", "second", "first"]
   );
 
+  run("success_status")?.assert().success();
+  assert_eq!(
+    fs::read_to_string(tmp_dir.path().join("success-status.txt"))?.trim(),
+    "unset"
+  );
+
   run("failure")?.assert().failure();
   assert_eq!(
     fs::read_to_string(tmp_dir.path().join("failure.txt"))?
       .lines()
       .collect::<Vec<_>>(),
-    vec!["work", "cleanup"]
+    vec!["work", "cleanup-23"]
   );
 
   run("late_defer")?.assert().failure();
@@ -2663,6 +2676,69 @@ fn test_json_output_rejects_raw_mode_before_execution() -> Result<(), Box<dyn st
     ))
     .stdout(predicate::str::contains("should-not-run").not());
 
+  Ok(())
+}
+
+#[test]
+fn test_raw_mode_runs_through_the_pty_without_a_terminal() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    "version: 1\ntasks:\n  interactive: echo raw-output\n",
+  )?;
+
+  let mut command = Command::cargo_bin("octa")?;
+  command
+    .current_dir(tmp_dir.path())
+    .args(["--raw", "interactive"])
+    .env("OCTA_CACHE_DIR", tmp_dir.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("raw-output"));
+
+  Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn test_raw_mode_uses_and_restores_an_attached_terminal() -> Result<(), Box<dyn std::error::Error>> {
+  use std::io::Read;
+
+  use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    "version: 1\ntasks:\n  interactive: echo terminal-output\n",
+  )?;
+  let pair = native_pty_system().openpty(PtySize {
+    rows: 24,
+    cols: 80,
+    pixel_width: 0,
+    pixel_height: 0,
+  })?;
+  let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_octa"));
+  command.cwd(tmp_dir.path());
+  command.args(["--raw", "interactive"]);
+  command.env("TERM", "xterm-256color");
+  command.env("OCTA_CACHE_DIR", tmp_dir.path().join("cache"));
+  command.env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+
+  let mut reader = pair.master.try_clone_reader()?;
+  let output = std::thread::spawn(move || {
+    let mut output = String::new();
+    reader.read_to_string(&mut output).unwrap();
+    output
+  });
+  let mut child = pair.slave.spawn_command(command)?;
+  drop(pair.slave);
+  let status = child.wait()?;
+  drop(pair.master);
+  let output = output.join().unwrap();
+
+  assert!(status.success(), "{output}");
+  assert!(output.contains("terminal-output"), "{output:?}");
   Ok(())
 }
 

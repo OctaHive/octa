@@ -896,6 +896,62 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn test_handle_command_routes_terminal_input_to_the_active_command() {
+    let (_reader, writer) = tokio::io::duplex(1024);
+    let writer = Arc::new(Mutex::new(writer));
+    let active_commands = Arc::new(Mutex::new(HashMap::new()));
+    let plugin = Arc::new(MockPlugin {
+      version: "1.0.0".to_string(),
+      execution_delay: None,
+      should_fail: false,
+      output_lines: Vec::new(),
+    });
+    let (input, mut input_rx) = mpsc::unbounded_channel();
+    active_commands.lock().await.insert(
+      "command".to_owned(),
+      ActiveCommand {
+        handle: tokio::spawn(std::future::pending()),
+        cancel_token: CancellationToken::new(),
+        input,
+      },
+    );
+
+    for command in [
+      OctaCommand::Stdin {
+        id: "command".to_owned(),
+        bytes: vec![1, 2, 3],
+      },
+      OctaCommand::Resize {
+        id: "command".to_owned(),
+        rows: 24,
+        cols: 80,
+      },
+      OctaCommand::CloseStdin {
+        id: "command".to_owned(),
+      },
+    ] {
+      handle_command(
+        command,
+        writer.clone(),
+        active_commands.clone(),
+        plugin.clone(),
+        Arc::new(MockLogger::new()),
+        CancellationToken::new(),
+      )
+      .await
+      .unwrap();
+    }
+
+    assert!(matches!(input_rx.recv().await, Some(PluginInput::Bytes(bytes)) if bytes == [1, 2, 3]));
+    assert!(matches!(
+      input_rx.recv().await,
+      Some(PluginInput::Resize { rows: 24, cols: 80 })
+    ));
+    assert!(matches!(input_rx.recv().await, Some(PluginInput::Close)));
+    active_commands.lock().await.remove("command").unwrap().handle.abort();
+  }
+
+  #[tokio::test]
   async fn test_handle_command_with_failure() {
     let (reader, writer) = tokio::io::duplex(1024);
     let writer = Arc::new(Mutex::new(writer));
