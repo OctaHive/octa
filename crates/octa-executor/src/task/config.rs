@@ -23,6 +23,10 @@ impl NodeAction {
   fn needs_working_directory(&self) -> bool {
     matches!(self, Self::Command)
   }
+
+  pub(super) fn needs_runtime_lock(&self) -> bool {
+    !matches!(self, Self::Barrier)
+  }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -206,8 +210,11 @@ pub struct TaskConfig {
   // Execution configuration
   pub dir: PathBuf,        // Working directory
   pub ignore_errors: bool, // Whether to continue on error
-  pub silent: bool,        // Should task print to stdout or stderr
-  pub failfast: bool,      // Cancel parallel work after the first failure
+  pub silence: octa_octafile::Silence,
+  pub quiet: bool,
+  pub raw: bool,
+  pub interactive_session: Option<String>,
+  pub failfast: bool, // Cancel parallel work after the first failure
 
   // Runtime behavior
   pub run_mode: RunMode, // Run mode
@@ -219,6 +226,7 @@ pub struct TaskConfig {
   pub preconditions: Option<Vec<String>>,         // Task preconditions
   pub timeout: Option<Timeout>,                   // Maximum task execution time
   pub(super) output_scope: Option<ConsoleScope>,
+  pub(super) prefix_template: Option<String>,
 
   // State management
   pub(super) action: NodeAction,
@@ -239,7 +247,9 @@ pub struct TaskConfigBuilder {
 
   pub dir: Option<PathBuf>,
   pub ignore_errors: Option<bool>,
-  pub silent: Option<bool>,
+  pub silent: Option<octa_octafile::Silence>,
+  pub quiet: Option<bool>,
+  pub raw: Option<bool>,
   pub failfast: Option<bool>,
 
   pub run_mode: Option<RunMode>,
@@ -255,6 +265,8 @@ pub struct TaskConfigBuilder {
   pub preconditions: Option<Vec<String>>,
   pub timeout: Option<Timeout>,
   output_scope: Option<ConsoleScope>,
+  prefix_template: Option<String>,
+  interactive_session: Option<String>,
 
   action: NodeAction,
   plugin: Option<PluginInvocation>,
@@ -316,6 +328,16 @@ impl TaskConfigBuilder {
     self
   }
 
+  pub(crate) fn prefix_template(mut self, prefix_template: Option<String>) -> Self {
+    self.prefix_template = prefix_template;
+    self
+  }
+
+  pub(crate) fn interactive_session(mut self, interactive_session: Option<String>) -> Self {
+    self.interactive_session = interactive_session;
+    self
+  }
+
   pub fn vars(mut self, vars: Vars) -> Self {
     self.vars = Some(vars);
     self
@@ -341,8 +363,18 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub fn silent(mut self, silent: Option<bool>) -> Self {
-    self.silent = silent;
+  pub fn silent<T: Into<octa_octafile::Silence>>(mut self, silent: Option<T>) -> Self {
+    self.silent = silent.map(Into::into);
+    self
+  }
+
+  pub fn quiet(mut self, quiet: Option<bool>) -> Self {
+    self.quiet = quiet;
+    self
+  }
+
+  pub fn raw(mut self, raw: Option<bool>) -> Self {
+    self.raw = raw;
     self
   }
 
@@ -405,7 +437,10 @@ impl TaskConfigBuilder {
       dep_name: self.dep_name.ok_or(ExecutorError::TaskConfigFieldMissing("dep_name"))?,
       dir,
       ignore_errors: self.ignore_errors.unwrap_or(false),
-      silent: self.silent.unwrap_or(false),
+      silence: self.silent.unwrap_or_default(),
+      quiet: self.quiet.unwrap_or(false),
+      raw: self.raw.unwrap_or(false),
+      interactive_session: self.interactive_session,
       failfast: self.failfast.unwrap_or(false),
       run_mode: self.run_mode.unwrap_or(RunMode::Always),
       vars: self.vars.unwrap_or_default(),
@@ -416,6 +451,7 @@ impl TaskConfigBuilder {
       preconditions: self.preconditions,
       timeout: self.timeout,
       output_scope: self.output_scope,
+      prefix_template: self.prefix_template,
       action: self.action,
       plugin: self.plugin,
     })

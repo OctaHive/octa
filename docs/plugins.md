@@ -1,301 +1,324 @@
-# Plugins workflow
+# Plugin protocol
 
-Plugins are executable applications that communicate with Octa by exchanging serialized data over a local socket stream. Interaction with a plugin consists of three stages.
-
-In the first stage, Octa launches the processes of all discovered plugins and communicates with the plugin using two commands: Hello and Schema. The Hello command is intended for synchronizing the versions of Octa and the plugin, while the Schema command is used to allow Octa to obtain the parameters for integrating the plugin into the task system.
-
-After starting the plugin, Octa sends the Hello command to the plugin with the Octa version and waits for a response Hello command from the plugin, including the requested Octa version. Once the command is received from the plugin, Octa checks whether its version matches the requested version, and if the versions do not match, the plugin launch is terminated.
-
-Here is what the Hello commands look like:
-
-Octa Hello request:
-| Field | Type | Description |
-| --- | --- | --- |
-| type | String | Plugin command type |
-| version | String | Version of Octa engine |
-| features | String | Octa features list. Reserved for feature use |
-
-Example:
+Octa plugins are executable processes connected to the engine through a local socket. The socket
+uses UTF-8 JSON Lines: every request and response is one complete JSON object followed by `\n`.
+Messages use Serde's adjacent representation:
 
 ```json
-{
-  "type":"Hello"
-  "payload":{
-    "version": "0.2.0",
-    "features": []
-  }
-}
+{"type":"Variant","payload":{"field":"value"}}
 ```
 
-Plugin Hello response:
-| Field | Type | Description |
-| --- | --- | --- |
-| type | String | Plugin command type |
-| version | String | Version of requested Octa engine in semver format |
-| features | String | Octa features list. Reserved for feature use |
+The Rust definitions in [`crates/octa-plugin/src/protocol.rs`](../crates/octa-plugin/src/protocol.rs)
+are the source of truth. Plugin authors should normally use the `octa-plugin` SDK and
+`serve_plugin`; the wire format is documented here for compatibility and non-Rust implementations.
 
-Example:
+## Lifecycle
+
+A plugin connection has three phases:
+
+1. `Hello` negotiates the Octa version.
+2. `Schema` registers the task key and capabilities.
+3. Zero or more `Execute` requests run concurrently until `Shutdown`.
+
+Octa may also send command-scoped `Cancel`, `Stdin`, `Resize`, and `CloseStdin` messages during the
+execution phase.
+
+## Handshake
+
+Octa sends its exact version and currently enabled protocol features:
 
 ```json
-{
-  "type":"Hello"
-  "payload":{
-    "version": ">=0.2.0",
-    "features": []
-  }
-}
+{"type":"Hello","payload":{"version":"0.3.0","features":[]}}
 ```
 
-After that, Octa sends the Schema command without any options to the plugin and waits for a Schema command in response. The response specifies the task attribute required by the plugin and can include a JSON Schema for its value.
+The plugin responds with a semver requirement that must accept the engine version:
 
-Plugin Schema response:
-| Field | Type | Description |
+```json
+{"type":"Hello","payload":{"version":">=0.3.0, <0.4.0","features":[]}}
+```
+
+| Field | Type | Meaning |
 | --- | --- | --- |
-| type | String | Plugin command type |
-| key | String | Plugin task key |
-| capabilities | Array | Optional generic capabilities implemented by the plugin |
-| validation_schema | Object | Optional JSON Schema for the plugin task value |
+| `version` | string | Exact engine version in the request; semver requirement in the response |
+| `features` | string array | Negotiated feature names; currently empty |
 
-Example:
+A version mismatch terminates plugin startup.
+
+## Schema discovery
+
+After the handshake Octa sends:
+
+```json
+{"type":"Schema"}
+```
+
+The plugin responds with its task key and optional capabilities:
 
 ```json
 {
-  "type":"Schema",
-  "payload":{
+  "type": "Schema",
+  "payload": {
     "key": "shell",
+    "supports_raw": true,
     "capabilities": ["shell"],
-    "validation_schema": {
-      "type": "string"
-    }
+    "validation_schema": {"type": "string"}
   }
 }
 ```
 
-Octa compiles `validation_schema` once when loading the plugins and validates every matching task,
-annotation, and command before execution. An invalid plugin schema prevents the Octafile from being
-loaded. Omitting `validation_schema` keeps compatibility with older plugins: the task key is recognized,
-but the plugin-specific value is not validated.
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `key` | string | required | Octafile task attribute and YAML annotation name |
+| `supports_raw` | boolean | `false` | Plugin accepts raw execution and the terminal-input messages |
+| `capabilities` | string array | `[]` | Generic behavior exposed independently of the plugin name |
+| `validation_schema` | JSON object | omitted | JSON Schema used to validate the plugin task value |
 
-Capabilities describe behavior independently of a task key or executable name. The built-in shell
-plugin advertises `shell`, which is used by `sh:` values and the `shell` Tera function and filter.
-Octa rejects duplicate keys and capabilities so their resolution remains deterministic.
+Octa compiles `validation_schema` once while loading plugins, then validates matching tasks,
+annotations, commands, and conditions before execution. Omitting it preserves compatibility with
+older plugins but leaves the plugin-specific value unvalidated.
 
-This concludes the first stage of interaction with the plugin.
+The built-in shell plugin advertises the `shell` capability. Octa uses that capability for plain
+string commands, `sh:` variable values, and shell template helpers. Keys and capabilities must be
+non-empty and unique across loaded plugins. Keys must not collide with Octafile syntax such as
+`cmds`, `task`, `if`, `timeout`, or `defer`.
 
-The schema key also defines the YAML annotation for tasks handled by the plugin. For example, a
-plugin that returns the `shell` key can be selected with `!shell`:
-
-```yaml
-tasks:
-  build: !shell cargo build
-```
-
-The same key can be selected as `default_plugin` in the global Octa configuration or an Octafile.
-Plain string tasks, commands, and conditions are then routed to that plugin. Octa validates the
-configured value against the keys returned by loaded plugins; the plugin executable name does not
-need to match its task-type key.
-
-Task-type keys must be non-empty and must not collide with Octafile syntax such as `cmds`, `task`,
-`if`, `timeout`, or `defer`. Octa rejects conflicting keys while loading plugin schemas so that a key
-cannot be interpreted differently in tasks, commands, and conditions.
-
-The tagged value is passed to the selected plugin. An annotation can also contain a structured
-payload for plugins that accept configuration; structured values are serialized as JSON when sent
-through the current string-based Execute protocol.
+The schema key can be used as a regular field or YAML annotation:
 
 ```yaml
 tasks:
+  build:
+    shell: cargo build
+
   deploy: !docker
     image: app:latest
     command: ./deploy
 ```
 
-Octa rejects an annotation when no loaded plugin exposes the corresponding schema key. The existing
-task attribute form, such as `shell: cargo build`, remains supported and is validated with the same
-schema.
+Structured plugin values are validated as structured JSON, then encoded into the current
+`Execute.params` string as compact JSON.
 
-Next, Octa can send an arbitrary number of Execute commands, including concurrent commands over the
-same connection. The SDK starts each command independently and identifies all responses by the ID
-returned in `Started`; plugin implementations therefore must be safe to call concurrently. Here is
-what the Execute commands look like:
+## Starting a command
 
-Because `Execute` has no client-generated request ID, `Started` acknowledgements must be returned in
-the same order as the corresponding requests. After that acknowledgement, output and terminal
-responses from different command IDs may be interleaved freely.
+Octa sends an `Execute` request:
 
-Octa Execute request:
-| Field | Type | Description |
-| --- | --- | --- |
-| type | String | Plugin command type |
-| command | String | Command to execute by plugin |
-| args | array | Array of arguments provided to octa when run some task |
-| dir | String | Directory for execute command |
-| envs | HashMap | A list of environment variables retrieved from the system and extended with variables defined in the task file |
-| envs | HashMap | A list of variables defined in the octafile |
-| dry | bool | True if Octa run in dry mode |
-
-Example:
 ```json
 {
-  "type":"Execute",
-  "payload":{
-    "command":"echo Test",
-    "args":[],
-    "dir":".",
-    "envs":{},
-    "vars":{},
-    "dry":false
+  "type": "Execute",
+  "payload": {
+    "params": "cargo test",
+    "args": ["--release"],
+    "dir": "/workspace/project",
+    "envs": {"CI": "true"},
+    "vars": {"PROFILE": "release"},
+    "secret_vars": ["TOKEN"],
+    "redact_params": false,
+    "raw": false,
+    "dry": false
   }
 }
 ```
 
-Upon receiving the Execute command, the plugin send `Started` command and after what can send `Stdout`, `Stderr`, and `ExitStatus` commands. There can be multiple `Stdout` and `Stderr` commands, and after receiving the ExitStatus command, Octa considers the command execution to be complete. Everything passed through the StdOut and StdErr commands is displayed on the screen by the Octa engine and also saved to a buffer to be returned as the task result.
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `params` | string | required | Plugin value; structured values arrive as compact JSON text |
+| `args` | string array | required | Arguments passed to the selected Octa task |
+| `dir` | path string | required | Effective task working directory |
+| `envs` | string map | required | Effective process environment |
+| `vars` | JSON value map | required | Resolved Octafile variables |
+| `secret_vars` | string array | `[]` | Variable names whose values must be redacted from SDK diagnostics |
+| `redact_params` | boolean | `false` | Treat the complete `params` value as sensitive |
+| `raw` | boolean | `false` | Request byte-oriented interactive execution |
+| `dry` | boolean | required | Describe/validate work without applying normal side effects |
 
-Plugin Start response:
-| Field | Type | Description |
-| --- | --- | --- |
-| id | String | Task identifier |
+The SDK assigns a command ID and must acknowledge the request before emitting command output:
 
-Example:
+```json
+{"type":"Started","payload":{"id":"9e16d0f3-8aba-4d16-a765-755f627b65dc"}}
+```
+
+`Execute` does not contain a client-generated ID. Consequently, when requests arrive concurrently,
+the plugin must send `Started` acknowledgements in the same order as the corresponding `Execute`
+requests. Once acknowledged, messages for different command IDs may be interleaved freely.
+
+Plugin implementations must therefore be concurrency-safe. The SDK starts each command in its own
+task and routes later control messages by command ID.
+
+## Transport and result limits
+
+Octa bounds every stage between a plugin and the task result:
+
+- one JSONL request or response frame may contain at most 1 MiB, excluding its trailing newline;
+- every running command has its own 32-response mailbox;
+- captured stdout and stderr share a 64 MiB task-result limit;
+- each captured stream stays in memory through 1 MiB and then spills to a temporary file.
+
+If one command fills its mailbox, Octa reports that command as failed, sends `Cancel`, and discards
+its remaining messages through the terminal response. Other commands on the same plugin connection
+continue normally; a noisy command therefore cannot block their routing or grow an unbounded host
+queue. Exceeding the result limit also fails and cancels only that command. Raw terminal output is
+still subject to these transport and result limits even though it bypasses presentation buffering.
+
+## Output, diagnostics, and completion
+
+Normal line-oriented commands use `Stdout` and `Stderr`:
+
+```json
+{"type":"Stdout","payload":{"id":"command-id","line":"compiled crate"}}
+{"type":"Stderr","payload":{"id":"command-id","line":"warning: unused value"}}
+```
+
+The `line` value does not need a trailing newline. Octa normalizes line endings and applies the
+selected output renderer, prefixes, buffering, and stream suppression.
+
+A plugin can report a structured diagnostic instead of making Octa parse arbitrary stderr text:
+
 ```json
 {
-  "type":"Start",
-  "payload":{
-    "id": "test-execution-id"
+  "type": "Diagnostic",
+  "payload": {
+    "id": "command-id",
+    "level": "error",
+    "message": "unexpected token",
+    "location": {"file": "src/main.rs", "line": 18, "column": 7}
   }
 }
 ```
 
-Plugin StdOut response:
-| Field | Type | Description |
-| --- | --- | --- |
-| id | String | Task identifier |
-| line | String | Message text for output to stdout |
+`level` is one of `trace`, `debug`, `info`, `warn`, or `error`. `location` is optional; `line` and
+`column` inside it are also optional. When GitHub Actions annotations are enabled, available
+coordinates are forwarded as annotation properties.
 
-Example:
-```json
-{
-  "type":"StdOut",
-  "payload":{
-    "id": "test-execution-id"
-    "line": "test output"
-  }
-}
-```
-
-Plugin StdErr response:
-| Field | Type | Description |
-| --- | --- | --- |
-| id | String | Task identifier |
-| line | String | Error message text for output to stderr |
-
-Example:
-```json
-{
-  "type":"StdErr",
-  "payload":{
-    "id": "test-execution-id"
-    "line": "test output"
-  }
-}
-```
-
-Plugin ExitStatus response:
-| Field | Type | Description |
-| --- | --- | --- |
-| id | String | Task identifier |
-| code | int | Task execution code |
-
-Example:
-```json
-{
-  "type":"ExitStatus",
-  "payload":{
-    "id": "test-execution-id"
-    "code": 0
-  }
-}
-```
-
-Finally, o third stage, upon completion, Octa sends the Shutdown command to the plugin and waits for a same Shutdown response. After that, the plugin process will be terminated.
-
-Example of Shutdown request:
+Every started command must finish with exactly one terminal response:
 
 ```json
-{
-  "type":"Shutdown"
-}
+{"type":"ExitStatus","payload":{"id":"command-id","code":0}}
 ```
 
-Example of Shutdown response:
+or:
 
 ```json
-{
-  "type":"Shutdown",
-  "payload":{
-    "message": "Shutting down"
-  }
-}
+{"type":"Error","payload":{"id":"command-id","message":"failed to start compiler"}}
 ```
 
-The first and last stages of communication with the plugin are abstracted within the SDK code for plugin creation. However, the execution stage (processing the Execute commands) is implemented by the plugin itself. At its minimal implementation, a plugin might look like this:
+`ExitStatus` represents a process-like result. `Error` represents a plugin/protocol failure. After
+either response, Octa removes the command ID; sending later output for it is a protocol violation.
+
+## Raw and PTY execution
+
+A plugin must declare `supports_raw: true` before Octa will send `Execute.raw: true`. Raw mode keeps
+terminal data byte-oriented and uses base64 in JSON so arbitrary bytes survive the UTF-8 transport:
+
+```json
+{"type":"StdoutBytes","payload":{"id":"command-id","bytes":"G1sySg=="}}
+{"type":"StderrBytes","payload":{"id":"command-id","bytes":"d2FybmluZw=="}}
+```
+
+For a raw command, Octa can send terminal input after `Started`:
+
+```json
+{"type":"Stdin","payload":{"id":"command-id","bytes":"eWVzCg=="}}
+{"type":"Resize","payload":{"id":"command-id","rows":40,"cols":120}}
+{"type":"CloseStdin","payload":{"id":"command-id"}}
+```
+
+| Request | Meaning |
+| --- | --- |
+| `Stdin` | Forward decoded bytes to the command's standard input |
+| `Resize` | Update the command PTY window size |
+| `CloseStdin` | Deliver end-of-input to this command |
+
+The built-in shell plugin allocates a real PTY, forwards resize events, and replies with byte
+events. Other plugins may implement a different terminal backend, but they must preserve byte order
+and command isolation. Raw output bypasses line prefixes and buffering because either transformation
+could corrupt a terminal protocol.
+
+## Cancellation
+
+Octa cancels one command without shutting down the plugin:
+
+```json
+{"type":"Cancel","payload":{"id":"command-id"}}
+```
+
+The plugin should stop the command and still send `ExitStatus` or `Error`. The SDK exposes a
+command-scoped `CancellationToken` and waits for the terminal response with a bounded timeout.
+
+## Shutdown
+
+At the end of the engine lifecycle Octa sends:
+
+```json
+{"type":"Shutdown"}
+```
+
+The plugin responds:
+
+```json
+{"type":"Shutdown","payload":{"message":"Shutting down"}}
+```
+
+The SDK cancels remaining commands, closes the connection, and terminates the plugin process if it
+does not exit normally.
+
+## Minimal Rust plugin
+
+The SDK owns handshake, schema discovery, command registration, routing, cancellation, and shutdown.
+A plugin only implements `Plugin::version` and `Plugin::execute_command`:
 
 ```rust
-struct SimplePlugin {}
+use std::sync::Arc;
+
+use anyhow::Result;
+use async_trait::async_trait;
+use octa_plugin::{
+  logger::Logger, protocol::PluginResponse, serve_plugin, Plugin, PluginCommand, PluginSchema,
+};
+use tokio::{io::{AsyncWrite, AsyncWriteExt}, sync::Mutex};
+use tokio_util::sync::CancellationToken;
+
+struct EchoPlugin;
 
 #[async_trait]
-impl Plugin for SimplePlugin {
-  /// Return plugin version
+impl Plugin for EchoPlugin {
   fn version(&self) -> String {
     env!("CARGO_PKG_VERSION").to_owned()
   }
 
   async fn execute_command(
     &self,
-    command: String,
-    args: Vec<String>,
-    dir: PathBuf,
-    envs: HashMap<String, String>,
-    writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
-    logger: Arc<impl Logger>,
-    id: String,
-    cancel_token: CancellationToken,
-  ) -> anyhow::Result<()> {    
-    // Execute some command code
-    
-    // Write comand output
-    let response = ServerResponse::Stdout {
-      id: id.clone(),
-      line: "Plugin output",
+    command: PluginCommand,
+    writer: Arc<Mutex<impl AsyncWrite + Send + Unpin + 'static>>,
+    _logger: Arc<impl Logger>,
+    _cancel_token: CancellationToken,
+  ) -> Result<()> {
+    let output = PluginResponse::Stdout {
+      id: command.id.clone(),
+      line: command.command,
     };
-    
-    // Write result
-    let response = ServerResponse::ExitStatus {
-      id: id.clone(), // ID executed command
+    let done = PluginResponse::ExitStatus {
+      id: command.id,
       code: 0,
     };
-    let response_json = serde_json::to_string(&response).unwrap() + "\n";
-    let mut lock = writer.lock().await;
-    let _ = lock.write_all(response_json).await;
 
+    let mut writer = writer.lock().await;
+    for response in [output, done] {
+      writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+      writer.write_all(b"\n").await?;
+    }
+    writer.flush().await?;
     Ok(())
   }
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
   serve_plugin(
-    SimplePlugin {},
+    EchoPlugin,
     PluginSchema {
-      key: "key".to_owned(),
-      validation_schema: serde_json::json!({
-          "type": "object",
-          "properties": {
-            "image": { "type": "string" }
-          },
-          "required": ["image"],
-          "additionalProperties": false
-        })
+      key: "echo".to_owned(),
+      supports_raw: false,
+      capabilities: vec![],
+      validation_schema: serde_json::json!({"type": "string"})
         .as_object()
         .cloned(),
     },
@@ -303,3 +326,6 @@ async fn main() -> anyhow::Result<()> {
   .await
 }
 ```
+
+For raw support, consume `PluginCommand.input`, emit `StdoutBytes`/`StderrBytes`, and set
+`PluginSchema.supports_raw` to `true`. Use the built-in shell plugin as the reference implementation.

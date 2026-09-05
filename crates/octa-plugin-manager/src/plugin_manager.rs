@@ -12,7 +12,7 @@ use tokio::io::{self, AsyncReadExt};
 use tokio::process::Command;
 use tokio::{
   process::Child,
-  sync::Mutex,
+  sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
   task::JoinHandle,
   time::{timeout, Duration},
 };
@@ -100,6 +100,10 @@ impl PluginRegistration {
     &self.plugin_name
   }
 
+  pub fn supports_raw(&self) -> bool {
+    self.schema.supports_raw
+  }
+
   pub fn validate(&self, value: &serde_json::Value) -> std::result::Result<(), String> {
     let Some(validator) = &self.validator else {
       return Ok(());
@@ -157,6 +161,13 @@ pub struct PluginManager {
   active_plugins: Arc<Mutex<HashMap<String, PluginInstance>>>,
   plugin_registry: Arc<Mutex<PluginRegistry>>,
   starting_plugins: Arc<StdMutex<HashSet<String>>>,
+  execution_lock: Arc<RwLock<()>>,
+}
+
+/// Prevents an interactive command from overlapping another plugin invocation.
+pub enum PluginExecutionGuard {
+  Shared(OwnedRwLockReadGuard<()>),
+  Exclusive(OwnedRwLockWriteGuard<()>),
 }
 
 impl PluginManager {
@@ -166,6 +177,15 @@ impl PluginManager {
       active_plugins: Arc::new(Mutex::new(HashMap::new())),
       plugin_registry: Arc::new(Mutex::new(PluginRegistry::default())),
       starting_plugins: Arc::new(StdMutex::new(HashSet::new())),
+      execution_lock: Arc::new(RwLock::new(())),
+    }
+  }
+
+  pub async fn execution_guard(&self, raw: bool) -> PluginExecutionGuard {
+    if raw {
+      PluginExecutionGuard::Exclusive(self.execution_lock.clone().write_owned().await)
+    } else {
+      PluginExecutionGuard::Shared(self.execution_lock.clone().read_owned().await)
     }
   }
 
@@ -605,6 +625,7 @@ mod tests {
         plugin.to_owned(),
         Schema {
           key: key.to_owned(),
+          supports_raw: false,
           capabilities: capabilities.iter().map(|value| (*value).to_owned()).collect(),
           validation_schema: None,
         },
@@ -631,6 +652,7 @@ mod tests {
       "plugin".to_owned(),
       Schema {
         key: "key".to_owned(),
+        supports_raw: false,
         capabilities: Vec::new(),
         validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
       },
@@ -717,6 +739,7 @@ mod tests {
           envs: HashMap::new(),
           secret_vars: Vec::new(),
           redact_params: false,
+          raw: false,
         },
         cancel_token.clone(),
       )

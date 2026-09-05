@@ -2,10 +2,11 @@ use std::{
   collections::VecDeque,
   fmt, io,
   sync::{
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex as StdMutex,
   },
   thread::{self, JoinHandle},
+  time::{Duration, Instant},
 };
 
 use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
@@ -24,8 +25,19 @@ enum WriterRequest {
     entry: ConsoleEntry,
     completed: Option<oneshot::Sender<io::Result<()>>>,
   },
-  RenderBatch(Vec<ConsoleEntry>),
   Barrier(oneshot::Sender<()>),
+  SetParallel {
+    parallel: bool,
+    completed: oneshot::Sender<io::Result<()>>,
+  },
+  BeginRaw {
+    scope: ConsoleScope,
+    completed: oneshot::Sender<io::Result<()>>,
+  },
+  EndRaw {
+    scope: ConsoleScope,
+    entries: Vec<ConsoleEntry>,
+  },
 }
 
 #[derive(Default)]
@@ -39,14 +51,17 @@ struct RawState {
 /// Restores normal diagnostic routing if raw-session setup is cancelled.
 struct RawActivation<'a> {
   console: &'a Console,
+  scope: ConsoleScope,
   committed: bool,
 }
 
 impl<'a> RawActivation<'a> {
-  fn new(console: &'a Console) -> Self {
+  fn new(console: &'a Console, scope: ConsoleScope) -> Self {
     console.raw_state.lock().unwrap().active = true;
+    console.raw_ticks_paused.store(true, Ordering::Release);
     Self {
       console,
+      scope,
       committed: false,
     }
   }
@@ -59,7 +74,7 @@ impl<'a> RawActivation<'a> {
 impl Drop for RawActivation<'_> {
   fn drop(&mut self) {
     if !self.committed {
-      self.console.release_raw_state();
+      self.console.release_raw_state(self.scope.clone());
     }
   }
 }
@@ -68,6 +83,7 @@ struct WriterHandle {
   sender: Option<mpsc::Sender<WriterRequest>>,
   thread: StdMutex<Option<JoinHandle<()>>>,
   background_error: Arc<StdMutex<Option<io::Error>>>,
+  waker: thread::Thread,
 }
 
 impl WriterHandle {
@@ -78,7 +94,9 @@ impl WriterHandle {
       .ok_or_else(writer_closed)?
       .send(request)
       .await
-      .map_err(|_| writer_closed())
+      .map_err(|_| writer_closed())?;
+    self.waker.unpark();
+    Ok(())
   }
 
   fn try_send(&self, request: WriterRequest) -> io::Result<()> {
@@ -90,7 +108,9 @@ impl WriterHandle {
       .map_err(|error| match error {
         mpsc::error::TrySendError::Full(_) => io::Error::new(io::ErrorKind::WouldBlock, "output writer queue is full"),
         mpsc::error::TrySendError::Closed(_) => writer_closed(),
-      })
+      })?;
+    self.waker.unpark();
+    Ok(())
   }
 
   fn take_background_error(&self) -> Option<io::Error> {
@@ -102,6 +122,7 @@ impl Drop for WriterHandle {
   fn drop(&mut self) {
     // Closing the final sender lets the worker drain accepted records before it exits.
     drop(self.sender.take());
+    self.waker.unpark();
     if let Some(thread) = self.thread.lock().unwrap().take() {
       if thread.thread().id() != thread::current().id() {
         let _ = thread.join();
@@ -115,29 +136,38 @@ pub struct Console {
   writer: WriterHandle,
   render_lock: Arc<Mutex<()>>,
   raw_state: StdMutex<RawState>,
+  raw_ticks_paused: Arc<AtomicBool>,
   dropped_diagnostics: AtomicU64,
+  raw_terminal_supported: bool,
 }
 
 impl Console {
   pub fn new(renderer: impl ConsoleRenderer) -> Self {
+    let raw_terminal_supported = renderer.supports_raw_terminal();
     let (sender, receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
     let background_error = Arc::new(StdMutex::new(None));
+    let raw_ticks_paused = Arc::new(AtomicBool::new(false));
     let writer = thread::Builder::new()
       .name("octa-output".to_owned())
       .spawn({
         let background_error = background_error.clone();
-        move || render_loop(renderer, receiver, background_error)
+        let raw_ticks_paused = raw_ticks_paused.clone();
+        move || render_loop(renderer, receiver, background_error, raw_ticks_paused)
       })
       .expect("failed to start output writer thread");
+    let waker = writer.thread().clone();
     Self {
       writer: WriterHandle {
         sender: Some(sender),
         thread: StdMutex::new(Some(writer)),
         background_error,
+        waker,
       },
       render_lock: Arc::new(Mutex::new(())),
       raw_state: StdMutex::new(RawState::default()),
+      raw_ticks_paused,
       dropped_diagnostics: AtomicU64::new(0),
+      raw_terminal_supported,
     }
   }
 
@@ -165,6 +195,16 @@ impl Console {
     self.emit_message(Some(run_id), None, level, message).await
   }
 
+  pub async fn run_diagnostic(
+    &self,
+    run_id: u64,
+    level: ConsoleLevel,
+    message: impl Into<String>,
+    location: Option<super::SourceLocation>,
+  ) -> io::Result<()> {
+    self.emit_diagnostic(Some(run_id), None, level, message, location).await
+  }
+
   /// Publishes a diagnostic associated with a scope inside an execution run.
   pub async fn run_message_at(
     &self,
@@ -174,6 +214,19 @@ impl Console {
     message: impl Into<String>,
   ) -> io::Result<()> {
     self.emit_message(Some(run_id), Some(scope), level, message).await
+  }
+
+  pub async fn run_diagnostic_at(
+    &self,
+    run_id: u64,
+    scope: ConsoleScope,
+    level: ConsoleLevel,
+    message: impl Into<String>,
+    location: Option<super::SourceLocation>,
+  ) -> io::Result<()> {
+    self
+      .emit_diagnostic(Some(run_id), Some(scope), level, message, location)
+      .await
   }
 
   /// Queues a diagnostic from synchronous integrations such as a tracing layer.
@@ -200,6 +253,7 @@ impl Console {
       scope: None,
       level,
       message: message.into(),
+      location: None,
     }));
     let mut state = self.raw_state.lock().unwrap();
     if state.active {
@@ -231,10 +285,31 @@ impl Console {
     scope: ConsoleScope,
     command_id: impl Into<String>,
   ) -> io::Result<RawConsoleSession> {
+    if !self.raw_terminal_supported {
+      return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "raw/PTY mode is incompatible with the selected output renderer",
+      ));
+    }
     let command_id = command_id.into();
     let guard = self.render_lock.clone().lock_owned().await;
-    let activation = RawActivation::new(self);
-    self.writer_barrier().await?;
+    let activation = RawActivation::new(self, scope.clone());
+    let (completed, result) = oneshot::channel();
+    self
+      .writer
+      .send(WriterRequest::BeginRaw {
+        scope: scope.clone(),
+        completed,
+      })
+      .await?;
+    let begin_result = result.await.map_err(|_| writer_closed())?;
+    if let Some(error) = self.writer.take_background_error() {
+      if let Err(current) = begin_result {
+        store_background_error(&self.writer.background_error, current);
+      }
+      return Err(error);
+    }
+    begin_result?;
     activation.commit();
 
     Ok(RawConsoleSession {
@@ -253,12 +328,24 @@ impl Console {
     level: ConsoleLevel,
     message: impl Into<String>,
   ) -> io::Result<()> {
+    self.emit_diagnostic(run_id, scope, level, message, None).await
+  }
+
+  async fn emit_diagnostic(
+    &self,
+    run_id: Option<u64>,
+    scope: Option<ConsoleScope>,
+    level: ConsoleLevel,
+    message: impl Into<String>,
+    location: Option<super::SourceLocation>,
+  ) -> io::Result<()> {
     self
       .emit(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
         run_id,
         scope,
         level,
         message: message.into(),
+        location,
       }))
       .await
   }
@@ -284,6 +371,7 @@ impl Console {
         scope: None,
         level: ConsoleLevel::Warn,
         message: format!("Dropped {dropped} diagnostics because the output buffer was full"),
+        location: None,
       })))
       .await;
     if result.is_err() {
@@ -320,6 +408,26 @@ impl Console {
     self.writer_barrier().await
   }
 
+  /// Tells adaptive presentation whether the built execution plan can run work concurrently.
+  pub async fn set_parallel(&self, parallel: bool) -> io::Result<()> {
+    let _guard = self.render_lock.lock().await;
+    let (completed, result) = oneshot::channel();
+    self
+      .writer
+      .send(WriterRequest::SetParallel { parallel, completed })
+      .await?;
+    let render_result = result.await.map_err(|_| writer_closed())?;
+    match self.writer.take_background_error() {
+      Some(error) => {
+        if let Err(current) = render_result {
+          store_background_error(&self.writer.background_error, current);
+        }
+        Err(error)
+      },
+      None => render_result,
+    }
+  }
+
   async fn writer_barrier(&self) -> io::Result<()> {
     let (completed, result) = oneshot::channel();
     self.writer.send(WriterRequest::Barrier(completed)).await?;
@@ -331,21 +439,24 @@ impl Console {
     self.writer.try_send(request)
   }
 
-  fn release_raw_state(&self) {
+  fn release_raw_state(&self, scope: ConsoleScope) {
     let mut state = self.raw_state.lock().unwrap();
     let pending = state.pending.drain(..).collect::<Vec<_>>();
-    if !pending.is_empty() {
-      let count = pending.len() as u64;
-      if self
-        .try_send(WriterRequest::RenderBatch(pending))
-        .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
-      {
-        self.dropped_diagnostics.fetch_add(count, Ordering::Relaxed);
-      }
+    let count = pending.len() as u64;
+    if self
+      .try_send(WriterRequest::EndRaw {
+        scope,
+        entries: pending,
+      })
+      .is_err()
+    {
+      self.dropped_diagnostics.fetch_add(count, Ordering::Relaxed);
     }
     // Keep the state lock until the pending batch has been queued so a new
     // synchronous diagnostic cannot overtake records buffered by the session.
     state.active = false;
+    self.raw_ticks_paused.store(false, Ordering::Release);
+    self.writer.waker.unpark();
   }
 }
 
@@ -380,7 +491,7 @@ impl RawConsoleSession {
         scope: Some(self.scope.clone()),
         command_id: self.command_id.clone(),
         stream,
-        payload: ConsolePayload::Bytes(bytes.into()),
+        payload: ConsolePayload::RawBytes(bytes.into()),
       })))
       .await
   }
@@ -388,7 +499,7 @@ impl RawConsoleSession {
 
 impl Drop for RawConsoleSession {
   fn drop(&mut self) {
-    self.console.release_raw_state();
+    self.console.release_raw_state(self.scope.clone());
   }
 }
 
@@ -396,10 +507,35 @@ fn render_loop(
   mut renderer: impl ConsoleRenderer,
   mut receiver: mpsc::Receiver<WriterRequest>,
   background_error: Arc<StdMutex<Option<io::Error>>>,
+  raw_ticks_paused: Arc<AtomicBool>,
 ) {
-  while let Some(request) = receiver.blocking_recv() {
+  const TICK_INTERVAL: Duration = Duration::from_millis(100);
+  let mut next_sequence = 1;
+  let mut last_tick = Instant::now();
+  loop {
+    if raw_ticks_paused.load(Ordering::Acquire) {
+      last_tick = Instant::now();
+    } else if last_tick.elapsed() >= TICK_INTERVAL {
+      if let Err(error) = renderer.tick() {
+        store_background_error(&background_error, error);
+      }
+      last_tick = Instant::now();
+    }
+    let request = match receiver.try_recv() {
+      Ok(request) => request,
+      Err(mpsc::error::TryRecvError::Empty) => {
+        if receiver.is_closed() {
+          break;
+        }
+        thread::park_timeout(TICK_INTERVAL.saturating_sub(last_tick.elapsed()));
+        continue;
+      },
+      Err(mpsc::error::TryRecvError::Disconnected) => break,
+    };
     match request {
-      WriterRequest::Render { entry, completed } => {
+      WriterRequest::Render { mut entry, completed } => {
+        entry.assign_sequence(next_sequence);
+        next_sequence += 1;
         let result = renderer.render(&entry);
         if let Some(completed) = completed {
           if let Err(Err(error)) = completed.send(result) {
@@ -409,15 +545,29 @@ fn render_loop(
           store_background_error(&background_error, error);
         }
       },
-      WriterRequest::RenderBatch(entries) => {
-        for entry in entries {
-          if let Err(error) = renderer.render(&entry) {
-            store_background_error(&background_error, error);
-          }
+      WriterRequest::SetParallel { parallel, completed } => {
+        let result = renderer.set_parallel(parallel);
+        if let Err(Err(error)) = completed.send(result) {
+          store_background_error(&background_error, error);
         }
       },
       WriterRequest::Barrier(completed) => {
         let _ = completed.send(());
+      },
+      WriterRequest::BeginRaw { scope, completed } => {
+        let _ = completed.send(renderer.begin_raw(&scope));
+      },
+      WriterRequest::EndRaw { scope, entries } => {
+        for mut entry in entries {
+          entry.assign_sequence(next_sequence);
+          next_sequence += 1;
+          if let Err(error) = renderer.render(&entry) {
+            store_background_error(&background_error, error);
+          }
+        }
+        if let Err(error) = renderer.end_raw(&scope) {
+          store_background_error(&background_error, error);
+        }
       },
     }
   }
@@ -448,12 +598,14 @@ mod tests {
   #[derive(Default)]
   struct RecordingRenderer {
     records: StdMutex<Vec<ConsoleRecord>>,
+    sequences: StdMutex<Vec<u64>>,
     threads: StdMutex<Vec<thread::ThreadId>>,
   }
 
   impl ConsoleRenderer for Arc<RecordingRenderer> {
     fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
       self.records.lock().unwrap().push(entry.record().clone());
+      self.sequences.lock().unwrap().push(entry.sequence());
       self.threads.lock().unwrap().push(thread::current().id());
       Ok(())
     }
@@ -534,6 +686,37 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn assigns_monotonic_sequence_numbers_on_the_writer() {
+    let (console, renderer) = recording_console();
+    console.message(ConsoleLevel::Info, "one").await.unwrap();
+    console.message(ConsoleLevel::Info, "two").await.unwrap();
+    assert_eq!(*renderer.sequences.lock().unwrap(), [1, 2]);
+  }
+
+  struct NoRawRenderer;
+
+  impl ConsoleRenderer for NoRawRenderer {
+    fn render(&mut self, _entry: &ConsoleEntry) -> io::Result<()> {
+      Ok(())
+    }
+
+    fn supports_raw_terminal(&self) -> bool {
+      false
+    }
+  }
+
+  #[tokio::test]
+  async fn rejects_raw_sessions_for_incompatible_renderers() {
+    let console = Arc::new(Console::new(NoRawRenderer));
+    let error = console
+      .begin_raw(1, ConsoleScopeAllocator::default().scope("raw"), "command")
+      .await
+      .err()
+      .expect("raw mode must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+  }
+
+  #[tokio::test]
   async fn cli_documents_use_the_same_writer() {
     let (console, renderer) = recording_console();
 
@@ -580,9 +763,40 @@ mod tests {
         scope: Some(scope),
         command_id: "command-1".to_owned(),
         stream: ConsoleStream::Stdout,
-        payload: ConsolePayload::Bytes(b"raw".to_vec()),
+        payload: ConsolePayload::RawBytes(b"raw".to_vec()),
       })
     );
+  }
+
+  struct RawLifecycleRenderer(Arc<StdMutex<Vec<&'static str>>>);
+
+  impl ConsoleRenderer for RawLifecycleRenderer {
+    fn render(&mut self, _entry: &ConsoleEntry) -> io::Result<()> {
+      Ok(())
+    }
+
+    fn begin_raw(&mut self, _scope: &ConsoleScope) -> io::Result<()> {
+      self.0.lock().unwrap().push("begin");
+      Ok(())
+    }
+
+    fn end_raw(&mut self, _scope: &ConsoleScope) -> io::Result<()> {
+      self.0.lock().unwrap().push("end");
+      Ok(())
+    }
+  }
+
+  #[tokio::test]
+  async fn raw_lifecycle_is_reported_even_when_the_process_writes_nothing() {
+    let lifecycle = Arc::new(StdMutex::new(Vec::new()));
+    let console = Arc::new(Console::new(RawLifecycleRenderer(lifecycle.clone())));
+    let session = console
+      .begin_raw(1, ConsoleScopeAllocator::default().scope("prompt"), "command")
+      .await
+      .unwrap();
+    drop(session);
+    console.drain().await.unwrap();
+    assert_eq!(*lifecycle.lock().unwrap(), ["begin", "end"]);
   }
 
   #[tokio::test]
@@ -600,7 +814,7 @@ mod tests {
     assert!(matches!(
       &records[0],
       ConsoleRecord::Execution(ExecutionEvent::Output {
-        payload: ConsolePayload::Bytes(bytes),
+        payload: ConsolePayload::RawBytes(bytes),
         ..
       }) if bytes == b"raw"
     ));
@@ -632,6 +846,29 @@ mod tests {
     drop(console);
 
     assert!(dropped.load(Ordering::SeqCst));
+  }
+
+  struct TickRenderer(std_mpsc::Sender<()>);
+
+  impl ConsoleRenderer for TickRenderer {
+    fn render(&mut self, _entry: &ConsoleEntry) -> io::Result<()> {
+      Ok(())
+    }
+
+    fn tick(&mut self) -> io::Result<()> {
+      let _ = self.0.send(());
+      Ok(())
+    }
+  }
+
+  #[test]
+  fn writer_advances_time_based_renderers_without_new_events() {
+    let (sender, receiver) = std_mpsc::channel();
+    let console = Console::new(TickRenderer(sender));
+    receiver
+      .recv_timeout(Duration::from_secs(1))
+      .expect("writer did not tick renderer");
+    drop(console);
   }
 
   struct FailingRenderer;
@@ -959,24 +1196,28 @@ mod tests {
           scope: None,
           level: ConsoleLevel::Info,
           message: "global".to_owned(),
+          location: None,
         }),
         ConsoleRecord::Diagnostic(ConsoleDiagnostic {
           run_id: Some(7),
           scope: None,
           level: ConsoleLevel::Debug,
           message: "run".to_owned(),
+          location: None,
         }),
         ConsoleRecord::Diagnostic(ConsoleDiagnostic {
           run_id: Some(7),
           scope: None,
           level: ConsoleLevel::Warn,
           message: "synchronous run".to_owned(),
+          location: None,
         }),
         ConsoleRecord::Diagnostic(ConsoleDiagnostic {
           run_id: Some(7),
           scope: Some(scope),
           level: ConsoleLevel::Error,
           message: "run task".to_owned(),
+          location: None,
         }),
       ]
     );

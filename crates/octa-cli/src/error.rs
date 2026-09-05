@@ -31,6 +31,9 @@ pub enum OctaError {
   #[error("Invalid CLI variable: {0}")]
   InvalidVariable(String),
 
+  #[error("Invalid output configuration: {0}")]
+  InvalidOutputConfig(String),
+
   #[error("Watch mode requires at least one task with sources")]
   WatchSourcesMissing,
 

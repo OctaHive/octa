@@ -1,0 +1,219 @@
+use std::{collections::HashMap, io};
+
+use super::{
+  ConsoleEntry, ConsoleRecord, ConsoleRenderer, ConsoleScope, ExecutionEvent, GroupRenderer, JsonLinesRenderer,
+  KeepOrderRenderer, OnErrorRenderer, PrefixedRenderer, RenderMode, ReplacingRenderer, TerminalRenderer, TimedRenderer,
+};
+
+/// Routes each task scope to its selected presentation strategy while keeping
+/// all strategies behind one renderer boundary.
+pub struct OutputRouterRenderer {
+  default_mode: RenderMode,
+  adaptive_default: bool,
+  force_default: bool,
+  progress_enabled: bool,
+  renderers: HashMap<RenderMode, Box<dyn ConsoleRenderer>>,
+  replacing: ReplacingRenderer<Box<dyn ConsoleRenderer>>,
+}
+
+pub struct OutputRouterConfig {
+  pub default_mode: RenderMode,
+  pub group_begin: Option<String>,
+  pub group_end: Option<String>,
+  pub group_error_only: bool,
+  pub progress_enabled: bool,
+  /// Select interleaved/prefixed after the execution plan reports its concurrency.
+  pub adaptive_default: bool,
+  /// CLI/environment output overrides task-local presentation when true.
+  pub force_default: bool,
+}
+
+impl OutputRouterRenderer {
+  pub fn new(config: OutputRouterConfig) -> Self {
+    let OutputRouterConfig {
+      default_mode,
+      group_begin,
+      group_end,
+      group_error_only,
+      progress_enabled,
+      adaptive_default,
+      force_default,
+    } = config;
+    let mut renderers: HashMap<RenderMode, Box<dyn ConsoleRenderer>> = HashMap::new();
+    renderers.insert(RenderMode::Interleaved, Box::new(TerminalRenderer::default()));
+    renderers.insert(
+      RenderMode::Group,
+      Box::new(GroupRenderer::with_templates(
+        TerminalRenderer::default(),
+        group_begin,
+        group_end,
+        group_error_only,
+      )),
+    );
+    renderers.insert(
+      RenderMode::Prefixed,
+      Box::new(PrefixedRenderer::new(TerminalRenderer::default())),
+    );
+    renderers.insert(
+      RenderMode::OnError,
+      Box::new(OnErrorRenderer::new(TerminalRenderer::default())),
+    );
+    renderers.insert(
+      RenderMode::KeepOrder,
+      Box::new(KeepOrderRenderer::new(PrefixedRenderer::new(
+        TerminalRenderer::default(),
+      ))),
+    );
+    renderers.insert(
+      RenderMode::Timed,
+      Box::new(TimedRenderer::new(PrefixedRenderer::new(TerminalRenderer::default()))),
+    );
+    renderers.insert(RenderMode::Json, Box::new(JsonLinesRenderer::new()));
+
+    let replacing: Box<dyn ConsoleRenderer> = Box::new(TerminalRenderer::default());
+    Self {
+      default_mode,
+      adaptive_default,
+      force_default,
+      progress_enabled,
+      renderers,
+      replacing: ReplacingRenderer::new(replacing),
+    }
+  }
+
+  fn selected_mode(&self, scope: Option<&ConsoleScope>) -> RenderMode {
+    // A machine-readable stream must never be mixed with human output.
+    if self.default_mode == RenderMode::Json || self.force_default {
+      return self.default_mode;
+    }
+    scope.and_then(ConsoleScope::render_mode).unwrap_or(self.default_mode)
+  }
+
+  fn effective_mode(&self, mode: RenderMode) -> RenderMode {
+    if mode == RenderMode::Replacing && !self.progress_enabled {
+      RenderMode::Prefixed
+    } else {
+      mode
+    }
+  }
+}
+
+impl ConsoleRenderer for OutputRouterRenderer {
+  fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
+    let mode = self.effective_mode(self.selected_mode(record_scope(entry.record())));
+    if mode == RenderMode::Replacing {
+      return self.replacing.render(entry);
+    }
+    let renderer = self
+      .renderers
+      .get_mut(&mode)
+      .expect("every non-replacing render mode has a renderer");
+    if self.replacing.has_progress() {
+      self.replacing.render_external(&mut **renderer, entry)
+    } else {
+      renderer.render(entry)
+    }
+  }
+
+  fn supports_raw_terminal(&self) -> bool {
+    self.default_mode != RenderMode::Json
+  }
+
+  fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
+    if self.adaptive_default {
+      self.default_mode = if parallel {
+        RenderMode::Prefixed
+      } else {
+        RenderMode::Interleaved
+      };
+    }
+    Ok(())
+  }
+
+  fn tick(&mut self) -> io::Result<()> {
+    let mut first_error = self.replacing.tick().err();
+    for renderer in self.renderers.values_mut() {
+      let result = if self.replacing.has_progress() {
+        self.replacing.tick_external(&mut **renderer)
+      } else {
+        renderer.tick()
+      };
+      if let Err(error) = result {
+        first_error.get_or_insert(error);
+      }
+    }
+    first_error.map_or(Ok(()), Err)
+  }
+
+  fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    let mode = self.effective_mode(self.selected_mode(Some(scope)));
+    self.replacing.begin_raw(scope)?;
+    if mode == RenderMode::Replacing {
+      return Ok(());
+    }
+    self
+      .renderers
+      .get_mut(&mode)
+      .expect("every non-replacing render mode has a renderer")
+      .begin_raw(scope)
+  }
+
+  fn end_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    let mode = self.effective_mode(self.selected_mode(Some(scope)));
+    let mut first_error = self.replacing.end_raw(scope).err();
+    if mode != RenderMode::Replacing {
+      let renderer = self
+        .renderers
+        .get_mut(&mode)
+        .expect("every non-replacing render mode has a renderer");
+      if let Err(error) = renderer.end_raw(scope) {
+        first_error.get_or_insert(error);
+      }
+    }
+    first_error.map_or(Ok(()), Err)
+  }
+}
+
+fn record_scope(record: &ConsoleRecord) -> Option<&ConsoleScope> {
+  match record {
+    ConsoleRecord::Execution(ExecutionEvent::ScopeDeclared { scope, .. })
+    | ConsoleRecord::Execution(ExecutionEvent::ScopeStarted { scope, .. })
+    | ConsoleRecord::Execution(ExecutionEvent::ScopeFinished { scope, .. })
+    | ConsoleRecord::Execution(ExecutionEvent::Output { scope: Some(scope), .. }) => Some(scope),
+    ConsoleRecord::Diagnostic(diagnostic) => diagnostic.scope.as_ref(),
+    _ => None,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn router(adaptive_default: bool) -> OutputRouterRenderer {
+    OutputRouterRenderer::new(OutputRouterConfig {
+      default_mode: RenderMode::Interleaved,
+      group_begin: None,
+      group_end: None,
+      group_error_only: false,
+      progress_enabled: false,
+      adaptive_default,
+      force_default: false,
+    })
+  }
+
+  #[test]
+  fn adaptive_default_follows_built_plan_parallelism() {
+    let mut router = router(true);
+    router.set_parallel(true).unwrap();
+    assert_eq!(router.default_mode, RenderMode::Prefixed);
+    router.set_parallel(false).unwrap();
+    assert_eq!(router.default_mode, RenderMode::Interleaved);
+  }
+
+  #[test]
+  fn configured_default_ignores_plan_parallelism() {
+    let mut router = router(false);
+    router.set_parallel(true).unwrap();
+    assert_eq!(router.default_mode, RenderMode::Interleaved);
+  }
+}

@@ -108,6 +108,14 @@ pub trait TaskItem {
   fn failfast(&self) -> bool;
   fn requires_concurrency_permit(&self) -> bool;
 
+  fn interactive_session(&self) -> Option<&str> {
+    None
+  }
+
+  fn requires_runtime_lock(&self) -> bool {
+    self.requires_concurrency_permit()
+  }
+
   /// Associates executable output with its logical task invocation when available.
   fn output_scope(&self) -> Option<ConsoleScope> {
     None
@@ -146,8 +154,11 @@ pub struct TaskNode {
   // Execution configuration
   pub dir: PathBuf,        // Working directory
   pub ignore_errors: bool, // Whether to continue on error
-  pub silent: bool,        // Should task print to stdout or stderr
-  pub failfast: bool,      // Cancel parallel work after the first failure
+  pub silence: octa_octafile::Silence,
+  pub quiet: bool,
+  pub raw: bool,
+  interactive_session: Option<String>,
+  pub failfast: bool, // Cancel parallel work after the first failure
 
   // Runtime behavior
   pub run_mode: RunMode, // Run mode
@@ -159,6 +170,7 @@ pub struct TaskNode {
   pub preconditions: Option<Vec<String>>, // Task run preconditions
   pub timeout: Option<Timeout>,           // Maximum task execution time
   output_scope: Option<ConsoleScope>,
+  prefix_template: Option<String>,
 
   // State management
   pub deps_res: Arc<Mutex<HashMap<String, String>>>, // Dependencies results
@@ -215,6 +227,14 @@ impl TaskItem for TaskNode {
 
   fn requires_concurrency_permit(&self) -> bool {
     !matches!(self.action, NodeAction::Barrier | NodeAction::FreshnessCommit(_))
+  }
+
+  fn interactive_session(&self) -> Option<&str> {
+    self.interactive_session.as_deref()
+  }
+
+  fn requires_runtime_lock(&self) -> bool {
+    self.action.needs_runtime_lock()
   }
 
   fn output_scope(&self) -> Option<ConsoleScope> {

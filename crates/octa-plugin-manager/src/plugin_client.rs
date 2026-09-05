@@ -10,12 +10,16 @@ use interprocess::local_socket::{tokio::Stream as TokioStream, traits::tokio::St
 use semver::{Version as SemVersion, VersionReq};
 use serde_json::Value;
 use tokio::{
-  io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
+  io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
   sync::{mpsc, oneshot, Mutex},
 };
 use tokio_util::sync::CancellationToken;
 
 use octa_plugin::protocol::{OctaCommand, PluginResponse, Schema, Version};
+
+const CONTROL_RESPONSE_CAPACITY: usize = 16;
+const COMMAND_RESPONSE_CAPACITY: usize = 32;
+const MAX_PLUGIN_FRAME_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub enum PluginClientError {
@@ -25,6 +29,8 @@ pub enum PluginClientError {
   ConnectionClosed,
   VersionMismatch,
   WriterClosed,
+  FrameTooLarge { bytes: usize, limit: usize },
+  ResponseQueueOverflow { id: String, capacity: usize },
 }
 
 impl From<PluginClientError> for io::Error {
@@ -36,6 +42,13 @@ impl From<PluginClientError> for io::Error {
       PluginClientError::ConnectionClosed => io::Error::new(io::ErrorKind::ConnectionAborted, "Connection closed"),
       PluginClientError::VersionMismatch => io::Error::other("Version mismatch"),
       PluginClientError::WriterClosed => io::Error::new(io::ErrorKind::ConnectionAborted, "Writer closed"),
+      PluginClientError::FrameTooLarge { bytes, limit } => io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Plugin protocol frame contains {bytes} bytes; limit is {limit}"),
+      ),
+      PluginClientError::ResponseQueueOverflow { id, capacity } => io::Error::other(format!(
+        "Plugin command '{id}' produced output faster than Octa could consume it (queue capacity: {capacity})"
+      )),
     }
   }
 }
@@ -61,6 +74,13 @@ impl std::fmt::Display for PluginClientError {
       PluginClientError::ConnectionClosed => write!(f, "Connection closed"),
       PluginClientError::VersionMismatch => write!(f, "Version mismatch"),
       PluginClientError::WriterClosed => write!(f, "Writer closed"),
+      PluginClientError::FrameTooLarge { bytes, limit } => {
+        write!(f, "Plugin protocol frame contains {bytes} bytes; limit is {limit}")
+      },
+      PluginClientError::ResponseQueueOverflow { id, capacity } => write!(
+        f,
+        "Plugin command '{id}' produced output faster than Octa could consume it (queue capacity: {capacity})"
+      ),
     }
   }
 }
@@ -73,10 +93,18 @@ pub struct PluginClient {
 #[derive(Debug)]
 struct PluginClientInner {
   writer: Mutex<Option<WriteHalf<TokioStream>>>,
-  control_rx: Mutex<mpsc::UnboundedReceiver<PluginResponse>>,
+  control_rx: Mutex<mpsc::Receiver<PluginResponse>>,
   pending_starts: Mutex<VecDeque<oneshot::Sender<Result<PluginExecution, PluginClientError>>>>,
-  commands: Mutex<HashMap<String, mpsc::UnboundedSender<PluginResponse>>>,
+  commands: Mutex<HashMap<String, CommandRoute>>,
   shutdown_signal: CancellationToken,
+  connection_closed: CancellationToken,
+}
+
+#[derive(Debug)]
+struct CommandRoute {
+  sender: Option<mpsc::Sender<PluginResponse>>,
+  overflowed: CancellationToken,
+  completed: CancellationToken,
 }
 
 impl Drop for PluginClient {
@@ -90,8 +118,43 @@ impl Drop for PluginClient {
 #[derive(Debug)]
 pub struct PluginExecution {
   id: String,
-  response_rx: mpsc::UnboundedReceiver<PluginResponse>,
+  response_rx: mpsc::Receiver<PluginResponse>,
+  overflowed: CancellationToken,
+  completed: CancellationToken,
   client: PluginClient,
+}
+
+#[derive(Clone, Debug)]
+pub struct PluginTerminalInput {
+  id: String,
+  client: PluginClient,
+}
+
+impl PluginTerminalInput {
+  pub async fn write(&self, bytes: Vec<u8>) -> Result<(), PluginClientError> {
+    self
+      .client
+      .send(&OctaCommand::Stdin {
+        id: self.id.clone(),
+        bytes,
+      })
+      .await
+  }
+
+  pub async fn resize(&self, rows: u16, cols: u16) -> Result<(), PluginClientError> {
+    self
+      .client
+      .send(&OctaCommand::Resize {
+        id: self.id.clone(),
+        rows,
+        cols,
+      })
+      .await
+  }
+
+  pub async fn close(&self) -> Result<(), PluginClientError> {
+    self.client.send(&OctaCommand::CloseStdin { id: self.id.clone() }).await
+  }
 }
 
 impl PluginExecution {
@@ -99,13 +162,25 @@ impl PluginExecution {
     &self.id
   }
 
+  pub fn terminal_input(&self) -> PluginTerminalInput {
+    PluginTerminalInput {
+      id: self.id.clone(),
+      client: self.client.clone(),
+    }
+  }
+
   pub async fn receive_output(
     &mut self,
     cancel_token: &CancellationToken,
   ) -> Result<Option<PluginResponse>, PluginClientError> {
     tokio::select! {
-      response = self.response_rx.recv() => Ok(response),
+      biased;
       _ = cancel_token.cancelled() => Err(PluginClientError::Protocol("Command cancelled".into())),
+      _ = self.overflowed.cancelled() => Err(PluginClientError::ResponseQueueOverflow {
+        id: self.id.clone(),
+        capacity: COMMAND_RESPONSE_CAPACITY,
+      }),
+      response = self.response_rx.recv() => Ok(response),
     }
   }
 
@@ -114,12 +189,9 @@ impl PluginExecution {
     self.client.send(&OctaCommand::Cancel { id: self.id.clone() }).await?;
 
     let wait = async {
-      loop {
-        match self.response_rx.recv().await {
-          Some(PluginResponse::ExitStatus { .. } | PluginResponse::Error { .. }) => return Ok(()),
-          Some(_) => {},
-          None => return Err(PluginClientError::ConnectionClosed),
-        }
+      tokio::select! {
+        _ = self.completed.cancelled() => Ok(()),
+        _ = self.client.inner.connection_closed.cancelled() => Err(PluginClientError::ConnectionClosed),
       }
     };
 
@@ -139,6 +211,7 @@ pub struct PluginExecutionRequest {
   pub envs: HashMap<String, String>,
   pub secret_vars: Vec<String>,
   pub redact_params: bool,
+  pub raw: bool,
 }
 
 pub async fn connect_to_plugin(socket_path: &Name<'_>) -> io::Result<TokioStream> {
@@ -164,7 +237,7 @@ impl PluginClient {
     let stream = connect_to_plugin(socket_name).await.map_err(PluginClientError::Io)?;
     let (reader, writer) = tokio::io::split(stream);
 
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::channel(CONTROL_RESPONSE_CAPACITY);
 
     let inner = Arc::new(PluginClientInner {
       writer: Mutex::new(Some(writer)),
@@ -172,6 +245,7 @@ impl PluginClient {
       pending_starts: Mutex::new(VecDeque::new()),
       commands: Mutex::new(HashMap::new()),
       shutdown_signal: CancellationToken::new(),
+      connection_closed: CancellationToken::new(),
     });
 
     Self::start_response_handler(
@@ -185,7 +259,7 @@ impl PluginClient {
   }
 
   async fn send(&self, command: &OctaCommand) -> Result<(), PluginClientError> {
-    let json = serde_json::to_string(command)? + "\n";
+    let json = encode_command(command)?;
     let mut writer = self.inner.writer.lock().await;
     let writer = writer.as_mut().ok_or(PluginClientError::WriterClosed)?;
     if let Err(error) = writer.write_all(json.as_bytes()).await {
@@ -246,7 +320,7 @@ impl PluginClient {
     reader: ReadHalf<TokioStream>,
     inner: Weak<PluginClientInner>,
     shutdown_signal: CancellationToken,
-    control_tx: mpsc::UnboundedSender<PluginResponse>,
+    control_tx: mpsc::Sender<PluginResponse>,
   ) {
     tokio::spawn(async move {
       let mut reader = BufReader::new(reader);
@@ -256,7 +330,7 @@ impl PluginClient {
         buffer.clear();
         let read = tokio::select! {
           _ = shutdown_signal.cancelled() => break,
-          result = reader.read_line(&mut buffer) => result,
+          result = read_plugin_frame(&mut reader, &mut buffer) => result,
         };
         match read {
           Ok(0) => break,
@@ -269,13 +343,16 @@ impl PluginClient {
             let Some(inner) = inner.upgrade() else {
               break;
             };
-            Self::dispatch_response(&inner, &control_tx, response).await;
+            if !Self::dispatch_response(&inner, &control_tx, response).await {
+              break;
+            }
           },
           Err(_) => break,
         }
       }
 
       if let Some(inner) = inner.upgrade() {
+        inner.connection_closed.cancel();
         for pending in inner.pending_starts.lock().await.drain(..) {
           let _ = pending.send(Err(PluginClientError::ConnectionClosed));
         }
@@ -286,18 +363,29 @@ impl PluginClient {
 
   async fn dispatch_response(
     inner: &Arc<PluginClientInner>,
-    control_tx: &mpsc::UnboundedSender<PluginResponse>,
+    control_tx: &mpsc::Sender<PluginResponse>,
     response: PluginResponse,
-  ) {
+  ) -> bool {
     if let PluginResponse::Started { id } = &response {
       let Some(pending) = inner.pending_starts.lock().await.pop_front() else {
-        return;
+        return true;
       };
-      let (response_tx, response_rx) = mpsc::unbounded_channel();
-      inner.commands.lock().await.insert(id.clone(), response_tx);
+      let (response_tx, response_rx) = mpsc::channel(COMMAND_RESPONSE_CAPACITY);
+      let overflowed = CancellationToken::new();
+      let completed = CancellationToken::new();
+      inner.commands.lock().await.insert(
+        id.clone(),
+        CommandRoute {
+          sender: Some(response_tx),
+          overflowed: overflowed.clone(),
+          completed: completed.clone(),
+        },
+      );
       let execution = PluginExecution {
         id: id.clone(),
         response_rx,
+        overflowed,
+        completed,
         client: PluginClient { inner: inner.clone() },
       };
       if let Err(Ok(mut execution)) = pending.send(Ok(execution)) {
@@ -305,39 +393,60 @@ impl PluginClient {
           let _ = execution.cancel_and_wait().await;
         });
       }
-      return;
+      return true;
     }
 
     let (id, terminal) = match &response {
-      PluginResponse::Stdout { id, .. } | PluginResponse::Stderr { id, .. } => (Some(id.clone()), false),
+      PluginResponse::Stdout { id, .. }
+      | PluginResponse::Stderr { id, .. }
+      | PluginResponse::StdoutBytes { id, .. }
+      | PluginResponse::StderrBytes { id, .. }
+      | PluginResponse::Diagnostic { id, .. } => (Some(id.clone()), false),
       PluginResponse::ExitStatus { id, .. } | PluginResponse::Error { id, .. } => (Some(id.clone()), true),
       _ => (None, false),
     };
     if let Some(id) = id {
-      let sender = {
-        let mut commands = inner.commands.lock().await;
-        if terminal {
-          commands.remove(&id)
-        } else {
-          commands.get(&id).cloned()
+      let mut commands = inner.commands.lock().await;
+      if terminal {
+        if let Some(mut route) = commands.remove(&id) {
+          route.completed.cancel();
+          if let Some(sender) = route.sender.take() {
+            if sender.try_send(response).is_err() {
+              route.overflowed.cancel();
+            }
+          }
+          return true;
         }
-      };
-      if let Some(sender) = sender {
-        let _ = sender.send(response);
-        return;
+      } else if let Some(route) = commands.get_mut(&id) {
+        if let Some(sender) = &route.sender {
+          match sender.try_send(response) {
+            Ok(()) => {},
+            Err(mpsc::error::TrySendError::Full(_)) => {
+              route.sender.take();
+              route.overflowed.cancel();
+            },
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+              route.sender.take();
+            },
+          }
+        }
+        return true;
       }
+      drop(commands);
 
-      if let PluginResponse::Error { message, .. } = response {
+      if let PluginResponse::Error { message, .. } = &response {
         if let Some(pending) = inner.pending_starts.lock().await.pop_front() {
-          let _ = pending.send(Err(PluginClientError::Protocol(message)));
-          return;
+          let _ = pending.send(Err(PluginClientError::Protocol(message.clone())));
+          return true;
         }
-        let _ = control_tx.send(PluginResponse::Error { id, message });
-        return;
+        return control_tx.try_send(response).is_ok();
       }
+      // Output for an unknown or already completed command cannot be routed and
+      // must not pollute the bounded control channel.
+      return true;
     }
 
-    let _ = control_tx.send(response);
+    control_tx.try_send(response).is_ok()
   }
 
   /// Starts a command and returns an independently routed response stream.
@@ -354,9 +463,10 @@ impl PluginClient {
       vars: request.vars,
       secret_vars: request.secret_vars,
       redact_params: request.redact_params,
+      raw: request.raw,
       dry: request.dry,
     };
-    let command_json = serde_json::to_string(&cmd)? + "\n";
+    let command_json = encode_command(&cmd)?;
     let (started_tx, started_rx) = oneshot::channel();
     {
       // Queue and wire order must match because the protocol assigns the id in Started.
@@ -425,6 +535,7 @@ impl PluginClient {
 
   async fn cleanup(&self) {
     self.inner.shutdown_signal.cancel();
+    self.inner.connection_closed.cancel();
 
     let mut writer = self.inner.writer.lock().await;
     if let Some(writer) = writer.as_mut() {
@@ -432,6 +543,19 @@ impl PluginClient {
     }
     *writer = None;
   }
+}
+
+async fn read_plugin_frame<R: AsyncRead + Unpin>(reader: &mut BufReader<R>, buffer: &mut String) -> io::Result<usize> {
+  buffer.clear();
+  let mut limited = (&mut *reader).take((MAX_PLUGIN_FRAME_BYTES + 1) as u64);
+  let read = limited.read_line(buffer).await?;
+  if read == MAX_PLUGIN_FRAME_BYTES + 1 && !buffer.ends_with('\n') {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      format!("Plugin response exceeds the {MAX_PLUGIN_FRAME_BYTES}-byte frame limit"),
+    ));
+  }
+  Ok(read)
 }
 
 fn is_connection_closed(error: &io::Error) -> bool {
@@ -443,6 +567,18 @@ fn is_connection_closed(error: &io::Error) -> bool {
       | io::ErrorKind::NotConnected
       | io::ErrorKind::UnexpectedEof
   ) || error.raw_os_error() == Some(233)
+}
+
+fn encode_command(command: &OctaCommand) -> Result<String, PluginClientError> {
+  let mut json = serde_json::to_string(command)?;
+  if json.len() > MAX_PLUGIN_FRAME_BYTES {
+    return Err(PluginClientError::FrameTooLarge {
+      bytes: json.len(),
+      limit: MAX_PLUGIN_FRAME_BYTES,
+    });
+  }
+  json.push('\n');
+  Ok(json)
 }
 
 #[cfg(test)]
@@ -470,7 +606,46 @@ mod tests {
       envs: HashMap::new(),
       secret_vars: Vec::new(),
       redact_params: false,
+      raw: false,
     }
+  }
+
+  #[test]
+  fn rejects_oversized_outbound_protocol_frames() {
+    let command = OctaCommand::Execute {
+      params: "x".repeat(MAX_PLUGIN_FRAME_BYTES),
+      args: Vec::new(),
+      dir: PathBuf::from("."),
+      envs: HashMap::new(),
+      vars: HashMap::new(),
+      secret_vars: Vec::new(),
+      redact_params: false,
+      raw: false,
+      dry: false,
+    };
+
+    assert!(matches!(
+      encode_command(&command),
+      Err(PluginClientError::FrameTooLarge {
+        limit: MAX_PLUGIN_FRAME_BYTES,
+        ..
+      })
+    ));
+  }
+
+  #[tokio::test]
+  async fn bounds_inbound_protocol_frames_while_reading() {
+    let (mut writer, reader) = tokio::io::duplex(MAX_PLUGIN_FRAME_BYTES + 1);
+    let write = tokio::spawn(async move {
+      writer.write_all(&vec![b'x'; MAX_PLUGIN_FRAME_BYTES + 1]).await.unwrap();
+    });
+    let mut reader = BufReader::new(reader);
+    let mut frame = String::new();
+
+    let error = read_plugin_frame(&mut reader, &mut frame).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert_eq!(frame.len(), MAX_PLUGIN_FRAME_BYTES + 1);
+    write.await.unwrap();
   }
 
   async fn write_response(writer: &Arc<Mutex<WriteHalf<TokioStream>>>, response: PluginResponse) {
@@ -594,6 +769,7 @@ mod tests {
         } else if buffer.contains("Schema") {
           Some(PluginResponse::Schema(Schema {
             key: "key".to_owned(),
+            supports_raw: false,
             capabilities: Vec::new(),
             validation_schema: None,
           }))
@@ -906,6 +1082,109 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn overflowing_one_command_does_not_block_other_commands() {
+    let server = TestServer::new().await;
+    let listener = Arc::clone(&server.listener);
+    let server_handle = tokio::spawn(async move {
+      let stream = listener.accept().await.unwrap();
+      let (reader, writer) = tokio::io::split(stream);
+      let mut reader = BufReader::new(reader);
+      let writer = Arc::new(Mutex::new(writer));
+      let mut line = String::new();
+
+      loop {
+        line.clear();
+        if reader.read_line(&mut line).await.unwrap() == 0 {
+          break;
+        }
+        match serde_json::from_str::<OctaCommand>(line.trim()).unwrap() {
+          OctaCommand::Hello(_) => {
+            write_response(
+              &writer,
+              PluginResponse::Hello(Version {
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+                features: Vec::new(),
+              }),
+            )
+            .await;
+          },
+          OctaCommand::Execute { params, .. } if params == "noisy" => {
+            write_response(&writer, PluginResponse::Started { id: params.clone() }).await;
+            for index in 0..=COMMAND_RESPONSE_CAPACITY {
+              write_response(
+                &writer,
+                PluginResponse::Stdout {
+                  id: params.clone(),
+                  line: index.to_string(),
+                },
+              )
+              .await;
+            }
+            write_response(&writer, PluginResponse::ExitStatus { id: params, code: 0 }).await;
+          },
+          OctaCommand::Execute { params, .. } => {
+            write_response(&writer, PluginResponse::Started { id: params.clone() }).await;
+            write_response(
+              &writer,
+              PluginResponse::Stdout {
+                id: params.clone(),
+                line: "ready".to_owned(),
+              },
+            )
+            .await;
+            write_response(&writer, PluginResponse::ExitStatus { id: params, code: 0 }).await;
+          },
+          OctaCommand::Cancel { id } => {
+            write_response(&writer, PluginResponse::ExitStatus { id, code: -1 }).await;
+          },
+          OctaCommand::Shutdown => {
+            write_response(
+              &writer,
+              PluginResponse::Shutdown {
+                message: "done".to_owned(),
+              },
+            )
+            .await;
+            break;
+          },
+          _ => {},
+        }
+      }
+    });
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let mut noisy = client
+      .start_execution(execution_request("noisy"), CancellationToken::new())
+      .await
+      .unwrap();
+    tokio::time::timeout(TIMEOUT, noisy.overflowed.cancelled())
+      .await
+      .expect("noisy command queue did not overflow");
+    assert!(matches!(
+      noisy.receive_output(&CancellationToken::new()).await,
+      Err(PluginClientError::ResponseQueueOverflow { .. })
+    ));
+    noisy.cancel_and_wait().await.unwrap();
+
+    let mut quiet = client
+      .start_execution(execution_request("quiet"), CancellationToken::new())
+      .await
+      .unwrap();
+    assert!(matches!(
+      quiet.receive_output(&CancellationToken::new()).await.unwrap(),
+      Some(PluginResponse::Stdout { line, .. }) if line == "ready"
+    ));
+    assert!(matches!(
+      quiet.receive_output(&CancellationToken::new()).await.unwrap(),
+      Some(PluginResponse::ExitStatus { code: 0, .. })
+    ));
+
+    client.shutdown().await.unwrap();
+    server_handle.await.unwrap();
+  }
+
+  #[tokio::test]
   async fn test_shutdown_with_timeout() {
     let mut server = TestServer::new().await;
 
@@ -936,6 +1215,7 @@ mod tests {
 
             let response = PluginResponse::Schema(Schema {
               key: "key".to_owned(),
+              supports_raw: false,
               capabilities: Vec::new(),
               validation_schema: None,
             });
