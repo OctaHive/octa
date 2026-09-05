@@ -236,4 +236,26 @@ mod tests {
     assert_eq!(value["data"]["run_id"], 42);
     assert_eq!(value["data"]["message"], "invalid configuration");
   }
+
+  #[test]
+  fn byte_payloads_round_trip_and_entry_metadata_is_accessible() {
+    let payloads = [
+      ConsolePayload::Bytes(vec![0, 1, 254, 255]),
+      ConsolePayload::RawBytes(vec![9, 8, 7]),
+    ];
+    for payload in payloads {
+      let json = serde_json::to_string(&payload).unwrap();
+      assert_eq!(serde_json::from_str::<ConsolePayload>(&json).unwrap(), payload);
+    }
+    assert!(serde_json::from_str::<ConsolePayload>(r#"{"format":"bytes","data":"%%%"}"#).is_err());
+
+    let mut entry = ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::RunStarted {
+      run_id: 1,
+      command: "build".to_owned(),
+    }));
+    entry.assign_sequence(42);
+    assert_eq!(entry.schema_version(), 1);
+    assert_eq!(entry.sequence(), 42);
+    assert!(*entry.timestamp() <= Utc::now());
+  }
 }

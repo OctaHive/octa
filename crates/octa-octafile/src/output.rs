@@ -204,6 +204,24 @@ mod tests {
   }
 
   #[test]
+  fn displays_every_canonical_output_mode() {
+    let values = [
+      (OutputMode::Interleaved, "interleaved"),
+      (OutputMode::Group, "group"),
+      (OutputMode::Prefixed, "prefixed"),
+      (OutputMode::OnError, "on-error"),
+      (OutputMode::KeepOrder, "keep-order"),
+      (OutputMode::Replacing, "replacing"),
+      (OutputMode::Timed, "timed"),
+      (OutputMode::Json, "json"),
+    ];
+
+    for (mode, expected) in values {
+      assert_eq!(mode.to_string(), expected);
+    }
+  }
+
+  #[test]
   fn task_output_modes_accept_aliases_but_reject_json() {
     assert_eq!(
       serde_yml::from_str::<TaskOutputMode>("prefix").unwrap(),
@@ -214,6 +232,17 @@ mod tests {
       TaskOutputMode::Interleaved
     );
     assert!(serde_yml::from_str::<TaskOutputMode>("json").is_err());
+
+    let modes = [
+      ("group", TaskOutputMode::Group),
+      ("on-error", TaskOutputMode::OnError),
+      ("keep-order", TaskOutputMode::KeepOrder),
+      ("replacing", TaskOutputMode::Replacing),
+      ("timed", TaskOutputMode::Timed),
+    ];
+    for (yaml, expected) in modes {
+      assert_eq!(serde_yml::from_str::<TaskOutputMode>(yaml).unwrap(), expected);
+    }
   }
 
   #[test]

@@ -53,6 +53,8 @@ pub struct TaskRuntime {
   pub dry: bool,
   /// Whether freshness checks should be bypassed.
   pub force: bool,
+  /// Exit code exposed to commands executing as part of a deferred action.
+  pub deferred_exit_code: Option<i32>,
 }
 
 /// Result of one DAG node, including whether it performed work or was skipped.

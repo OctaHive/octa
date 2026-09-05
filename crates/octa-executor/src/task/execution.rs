@@ -2,7 +2,27 @@
 
 use super::*;
 
+struct GraphActionRuntime<'a> {
+  dry: bool,
+  force: bool,
+  cancel_token: &'a CancellationToken,
+  deferred_exit_code: Option<i32>,
+}
+
 impl TaskNode {
+  fn deferred_variable_overrides(exit_code: Option<i32>) -> IndexMap<String, Value> {
+    exit_code
+      .map(|exit_code| ("EXIT_CODE".to_owned(), Value::from(exit_code)))
+      .into_iter()
+      .collect()
+  }
+
+  fn expose_deferred_exit_code(vars: &mut Vars, exit_code: Option<i32>) {
+    if let Some(exit_code) = exit_code {
+      vars.insert("EXIT_CODE", &exit_code);
+    }
+  }
+
   pub fn new(config: TaskConfig) -> Self {
     Self {
       id: config.id,
@@ -167,11 +187,14 @@ impl TaskNode {
     evaluator: Arc<dyn PluginEvaluator>,
     dry: bool,
     cancel_token: CancellationToken,
+    deferred_exit_code: Option<i32>,
   ) -> ExecutorResult<RuntimeContext> {
-    if let Some(context) = self.freshness_runtime.shared_runtime_context() {
+    if let Some(mut context) = self.freshness_runtime.shared_runtime_context() {
+      Self::expose_deferred_exit_code(&mut context.vars, deferred_exit_code);
       return Ok(context);
     }
-    if let Some(context) = self.condition_runtime.shared_runtime_context() {
+    if let Some(mut context) = self.condition_runtime.shared_runtime_context() {
+      Self::expose_deferred_exit_code(&mut context.vars, deferred_exit_code);
       return Ok(context);
     }
 
@@ -189,7 +212,12 @@ impl TaskNode {
 
     let mut vars = self.vars.clone();
     vars
-      .expand_with_evaluator(evaluator.clone(), dry, cancel_token.clone())
+      .expand_with_evaluator_and_overrides(
+        evaluator.clone(),
+        dry,
+        cancel_token.clone(),
+        Self::deferred_variable_overrides(deferred_exit_code),
+      )
       .await?;
 
     // A templated directory can only be created after its variables have been expanded.
@@ -223,9 +251,7 @@ impl TaskNode {
     fingerprint: &Db,
     evaluator: Arc<dyn PluginEvaluator>,
     output: &ConsoleTarget,
-    dry: bool,
-    force: bool,
-    cancel_token: &CancellationToken,
+    runtime: GraphActionRuntime<'_>,
   ) -> ExecutorResult<Option<TaskOutcome>> {
     if !self.freshness_runtime.should_run()? {
       // A skipped condition gate must still publish a result so descendants do not observe an
@@ -243,15 +269,20 @@ impl TaskNode {
       NodeAction::Barrier => Ok(Some(TaskOutcome::success(String::new()))),
       NodeAction::FreshnessCheck { spec, state } => {
         let runtime_context = self
-          .resolve_runtime_context(evaluator, dry, cancel_token.clone())
+          .resolve_runtime_context(
+            evaluator,
+            runtime.dry,
+            runtime.cancel_token.clone(),
+            runtime.deferred_exit_code,
+          )
           .await?;
         let outcome = spec
           .evaluate(
             fingerprint,
-            force,
+            runtime.force,
             &runtime_context.vars,
             &runtime_context.envs,
-            cancel_token,
+            runtime.cancel_token,
           )
           .await?;
         let should_run = outcome.should_run();
@@ -268,7 +299,7 @@ impl TaskNode {
         }))
       },
       NodeAction::FreshnessCommit(state) => {
-        if !dry {
+        if !runtime.dry {
           state.commit(fingerprint)?;
         }
         Ok(Some(TaskOutcome::success(String::new())))
@@ -478,6 +509,7 @@ impl TaskNode {
       run_id,
       dry,
       force,
+      deferred_exit_code,
     } = runtime;
     let console_target = ConsoleTarget::with_silence(console, run_id, self.output_scope.clone(), self.silence);
     let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::new(plugin_manager.clone()));
@@ -494,9 +526,12 @@ impl TaskNode {
         &fingerprint,
         evaluator.clone(),
         &console_target,
-        dry,
-        force,
-        &cancel_token,
+        GraphActionRuntime {
+          dry,
+          force,
+          cancel_token: &cancel_token,
+          deferred_exit_code,
+        },
       )
       .await?
     {
@@ -504,7 +539,7 @@ impl TaskNode {
     }
 
     let RuntimeContext { vars, envs, dir } = self
-      .resolve_runtime_context(evaluator.clone(), dry, cancel_token.clone())
+      .resolve_runtime_context(evaluator.clone(), dry, cancel_token.clone(), deferred_exit_code)
       .await?;
     if let Some(scope) = &self.output_scope {
       let mut values = vars.to_merged_hashmap();
@@ -614,10 +649,11 @@ impl TaskNode {
               .await?;
             Ok("".to_string())
           } else {
-            Err(ExecutorError::TaskFailed(format!(
-              "Task {} failed: {}",
-              self.name, output.stderr
-            )))
+            Err(ExecutorError::CommandFailed {
+              task: self.name.clone(),
+              code: output.code,
+              stderr: output.stderr,
+            })
           }
         } else {
           self.update_cache(output.stdout.trim(), vars, &cache).await?;

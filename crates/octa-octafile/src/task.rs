@@ -974,4 +974,27 @@ mod tests {
 
     assert_eq!(task.interactive, Some(true));
   }
+
+  #[test]
+  fn silence_parses_serializes_and_reports_hidden_streams() {
+    let values = [
+      (Silence::None, "false", false, false),
+      (Silence::All, "true", true, true),
+      (Silence::Stdout, "stdout", true, false),
+      (Silence::Stderr, "stderr", false, true),
+    ];
+
+    for (silence, serialized, hides_stdout, hides_stderr) in values {
+      assert_eq!(serde_yml::to_string(&silence).unwrap().trim(), serialized);
+      assert_eq!(silence.hides_stdout(), hides_stdout);
+      assert_eq!(silence.hides_stderr(), hides_stderr);
+    }
+
+    assert_eq!(Silence::from(false), Silence::None);
+    assert_eq!(Silence::from(true), Silence::All);
+    assert_eq!("0".parse(), Ok(Silence::None));
+    assert_eq!("1".parse(), Ok(Silence::All));
+    assert!("quiet".parse::<Silence>().is_err());
+    assert!(serde_yml::from_str::<Silence>("quiet").is_err());
+  }
 }

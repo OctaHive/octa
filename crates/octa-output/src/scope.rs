@@ -232,6 +232,8 @@ impl ConsoleScopeAllocator {
 
 #[cfg(test)]
 mod tests {
+  use std::collections::hash_map::DefaultHasher;
+
   use super::*;
 
   #[test]
@@ -271,5 +273,39 @@ mod tests {
     let serialized = serde_json::to_string(&scope).unwrap();
     assert!(!serialized.contains("TOKEN"));
     assert!(!serialized.contains("secret"));
+  }
+
+  #[test]
+  fn options_render_mode_debug_and_hash_are_stable() {
+    let scope = ConsoleScopeAllocator::default().scope_with_options("build", Some("api".to_owned()), true, false);
+    scope.set_render_mode(Some(RenderMode::KeepOrder));
+
+    assert_eq!(scope.label(), "build");
+    assert_eq!(scope.prefix(), "api");
+    assert_eq!(scope.render_mode(), Some(RenderMode::KeepOrder));
+    assert!(scope.hides_stdout());
+    assert!(!scope.hides_stderr());
+    assert!(format!("{scope:?}").contains("KeepOrder"));
+
+    let mut first = DefaultHasher::new();
+    let mut second = DefaultHasher::new();
+    scope.hash(&mut first);
+    scope.clone().hash(&mut second);
+    assert_eq!(first.finish(), second.finish());
+  }
+
+  #[test]
+  fn serialized_scope_round_trips_public_metadata() {
+    let original = ConsoleScopeAllocator::default().scope_with_options("build", Some("api".to_owned()), true, true);
+    original.set_render_mode(Some(RenderMode::Timed));
+    let restored: ConsoleScope = serde_json::from_value(serde_json::to_value(original).unwrap()).unwrap();
+
+    assert_eq!(restored.id(), 0);
+    assert_eq!(restored.label(), "build");
+    assert_eq!(restored.prefix(), "api");
+    assert_eq!(restored.render_mode(), Some(RenderMode::Timed));
+    assert!(restored.hides_stdout());
+    assert!(restored.hides_stderr());
+    assert!(restored.template_values().is_empty());
   }
 }

@@ -76,4 +76,10 @@ mod tests {
     assert_eq!(value["category"], "diagnostic");
     assert_eq!(value["data"]["message"], "ready");
   }
+
+  #[test]
+  fn default_renderer_is_machine_only() {
+    let renderer = JsonLinesRenderer::default();
+    assert!(!renderer.supports_raw_terminal());
+  }
 }

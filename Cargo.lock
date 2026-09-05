@@ -2184,6 +2184,7 @@ dependencies = [
  "octa-output",
  "octa-plugin",
  "octa-plugin-manager",
+ "portable-pty",
  "predicates",
  "pretty_assertions",
  "serde",

@@ -169,3 +169,48 @@ fn plugin_definition(plugin: &PluginCommand) -> ExecutorResult<Value> {
 fn json_value<T: Serialize>(value: &T) -> ExecutorResult<Value> {
   serde_json::to_value(value).map_err(|error| ExecutorError::FreshnessIdentityError(error.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+  use octa_octafile::ConditionEvaluation;
+
+  use super::*;
+
+  #[test]
+  fn dependency_and_condition_definitions_preserve_their_distinct_shapes() {
+    let dependencies = dep_definitions(&[
+      Deps::Simple("prepare".to_owned()),
+      Deps::Complex(ComplexDep {
+        task: "build".to_owned(),
+        vars: None,
+        envs: None,
+        quiet: None,
+        silent: None,
+        raw: Some(true),
+        interactive: Some(true),
+        timeout: None,
+      }),
+    ]);
+    assert_eq!(dependencies[0]["type"], "simple");
+    assert_eq!(dependencies[1]["type"], "complex");
+    assert_eq!(dependencies[1]["value"]["raw"], true);
+
+    let plugin = |value: &str| PluginCommand {
+      key: "shell".to_owned(),
+      value: serde_yml::Value::String(value.to_owned()),
+    };
+    let conditions = condition_definitions(&TaskConditions {
+      before_deps: Some(TaskCondition {
+        command: plugin("before"),
+        evaluate: ConditionEvaluation::Once,
+      }),
+      after_deps: Some(TaskCondition {
+        command: plugin("after"),
+        evaluate: ConditionEvaluation::PerCommand,
+      }),
+    })
+    .unwrap();
+    assert_eq!(conditions["before_deps"]["evaluate"], "once");
+    assert_eq!(conditions["after_deps"]["evaluate"], "per_command");
+  }
+}

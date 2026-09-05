@@ -1107,6 +1107,31 @@ mod tests {
   }
 
   #[test]
+  fn reads_root_presentation_and_visibility_settings() {
+    let content = "version: 1\noutput: prefixed\nquiet: true\nsilent: stdout\nraw: true\ntasks: {}\n";
+    let (_temp_dir, file_path) = create_temp_octafile(content, "root_presentation");
+
+    let presentation = Octafile::read_presentation_config(&file_path).unwrap();
+    assert_eq!(presentation.output.unwrap().mode, OutputMode::Prefixed);
+    assert_eq!(presentation.quiet, Some(true));
+    assert_eq!(
+      Octafile::read_output_config(&file_path).unwrap().unwrap().mode,
+      OutputMode::Prefixed
+    );
+
+    let octafile = Octafile::load(Some(file_path), false, vec!["shell".to_owned()], "shell").unwrap();
+    assert_eq!(octafile.output.as_ref().unwrap().mode, OutputMode::Prefixed);
+    assert_eq!(octafile.quiet, Some(true));
+    assert_eq!(octafile.silent, Some(Silence::Stdout));
+    assert_eq!(octafile.raw, Some(true));
+    let debug = format!("{octafile:?}");
+    assert!(debug.contains("output"));
+    assert!(debug.contains("quiet"));
+    assert!(debug.contains("silent"));
+    assert!(debug.contains("raw"));
+  }
+
+  #[test]
   fn test_invalid_octafile_run_mode() {
     let content = r#"
       version: 1

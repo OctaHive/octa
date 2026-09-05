@@ -152,11 +152,40 @@ mod tests {
   use crate::{ConsolePayload, ConsoleScopeAllocator, ConsoleStatus, ConsoleStream};
 
   #[derive(Default)]
-  struct Recording(Vec<ConsoleRecord>);
+  struct Recording {
+    records: Vec<ConsoleRecord>,
+    ticks: usize,
+    parallel: Option<bool>,
+    raw: Vec<(&'static str, ConsoleScope)>,
+  }
 
   impl ConsoleRenderer for Recording {
     fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
-      self.0.push(entry.record().clone());
+      self.records.push(entry.record().clone());
+      Ok(())
+    }
+
+    fn supports_raw_terminal(&self) -> bool {
+      true
+    }
+
+    fn tick(&mut self) -> io::Result<()> {
+      self.ticks += 1;
+      Ok(())
+    }
+
+    fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
+      self.parallel = Some(parallel);
+      Ok(())
+    }
+
+    fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+      self.raw.push(("begin", scope.clone()));
+      Ok(())
+    }
+
+    fn end_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+      self.raw.push(("end", scope.clone()));
       Ok(())
     }
   }
@@ -208,7 +237,7 @@ mod tests {
 
     let lines = renderer
       .renderer
-      .0
+      .records
       .iter()
       .filter_map(|record| match record {
         ConsoleRecord::Execution(ExecutionEvent::Output {
@@ -247,10 +276,10 @@ mod tests {
     });
     renderer.render(&raw).unwrap();
 
-    assert!(renderer.renderer.0.iter().any(|record| record == raw.record()));
+    assert!(renderer.renderer.records.iter().any(|record| record == raw.record()));
     let lines = renderer
       .renderer
-      .0
+      .records
       .iter()
       .filter_map(|record| match record {
         ConsoleRecord::Execution(ExecutionEvent::Output {
@@ -261,5 +290,29 @@ mod tests {
       })
       .collect::<Vec<_>>();
     assert_eq!(lines, ["buffered-before-raw"]);
+  }
+
+  #[test]
+  fn delegates_capabilities_ticks_parallel_and_raw_lifecycle() {
+    let scope = ConsoleScopeAllocator::default().scope("interactive");
+    let mut renderer = KeepOrderRenderer::new(Recording::default());
+    renderer.render(&output(scope.clone(), "buffered")).unwrap();
+
+    assert!(renderer.supports_raw_terminal());
+    renderer.tick().unwrap();
+    renderer.set_parallel(true).unwrap();
+    renderer.begin_raw(&scope).unwrap();
+    renderer.end_raw(&scope).unwrap();
+
+    assert_eq!(renderer.renderer.ticks, 1);
+    assert_eq!(renderer.renderer.parallel, Some(true));
+    assert_eq!(renderer.renderer.raw, [("begin", scope.clone()), ("end", scope)]);
+    assert!(matches!(
+      renderer.renderer.records.first(),
+      Some(ConsoleRecord::Execution(ExecutionEvent::Output {
+        payload: ConsolePayload::Line(line),
+        ..
+      })) if line == "buffered"
+    ));
   }
 }

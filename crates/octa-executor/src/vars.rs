@@ -293,7 +293,7 @@ impl Vars {
 
   pub async fn expand(&mut self, dry: bool) -> ExecutorResult<()> {
     self
-      .expand_with_evaluator_option(None, dry, CancellationToken::new())
+      .expand_with_evaluator_option(None, dry, CancellationToken::new(), IndexMap::new())
       .await
   }
 
@@ -315,7 +315,21 @@ impl Vars {
     cancel_token: CancellationToken,
   ) -> ExecutorResult<()> {
     self
-      .expand_with_evaluator_option(Some(evaluator), dry, cancel_token)
+      .expand_with_evaluator_option(Some(evaluator), dry, cancel_token, IndexMap::new())
+      .await
+  }
+
+  /// Expands variables with runtime values that are visible to every inherited layer and win
+  /// over configured values with the same name.
+  pub(crate) async fn expand_with_evaluator_and_overrides(
+    &mut self,
+    evaluator: Arc<dyn PluginEvaluator>,
+    dry: bool,
+    cancel_token: CancellationToken,
+    overrides: IndexMap<String, Value>,
+  ) -> ExecutorResult<()> {
+    self
+      .expand_with_evaluator_option(Some(evaluator), dry, cancel_token, overrides)
       .await
   }
 
@@ -324,14 +338,19 @@ impl Vars {
     evaluator: Option<Arc<dyn PluginEvaluator>>,
     dry: bool,
     cancel_token: CancellationToken,
+    overrides: IndexMap<String, Value>,
   ) -> ExecutorResult<()> {
     if self.expanded {
+      for (key, value) in overrides {
+        self.values.insert(key.clone(), value);
+        self.secrets.remove(&key);
+      }
       return Ok(());
     }
 
     let contexts = self.collect_context_chain();
     let resolved = self
-      .process_context_chain(contexts, evaluator, dry, cancel_token)
+      .process_context_chain(contexts, evaluator, dry, cancel_token, overrides)
       .await?;
     self.values = resolved.values;
     self.secrets = resolved.secrets;
@@ -366,6 +385,7 @@ impl Vars {
     evaluator: Option<Arc<dyn PluginEvaluator>>,
     dry: bool,
     cancel_token: CancellationToken,
+    overrides: IndexMap<String, Value>,
   ) -> ExecutorResult<ResolvedVars> {
     let required_definitions = collect_required_vars(&contexts);
     let required_vars = resolve_required_vars(&contexts, required_definitions.clone())?;
@@ -385,6 +405,10 @@ impl Vars {
       .filter(|(key, supplied)| supplied.secret || required_vars.get(*key).is_some_and(|required| required.secret))
       .map(|(key, _)| key.clone())
       .collect::<HashSet<_>>();
+    for (key, value) in &overrides {
+      accumulated.insert(key.clone(), value.clone());
+      secrets.remove(key);
+    }
 
     // Each value is added immediately after expansion. This preserves YAML declaration order
     // and makes earlier values in the same `vars` mapping available to later ones.
@@ -401,6 +425,9 @@ impl Vars {
       };
 
       for (key, value) in values {
+        if overrides.contains_key(&key) {
+          continue;
+        }
         // Required values are concrete inputs and were inserted before dependent declarations.
         if required_vars.contains_key(&key) {
           continue;
@@ -840,6 +867,29 @@ mod tests {
     assert!(vars.parent.is_none());
     assert!(!vars.expanded);
     assert!(vars.values.is_empty());
+  }
+
+  #[tokio::test]
+  async fn re_expansion_applies_runtime_overrides_and_removes_secret_metadata() {
+    let mut vars = Vars::with_value(json!({"value": "initial"}));
+    vars
+      .expand_with_evaluator_option(None, false, CancellationToken::new(), IndexMap::new())
+      .await
+      .unwrap();
+    vars.secrets.insert("value".to_owned());
+
+    vars
+      .expand_with_evaluator_option(
+        None,
+        false,
+        CancellationToken::new(),
+        IndexMap::from([("value".to_owned(), json!("override"))]),
+      )
+      .await
+      .unwrap();
+
+    assert_eq!(vars.get("value"), Some(&json!("override")));
+    assert!(!vars.secrets.contains("value"));
   }
 
   #[test]

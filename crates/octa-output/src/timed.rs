@@ -120,6 +120,10 @@ mod tests {
       self.0.push(entry.record().clone());
       Ok(())
     }
+
+    fn supports_raw_terminal(&self) -> bool {
+      true
+    }
   }
 
   fn line(scope: ConsoleScope, value: &str) -> ConsoleEntry {
@@ -169,5 +173,61 @@ mod tests {
       })] if line == "compiling"
     ));
     assert!(renderer.pending.is_empty());
+  }
+
+  #[test]
+  fn replaces_and_finishes_visible_pending_lines() {
+    let scope = ConsoleScopeAllocator::default().scope("build");
+    let mut renderer = TimedRenderer::new(Recording::default());
+    renderer.render(&line(scope.clone(), "one")).unwrap();
+    renderer.pending.get_mut(&scope).unwrap().since = Instant::now() - VISIBILITY_THRESHOLD;
+    renderer.render(&line(scope.clone(), "two")).unwrap();
+    renderer.pending.get_mut(&scope).unwrap().since = Instant::now() - VISIBILITY_THRESHOLD;
+    renderer
+      .render(&ConsoleEntry::new(ConsoleRecord::Execution(
+        ExecutionEvent::ScopeFinished {
+          run_id: 1,
+          scope,
+          status: ConsoleStatus::Success,
+        },
+      )))
+      .unwrap();
+
+    let lines = renderer
+      .renderer
+      .0
+      .iter()
+      .filter_map(|record| match record {
+        ConsoleRecord::Execution(ExecutionEvent::Output {
+          payload: ConsolePayload::Line(line),
+          ..
+        }) => Some(line.as_str()),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(lines, ["one", "two"]);
+  }
+
+  #[test]
+  fn raw_output_and_lifecycle_clear_pending_state() {
+    let scope = ConsoleScopeAllocator::default().scope("raw");
+    let mut renderer = TimedRenderer::new(Recording::default());
+    renderer.render(&line(scope.clone(), "pending")).unwrap();
+    let raw = ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
+      run_id: 1,
+      scope: Some(scope.clone()),
+      command_id: "raw".to_owned(),
+      stream: ConsoleStream::Stdout,
+      payload: ConsolePayload::RawBytes(b"raw".to_vec()),
+    }));
+    renderer.render(&raw).unwrap();
+    assert!(renderer.pending.is_empty());
+
+    renderer.render(&line(scope.clone(), "pending-again")).unwrap();
+    renderer.begin_raw(&scope).unwrap();
+    assert!(renderer.pending.is_empty());
+    renderer.end_raw(&scope).unwrap();
+    assert!(renderer.supports_raw_terminal());
+    renderer.set_parallel(true).unwrap();
   }
 }

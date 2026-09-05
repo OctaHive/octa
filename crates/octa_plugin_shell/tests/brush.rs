@@ -73,7 +73,10 @@ async fn raw_execution_receives_host_input_over_the_plugin_protocol() {
   let mut command = request("read value; printf 'input=%s' \"$value\"");
   command.raw = true;
   let execution = client.start_execution(command, CancellationToken::new()).await.unwrap();
-  execution.terminal_input().write(b"hello\n".to_vec()).await.unwrap();
+  let input = execution.terminal_input();
+  input.resize(40, 100).await.unwrap();
+  input.write(b"hello\n".to_vec()).await.unwrap();
+  input.close().await.unwrap();
 
   let (stdout, stderr, code) = tokio::time::timeout(Duration::from_secs(5), collect(execution))
     .await
@@ -81,6 +84,23 @@ async fn raw_execution_receives_host_input_over_the_plugin_protocol() {
   assert!(stdout.contains("input=hello"), "{stdout:?}");
   assert!(stderr.is_empty());
   assert_eq!(code, 0);
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn cancelling_raw_execution_terminates_the_pty_child() {
+  let (manager, plugin_name) = plugin_manager();
+  manager.start_plugin(&plugin_name).await.unwrap();
+  let client = manager.get_client("shell").await.unwrap();
+  let mut command = request("while true; do :; done");
+  command.raw = true;
+  let mut execution = client.start_execution(command, CancellationToken::new()).await.unwrap();
+
+  tokio::time::sleep(Duration::from_millis(100)).await;
+  tokio::time::timeout(Duration::from_secs(5), execution.cancel_and_wait())
+    .await
+    .expect("raw PTY cancellation timed out")
+    .unwrap();
   assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
 }
 

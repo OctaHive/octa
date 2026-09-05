@@ -195,6 +195,10 @@ mod tests {
       self.0.push(entry.record().clone());
       Ok(())
     }
+
+    fn supports_raw_terminal(&self) -> bool {
+      true
+    }
   }
 
   fn renderer() -> ReplacingRenderer<Recording> {
@@ -316,5 +320,63 @@ mod tests {
       })))
       .unwrap();
     assert_eq!(renderer.bars[&background].message(), "resumed");
+  }
+
+  #[test]
+  fn completion_labels_cover_every_status_and_clear_raw_scope() {
+    let allocator = ConsoleScopeAllocator::default();
+    for (status, symbol, label) in [
+      (ConsoleStatus::Success, "✓", "done"),
+      (ConsoleStatus::Skipped, "−", "skipped"),
+      (ConsoleStatus::Cancelled, "!", "cancelled"),
+      (ConsoleStatus::Failed, "✗", "failed"),
+    ] {
+      let scope = allocator.scope(label);
+      let mut renderer = renderer();
+      let bar = renderer.bar(&scope);
+      renderer.raw_scope = Some(scope.clone());
+      renderer.finish_scope(&scope, status);
+      assert_eq!(bar.prefix(), format!("{symbol} [{label}]"));
+      assert_eq!(bar.message(), label);
+      assert!(renderer.raw_scope.is_none());
+    }
+  }
+
+  #[test]
+  fn ignores_blank_progress_lines_and_delegates_while_raw_is_active() {
+    let allocator = ConsoleScopeAllocator::default();
+    let scope = allocator.scope("build");
+    let mut renderer = renderer();
+    renderer.bar(&scope);
+    renderer
+      .render(&ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
+        run_id: 1,
+        scope: Some(scope.clone()),
+        command_id: "build".to_owned(),
+        stream: ConsoleStream::Stdout,
+        payload: ConsolePayload::Line("   ".to_owned()),
+      })))
+      .unwrap();
+    assert_eq!(renderer.bars[&scope].message(), "waiting");
+
+    renderer.raw_scope = Some(scope);
+    let diagnostic = ConsoleEntry::new(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
+      run_id: Some(1),
+      scope: None,
+      level: ConsoleLevel::Info,
+      message: "raw diagnostic".to_owned(),
+      location: None,
+    }));
+    renderer.render(&diagnostic).unwrap();
+    renderer.tick().unwrap();
+    assert_eq!(renderer.renderer.0, [diagnostic.record().clone()]);
+  }
+
+  #[test]
+  fn delegates_capabilities_ticks_and_parallel_state() {
+    let mut renderer = renderer();
+    assert!(renderer.supports_raw_terminal());
+    renderer.tick().unwrap();
+    renderer.set_parallel(true).unwrap();
   }
 }

@@ -611,6 +611,60 @@ mod tests {
   }
 
   #[test]
+  fn client_errors_preserve_context_when_converted_to_io_errors() {
+    fn assert_error(error: PluginClientError, message: &str, kind: io::ErrorKind) {
+      assert!(error.to_string().contains(message));
+      let error = io::Error::from(error);
+      assert_eq!(error.kind(), kind);
+      assert!(error.to_string().contains(message));
+    }
+
+    assert_error(
+      PluginClientError::Io(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+      "denied",
+      io::ErrorKind::PermissionDenied,
+    );
+    assert_error(
+      PluginClientError::SerdeJson(serde_json::from_str::<Value>("{").unwrap_err()),
+      "EOF",
+      io::ErrorKind::InvalidData,
+    );
+    assert_error(
+      PluginClientError::Protocol("bad response".to_owned()),
+      "bad response",
+      io::ErrorKind::Other,
+    );
+    assert_error(
+      PluginClientError::ConnectionClosed,
+      "Connection closed",
+      io::ErrorKind::ConnectionAborted,
+    );
+    assert_error(
+      PluginClientError::VersionMismatch,
+      "Version mismatch",
+      io::ErrorKind::Other,
+    );
+    assert_error(
+      PluginClientError::WriterClosed,
+      "Writer closed",
+      io::ErrorKind::ConnectionAborted,
+    );
+    assert_error(
+      PluginClientError::FrameTooLarge { bytes: 2, limit: 1 },
+      "2 bytes; limit is 1",
+      io::ErrorKind::InvalidData,
+    );
+    assert_error(
+      PluginClientError::ResponseQueueOverflow {
+        id: "command".to_owned(),
+        capacity: 32,
+      },
+      "command",
+      io::ErrorKind::Other,
+    );
+  }
+
+  #[test]
   fn rejects_oversized_outbound_protocol_frames() {
     let command = OctaCommand::Execute {
       params: "x".repeat(MAX_PLUGIN_FRAME_BYTES),
@@ -872,6 +926,43 @@ mod tests {
       "No Execute message found in messages: {:?}",
       messages
     );
+  }
+
+  #[tokio::test]
+  async fn terminal_input_sends_data_resize_and_close_commands() {
+    let mut server = TestServer::new().await;
+    server.start("multiple".to_string()).await;
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let execution = client
+      .start_execution(execution_request("terminal"), CancellationToken::new())
+      .await
+      .unwrap();
+    let input = execution.terminal_input();
+
+    input.write(vec![1, 2, 3]).await.unwrap();
+    input.resize(24, 80).await.unwrap();
+    input.close().await.unwrap();
+
+    client.shutdown().await.unwrap();
+    let messages = server.stop().await;
+    let commands: Vec<OctaCommand> = messages
+      .iter()
+      .filter_map(|message| serde_json::from_str(message).ok())
+      .collect();
+    assert!(commands.iter().any(|command| matches!(
+      command,
+      OctaCommand::Stdin { id, bytes } if id == "terminal" && bytes == &[1, 2, 3]
+    )));
+    assert!(commands.iter().any(|command| matches!(
+      command,
+      OctaCommand::Resize { id, rows: 24, cols: 80 } if id == "terminal"
+    )));
+    assert!(commands.iter().any(|command| matches!(
+      command,
+      OctaCommand::CloseStdin { id } if id == "terminal"
+    )));
   }
 
   #[tokio::test]

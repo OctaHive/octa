@@ -164,113 +164,26 @@ impl PluginInvoker {
       let mut output = OutputCapture::default();
       loop {
         match execution.receive_output(&cancel_token).await {
-          Ok(Some(response)) => match response {
-            PluginResponse::Stdout { id, line } if id == command_id => {
-              let line = without_line_ending(&line);
-              if let Some(session) = &mut raw_session {
-                if !request
-                  .output
-                  .as_ref()
-                  .is_some_and(|target| target.hides(ConsoleStream::Stdout))
-                {
-                  let mut bytes = line.as_bytes().to_vec();
-                  bytes.push(b'\n');
-                  session.write(ConsoleStream::Stdout, bytes).await?;
-                }
-              } else if let Some(target) = &request.output {
-                target.line(&command_id, ConsoleStream::Stdout, line.to_owned()).await?;
-              }
-              output
-                .append_line(ConsoleStream::Stdout, line)
-                .await
-                .map_err(|error| capture_error(&plugin_name, error))?;
-            },
-            PluginResponse::Stderr { id, line } if id == command_id => {
-              let line = without_line_ending(&line);
-              if let Some(session) = &mut raw_session {
-                if !request
-                  .output
-                  .as_ref()
-                  .is_some_and(|target| target.hides(ConsoleStream::Stderr))
-                {
-                  let mut bytes = line.as_bytes().to_vec();
-                  bytes.push(b'\n');
-                  session.write(ConsoleStream::Stderr, bytes).await?;
-                }
-              } else if let Some(target) = &request.output {
-                target.line(&command_id, ConsoleStream::Stderr, line.to_owned()).await?;
-              }
-              output
-                .append_line(ConsoleStream::Stderr, line)
-                .await
-                .map_err(|error| capture_error(&plugin_name, error))?;
-            },
-            PluginResponse::StdoutBytes { id, bytes } if id == command_id => {
-              if let Some(session) = &mut raw_session {
-                if !request
-                  .output
-                  .as_ref()
-                  .is_some_and(|target| target.hides(ConsoleStream::Stdout))
-                {
-                  session.write(ConsoleStream::Stdout, bytes.clone()).await?;
-                }
-              } else if let Some(target) = &request.output {
-                target.bytes(&command_id, ConsoleStream::Stdout, bytes.clone()).await?;
-              }
-              output
-                .append(ConsoleStream::Stdout, String::from_utf8_lossy(&bytes).as_bytes())
-                .await
-                .map_err(|error| capture_error(&plugin_name, error))?;
-            },
-            PluginResponse::StderrBytes { id, bytes } if id == command_id => {
-              if let Some(session) = &mut raw_session {
-                if !request
-                  .output
-                  .as_ref()
-                  .is_some_and(|target| target.hides(ConsoleStream::Stderr))
-                {
-                  session.write(ConsoleStream::Stderr, bytes.clone()).await?;
-                }
-              } else if let Some(target) = &request.output {
-                target.bytes(&command_id, ConsoleStream::Stderr, bytes.clone()).await?;
-              }
-              output
-                .append(ConsoleStream::Stderr, String::from_utf8_lossy(&bytes).as_bytes())
-                .await
-                .map_err(|error| capture_error(&plugin_name, error))?;
-            },
-            PluginResponse::Diagnostic {
-              id,
-              level,
-              message,
-              location,
-            } if id == command_id => {
-              if let Some(target) = &request.output {
-                let level = match level {
-                  PluginDiagnosticLevel::Trace => octa_output::ConsoleLevel::Trace,
-                  PluginDiagnosticLevel::Debug => octa_output::ConsoleLevel::Debug,
-                  PluginDiagnosticLevel::Info => octa_output::ConsoleLevel::Info,
-                  PluginDiagnosticLevel::Warn => octa_output::ConsoleLevel::Warn,
-                  PluginDiagnosticLevel::Error => octa_output::ConsoleLevel::Error,
-                };
-                let location = location.map(|location| octa_output::SourceLocation {
-                  file: location.file,
-                  line: location.line,
-                  column: location.column,
-                });
-                target.diagnostic(level, message, location).await?;
-              }
-            },
-            PluginResponse::ExitStatus { id, code } if id == command_id => {
+          Ok(Some(response)) => match route_plugin_response(
+            response,
+            &command_id,
+            request.output.as_ref(),
+            raw_session.as_mut(),
+            &mut output,
+            &plugin_name,
+          )
+          .await?
+          {
+            PluginResponseAction::Continue => {},
+            PluginResponseAction::Exit(code) => {
               terminal_response = true;
               let (stdout, stderr) = output.into_strings().await?;
               break Ok(PluginOutput { code, stdout, stderr });
             },
-            PluginResponse::Error { id, message } if id == command_id => {
+            PluginResponseAction::Error(message) => {
               terminal_response = true;
               break Err(io::Error::other(format!("Plugin error: {message}")).into());
             },
-            _ => {},
           },
           Ok(None) => {
             break Err(
@@ -301,6 +214,117 @@ impl PluginInvoker {
     drop(raw_session);
     result
   }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PluginResponseAction {
+  Continue,
+  Exit(i32),
+  Error(String),
+}
+
+async fn route_plugin_response(
+  response: PluginResponse,
+  command_id: &str,
+  target: Option<&ConsoleTarget>,
+  raw_session: Option<&mut octa_output::RawConsoleSession>,
+  output: &mut OutputCapture,
+  plugin_name: &str,
+) -> ExecutorResult<PluginResponseAction> {
+  match response {
+    PluginResponse::Stdout { id, line } if id == command_id => {
+      let line = without_line_ending(&line);
+      route_line(target, raw_session, command_id, ConsoleStream::Stdout, line).await?;
+      output
+        .append_line(ConsoleStream::Stdout, line)
+        .await
+        .map_err(|error| capture_error(plugin_name, error))?;
+    },
+    PluginResponse::Stderr { id, line } if id == command_id => {
+      let line = without_line_ending(&line);
+      route_line(target, raw_session, command_id, ConsoleStream::Stderr, line).await?;
+      output
+        .append_line(ConsoleStream::Stderr, line)
+        .await
+        .map_err(|error| capture_error(plugin_name, error))?;
+    },
+    PluginResponse::StdoutBytes { id, bytes } if id == command_id => {
+      route_bytes(target, raw_session, command_id, ConsoleStream::Stdout, bytes.clone()).await?;
+      output
+        .append(ConsoleStream::Stdout, String::from_utf8_lossy(&bytes).as_bytes())
+        .await
+        .map_err(|error| capture_error(plugin_name, error))?;
+    },
+    PluginResponse::StderrBytes { id, bytes } if id == command_id => {
+      route_bytes(target, raw_session, command_id, ConsoleStream::Stderr, bytes.clone()).await?;
+      output
+        .append(ConsoleStream::Stderr, String::from_utf8_lossy(&bytes).as_bytes())
+        .await
+        .map_err(|error| capture_error(plugin_name, error))?;
+    },
+    PluginResponse::Diagnostic {
+      id,
+      level,
+      message,
+      location,
+    } if id == command_id => {
+      if let Some(target) = target {
+        let level = match level {
+          PluginDiagnosticLevel::Trace => octa_output::ConsoleLevel::Trace,
+          PluginDiagnosticLevel::Debug => octa_output::ConsoleLevel::Debug,
+          PluginDiagnosticLevel::Info => octa_output::ConsoleLevel::Info,
+          PluginDiagnosticLevel::Warn => octa_output::ConsoleLevel::Warn,
+          PluginDiagnosticLevel::Error => octa_output::ConsoleLevel::Error,
+        };
+        let location = location.map(|location| octa_output::SourceLocation {
+          file: location.file,
+          line: location.line,
+          column: location.column,
+        });
+        target.diagnostic(level, message, location).await?;
+      }
+    },
+    PluginResponse::ExitStatus { id, code } if id == command_id => return Ok(PluginResponseAction::Exit(code)),
+    PluginResponse::Error { id, message } if id == command_id => return Ok(PluginResponseAction::Error(message)),
+    _ => {},
+  }
+  Ok(PluginResponseAction::Continue)
+}
+
+async fn route_line(
+  target: Option<&ConsoleTarget>,
+  raw_session: Option<&mut octa_output::RawConsoleSession>,
+  command_id: &str,
+  stream: ConsoleStream,
+  line: &str,
+) -> io::Result<()> {
+  if let Some(session) = raw_session {
+    if !target.is_some_and(|target| target.hides(stream)) {
+      let mut bytes = line.as_bytes().to_vec();
+      bytes.push(b'\n');
+      session.write(stream, bytes).await?;
+    }
+  } else if let Some(target) = target {
+    target.line(command_id, stream, line.to_owned()).await?;
+  }
+  Ok(())
+}
+
+async fn route_bytes(
+  target: Option<&ConsoleTarget>,
+  raw_session: Option<&mut octa_output::RawConsoleSession>,
+  command_id: &str,
+  stream: ConsoleStream,
+  bytes: Vec<u8>,
+) -> io::Result<()> {
+  if let Some(session) = raw_session {
+    if !target.is_some_and(|target| target.hides(stream)) {
+      session.write(stream, bytes).await?;
+    }
+  } else if let Some(target) = target {
+    target.bytes(command_id, stream, bytes).await?;
+  }
+  Ok(())
 }
 
 fn capture_error(plugin: &str, error: CaptureError) -> ExecutorError {
@@ -442,12 +466,234 @@ impl PluginEvaluator for SystemTestEvaluator {
 
 #[cfg(test)]
 mod tests {
-  use super::without_line_ending;
+  use std::sync::{Arc, Mutex};
+
+  use octa_octafile::Silence;
+  use octa_output::{
+    Console, ConsoleEntry, ConsolePayload, ConsoleRecord, ConsoleRenderer, ConsoleScopeAllocator, ExecutionEvent,
+  };
+  use octa_plugin::protocol::SourceLocation as PluginSourceLocation;
+
+  use super::*;
+
+  #[derive(Clone, Default)]
+  struct Recording(Arc<Mutex<Vec<ConsoleRecord>>>);
+
+  impl ConsoleRenderer for Recording {
+    fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
+      self.0.lock().unwrap().push(entry.record().clone());
+      Ok(())
+    }
+  }
 
   #[test]
   fn removes_protocol_line_endings_without_trimming_output() {
     assert_eq!(without_line_ending("  value  \r\n"), "  value  ");
     assert_eq!(without_line_ending("  value  "), "  value  ");
     assert_eq!(without_line_ending("\n"), "");
+  }
+
+  #[tokio::test]
+  async fn routes_every_structured_plugin_response_and_captures_output() {
+    let records = Recording::default();
+    let console = Arc::new(Console::new(records.clone()));
+    let target = ConsoleTarget::new(console.clone(), 7, Some(ConsoleScopeAllocator::default().scope("task")));
+    let mut output = OutputCapture::default();
+
+    let responses = [
+      PluginResponse::Stdout {
+        id: "command".to_owned(),
+        line: "out\r\n".to_owned(),
+      },
+      PluginResponse::Stderr {
+        id: "command".to_owned(),
+        line: "err\n".to_owned(),
+      },
+      PluginResponse::StdoutBytes {
+        id: "command".to_owned(),
+        bytes: b"-bytes".to_vec(),
+      },
+      PluginResponse::StderrBytes {
+        id: "command".to_owned(),
+        bytes: b"-bytes".to_vec(),
+      },
+    ];
+    for response in responses {
+      assert_eq!(
+        route_plugin_response(response, "command", Some(&target), None, &mut output, "shell")
+          .await
+          .unwrap(),
+        PluginResponseAction::Continue
+      );
+    }
+
+    for level in [
+      PluginDiagnosticLevel::Trace,
+      PluginDiagnosticLevel::Debug,
+      PluginDiagnosticLevel::Info,
+      PluginDiagnosticLevel::Warn,
+      PluginDiagnosticLevel::Error,
+    ] {
+      route_plugin_response(
+        PluginResponse::Diagnostic {
+          id: "command".to_owned(),
+          level,
+          message: "diagnostic".to_owned(),
+          location: Some(PluginSourceLocation {
+            file: "Octafile.yml".to_owned(),
+            line: Some(3),
+            column: Some(5),
+          }),
+        },
+        "command",
+        Some(&target),
+        None,
+        &mut output,
+        "shell",
+      )
+      .await
+      .unwrap();
+    }
+
+    assert_eq!(
+      route_plugin_response(
+        PluginResponse::ExitStatus {
+          id: "command".to_owned(),
+          code: 4,
+        },
+        "command",
+        Some(&target),
+        None,
+        &mut output,
+        "shell",
+      )
+      .await
+      .unwrap(),
+      PluginResponseAction::Exit(4)
+    );
+    assert_eq!(
+      route_plugin_response(
+        PluginResponse::Error {
+          id: "command".to_owned(),
+          message: "failed".to_owned(),
+        },
+        "command",
+        Some(&target),
+        None,
+        &mut output,
+        "shell",
+      )
+      .await
+      .unwrap(),
+      PluginResponseAction::Error("failed".to_owned())
+    );
+    assert_eq!(
+      route_plugin_response(
+        PluginResponse::Stdout {
+          id: "another-command".to_owned(),
+          line: "ignored".to_owned(),
+        },
+        "command",
+        None,
+        None,
+        &mut output,
+        "shell",
+      )
+      .await
+      .unwrap(),
+      PluginResponseAction::Continue
+    );
+
+    let (stdout, stderr) = output.into_strings().await.unwrap();
+    assert_eq!(stdout, "out\n-bytes");
+    assert_eq!(stderr, "err\n-bytes");
+    console.drain().await.unwrap();
+    let records = records.0.lock().unwrap();
+    assert_eq!(
+      records
+        .iter()
+        .filter(|record| matches!(record, ConsoleRecord::Execution(ExecutionEvent::Output { .. })))
+        .count(),
+      4
+    );
+    assert_eq!(
+      records
+        .iter()
+        .filter(|record| matches!(record, ConsoleRecord::Diagnostic(_)))
+        .count(),
+      5
+    );
+  }
+
+  #[tokio::test]
+  async fn raw_routing_preserves_bytes_and_honors_stream_silence() {
+    let records = Recording::default();
+    let console = Arc::new(Console::new(records.clone()));
+    let scope = ConsoleScopeAllocator::default().scope("raw");
+    let target = ConsoleTarget::with_silence(console.clone(), 1, Some(scope), Silence::Stdout);
+    let mut session = target.begin_raw("command").await.unwrap().unwrap();
+    let mut output = OutputCapture::default();
+
+    for response in [
+      PluginResponse::Stdout {
+        id: "command".to_owned(),
+        line: "hidden".to_owned(),
+      },
+      PluginResponse::Stderr {
+        id: "command".to_owned(),
+        line: "line".to_owned(),
+      },
+      PluginResponse::StdoutBytes {
+        id: "command".to_owned(),
+        bytes: b"hidden".to_vec(),
+      },
+      PluginResponse::StderrBytes {
+        id: "command".to_owned(),
+        bytes: b"bytes".to_vec(),
+      },
+    ] {
+      route_plugin_response(
+        response,
+        "command",
+        Some(&target),
+        Some(&mut session),
+        &mut output,
+        "shell",
+      )
+      .await
+      .unwrap();
+    }
+    drop(session);
+    console.drain().await.unwrap();
+
+    let payloads = records
+      .0
+      .lock()
+      .unwrap()
+      .iter()
+      .filter_map(|record| match record {
+        ConsoleRecord::Execution(ExecutionEvent::Output { payload, .. }) => Some(payload.clone()),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(
+      payloads,
+      [
+        ConsolePayload::RawBytes(b"line\n".to_vec()),
+        ConsolePayload::RawBytes(b"bytes".to_vec())
+      ]
+    );
+  }
+
+  #[test]
+  fn capture_errors_retain_their_specific_failure() {
+    assert!(matches!(
+      capture_error("shell", CaptureError::LimitExceeded),
+      ExecutorError::PluginOutputTooLarge { plugin, .. } if plugin == "shell"
+    ));
+    assert!(matches!(
+      capture_error("shell", CaptureError::Io(io::Error::other("disk"))),
+      ExecutorError::IoError(_)
+    ));
   }
 }
