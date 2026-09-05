@@ -28,6 +28,12 @@ pub enum ExecutorError {
   #[error("Invalid parameters for plugin '{0}': {1}")]
   PluginValidationFailed(String, String),
 
+  #[error("Plugin '{0}' does not support raw/PTY execution")]
+  RawUnsupported(String),
+
+  #[error("Plugin '{plugin}' output exceeds the {limit_mib} MiB task-result limit")]
+  PluginOutputTooLarge { plugin: String, limit_mib: usize },
+
   #[error("Plugin '{key}' evaluation failed with status {code}: {stderr}")]
   PluginEvaluationFailed { key: String, code: i32, stderr: String },
 

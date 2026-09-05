@@ -6,6 +6,25 @@ use brush_core::{ProfileLoadBehavior, RcLoadBehavior, Shell};
 
 const CHILD_MODE_ARG: &str = "--octa-brush-command";
 
+pub(crate) fn pty_command(
+  source: &str,
+  dir: &Path,
+  envs: HashMap<String, String>,
+  coreutils_path: &Path,
+) -> anyhow::Result<portable_pty::CommandBuilder> {
+  let executable = env::current_exe().context("Failed to locate the shell plugin executable")?;
+  let path = command_path(&envs, coreutils_path)?;
+  let mut command = portable_pty::CommandBuilder::new(executable);
+  command.arg(CHILD_MODE_ARG);
+  command.arg(source);
+  command.cwd(dir);
+  for (name, value) in envs {
+    command.env(name, value);
+  }
+  command.env("PATH", path);
+  Ok(command)
+}
+
 /// Builds an isolated Brush process whose standard streams can be routed through the plugin protocol.
 pub(crate) fn command(
   source: &str,

@@ -1,6 +1,8 @@
 use std::{collections::HashMap, io};
 
-use super::{ConsoleEntry, ConsoleRecord, ConsoleRenderer, ConsoleScope, ConsoleStatus, ExecutionEvent};
+use super::{
+  spool::EntrySpool, ConsoleEntry, ConsoleRecord, ConsoleRenderer, ConsoleScope, ConsoleStatus, ExecutionEvent,
+};
 
 #[derive(Clone, Copy)]
 enum FlushPolicy {
@@ -18,10 +20,16 @@ struct BufferedRenderer<R> {
   renderer: R,
   scopes: HashMap<ConsoleScope, ScopeOutput>,
   policy: FlushPolicy,
+  group_templates: Option<GroupTemplates>,
+}
+
+struct GroupTemplates {
+  begin: Option<String>,
+  end: Option<String>,
 }
 
 enum ScopeOutput {
-  Buffered(Vec<ConsoleEntry>),
+  Buffered(EntrySpool),
   Live,
 }
 
@@ -31,17 +39,56 @@ impl<R> BufferedRenderer<R> {
       renderer,
       scopes: HashMap::new(),
       policy,
+      group_templates: None,
     }
   }
 }
 
 impl<R: ConsoleRenderer> BufferedRenderer<R> {
+  fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    let entries = match self.scopes.insert(scope.clone(), ScopeOutput::Live) {
+      Some(ScopeOutput::Buffered(entries)) => entries,
+      Some(ScopeOutput::Live) => return Ok(()),
+      None => EntrySpool::default(),
+    };
+    let mut first_error = None;
+    record_error(&mut first_error, entries.render_into(&mut self.renderer));
+    record_error(&mut first_error, self.renderer.begin_raw(scope));
+    first_error.map_or(Ok(()), Err)
+  }
+
   fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
     if let ConsoleRecord::Execution(ExecutionEvent::ScopeFinished { scope, status, .. }) = entry.record() {
       return match self.scopes.remove(scope) {
-        Some(ScopeOutput::Buffered(mut entries)) if self.policy.should_flush(*status) => {
-          entries.push(entry.clone());
-          render_all(&mut self.renderer, entries)
+        Some(ScopeOutput::Buffered(entries)) if self.policy.should_flush(*status) => {
+          let mut first_error = None;
+          if !scope.hides_stdout() {
+            if let Some(begin) = self
+              .group_templates
+              .as_ref()
+              .and_then(|templates| templates.begin.as_deref())
+            {
+              record_error(
+                &mut first_error,
+                group_entry(entry, scope, begin).and_then(|entry| self.renderer.render(&entry)),
+              );
+            }
+          }
+          record_error(&mut first_error, entries.render_into(&mut self.renderer));
+          record_error(&mut first_error, self.renderer.render(entry));
+          if !scope.hides_stdout() {
+            if let Some(end) = self
+              .group_templates
+              .as_ref()
+              .and_then(|templates| templates.end.as_deref())
+            {
+              record_error(
+                &mut first_error,
+                group_entry(entry, scope, end).and_then(|entry| self.renderer.render(&entry)),
+              );
+            }
+          }
+          first_error.map_or(Ok(()), Err)
         },
         Some(ScopeOutput::Buffered(_)) => Ok(()),
         Some(ScopeOutput::Live) => self.renderer.render(entry),
@@ -56,24 +103,16 @@ impl<R: ConsoleRenderer> BufferedRenderer<R> {
     // A raw stream may be interactive. Flush its buffered prefix and keep the
     // scope live because delaying or decorating later bytes could break its protocol.
     if is_raw_output(entry.record()) {
-      let mut entries = match self.scopes.insert(scope.clone(), ScopeOutput::Live) {
-        Some(ScopeOutput::Buffered(entries)) => entries,
-        Some(ScopeOutput::Live) => return self.renderer.render(entry),
-        None => Vec::new(),
-      };
-      entries.push(entry.clone());
-      return render_all(&mut self.renderer, entries);
+      self.begin_raw(scope)?;
+      return self.renderer.render(entry);
     }
 
     match self
       .scopes
       .entry(scope.clone())
-      .or_insert_with(|| ScopeOutput::Buffered(Vec::new()))
+      .or_insert_with(|| ScopeOutput::Buffered(EntrySpool::default()))
     {
-      ScopeOutput::Buffered(entries) => {
-        entries.push(entry.clone());
-        Ok(())
-      },
+      ScopeOutput::Buffered(entries) => entries.push(entry.clone()),
       ScopeOutput::Live => self.renderer.render(entry),
     }
   }
@@ -86,11 +125,44 @@ impl<R> GroupRenderer<R> {
   pub fn new(renderer: R) -> Self {
     Self(BufferedRenderer::new(renderer, FlushPolicy::Always))
   }
+
+  pub fn with_templates(renderer: R, begin: Option<String>, end: Option<String>, error_only: bool) -> Self {
+    let mut buffered = BufferedRenderer::new(
+      renderer,
+      if error_only {
+        FlushPolicy::OnFailure
+      } else {
+        FlushPolicy::Always
+      },
+    );
+    buffered.group_templates = Some(GroupTemplates { begin, end });
+    Self(buffered)
+  }
 }
 
 impl<R: ConsoleRenderer> ConsoleRenderer for GroupRenderer<R> {
   fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
     self.0.render(entry)
+  }
+
+  fn supports_raw_terminal(&self) -> bool {
+    self.0.renderer.supports_raw_terminal()
+  }
+
+  fn tick(&mut self) -> io::Result<()> {
+    self.0.renderer.tick()
+  }
+
+  fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
+    self.0.renderer.set_parallel(parallel)
+  }
+
+  fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    self.0.begin_raw(scope)
+  }
+
+  fn end_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    self.0.renderer.end_raw(scope)
   }
 }
 
@@ -108,6 +180,26 @@ impl<R: ConsoleRenderer> ConsoleRenderer for OnErrorRenderer<R> {
   fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
     self.0.render(entry)
   }
+
+  fn supports_raw_terminal(&self) -> bool {
+    self.0.renderer.supports_raw_terminal()
+  }
+
+  fn tick(&mut self) -> io::Result<()> {
+    self.0.renderer.tick()
+  }
+
+  fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
+    self.0.renderer.set_parallel(parallel)
+  }
+
+  fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    self.0.begin_raw(scope)
+  }
+
+  fn end_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    self.0.renderer.end_raw(scope)
+  }
 }
 
 fn record_scope(record: &ConsoleRecord) -> Option<&ConsoleScope> {
@@ -123,22 +215,36 @@ fn is_raw_output(record: &ConsoleRecord) -> bool {
   matches!(
     record,
     ConsoleRecord::Execution(ExecutionEvent::Output {
-      payload: crate::ConsolePayload::Bytes(_),
+      payload: crate::ConsolePayload::RawBytes(_),
       ..
     })
   )
 }
 
-fn render_all(renderer: &mut impl ConsoleRenderer, entries: Vec<ConsoleEntry>) -> io::Result<()> {
-  let mut first_error = None;
-  for entry in entries {
-    if let Err(error) = renderer.render(&entry) {
-      if first_error.is_none() {
-        first_error = Some(error);
-      }
+fn record_error(first_error: &mut Option<io::Error>, result: io::Result<()>) {
+  if let Err(error) = result {
+    if first_error.is_none() {
+      *first_error = Some(error);
     }
   }
-  first_error.map_or(Ok(()), Err)
+}
+
+fn group_entry(reference: &ConsoleEntry, scope: &ConsoleScope, template: &str) -> io::Result<ConsoleEntry> {
+  let run_id = match reference.record() {
+    ConsoleRecord::Execution(ExecutionEvent::ScopeFinished { run_id, .. }) => *run_id,
+    _ => 0,
+  };
+  let mut values = scope.template_values();
+  values.insert("TASK".to_owned(), serde_json::Value::String(scope.label().to_owned()));
+  values.insert("PREFIX".to_owned(), serde_json::Value::String(scope.prefix()));
+  let line = crate::render_output_template(template, &values).map_err(io::Error::other)?;
+  Ok(reference.with_record(ConsoleRecord::Execution(ExecutionEvent::Output {
+    run_id,
+    scope: Some(scope.clone()),
+    command_id: "group".to_owned(),
+    stream: crate::ConsoleStream::Stdout,
+    payload: crate::ConsolePayload::Line(line),
+  })))
 }
 
 #[cfg(test)]
@@ -251,12 +357,14 @@ mod tests {
       scope: None,
       level: ConsoleLevel::Info,
       message: "global".to_owned(),
+      location: None,
     }));
     let scoped = entry(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
       run_id: Some(7),
       scope: Some(scope.clone()),
       level: ConsoleLevel::Info,
       message: "scoped".to_owned(),
+      location: None,
     }));
 
     renderer.render(&started(scope.clone())).unwrap();
@@ -301,6 +409,57 @@ mod tests {
   }
 
   #[test]
+  fn group_templates_respect_scope_stdout_silence() {
+    let scope = ConsoleScopeAllocator::default().scope_with_options("hidden", None, true, false);
+    let mut renderer = GroupRenderer::with_templates(
+      RecordingRenderer::default(),
+      Some("BEGIN {{.TASK}}".to_owned()),
+      Some("END {{.TASK}}".to_owned()),
+      false,
+    );
+    renderer.render(&started(scope.clone())).unwrap();
+    renderer.render(&finished(scope, ConsoleStatus::Success)).unwrap();
+
+    assert_eq!(renderer.0.renderer.records.len(), 2);
+    assert!(renderer.0.renderer.records.iter().all(|record| !matches!(
+      record,
+      ConsoleRecord::Execution(ExecutionEvent::Output { command_id, .. }) if command_id == "group"
+    )));
+  }
+
+  #[test]
+  fn group_templates_can_use_runtime_task_variables() {
+    let scope = ConsoleScopeAllocator::default().scope("deploy");
+    scope.set_template_values(std::collections::HashMap::from([(
+      "ENVIRONMENT".to_owned(),
+      serde_json::Value::String("production".to_owned()),
+    )]));
+    let mut renderer = GroupRenderer::with_templates(
+      RecordingRenderer::default(),
+      Some("BEGIN {{.TASK}} {{.ENVIRONMENT}}".to_owned()),
+      None,
+      false,
+    );
+    renderer.render(&output(scope.clone(), "release")).unwrap();
+    renderer.render(&finished(scope, ConsoleStatus::Success)).unwrap();
+
+    let lines = renderer
+      .0
+      .renderer
+      .records
+      .iter()
+      .filter_map(|record| match record {
+        ConsoleRecord::Execution(ExecutionEvent::Output {
+          payload: ConsolePayload::Line(line),
+          ..
+        }) => Some(line.as_str()),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(lines, ["BEGIN deploy production", "release"]);
+  }
+
+  #[test]
   fn raw_output_turns_its_scope_into_live_passthrough() {
     let scope = ConsoleScopeAllocator::default().scope("interactive");
     let mut renderer = GroupRenderer::new(RecordingRenderer::default());
@@ -309,7 +468,7 @@ mod tests {
       scope: Some(scope.clone()),
       command_id: "shell".to_owned(),
       stream: ConsoleStream::Stdout,
-      payload: ConsolePayload::Bytes(b"prompt".to_vec()),
+      payload: ConsolePayload::RawBytes(b"prompt".to_vec()),
     }));
 
     renderer.render(&declared(scope.clone())).unwrap();
@@ -370,7 +529,7 @@ mod tests {
       scope: Some(scope.clone()),
       command_id: "interactive".to_owned(),
       stream: ConsoleStream::Stdout,
-      payload: ConsolePayload::Bytes(b"prompt".to_vec()),
+      payload: ConsolePayload::RawBytes(b"prompt".to_vec()),
     }));
 
     renderer.render(&started(scope.clone())).unwrap();

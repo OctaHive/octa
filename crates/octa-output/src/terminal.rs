@@ -166,7 +166,7 @@ fn write_payload(mut writer: impl Write, payload: &ConsolePayload) -> io::Result
       writer.write_all(b"\n")?;
       writer.flush()
     },
-    ConsolePayload::Bytes(bytes) => {
+    ConsolePayload::Bytes(bytes) | ConsolePayload::RawBytes(bytes) => {
       writer.write_all(bytes)?;
       writer.flush()
     },
@@ -227,6 +227,7 @@ mod tests {
         scope: None,
         level: ConsoleLevel::Debug,
         message: "diagnostic".to_owned(),
+        location: None,
       })))
       .unwrap();
     renderer

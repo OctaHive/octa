@@ -13,7 +13,7 @@ use socket::interpret_local_socket_name;
 use tokio::io::{AsyncWrite, ReadHalf};
 use tokio::{
   io::{split, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, WriteHalf},
-  sync::Mutex,
+  sync::{mpsc, oneshot, Mutex},
   task::JoinHandle,
 };
 use tokio_util::{
@@ -34,8 +34,30 @@ pub const SHELL_CAPABILITY: &str = "shell";
 #[derive(Clone)]
 pub struct PluginSchema {
   pub key: String,
+  pub supports_raw: bool,
   pub capabilities: Vec<String>,
   pub validation_schema: Option<Map<String, Value>>,
+}
+
+/// Host-side terminal input delivered to an interactive plugin command.
+#[derive(Debug)]
+pub enum PluginInput {
+  Bytes(Vec<u8>),
+  Resize { rows: u16, cols: u16 },
+  Close,
+}
+
+/// Complete, command-scoped input passed to a plugin implementation.
+pub struct PluginCommand {
+  pub id: String,
+  pub dry: bool,
+  pub command: String,
+  pub args: Vec<String>,
+  pub dir: PathBuf,
+  pub vars: HashMap<String, Value>,
+  pub envs: HashMap<String, String>,
+  pub raw: bool,
+  pub input: mpsc::UnboundedReceiver<PluginInput>,
 }
 
 #[derive(Parser, Debug)]
@@ -54,16 +76,9 @@ struct Args {
 pub trait Plugin: Send + Sync + 'static {
   fn version(&self) -> String;
 
-  #[allow(clippy::too_many_arguments)]
   async fn execute_command(
     &self,
-    id: String,
-    dry: bool,
-    command: String,
-    args: Vec<String>,
-    dir: PathBuf,
-    vars: HashMap<String, Value>,
-    envs: HashMap<String, String>,
+    command: PluginCommand,
     writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
     logger: Arc<impl Logger>,
     cancel_token: CancellationToken,
@@ -73,6 +88,7 @@ pub trait Plugin: Send + Sync + 'static {
 struct ActiveCommand {
   handle: JoinHandle<()>,
   cancel_token: CancellationToken,
+  input: mpsc::UnboundedSender<PluginInput>,
 }
 
 type ActiveCommands = Arc<Mutex<HashMap<String, ActiveCommand>>>;
@@ -130,6 +146,7 @@ where
       vars,
       secret_vars,
       redact_params,
+      raw,
       dry,
     } => {
       let id = Uuid::new_v4().to_string();
@@ -163,16 +180,25 @@ where
       // Every command gets a child token so it can be stopped without shutting down the plugin.
       let command_cancel_token = cancel_token.child_token();
       let execute_cancel_token = command_cancel_token.clone();
+      let (input, input_rx) = mpsc::unbounded_channel();
+      let active_commands_for_task = active_commands.clone();
+      let (registered_tx, registered_rx) = oneshot::channel();
       let handle = tokio::spawn(async move {
+        // Do not finish before the command has been inserted into the registry.
+        let _ = registered_rx.await;
         if let Err(e) = plugin
           .execute_command(
-            command_id.clone(),
-            dry,
-            params,
-            args,
-            dir,
-            vars,
-            envs,
+            PluginCommand {
+              id: command_id.clone(),
+              dry,
+              command: params,
+              args,
+              dir,
+              vars,
+              envs,
+              raw,
+              input: input_rx,
+            },
             writer_clone.clone(),
             command_logger,
             execute_cancel_token,
@@ -181,7 +207,7 @@ where
         {
           // Plugin errors bypass the logger, so sanitize the protocol response explicitly.
           let error = PluginResponse::Error {
-            id: command_id,
+            id: command_id.clone(),
             message: redact(&format!("Command execution error: {}", e), &redactions),
           };
           if let Ok(json) = serde_json::to_string(&error) {
@@ -190,6 +216,7 @@ where
             let _ = lock.write_all(error_json.as_bytes()).await;
           }
         }
+        active_commands_for_task.lock().await.remove(&command_id);
       });
 
       // Store the handle with the original id
@@ -198,12 +225,44 @@ where
         ActiveCommand {
           handle,
           cancel_token: command_cancel_token,
+          input,
         },
       );
+      let _ = registered_tx.send(());
     },
     OctaCommand::Cancel { id } => {
       if let Some(command) = active_commands.lock().await.get(&id) {
         command.cancel_token.cancel();
+      }
+    },
+    OctaCommand::Stdin { id, bytes } => {
+      let input = active_commands
+        .lock()
+        .await
+        .get(&id)
+        .map(|command| command.input.clone());
+      if let Some(input) = input {
+        let _ = input.send(PluginInput::Bytes(bytes));
+      }
+    },
+    OctaCommand::Resize { id, rows, cols } => {
+      let input = active_commands
+        .lock()
+        .await
+        .get(&id)
+        .map(|command| command.input.clone());
+      if let Some(input) = input {
+        let _ = input.send(PluginInput::Resize { rows, cols });
+      }
+    },
+    OctaCommand::CloseStdin { id } => {
+      let input = active_commands
+        .lock()
+        .await
+        .get(&id)
+        .map(|command| command.input.clone());
+      if let Some(input) = input {
+        let _ = input.send(PluginInput::Close);
       }
     },
     OctaCommand::Schema => {
@@ -307,12 +366,13 @@ async fn handle_conn(
   }
 
   // Graceful connection shutdown
-  {
+  let commands = {
     let mut commands = active_commands.lock().await;
-    for (_, command) in commands.drain() {
-      if let Err(e) = command.handle.await {
-        logger.log(&format!("Error waiting for complete commands: {}", e))?;
-      }
+    commands.drain().map(|(_, command)| command).collect::<Vec<_>>()
+  };
+  for command in commands {
+    if let Err(e) = command.handle.await {
+      logger.log(&format!("Error waiting for complete commands: {}", e))?;
     }
   }
 
@@ -413,6 +473,7 @@ where
     Ok(OctaCommand::Schema) => {
       let schema_response = PluginResponse::Schema(Schema {
         key: schema.key,
+        supports_raw: schema.supports_raw,
         capabilities: schema.capabilities,
         validation_schema: schema.validation_schema,
       });
@@ -584,17 +645,12 @@ mod tests {
 
     async fn execute_command(
       &self,
-      id: String,
-      _dry: bool,
-      command: String,
-      args: Vec<String>,
-      _dir: PathBuf,
-      _vars: HashMap<String, Value>,
-      _envs: HashMap<String, String>,
+      request: PluginCommand,
       writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
       logger: Arc<impl Logger>,
       cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
+      let PluginCommand { id, command, args, .. } = request;
       logger.log(&format!("Executing command: {} {:?}", command, args))?;
 
       for line in &self.output_lines {
@@ -672,6 +728,7 @@ mod tests {
       vars: HashMap::new(),
       secret_vars: Vec::new(),
       redact_params: false,
+      raw: false,
       dry: false,
     };
 
@@ -725,6 +782,7 @@ mod tests {
       vars: HashMap::new(),
       secret_vars: Vec::new(),
       redact_params: true,
+      raw: false,
       dry: false,
     };
 
@@ -810,6 +868,7 @@ mod tests {
         vars: HashMap::new(),
         secret_vars: Vec::new(),
         redact_params: false,
+        raw: false,
         dry: false,
       },
       writer.clone(),
@@ -860,6 +919,7 @@ mod tests {
       vars: HashMap::new(),
       secret_vars: Vec::new(),
       redact_params: false,
+      raw: false,
       dry: false,
     };
 
@@ -912,6 +972,7 @@ mod tests {
       vars: HashMap::new(),
       secret_vars: Vec::new(),
       redact_params: false,
+      raw: false,
       dry: false,
     };
 
@@ -968,6 +1029,7 @@ mod tests {
       vars: HashMap::new(),
       secret_vars: Vec::new(),
       redact_params: false,
+      raw: false,
       dry: false,
     };
 
@@ -1070,6 +1132,7 @@ mod tests {
       vars: HashMap::new(),
       secret_vars: Vec::new(),
       redact_params: false,
+      raw: false,
       dry: false,
     };
 
@@ -1125,6 +1188,7 @@ mod tests {
       vars: HashMap::new(),
       secret_vars: Vec::new(),
       redact_params: false,
+      raw: false,
       dry: false,
     };
 
@@ -1176,6 +1240,7 @@ mod tests {
       vars: HashMap::new(),
       secret_vars: Vec::new(),
       redact_params: false,
+      raw: false,
       dry: false,
     };
 
@@ -1242,6 +1307,7 @@ mod tests {
         vars: HashMap::new(),
         secret_vars: Vec::new(),
         redact_params: false,
+        raw: false,
         dry: false,
       };
 
@@ -1309,6 +1375,7 @@ mod tests {
 
     let schema = PluginSchema {
       key: "key".to_owned(),
+      supports_raw: false,
       capabilities: Vec::new(),
       validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
     };
@@ -1370,6 +1437,7 @@ mod tests {
       vars: HashMap::new(),
       secret_vars: Vec::new(),
       redact_params: false,
+      raw: false,
       dry: false,
     };
     let cmd_json = serde_json::to_string(&cmd_command).unwrap() + "\n";

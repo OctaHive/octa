@@ -18,8 +18,9 @@ use crate::{
   error::{OctafileError, OctafileResult},
   include::IncludeInfo,
   monorepo::MonorepoConfig,
+  output::OutputConfig,
   parser::{self, location_error, Node},
-  task::{AllowedRun, Context, PluginCommand, PluginSchemas, SourceStrategies, Task, TaskSeed},
+  task::{AllowedRun, Context, PluginCommand, PluginSchemas, Silence, SourceStrategies, Task, TaskSeed},
   variable::Variable,
 };
 
@@ -200,6 +201,14 @@ pub struct Octafile {
   // Watch polling interval
   pub interval: Option<WatchInterval>,
 
+  // Runtime task output presentation
+  pub output: Option<OutputConfig>,
+
+  // Root defaults for task verbosity and terminal transport
+  pub quiet: Option<bool>,
+  pub silent: Option<Silence>,
+  pub raw: Option<bool>,
+
   // Plugin used by short task and command forms
   pub default_plugin: String,
 
@@ -249,6 +258,10 @@ impl fmt::Debug for Octafile {
       .field("failfast", &self.failfast)
       .field("concurrency", &self.concurrency)
       .field("interval", &self.interval)
+      .field("output", &self.output)
+      .field("quiet", &self.quiet)
+      .field("silent", &self.silent)
+      .field("raw", &self.raw)
       .field("default_plugin", &self.default_plugin)
       .field("includes", &self.includes)
       .field("monorepo", &self.monorepo)
@@ -259,7 +272,53 @@ impl fmt::Debug for Octafile {
   }
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PresentationConfig {
+  pub output: Option<OutputConfig>,
+  pub quiet: Option<bool>,
+}
+
 impl Octafile {
+  /// Reads root presentation settings before plugin schemas are available.
+  pub fn read_presentation_config(path: impl AsRef<Path>) -> OctafileResult<PresentationConfig> {
+    let path = path.as_ref();
+    let root = parser::parse_file(path)?;
+    let mapping = root
+      .into_mapping()
+      .ok_or_else(|| OctafileError::ParseError(path.display().to_string(), "Expected mapping".to_owned()))?;
+    let mut config = PresentationConfig::default();
+    for (key, value) in mapping {
+      match key.as_str() {
+        Some("output") => {
+          let value = value
+            .into_value()
+            .map_err(|error| OctafileError::ParseError(path.display().to_string(), error))?;
+          config.output = Some(
+            serde_yml::from_value(value)
+              .map_err(|error| OctafileError::ParseError(path.display().to_string(), error.to_string()))?,
+          );
+        },
+        Some("quiet") => {
+          let value = value
+            .into_value()
+            .map_err(|error| OctafileError::ParseError(path.display().to_string(), error))?;
+          config.quiet = Some(
+            serde_yml::from_value(value)
+              .map_err(|error| OctafileError::ParseError(path.display().to_string(), error.to_string()))?,
+          );
+        },
+        _ => {},
+      }
+    }
+    Ok(config)
+  }
+
+  /// Reads only the root output setting, before plugin schemas are available.
+  /// This lets the CLI select its renderer early enough to include startup diagnostics.
+  pub fn read_output_config(path: impl AsRef<Path>) -> OctafileResult<Option<OutputConfig>> {
+    Ok(Self::read_presentation_config(path)?.output)
+  }
+
   pub fn load(
     path: Option<PathBuf>,
     global: bool,
@@ -450,6 +509,18 @@ impl Octafile {
         },
         "interval" => {
           octafile.interval = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "output" => {
+          octafile.output = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "quiet" => {
+          octafile.quiet = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "silent" => {
+          octafile.silent = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
+        },
+        "raw" => {
+          octafile.raw = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
         },
         "default_plugin" => {},
         "includes" => {
@@ -1737,7 +1808,7 @@ tasks: {}
     assert_eq!(task.platforms, Some(vec!["linux".to_string(), "macos".to_string()]));
     assert_eq!(task.ignore_error, Some(true));
     assert!(task.deps.is_some());
-    assert_eq!(task.silent, Some(true));
+    assert_eq!(task.silent, Some(Silence::All));
   }
 
   #[test]
@@ -2098,10 +2169,10 @@ tasks: {}
       commands[0].options.condition,
       Some(shell_condition("test -f Cargo.toml"))
     );
-    assert_eq!(commands[0].options.silent, Some(true));
+    assert_eq!(commands[0].options.silent, Some(Silence::All));
     assert_eq!(commands[0].options.ignore_error, Some(true));
     assert_eq!(commands[1].options.condition, Some(shell_condition("test -d target")));
-    assert_eq!(commands[1].options.silent, Some(false));
+    assert_eq!(commands[1].options.silent, Some(Silence::None));
     assert_eq!(commands[1].options.ignore_error, Some(false));
   }
 
@@ -2181,7 +2252,7 @@ tasks: {}
     assert!(commands[1].options.deferred);
     assert_eq!(commands[1].options.platforms, Some(vec!["linux".to_string()]));
     assert_eq!(commands[1].options.condition, Some(shell_condition("test -d target")));
-    assert_eq!(commands[1].options.silent, Some(true));
+    assert_eq!(commands[1].options.silent, Some(Silence::All));
     assert_eq!(commands[1].options.ignore_error, Some(true));
     assert!(matches!(
       &commands[1].payload,
@@ -2369,7 +2440,7 @@ tasks: {}
     assert_eq!(task.ignore_error, Some(true));
     assert!(task.deps.is_some());
     assert!(task.run.is_some());
-    assert_eq!(task.silent, Some(true));
+    assert_eq!(task.silent, Some(Silence::All));
     assert!(task.execute_mode.is_some());
     assert_eq!(task.timeout.unwrap().duration(), std::time::Duration::from_secs(120));
     assert!(task.sources.is_some());

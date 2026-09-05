@@ -114,6 +114,40 @@ async fn test_build_simple_task() -> ExecutorResult<()> {
 }
 
 #[tokio::test]
+async fn interactive_task_body_shares_one_raw_exclusive_session() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let content = r#"
+      version: 1
+      tasks:
+        terminal:
+          interactive: true
+          cmds:
+            - echo one
+            - echo two
+  "#;
+  let octafile_path = temp_dir.path().join("Octafile.yml");
+  fs::write(&octafile_path, content)?;
+
+  let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_string()], "shell")?;
+  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+  let plan = TaskGraphBuilder::new(plugin_manager)?
+    .build(octafile, "terminal", false, vec![])
+    .await?;
+
+  let commands = plan
+    .nodes()
+    .iter()
+    .filter(|node| !node.is_internal())
+    .collect::<Vec<_>>();
+  assert_eq!(commands.len(), 2);
+  assert!(commands.iter().all(|node| node.raw));
+  let session = commands[0].interactive_session().unwrap();
+  assert!(commands.iter().all(|node| node.interactive_session() == Some(session)));
+  Ok(())
+}
+
+#[tokio::test]
 async fn command_nodes_share_an_ordered_invocation_scope() -> ExecutorResult<()> {
   let temp_dir = TempDir::new().unwrap();
   let content = r#"
@@ -211,7 +245,7 @@ tasks:
     plugin_manager.clone(),
     plan,
     crate::executor::ExecutorConfig {
-      silent: false,
+      emit_run_events: true,
       console,
       ..crate::executor::ExecutorConfig::default()
     },
@@ -343,17 +377,17 @@ async fn test_command_options_inherit_and_override_task_defaults() -> ExecutorRe
 
   let inherited = dag.nodes().iter().find(|task| task.name == "echo inherited").unwrap();
   assert!(inherited.conditions().is_empty());
-  assert!(inherited.silent);
+  assert_eq!(inherited.silence, octa_octafile::Silence::All);
   assert!(inherited.ignore_errors);
 
   let overridden = dag.nodes().iter().find(|task| task.name == "echo overridden").unwrap();
   assert_eq!(overridden.conditions(), ["command-condition"]);
-  assert!(!overridden.silent);
+  assert_eq!(overridden.silence, octa_octafile::Silence::None);
   assert!(!overridden.ignore_errors);
 
   let referenced = dag.nodes().iter().find(|task| task.name == "called").unwrap();
   assert!(referenced.conditions().is_empty());
-  assert!(!referenced.silent);
+  assert_eq!(referenced.silence, octa_octafile::Silence::None);
   assert!(!referenced.ignore_errors);
 
   let gates = dag

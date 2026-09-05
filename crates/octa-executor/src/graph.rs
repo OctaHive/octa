@@ -20,16 +20,42 @@ impl TaskGraphBuilder {
     mut request: InvocationRequest,
     run_parallel: Option<bool>,
   ) -> ExecutorResult<Option<ArcNode>> {
-    let scope = self
-      .scope_allocator
-      .scope_with_prefix(command.name.clone(), command.task.prefix.clone());
+    let silence = self
+      .force_silence
+      .or(command.task.silent)
+      .or(command.octafile.silent)
+      .unwrap_or_default();
+    let static_prefix = command
+      .task
+      .prefix
+      .as_ref()
+      .filter(|prefix| !prefix.contains("{{"))
+      .cloned();
+    let scope = self.scope_allocator.scope_with_options(
+      command.name.clone(),
+      static_prefix,
+      silence.hides_stdout(),
+      silence.hides_stderr(),
+    );
+    scope.set_render_mode(
+      command
+        .task
+        .presentation
+        .as_ref()
+        .and_then(|presentation| presentation.output)
+        .map(task_output_mode),
+    );
     self
       .scopes
       .lock()
       .map_err(|error| ExecutorError::LockError(error.to_string()))?
       .push(scope.clone());
     request.context.output_scope = Some(scope);
-    let prepared = self.prepare_invocation(dag, command, request).await?;
+    let interactive = command.task.interactive.unwrap_or(false);
+    let mut prepared = self.prepare_invocation(dag, command, request).await?;
+    if interactive && prepared.context.interactive_session.is_none() {
+      prepared.context.interactive_session = Some(Uuid::new_v4().to_string());
+    }
     self
       .build_task_body(dag, command, prepared.context, prepared.parents, run_parallel)
       .await
@@ -202,6 +228,7 @@ impl TaskGraphBuilder {
       ))
       .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
       .output_scope(context.output_scope.clone())
+      .interactive_session(context.interactive_session.clone())
       .silent(Some(true))
       .failfast(command.task.failfast.or(command.octafile.failfast))
       .action(NodeAction::FreshnessCheck {
@@ -238,6 +265,7 @@ impl TaskGraphBuilder {
       .dep_name(command.name.clone())
       .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
       .output_scope(context.output_scope.clone())
+      .interactive_session(context.interactive_session.clone())
       .silent(Some(true))
       .failfast(command.task.failfast.or(command.octafile.failfast))
       .action(NodeAction::FreshnessCommit(state))
@@ -378,6 +406,9 @@ impl TaskGraphBuilder {
       variable_resolver: self.variable_resolver.clone(),
       source_strategies: self.source_strategies.clone(),
       scope_allocator: self.scope_allocator.clone(),
+      force_quiet: self.force_quiet,
+      force_silence: self.force_silence,
+      force_raw: self.force_raw,
       scopes: Mutex::new(Vec::new()),
       os_arch: self.os_arch.clone(),
       os_type: self.os_type.clone(),
@@ -450,7 +481,19 @@ impl TaskGraphBuilder {
       .preconditions(cmd.task.preconditions.clone())
       .timeout(cmd.task.timeout)
       .output_scope(context.output_scope.clone())
-      .silent(cmd.task.silent)
+      .prefix_template(cmd.task.prefix.clone())
+      .interactive_session(context.interactive_session.clone())
+      .silent(self.force_silence.or(cmd.task.silent).or(cmd.octafile.silent))
+      .quiet(if self.force_quiet {
+        Some(true)
+      } else {
+        cmd.task.quiet.or(cmd.octafile.quiet)
+      })
+      .raw(if self.force_raw || context.interactive_session.is_some() {
+        Some(true)
+      } else {
+        cmd.task.raw.or(cmd.octafile.raw)
+      })
       .failfast(cmd.task.failfast.or(cmd.octafile.failfast))
       .ignore_errors(cmd.task.ignore_error)
       .run_mode(self.task_run_mode(cmd))
@@ -489,6 +532,7 @@ impl TaskGraphBuilder {
       ))
       .freshness_runtime(FreshnessRuntime::guarded(request.context.freshness.clone()))
       .output_scope(request.context.output_scope.clone())
+      .interactive_session(request.context.interactive_session.clone())
       .timeout(command.task.timeout)
       .silent(Some(true))
       .failfast(command.task.failfast.or(command.octafile.failfast))
@@ -619,15 +663,28 @@ impl TaskGraphBuilder {
     let mut terminals = Vec::new();
 
     for dep in deps {
-      let (dep_name, vars, envs, timeout) = match dep {
-        Deps::Simple(name) => (name.as_str(), None, None, None),
-        Deps::Complex(dep) => (dep.task.as_str(), dep.vars.clone(), dep.envs.clone(), dep.timeout),
+      let (dep_name, vars, envs, timeout, quiet, silent, raw, interactive) = match dep {
+        Deps::Simple(name) => (name.as_str(), None, None, None, None, None, None, None),
+        Deps::Complex(dep) => (
+          dep.task.as_str(),
+          dep.vars.clone(),
+          dep.envs.clone(),
+          dep.timeout,
+          dep.quiet,
+          dep.silent,
+          dep.raw,
+          dep.interactive,
+        ),
       };
       let mut dependencies = self.find_and_filter_commands(&cmd.octafile, dep_name)?;
       dependencies = self.filter_command_by_platform(dependencies);
 
       for mut dependency in dependencies {
         dependency.task.timeout = timeout.or(dependency.task.timeout);
+        dependency.task.quiet = quiet.or(dependency.task.quiet);
+        dependency.task.silent = silent.or(dependency.task.silent);
+        dependency.task.raw = raw.or(dependency.task.raw);
+        dependency.task.interactive = interactive.or(dependency.task.interactive);
         Self::inherit_failfast(cmd, &mut dependency);
         let task_name = Self::generate_unique_task_name(dep_name, &mut deps_map);
         let dependency_context = scope.nested(task_name, vars.clone(), envs.clone());
@@ -808,7 +865,9 @@ impl TaskGraphBuilder {
   /// Applies command metadata while retaining defaults from its containing and referenced tasks.
   fn apply_command_options(task: &mut Task, containing_task: &Task, options: &CommandOptions) {
     task.timeout = options.timeout.or(containing_task.timeout).or(task.timeout);
+    task.quiet = options.quiet.or(containing_task.quiet).or(task.quiet);
     task.silent = options.silent.or(containing_task.silent).or(task.silent);
+    task.raw = options.raw.or(containing_task.raw).or(task.raw);
     task.ignore_error = options
       .ignore_error
       .or(containing_task.ignore_error)
@@ -846,5 +905,17 @@ impl TaskGraphBuilder {
     }
 
     Ok(())
+  }
+}
+
+fn task_output_mode(mode: TaskOutputMode) -> RenderMode {
+  match mode {
+    TaskOutputMode::Interleaved => RenderMode::Interleaved,
+    TaskOutputMode::Group => RenderMode::Group,
+    TaskOutputMode::Prefixed => RenderMode::Prefixed,
+    TaskOutputMode::OnError => RenderMode::OnError,
+    TaskOutputMode::KeepOrder => RenderMode::KeepOrder,
+    TaskOutputMode::Replacing => RenderMode::Replacing,
+    TaskOutputMode::Timed => RenderMode::Timed,
   }
 }

@@ -886,7 +886,8 @@ Overrides variables for the invoked task.
 Overrides environment variables for the invoked task.
 
 ##### silent
-Disables output of the task’s commands to the standard output.
+Disables both output streams for the invoked task. Use `silent: stdout` or `silent: stderr` to
+hide only one stream. `quiet: true` hides Octa's own task messages without hiding command output.
 
 ```yaml
 version: 1
@@ -907,49 +908,185 @@ tasks:
 
 # Output modes
 
-Octa streams task output as it arrives by default. When concurrently running tasks make that
-output difficult to read, `group` mode buffers each task invocation and prints its complete output
-as one contiguous block after the task finishes:
+Octa routes command output, executor diagnostics, progress, and machine-readable events through one
+ordered output pipeline. Output style and visibility are separate choices: `output` decides how
+records are presented, `quiet` hides Octa's informational messages, and `silent` hides command
+streams.
+
+## Selecting a mode
+
+Set the mode on the command line, with `TASK_OUTPUT`, or at the Octafile root:
 
 ```bash
 octa --parallel --output group build test
+TASK_OUTPUT=keep-order octa --parallel build test
 ```
 
-Use `--output interleaved` to select the default streaming behavior explicitly. Grouping applies
-only to task-scoped output; run-level diagnostics remain visible immediately.
-
-`prefixed` mode keeps output live and identifies every command line with its task name:
-
-```bash
-octa --parallel --output prefixed build test
+```yaml
+version: 1
+output: prefixed
+tasks: {}
 ```
 
-Use `prefix` on a task when a shorter or more meaningful label is needed:
+Selection precedence is:
+
+1. `--output`
+2. `TASK_OUTPUT`
+3. `tasks.<name>.presentation.output`
+4. Root `output`
+5. The adaptive default
+
+An explicit CLI or environment mode applies to every task. A task-specific presentation can
+override the root mode, but not a CLI/environment override. `json` is deliberately global-only so
+human-readable text can never be mixed into a JSON Lines stream.
+
+When no mode is configured, Octa examines the built execution graph. It uses `prefixed` if work can
+run concurrently and `interleaved` for a linear plan. `--parallel` also selects the parallel
+default, while a concurrency limit of one keeps output interleaved.
+
+## Mode reference
+
+| Mode | Behavior | Best suited for |
+| --- | --- | --- |
+| `interleaved` (`interleave`) | Writes stdout and stderr as records arrive, without prefixes | Sequential work or direct log consumption |
+| `prefixed` (`prefix`) | Streams each complete line as `[prefix] line` | Parallel work where full logs must remain live |
+| `group` | Buffers each task invocation and prints it as one contiguous block | Readable CI logs and non-interleaved failures |
+| `on-error` | Buffers task output, discards it on success, and prints it on failure or cancellation | Quiet successful CI runs |
+| `keep-order` | Streams the first declared unfinished task; buffers later tasks and replays them in declaration order | Deterministic parallel logs with one live task |
+| `replacing` | Maintains one updating progress row per task and leaves a final status with elapsed time | Interactive local runs |
+| `timed` | Prints a stdout line only if it remains the current line for at least one second; stderr stays live | Hiding short-lived progress chatter |
+| `json` (`jsonl`) | Emits every structured console entry as one JSON object per line | Automation, log ingestion, and editor integrations |
+
+`group`, `on-error`, and `keep-order` use a bounded in-memory spool and spill large buffered output
+to a temporary file. Raw/PTY bytes always bypass buffering because delayed terminal traffic would
+break interactive programs.
+
+## Group templates
+
+The detailed root form configures messages surrounding each grouped task:
+
+```yaml
+output:
+  group:
+    begin: '::group::{{.TASK}}'
+    end: '::endgroup::'
+    error_only: false
+```
+
+`begin` and `end` are optional. `error_only: true` makes `group` behave like grouped-on-error output:
+successful buffers are discarded. Templates can use `TASK`, `PREFIX`, and resolved task variables.
+They are validated before execution.
+
+The equivalent CLI/environment controls are:
+
+| CLI | Environment |
+| --- | --- |
+| `--output-group-begin <template>` | `TASK_OUTPUT_GROUP_BEGIN` |
+| `--output-group-end <template>` | `TASK_OUTPUT_GROUP_END` |
+| `--output-group-error-only <bool>` | `TASK_OUTPUT_GROUP_ERROR_ONLY` |
+
+These options require the effective global output mode to be `group`.
+
+## Prefixes and task-specific presentation
+
+By default, prefixed modes use the task invocation name. `prefix` accepts a template and can use
+`TASK` plus resolved task variables:
 
 ```yaml
 tasks:
   deploy:
-    prefix: production
+    prefix: '{{.TASK}}-{{.ENVIRONMENT}}'
+    vars:
+      ENVIRONMENT: production
     shell: ./deploy.sh
 ```
 
-The command output is rendered as `[production] ...`. Raw interactive output is passed through
-unchanged so prefixes cannot corrupt terminal protocols.
+This renders command output as `[deploy-production] ...`. Prefixes apply only to line-oriented
+output. Raw byte streams pass through unchanged.
 
-Use `on-error` when successful task output should stay quiet but failed or cancelled task output
-must remain available for diagnostics:
+Use `presentation.output` for a task-specific human-readable style. The extra `presentation` level
+avoids colliding with the task's artifact `output` list:
 
-```bash
-octa --output on-error test
+```yaml
+tasks:
+  build:
+    presentation:
+      output: replacing
+    output: [dist/app]
+    shell: cargo build
 ```
 
-This mode buffers line-oriented output per task invocation and discards it after a successful run.
-Raw interactive output remains live because delaying it could break the terminal protocol.
+Task presentation accepts `interleaved`/`interleave`, `group`, `prefixed`/`prefix`, `on-error`,
+`keep-order`, `replacing`, and `timed`. JSON remains global so text and JSON cannot be mixed.
+
+## JSON Lines
+
+Select `json` or `jsonl` to serialize the same records consumed by terminal renderers:
+
+```bash
+octa --output jsonl build | jq -c 'select(.category == "execution")'
+```
+
+Each entry contains:
+
+- `schema_version`: currently `1`;
+- `sequence`: a monotonically increasing number assigned by the single output writer;
+- `timestamp`: an RFC 3339 timestamp;
+- `category`: `execution`, `diagnostic`, or `document`;
+- `data`: the category-specific payload.
+
+Execution records include run and scope lifecycle events plus stdout/stderr payloads. Byte payloads
+are base64 strings. Diagnostics can carry `file`, `line`, and `column`. All records, including
+logical stderr, are written as JSONL to process stdout. GitHub workflow commands are disabled in
+this mode. JSON output cannot be combined with raw/PTY mode because doing so would change terminal
+semantics and corrupt the machine-readable stream.
+
+Plugin output is bounded independently of the selected renderer. Each command has a bounded
+response mailbox, capture spills to disk after 1 MiB, and stdout plus stderr may contribute at most
+64 MiB to the task result. Exceeding either runtime bound fails and cancels only that command rather
+than blocking other commands sharing the plugin connection.
+
+## Quiet and silent
+
+| Setting | Octa informational messages | Command stdout | Command stderr |
+| --- | --- | --- | --- |
+| default | shown | shown | shown |
+| `quiet: true` | hidden | shown | shown |
+| `silent: true` | unchanged | hidden | hidden |
+| `silent: stdout` | unchanged | hidden | shown |
+| `silent: stderr` | unchanged | shown | hidden |
+
+`quiet` and `silent` compose with every output mode. They are accepted at root, task, command, and
+extended task-reference/dependency levels where applicable. CLI/environment overrides are
+`--quiet`/`TASK_QUIET` and `--silent[=stdout|stderr]`/`TASK_SILENT`.
+
+For example, this keeps prefixed compiler output but hides Octa's own lifecycle messages:
+
+```bash
+octa --output prefixed --quiet build
+```
+
+## Raw/PTY and uninterrupted tasks
+
+Set `raw: true` on a task or command, or use `--raw`/`TASK_RAW`, for an interactive program. Octa
+asks the selected plugin for raw execution, forwards stdin, terminal resize, and end-of-input, and
+passes byte output without line processing. The built-in shell plugin provides a real PTY. Plugins
+must advertise `supports_raw`; otherwise Octa rejects the task before execution.
+
+A raw command holds exclusive command and output locks for its lifetime. Global raw mode also
+disables parallel top-level scheduling. Raw output bypasses prefixes, redrawing, and buffering.
+
+Set `interactive: true` on a task when its complete command body must have uninterrupted terminal
+ownership. Interactive tasks use the same PTY transport as raw commands, but keep a separate
+task-runtime exclusive lock from the first body node through the last; unrelated tasks cannot run
+between commands. Dependencies run before this lock is acquired, while task references inside the
+command body inherit the interactive session.
 
 ## CI annotations
 
-When `GITHUB_ACTIONS=true`, Octa automatically emits a GitHub Actions error annotation if the
-invocation fails. Detection can also be controlled explicitly:
+When `GITHUB_ACTIONS=true`, Octa automatically emits GitHub Actions annotations for task failures.
+Task annotations use the task name in their title and include `file`, `line`, and `col` properties
+when the diagnostic provides source coordinates. Detection can also be controlled explicitly:
 
 ```bash
 octa --ci github test
@@ -1154,7 +1291,8 @@ version, which allows you to specify additional parameters:
 Overrides variables for the depended task.
 
 ##### silent
-Disables output of the task’s commands to the standard output.
+Disables both output streams for the depended task. `stdout` and `stderr` select one stream;
+`quiet` and `raw` can also be overridden on an extended dependency.
 
 ```yaml
 version: 1

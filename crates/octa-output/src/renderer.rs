@@ -1,16 +1,61 @@
 use std::io;
 
-use super::ConsoleEntry;
+use super::{ConsoleEntry, ConsoleScope};
 
 /// Presents structured output records in a concrete format.
 pub trait ConsoleRenderer: Send + 'static {
   /// This method runs on the dedicated output thread and must not call back into `Console`.
   fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()>;
+
+  /// Advances time-based presentation without moving rendering off the output thread.
+  fn tick(&mut self) -> io::Result<()> {
+    Ok(())
+  }
+
+  /// Updates an adaptive renderer after the execution plan has been built.
+  fn set_parallel(&mut self, _parallel: bool) -> io::Result<()> {
+    Ok(())
+  }
+
+  /// Suspends terminal UI before an exclusive PTY session starts.
+  fn begin_raw(&mut self, _scope: &ConsoleScope) -> io::Result<()> {
+    Ok(())
+  }
+
+  /// Restores terminal UI after an exclusive PTY session ends.
+  fn end_raw(&mut self, _scope: &ConsoleScope) -> io::Result<()> {
+    Ok(())
+  }
+
+  /// Whether this renderer can preserve an interactive byte-oriented terminal session.
+  fn supports_raw_terminal(&self) -> bool {
+    true
+  }
 }
 
 impl<R: ConsoleRenderer + ?Sized> ConsoleRenderer for Box<R> {
   fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
     (**self).render(entry)
+  }
+
+  fn tick(&mut self) -> io::Result<()> {
+    (**self).tick()
+  }
+
+  fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
+    (**self).set_parallel(parallel)
+  }
+
+  fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    (**self).begin_raw(scope)
+  }
+
+  fn end_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    (**self).end_raw(scope)
+  }
+
+  fn supports_raw_terminal(&self) -> bool {
+    (**self).supports_raw_terminal()
   }
 }
 

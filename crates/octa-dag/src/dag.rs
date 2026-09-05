@@ -73,6 +73,39 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
     &self.nodes
   }
 
+  /// Returns whether every topological step has at most one runnable node.
+  pub fn is_linear(&self) -> DAGResult<bool> {
+    let mut in_degree = self.calculate_in_degrees();
+    let mut ready = self
+      .nodes
+      .iter()
+      .filter(|node| in_degree[&node.id()] == 0)
+      .map(|node| node.id())
+      .collect::<Vec<_>>();
+    let mut visited = 0;
+
+    while !ready.is_empty() {
+      if ready.len() > 1 {
+        return Ok(false);
+      }
+      let node = ready.pop().expect("ready contains exactly one node");
+      visited += 1;
+      if let Some(dependants) = self.edges.get(&node) {
+        for dependant in dependants {
+          let count = in_degree
+            .get_mut(&dependant.id())
+            .ok_or_else(|| DAGError::NodeNotFound(dependant.id()))?;
+          *count -= 1;
+          if *count == 0 {
+            ready.push(dependant.id());
+          }
+        }
+      }
+    }
+
+    Ok(visited == self.nodes.len())
+  }
+
   /// Detects cycles in the graph
   pub fn has_cycle(&self) -> DAGResult<bool> {
     let mut in_degree = self.calculate_in_degrees();
@@ -339,7 +372,23 @@ mod tests {
 
     assert!(!dag.has_cycle().unwrap());
     assert_eq!(dag.node_count(), 3);
+    assert!(!dag.is_linear().unwrap());
     assert!(dag.edges()[&node_c.id()].is_empty());
+  }
+
+  #[test]
+  fn test_linear_graph_detection() {
+    let mut dag = DAG::new();
+    let node_a = TestNode::new("A");
+    let node_b = TestNode::new("B");
+    let node_c = TestNode::new("C");
+    dag.add_node(node_a.clone());
+    dag.add_node(node_b.clone());
+    dag.add_node(node_c.clone());
+    dag.add_dependency(&node_a, &node_b).unwrap();
+    dag.add_dependency(&node_b, &node_c).unwrap();
+
+    assert!(dag.is_linear().unwrap());
   }
 
   #[test]

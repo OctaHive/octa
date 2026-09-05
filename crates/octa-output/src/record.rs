@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{CliDocument, ConsoleScope};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsoleStream {
   Stdout,
@@ -11,14 +11,37 @@ pub enum ConsoleStream {
 }
 
 /// Command output is either a complete protocol line or an unchanged byte chunk.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "format", content = "data", rename_all = "snake_case")]
 pub enum ConsolePayload {
   Line(String),
-  Bytes(Vec<u8>),
+  Bytes(#[serde(with = "base64_bytes")] Vec<u8>),
+  /// Bytes belonging to an exclusive interactive terminal session.
+  RawBytes(#[serde(with = "base64_bytes")] Vec<u8>),
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+mod base64_bytes {
+  use base64::{engine::general_purpose::STANDARD, Engine as _};
+  use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+  pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    serializer.serialize_str(&STANDARD.encode(bytes))
+  }
+
+  pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    STANDARD
+      .decode(String::deserialize(deserializer)?)
+      .map_err(D::Error::custom)
+  }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsoleStatus {
   // Declaration order is aggregation priority: performed work wins over a skip,
@@ -29,7 +52,7 @@ pub enum ConsoleStatus {
   Failed,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsoleLevel {
   Trace,
@@ -40,7 +63,7 @@ pub enum ConsoleLevel {
 }
 
 /// Runtime state transitions and command output produced while executing a plan.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecutionEvent {
   RunStarted {
@@ -77,16 +100,27 @@ pub enum ExecutionEvent {
 }
 
 /// Human-oriented diagnostic enriched with optional execution context.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConsoleDiagnostic {
   pub run_id: Option<u64>,
   pub scope: Option<ConsoleScope>,
   pub level: ConsoleLevel,
   pub message: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub location: Option<SourceLocation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SourceLocation {
+  pub file: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub line: Option<u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub column: Option<u64>,
 }
 
 /// Structured payload carried inside a timestamped [`ConsoleEntry`].
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "category", content = "data", rename_all = "snake_case")]
 pub enum ConsoleRecord {
   Execution(ExecutionEvent),
@@ -95,8 +129,10 @@ pub enum ConsoleRecord {
 }
 
 /// A timestamped record delivered to renderers in global output order.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConsoleEntry {
+  schema_version: u16,
+  sequence: u64,
   timestamp: DateTime<Utc>,
   #[serde(flatten)]
   record: ConsoleRecord,
@@ -105,6 +141,8 @@ pub struct ConsoleEntry {
 impl ConsoleEntry {
   pub(crate) fn new(record: ConsoleRecord) -> Self {
     Self {
+      schema_version: 1,
+      sequence: 0,
       timestamp: Utc::now(),
       record,
     }
@@ -114,12 +152,26 @@ impl ConsoleEntry {
     &self.timestamp
   }
 
+  pub fn schema_version(&self) -> u16 {
+    self.schema_version
+  }
+
+  pub fn sequence(&self) -> u64 {
+    self.sequence
+  }
+
+  pub(crate) fn assign_sequence(&mut self, sequence: u64) {
+    self.sequence = sequence;
+  }
+
   pub fn record(&self) -> &ConsoleRecord {
     &self.record
   }
 
   pub(crate) fn with_record(&self, record: ConsoleRecord) -> Self {
     Self {
+      schema_version: self.schema_version,
+      sequence: self.sequence,
       timestamp: self.timestamp,
       record,
     }
@@ -144,6 +196,8 @@ mod tests {
     .unwrap();
 
     assert!(value["timestamp"].as_str().is_some());
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["sequence"], 0);
     assert_eq!(value["category"], "execution");
     assert_eq!(value["data"]["type"], "output");
     assert_eq!(value["data"]["run_id"], 42);
@@ -175,6 +229,7 @@ mod tests {
       scope: None,
       level: ConsoleLevel::Error,
       message: "invalid configuration".to_owned(),
+      location: None,
     }))
     .unwrap();
     assert_eq!(value["category"], "diagnostic");

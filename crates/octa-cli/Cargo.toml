@@ -41,3 +41,4 @@ tempfile = "3.27"
 pretty_assertions = "1.4"
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
+serde_json = { workspace = true }

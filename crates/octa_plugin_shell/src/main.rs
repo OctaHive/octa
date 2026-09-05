@@ -1,17 +1,21 @@
 use std::collections::HashMap;
 use std::env;
+use std::io::{Read, Write};
 use std::process::ExitCode;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use async_trait::async_trait;
 use octa_plugin::logger::Logger;
-use octa_plugin::{protocol::PluginResponse, serve_plugin, Plugin};
+use octa_plugin::{protocol::PluginResponse, serve_plugin, Plugin, PluginCommand, PluginInput};
 use octa_plugin::{PluginSchema, SHELL_CAPABILITY};
+use portable_pty::{native_pty_system, PtySize};
+#[cfg(test)]
 use serde_json::Value;
 use tera::{Context as TeraContext, Tera};
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::{
   io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
   sync::{mpsc, Mutex},
@@ -25,6 +29,197 @@ struct ShellPlugin {
   coreutils: coreutils::Coreutils,
 }
 
+struct PtyChildGuard {
+  child: Arc<StdMutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+  process_group: Option<i32>,
+  running: bool,
+}
+
+impl PtyChildGuard {
+  fn new(child: Box<dyn portable_pty::Child + Send + Sync>, process_group: Option<i32>) -> Self {
+    Self {
+      child: Arc::new(StdMutex::new(child)),
+      process_group,
+      running: true,
+    }
+  }
+
+  fn finished(&mut self) {
+    self.running = false;
+  }
+
+  fn terminate(&self) {
+    #[cfg(unix)]
+    if let Some(process_group) = self.process_group {
+      use nix::{
+        sys::signal::{kill, Signal},
+        unistd::Pid,
+      };
+      let _ = kill(Pid::from_raw(-process_group), Signal::SIGTERM);
+    }
+    let _ = self.child.lock().unwrap().kill();
+  }
+}
+
+impl Drop for PtyChildGuard {
+  fn drop(&mut self) {
+    if self.running {
+      self.terminate();
+    }
+  }
+}
+
+async fn forward_output(
+  stream: impl AsyncRead + Unpin,
+  id: String,
+  stdout: bool,
+  tx: mpsc::Sender<String>,
+  logger: Arc<impl Logger>,
+  cancel_token: CancellationToken,
+) {
+  let mut reader = BufReader::new(stream);
+  let mut buffer = String::new();
+  loop {
+    let read = tokio::select! {
+      read = reader.read_line(&mut buffer) => read,
+      _ = cancel_token.cancelled() => break,
+    };
+    match read {
+      Ok(0) | Err(_) => break,
+      Ok(_) => {
+        let response = if stdout {
+          PluginResponse::Stdout {
+            id: id.clone(),
+            line: buffer.clone(),
+          }
+        } else {
+          PluginResponse::Stderr {
+            id: id.clone(),
+            line: buffer.clone(),
+          }
+        };
+        let response_json = serde_json::to_string(&response).unwrap() + "\n";
+        let _ = tx.send(response_json.clone()).await;
+        let _ = logger.log(&response_json);
+        buffer.clear();
+      },
+    }
+  }
+}
+
+struct RawPtyCommand {
+  id: String,
+  command: String,
+  dir: PathBuf,
+  envs: HashMap<String, String>,
+  input: mpsc::UnboundedReceiver<PluginInput>,
+}
+
+async fn execute_raw_pty(
+  request: RawPtyCommand,
+  coreutils_path: &std::path::Path,
+  writer: Arc<Mutex<impl AsyncWrite + Send + 'static + Unpin>>,
+  cancel_token: CancellationToken,
+) -> anyhow::Result<()> {
+  let RawPtyCommand {
+    id,
+    command,
+    dir,
+    envs,
+    mut input,
+  } = request;
+  let size = PtySize::default();
+  let pair = native_pty_system().openpty(size)?;
+  #[cfg(unix)]
+  let process_group = pair.master.process_group_leader();
+  #[cfg(not(unix))]
+  let process_group = None;
+  let mut child = PtyChildGuard::new(
+    pair
+      .slave
+      .spawn_command(brush::pty_command(&command, &dir, envs, coreutils_path)?)?,
+    process_group,
+  );
+  drop(pair.slave);
+
+  let mut reader = pair.master.try_clone_reader()?;
+  let mut pty_writer = Some(Arc::new(StdMutex::new(pair.master.take_writer()?)));
+  let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(32);
+  let reader_task = tokio::task::spawn_blocking(move || {
+    let mut buffer = vec![0; 8192];
+    loop {
+      match reader.read(&mut buffer) {
+        Ok(0) | Err(_) => break,
+        Ok(count) if output_tx.blocking_send(buffer[..count].to_vec()).is_err() => break,
+        Ok(_) => {},
+      }
+    }
+  });
+
+  let mut code = None;
+  let mut output_closed = false;
+  while code.is_none() || !output_closed {
+    tokio::select! {
+      output = output_rx.recv(), if !output_closed => {
+        match output {
+          Some(bytes) => {
+            let response = PluginResponse::StdoutBytes { id: id.clone(), bytes };
+            let json = serde_json::to_string(&response)? + "\n";
+            let mut writer = writer.lock().await;
+            writer.write_all(json.as_bytes()).await?;
+            writer.flush().await?;
+          },
+          None => output_closed = true,
+        }
+      },
+      terminal_input = input.recv(), if code.is_none() => {
+        match terminal_input {
+          Some(PluginInput::Bytes(bytes)) => {
+            if let Some(pty_writer) = &pty_writer {
+              let pty_writer = pty_writer.clone();
+              tokio::task::spawn_blocking(move || {
+                let mut writer = pty_writer.lock().unwrap();
+                writer.write_all(&bytes)?;
+                writer.flush()
+              }).await??;
+            }
+          },
+          Some(PluginInput::Resize { rows, cols }) => pair.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+          })?,
+          Some(PluginInput::Close) | None => pty_writer = None,
+        }
+      },
+      _ = cancel_token.cancelled(), if code.is_none() => {
+        child.terminate();
+        code = Some(-1);
+      },
+      _ = tokio::time::sleep(Duration::from_millis(20)), if code.is_none() => {
+        let status = child.child.lock().unwrap().try_wait()?;
+        if let Some(status) = status {
+          code = Some(status.exit_code() as i32);
+          child.finished();
+          pty_writer = None;
+        }
+      },
+    }
+  }
+
+  let _ = reader_task.await;
+  let response = PluginResponse::ExitStatus {
+    id,
+    code: code.unwrap_or(-1),
+  };
+  let json = serde_json::to_string(&response)? + "\n";
+  let mut writer = writer.lock().await;
+  writer.write_all(json.as_bytes()).await?;
+  writer.flush().await?;
+  Ok(())
+}
+
 impl ShellPlugin {
   fn new() -> anyhow::Result<Self> {
     Ok(Self {
@@ -36,6 +231,7 @@ impl ShellPlugin {
 fn plugin_schema() -> PluginSchema {
   PluginSchema {
     key: "shell".to_owned(),
+    supports_raw: true,
     capabilities: vec![SHELL_CAPABILITY.to_owned()],
     validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
   }
@@ -50,17 +246,22 @@ impl Plugin for ShellPlugin {
 
   async fn execute_command(
     &self,
-    id: String,
-    dry: bool,
-    command: String,
-    _args: Vec<String>,
-    dir: PathBuf,
-    vars: HashMap<String, Value>,
-    envs: HashMap<String, String>,
+    request: PluginCommand,
     writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
     logger: Arc<impl Logger>,
     cancel_token: CancellationToken,
   ) -> anyhow::Result<()> {
+    let PluginCommand {
+      id,
+      dry,
+      command,
+      args: _,
+      dir,
+      vars,
+      envs,
+      raw,
+      input,
+    } = request;
     let mut tera = Tera::default();
     let template_name = format!("template_{}", id);
 
@@ -87,6 +288,22 @@ impl Plugin for ShellPlugin {
       writer.flush().await?;
 
       return Ok(());
+    }
+
+    if raw {
+      return execute_raw_pty(
+        RawPtyCommand {
+          id,
+          command: result,
+          dir,
+          envs,
+          input,
+        },
+        self.coreutils.path(),
+        writer,
+        cancel_token,
+      )
+      .await;
     }
 
     let (tx, mut rx): (mpsc::Sender<String>, mpsc::Receiver<String>) = mpsc::channel(100);
@@ -119,34 +336,7 @@ impl Plugin for ShellPlugin {
       let logger = logger.clone();
       let cancel_token = cancel_token.clone();
       tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout);
-        let mut buffer = String::new();
-
-        loop {
-          tokio::select! {
-            result = reader.read_line(&mut buffer) => {
-              match result {
-                Ok(0) => break,
-                Ok(_) => {
-                  if !buffer.is_empty() {
-                    let response = PluginResponse::Stdout {
-                      id: id.clone(),
-                      line: buffer.clone(),
-                    };
-                    let response_json = serde_json::to_string(&response).unwrap() + "\n";
-                    let _ = tx_stdout.send(response_json.clone()).await;
-                    let _ = logger.log(&response_json.to_string());
-                  }
-                  buffer.clear();
-                }
-                Err(_) => break,
-              }
-            }
-            _ = cancel_token.cancelled() => {
-              break;
-            }
-          }
-        }
+        forward_output(stdout, id, true, tx_stdout, logger, cancel_token).await;
         let _ = tx_done_stdout.send(()).await;
       })
     };
@@ -156,34 +346,7 @@ impl Plugin for ShellPlugin {
       let logger = logger.clone();
       let cancel_token = cancel_token.clone();
       tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
-        let mut buffer = String::new();
-
-        loop {
-          tokio::select! {
-            result = reader.read_line(&mut buffer) => {
-              match result {
-                Ok(0) => break,
-                Ok(_) => {
-                  if !buffer.is_empty() {
-                    let response = PluginResponse::Stderr {
-                      id: id.clone(),
-                      line: buffer.clone(),
-                    };
-                    let response_json = serde_json::to_string(&response).unwrap() + "\n";
-                    let _ = tx_stderr.send(response_json.clone()).await;
-                    let _ = logger.log(&response_json.to_string());
-                  }
-                  buffer.clear();
-                }
-                Err(_) => break,
-              }
-            }
-            _ = cancel_token.cancelled() => {
-              break;
-            }
-          }
-        }
+        forward_output(stderr, id, false, tx_stderr, logger, cancel_token).await;
         let _ = tx_done_stderr.send(()).await;
       })
     };
@@ -335,16 +498,21 @@ mod tests {
     let (writer, logger, dir) = setup_test().await;
     let plugin = ShellPlugin::new().unwrap();
     let cancel_token = CancellationToken::new();
+    let (_input, input) = mpsc::unbounded_channel();
 
     let result = plugin
       .execute_command(
-        "test-id".to_string(),
-        true,
-        "echo Hello, World!".to_owned(),
-        vec![],
-        dir,
-        HashMap::new(),
-        HashMap::new(),
+        PluginCommand {
+          id: "test-id".to_string(),
+          dry: true,
+          command: "echo Hello, World!".to_owned(),
+          args: vec![],
+          dir,
+          vars: HashMap::new(),
+          envs: HashMap::new(),
+          raw: false,
+          input,
+        },
         writer.clone(),
         logger.clone(),
         cancel_token,

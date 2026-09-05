@@ -7,7 +7,7 @@ use serde::{
 
 use serde_yml::Value;
 
-use crate::{octafile::Envs, Vars};
+use crate::{octafile::Envs, TaskPresentation, Vars};
 
 pub type PluginSchemas = HashMap<String, Option<serde_json::Map<String, serde_json::Value>>>;
 
@@ -18,6 +18,7 @@ const RESERVED_PLUGIN_KEYS: &[&str] = &[
   "dir",
   "desc",
   "prefix",
+  "presentation",
   "vars",
   "env",
   "dotenv",
@@ -27,6 +28,9 @@ const RESERVED_PLUGIN_KEYS: &[&str] = &[
   "ignore_error",
   "deps",
   "run",
+  "quiet",
+  "raw",
+  "interactive",
   "silent",
   "execute_mode",
   "failfast",
@@ -176,7 +180,10 @@ pub struct ComplexDep {
   pub task: String,
   pub vars: Option<Vars>,
   pub envs: Option<Envs>,
-  pub silent: Option<bool>,
+  pub quiet: Option<bool>,
+  pub silent: Option<Silence>,
+  pub raw: Option<bool>,
+  pub interactive: Option<bool>,
   pub timeout: Option<Timeout>,
 }
 
@@ -185,6 +192,99 @@ pub struct ComplexDep {
 pub enum Deps {
   Simple(String),
   Complex(ComplexDep),
+}
+
+/// Selects which command streams are hidden while retaining their captured
+/// values for dependency interpolation and error reporting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Silence {
+  #[default]
+  None,
+  All,
+  Stdout,
+  Stderr,
+}
+
+impl From<bool> for Silence {
+  fn from(value: bool) -> Self {
+    if value {
+      Self::All
+    } else {
+      Self::None
+    }
+  }
+}
+
+impl std::str::FromStr for Silence {
+  type Err = String;
+
+  fn from_str(value: &str) -> Result<Self, Self::Err> {
+    match value {
+      "true" | "1" => Ok(Self::All),
+      "false" | "0" => Ok(Self::None),
+      "stdout" => Ok(Self::Stdout),
+      "stderr" => Ok(Self::Stderr),
+      _ => Err("expected true, false, stdout, or stderr".to_owned()),
+    }
+  }
+}
+
+impl Silence {
+  pub fn hides_stdout(self) -> bool {
+    matches!(self, Self::All | Self::Stdout)
+  }
+
+  pub fn hides_stderr(self) -> bool {
+    matches!(self, Self::All | Self::Stderr)
+  }
+}
+
+impl Serialize for Silence {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: serde::Serializer,
+  {
+    match self {
+      Self::None => serializer.serialize_bool(false),
+      Self::All => serializer.serialize_bool(true),
+      Self::Stdout => serializer.serialize_str("stdout"),
+      Self::Stderr => serializer.serialize_str("stderr"),
+    }
+  }
+}
+
+impl<'de> Deserialize<'de> for Silence {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    struct SilenceVisitor;
+
+    impl<'de> Visitor<'de> for SilenceVisitor {
+      type Value = Silence;
+
+      fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a boolean, 'stdout', or 'stderr'")
+      }
+
+      fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(if value { Silence::All } else { Silence::None })
+      }
+
+      fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+      where
+        E: serde::de::Error,
+      {
+        match value {
+          "stdout" => Ok(Silence::Stdout),
+          "stderr" => Ok(Silence::Stderr),
+          _ => Err(E::unknown_variant(value, &["stdout", "stderr"])),
+        }
+      }
+    }
+
+    deserializer.deserialize_any(SilenceVisitor)
+  }
 }
 
 impl From<String> for Deps {
@@ -219,7 +319,13 @@ pub struct CommandOptions {
   pub condition: Option<PluginCommand>,
 
   /// Whether output from this command is suppressed.
-  pub silent: Option<bool>,
+  pub quiet: Option<bool>,
+
+  /// Whether one or both command output streams are suppressed.
+  pub silent: Option<Silence>,
+
+  /// Whether the command should use the exclusive raw/PTY transport.
+  pub raw: Option<bool>,
 
   /// Whether a failure from this command is ignored.
   pub ignore_error: Option<bool>,
@@ -458,11 +564,21 @@ impl Context {
           .remove("if")
           .map(|value| self.parse_condition_command(value))
           .transpose()?;
-        let silent = mapping
-          .remove("silent")
+        let quiet = mapping
+          .remove("quiet")
           .map(serde_yml::from_value::<bool>)
           .transpose()
+          .map_err(|error| format!("invalid command quiet option: {error}"))?;
+        let silent = mapping
+          .remove("silent")
+          .map(serde_yml::from_value::<Silence>)
+          .transpose()
           .map_err(|error| format!("invalid command silent option: {error}"))?;
+        let raw = mapping
+          .remove("raw")
+          .map(serde_yml::from_value::<bool>)
+          .transpose()
+          .map_err(|error| format!("invalid command raw option: {error}"))?;
         let ignore_error = mapping
           .remove("ignore_error")
           .map(serde_yml::from_value::<bool>)
@@ -472,7 +588,9 @@ impl Context {
           platforms,
           timeout,
           condition,
+          quiet,
           silent,
+          raw,
           ignore_error,
           ..CommandOptions::default()
         };
@@ -547,6 +665,7 @@ pub struct Task {
   pub dir: Option<PathBuf>,                      // Working directory for the task
   pub desc: Option<String>,                      // Task description
   pub prefix: Option<String>,                    // Label used by prefixed output
+  pub presentation: Option<TaskPresentation>,    // Task-specific output presentation
   pub vars: Option<Vars>,                        // Task-specific variables
   pub cmds: Option<Vec<TaskCommand>>,            // List of commands
   pub internal: Option<bool>,                    // Show command in list of available commands
@@ -554,7 +673,10 @@ pub struct Task {
   pub ignore_error: Option<bool>,                // Whether to continue on error
   pub deps: Option<Vec<Deps>>,                   // Task dependencies
   pub run: Option<AllowedRun>,                   // When task should run
-  pub silent: Option<bool>,                      // Should task print to stdout or stderr
+  pub quiet: Option<bool>,                       // Suppress Octa's task diagnostics
+  pub silent: Option<Silence>,                   // Suppress one or both task streams
+  pub raw: Option<bool>,                         // Use exclusive byte-oriented terminal IO
+  pub interactive: Option<bool>,                 // Reserve terminal IO for the whole task body
   pub execute_mode: Option<ExecuteMode>,         // How execute task commands
   pub failfast: Option<bool>,                    // Cancel parallel work after the first failure
   pub timeout: Option<Timeout>,                  // Default timeout for task commands
@@ -621,6 +743,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "dir" => task.dir = map.next_value()?,
         "desc" => task.desc = map.next_value()?,
         "prefix" => task.prefix = map.next_value()?,
+        "presentation" => task.presentation = map.next_value()?,
         "vars" => task.vars = map.next_value()?,
         "env" => task.env = map.next_value()?,
         "dotenv" => task.dotenv = map.next_value()?,
@@ -636,7 +759,10 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "ignore_error" => task.ignore_error = map.next_value()?,
         "deps" => task.deps = map.next_value()?,
         "run" => task.run = map.next_value()?,
+        "quiet" => task.quiet = map.next_value()?,
         "silent" => task.silent = map.next_value()?,
+        "raw" => task.raw = map.next_value()?,
+        "interactive" => task.interactive = map.next_value()?,
         "execute_mode" => task.execute_mode = map.next_value()?,
         "failfast" => task.failfast = map.next_value()?,
         "timeout" => task.timeout = map.next_value()?,
@@ -825,5 +951,27 @@ mod tests {
     let task = parse_task(&context(), "prefix: api\nshell: echo ready").unwrap();
 
     assert_eq!(task.prefix.as_deref(), Some("api"));
+  }
+
+  #[test]
+  fn parses_task_specific_presentation_without_colliding_with_artifact_outputs() {
+    let task = parse_task(
+      &context(),
+      "presentation:\n  output: replacing\noutput: [dist/app]\nshell: echo ready",
+    )
+    .unwrap();
+
+    assert_eq!(
+      task.presentation.and_then(|presentation| presentation.output),
+      Some(crate::TaskOutputMode::Replacing)
+    );
+    assert_eq!(task.output, Some(vec!["dist/app".to_owned()]));
+  }
+
+  #[test]
+  fn parses_task_wide_interactive_mode() {
+    let task = parse_task(&context(), "interactive: true\nshell: cargo test -- --nocapture").unwrap();
+
+    assert_eq!(task.interactive, Some(true));
   }
 }
