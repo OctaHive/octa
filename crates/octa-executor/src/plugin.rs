@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use octa_output::ConsoleStream;
 use octa_plugin::{
   logger::{collect_value_redactions, redact},
-  protocol::PluginResponse,
+  protocol::{DiagnosticLevel as PluginDiagnosticLevel, PluginResponse},
 };
 use octa_plugin_manager::plugin_client::PluginExecutionRequest;
 use octa_plugin_manager::plugin_manager::PluginManager;
@@ -16,6 +16,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
   console_target::ConsoleTarget,
   error::{ExecutorError, ExecutorResult},
+  output_capture::{CaptureError, OutputCapture, MAX_CAPTURED_OUTPUT_BYTES},
+  raw_terminal::RawTerminalBridge,
 };
 
 #[derive(Clone)]
@@ -43,6 +45,7 @@ pub(crate) struct PluginRequest {
   pub args: Vec<String>,
   pub context: PluginExecutionContext,
   pub output: Option<ConsoleTarget>,
+  pub raw: bool,
 }
 
 /// Data inherited by every plugin invocation, regardless of where it originated.
@@ -72,6 +75,7 @@ impl PluginInvoker {
     request: PluginRequest,
     cancel_token: CancellationToken,
   ) -> ExecutorResult<PluginOutput> {
+    let plugin_name = request.target.name().to_owned();
     let registration = match &request.target {
       PluginTarget::Key(key) => self.manager.resolve_key(key).await,
       PluginTarget::Capability(capability) => {
@@ -86,6 +90,10 @@ impl PluginInvoker {
     registration
       .validate(&request.value)
       .map_err(|error| ExecutorError::PluginValidationFailed(request.target.name().to_owned(), error))?;
+    if request.raw && !registration.supports_raw() {
+      return Err(ExecutorError::RawUnsupported(request.target.name().to_owned()));
+    }
+    let _execution_guard = self.manager.execution_guard(request.raw).await;
 
     let PluginExecutionContext {
       dir,
@@ -117,65 +125,191 @@ impl PluginInvoker {
           envs,
           secret_vars,
           redact_params,
+          raw: request.raw,
         },
         cancel_token.clone(),
       )
       .await
       .map_err(io::Error::from)?;
     let command_id = execution.id().to_owned();
-
-    let mut output = PluginOutput {
-      code: -1,
-      stdout: String::new(),
-      stderr: String::new(),
-    };
-    loop {
-      match execution.receive_output(&cancel_token).await {
-        Ok(Some(response)) => match response {
-          PluginResponse::Stdout { id, line } if id == command_id => {
-            let line = without_line_ending(&line);
-            if let Some(target) = &request.output {
-              target.line(&command_id, ConsoleStream::Stdout, line.to_owned()).await?;
-            }
-            output.stdout.push_str(line);
-            output.stdout.push('\n');
-          },
-          PluginResponse::Stderr { id, line } if id == command_id => {
-            let line = without_line_ending(&line);
-            if let Some(target) = &request.output {
-              target.line(&command_id, ConsoleStream::Stderr, line.to_owned()).await?;
-            }
-            output.stderr.push_str(line);
-            output.stderr.push('\n');
-          },
-          PluginResponse::ExitStatus { id, code } if id == command_id => {
-            output.code = code;
-            return Ok(output);
-          },
-          PluginResponse::Error { id, message } if id == command_id => {
-            return Err(io::Error::other(format!("Plugin error: {message}")).into());
-          },
-          _ => {},
-        },
-        Ok(None) => {
-          return Err(
-            io::Error::new(
-              io::ErrorKind::ConnectionAborted,
-              "Plugin connection closed unexpectedly",
-            )
-            .into(),
-          );
-        },
-        Err(error) => {
-          if cancel_token.is_cancelled() {
+    let mut raw_session = if request.raw {
+      match &request.output {
+        Some(output) => match output.begin_raw(&command_id).await {
+          Ok(session) => session,
+          Err(error) => {
             let _ = execution.cancel_and_wait().await;
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "Command cancelled").into());
-          }
-
-          return Err(io::Error::from(error).into());
+            return Err(error.into());
+          },
+        },
+        None => None,
+      }
+    } else {
+      None
+    };
+    let mut terminal_bridge = if request.raw {
+      match RawTerminalBridge::start(execution.terminal_input()).await {
+        Ok(bridge) => Some(bridge),
+        Err(error) => {
+          drop(raw_session);
+          let _ = execution.cancel_and_wait().await;
+          return Err(error.into());
         },
       }
+    } else {
+      None
+    };
+
+    let mut terminal_response = false;
+    let result: ExecutorResult<PluginOutput> = async {
+      let mut output = OutputCapture::default();
+      loop {
+        match execution.receive_output(&cancel_token).await {
+          Ok(Some(response)) => match response {
+            PluginResponse::Stdout { id, line } if id == command_id => {
+              let line = without_line_ending(&line);
+              if let Some(session) = &mut raw_session {
+                if !request
+                  .output
+                  .as_ref()
+                  .is_some_and(|target| target.hides(ConsoleStream::Stdout))
+                {
+                  let mut bytes = line.as_bytes().to_vec();
+                  bytes.push(b'\n');
+                  session.write(ConsoleStream::Stdout, bytes).await?;
+                }
+              } else if let Some(target) = &request.output {
+                target.line(&command_id, ConsoleStream::Stdout, line.to_owned()).await?;
+              }
+              output
+                .append_line(ConsoleStream::Stdout, line)
+                .await
+                .map_err(|error| capture_error(&plugin_name, error))?;
+            },
+            PluginResponse::Stderr { id, line } if id == command_id => {
+              let line = without_line_ending(&line);
+              if let Some(session) = &mut raw_session {
+                if !request
+                  .output
+                  .as_ref()
+                  .is_some_and(|target| target.hides(ConsoleStream::Stderr))
+                {
+                  let mut bytes = line.as_bytes().to_vec();
+                  bytes.push(b'\n');
+                  session.write(ConsoleStream::Stderr, bytes).await?;
+                }
+              } else if let Some(target) = &request.output {
+                target.line(&command_id, ConsoleStream::Stderr, line.to_owned()).await?;
+              }
+              output
+                .append_line(ConsoleStream::Stderr, line)
+                .await
+                .map_err(|error| capture_error(&plugin_name, error))?;
+            },
+            PluginResponse::StdoutBytes { id, bytes } if id == command_id => {
+              if let Some(session) = &mut raw_session {
+                if !request
+                  .output
+                  .as_ref()
+                  .is_some_and(|target| target.hides(ConsoleStream::Stdout))
+                {
+                  session.write(ConsoleStream::Stdout, bytes.clone()).await?;
+                }
+              } else if let Some(target) = &request.output {
+                target.bytes(&command_id, ConsoleStream::Stdout, bytes.clone()).await?;
+              }
+              output
+                .append(ConsoleStream::Stdout, String::from_utf8_lossy(&bytes).as_bytes())
+                .await
+                .map_err(|error| capture_error(&plugin_name, error))?;
+            },
+            PluginResponse::StderrBytes { id, bytes } if id == command_id => {
+              if let Some(session) = &mut raw_session {
+                if !request
+                  .output
+                  .as_ref()
+                  .is_some_and(|target| target.hides(ConsoleStream::Stderr))
+                {
+                  session.write(ConsoleStream::Stderr, bytes.clone()).await?;
+                }
+              } else if let Some(target) = &request.output {
+                target.bytes(&command_id, ConsoleStream::Stderr, bytes.clone()).await?;
+              }
+              output
+                .append(ConsoleStream::Stderr, String::from_utf8_lossy(&bytes).as_bytes())
+                .await
+                .map_err(|error| capture_error(&plugin_name, error))?;
+            },
+            PluginResponse::Diagnostic {
+              id,
+              level,
+              message,
+              location,
+            } if id == command_id => {
+              if let Some(target) = &request.output {
+                let level = match level {
+                  PluginDiagnosticLevel::Trace => octa_output::ConsoleLevel::Trace,
+                  PluginDiagnosticLevel::Debug => octa_output::ConsoleLevel::Debug,
+                  PluginDiagnosticLevel::Info => octa_output::ConsoleLevel::Info,
+                  PluginDiagnosticLevel::Warn => octa_output::ConsoleLevel::Warn,
+                  PluginDiagnosticLevel::Error => octa_output::ConsoleLevel::Error,
+                };
+                let location = location.map(|location| octa_output::SourceLocation {
+                  file: location.file,
+                  line: location.line,
+                  column: location.column,
+                });
+                target.diagnostic(level, message, location).await?;
+              }
+            },
+            PluginResponse::ExitStatus { id, code } if id == command_id => {
+              terminal_response = true;
+              let (stdout, stderr) = output.into_strings().await?;
+              break Ok(PluginOutput { code, stdout, stderr });
+            },
+            PluginResponse::Error { id, message } if id == command_id => {
+              terminal_response = true;
+              break Err(io::Error::other(format!("Plugin error: {message}")).into());
+            },
+            _ => {},
+          },
+          Ok(None) => {
+            break Err(
+              io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Plugin connection closed unexpectedly",
+              )
+              .into(),
+            );
+          },
+          Err(error) => {
+            if cancel_token.is_cancelled() {
+              break Err(io::Error::new(io::ErrorKind::Interrupted, "Command cancelled").into());
+            }
+
+            break Err(io::Error::from(error).into());
+          },
+        }
+      }
     }
+    .await;
+    if result.is_err() && !terminal_response {
+      let _ = execution.cancel_and_wait().await;
+    }
+    if let Some(bridge) = &mut terminal_bridge {
+      bridge.shutdown().await;
+    }
+    drop(raw_session);
+    result
+  }
+}
+
+fn capture_error(plugin: &str, error: CaptureError) -> ExecutorError {
+  match error {
+    CaptureError::LimitExceeded => ExecutorError::PluginOutputTooLarge {
+      plugin: plugin.to_owned(),
+      limit_mib: MAX_CAPTURED_OUTPUT_BYTES / (1024 * 1024),
+    },
+    CaptureError::Io(error) => error.into(),
   }
 }
 
@@ -232,6 +366,7 @@ impl PluginEvaluator for ManagerPluginEvaluator {
           args: Vec::new(),
           context: request.context,
           output: None,
+          raw: false,
         },
         cancel_token,
       )

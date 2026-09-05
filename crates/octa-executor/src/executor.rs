@@ -28,6 +28,8 @@ use tracing::{debug, info_span, Instrument};
 use crate::{
   console_scope_tracker::ConsoleScopeTracker,
   error::{ExecutorError, ExecutorResult},
+  interactive_scope_tracker::InteractiveScopeTracker,
+  runtime_coordinator::RuntimeCoordinator,
   summary::{Summary, TaskSummaryItem},
   task::{CacheItem, Executable, TaskItem, TaskOutcome, TaskRuntime},
 };
@@ -82,6 +84,11 @@ impl<T: Eq + Hash + Identifiable> ExecutionPlan<T> {
   pub(crate) fn new(dag: DAG<T>, deferred: HashMap<String, Arc<DeferredAction<T>>>, scopes: Vec<ConsoleScope>) -> Self {
     Self { dag, deferred, scopes }
   }
+
+  /// Whether the scheduler can have more than one graph node ready at once.
+  pub fn is_linear(&self) -> ExecutorResult<bool> {
+    self.dag.is_linear().map_err(Into::into)
+  }
 }
 
 impl<T: Eq + Hash + Identifiable> From<DAG<T>> for ExecutionPlan<T> {
@@ -107,7 +114,8 @@ impl<T: Eq + Hash + Identifiable> Deref for ExecutionPlan<T> {
 /// Configuration for the Executor
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
-  pub silent: bool,
+  /// Emit top-level run lifecycle events. Stream suppression belongs to task configuration.
+  pub emit_run_events: bool,
   /// Cancel tasks that are already running when any task in the plan fails.
   pub failfast: bool,
   /// Shared limiter for executable work; graph barriers do not consume permits.
@@ -116,16 +124,19 @@ pub struct ExecutorConfig {
   pub console: Arc<Console>,
   /// Existing run identity inherited by nested deferred plans.
   pub run_id: Option<u64>,
+  /// Isolation shared by independently built plans in one execution batch.
+  pub runtime_coordinator: Arc<RuntimeCoordinator>,
 }
 
 impl Default for ExecutorConfig {
   fn default() -> Self {
     Self {
-      silent: true,
+      emit_run_events: false,
       failfast: false,
       concurrency: None,
       console: Arc::new(Console::default()),
       run_id: None,
+      runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
     }
   }
 }
@@ -153,6 +164,7 @@ pub struct Executor<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Sen
   finished: CancellationToken,
   plugin_manager: Arc<PluginManager>,
   scope_tracker: Arc<ConsoleScopeTracker>,
+  interactive_tracker: Arc<InteractiveScopeTracker>,
   run_id: u64,
 }
 
@@ -183,6 +195,15 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       plan.scopes,
       node_scopes,
     ));
+    let interactive_tracker = Arc::new(InteractiveScopeTracker::new(
+      config.runtime_coordinator.clone(),
+      dag.nodes().iter().map(|node| {
+        (
+          node.interactive_session().map(str::to_owned),
+          node.requires_runtime_lock(),
+        )
+      }),
+    ));
     let in_degree = dag.nodes().iter().map(|n| (n.id().clone(), 0)).collect();
 
     let cache = match cache {
@@ -211,13 +232,14 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       finished: CancellationToken::new(),
       plugin_manager,
       scope_tracker,
+      interactive_tracker,
       run_id,
     })
   }
 
   /// Executes all tasks in the DAG
   pub async fn execute(&self, cancel_token: CancellationToken, command: &str) -> ExecutorResult<Vec<String>> {
-    if !self.config.silent {
+    if self.config.emit_run_events {
       self
         .config
         .console
@@ -230,7 +252,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     if let Err(error) = self.scope_tracker.declare().await {
       let error = ExecutorError::from(error);
       let _ = self.scope_tracker.finish_remaining(ConsoleStatus::Failed).await;
-      if !self.config.silent {
+      if self.config.emit_run_events {
         let _ = self
           .config
           .console
@@ -244,6 +266,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       return Err(error);
     }
     let result = self.execute_plan(cancel_token).await;
+    self.interactive_tracker.finish_remaining().await;
     self.run_deferred().await;
 
     let mut status = match &result {
@@ -255,9 +278,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
     if finish_result.is_err() {
       status = ConsoleStatus::Failed;
     }
-    let run_result = if self.config.silent {
-      Ok(())
-    } else {
+    let run_result = if self.config.emit_run_events {
       self
         .config
         .console
@@ -267,6 +288,8 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
           status,
         })
         .await
+    } else {
+      Ok(())
     };
     match result {
       Err(error) => Err(error),
@@ -341,6 +364,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
           force: self.state.force,
         },
         self.config.concurrency.clone(),
+        self.config.runtime_coordinator.clone(),
       )
       .await
       {
@@ -419,6 +443,8 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       concurrency: self.config.concurrency.clone(),
       console: self.config.console.clone(),
       scope_tracker: self.scope_tracker.clone(),
+      interactive_tracker: self.interactive_tracker.clone(),
+      runtime_coordinator: self.config.runtime_coordinator.clone(),
       run_id: self.run_id,
       completed_tasks: self.state.completed_tasks.clone(),
       deferred: self.deferred.clone(),
@@ -516,7 +542,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
   }
 
   async fn log_info(&self, message: &str) -> ExecutorResult<()> {
-    if !self.config.silent {
+    if self.config.emit_run_events {
       self
         .config
         .console
@@ -550,6 +576,8 @@ struct ExecutorContext<T: Hash + Identifiable + Eq> {
   concurrency: Option<Arc<Semaphore>>,
   console: Arc<Console>,
   scope_tracker: Arc<ConsoleScopeTracker>,
+  interactive_tracker: Arc<InteractiveScopeTracker>,
+  runtime_coordinator: Arc<RuntimeCoordinator>,
   run_id: u64,
   completed_tasks: Arc<Mutex<HashSet<String>>>,
   deferred: Arc<HashMap<String, Arc<DeferredAction<T>>>>,
@@ -581,6 +609,23 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
   }
 
   async fn execute(self) -> ExecutorResult<String> {
+    let session = self.task.interactive_session().map(str::to_owned);
+    let needs_runtime_lock = self.task.requires_runtime_lock();
+    let _runtime_guard = self
+      .context
+      .interactive_tracker
+      .enter(session.as_deref(), needs_runtime_lock)
+      .await;
+    let result = self.execute_locked().await;
+    self
+      .context
+      .interactive_tracker
+      .complete(session.as_deref(), needs_runtime_lock)
+      .await;
+    result
+  }
+
+  async fn execute_locked(&self) -> ExecutorResult<String> {
     let task_name = self.task.id();
     debug!("Executing task: {}", task_name);
 
@@ -615,6 +660,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
           force: self.context.force,
         },
         self.context.concurrency.clone(),
+        self.context.runtime_coordinator.clone(),
       )
       .await
       .map(TaskOutcome::success)
@@ -801,6 +847,7 @@ async fn execute_deferred_action<
   action: Arc<DeferredAction<T>>,
   runtime: TaskRuntime,
   concurrency: Option<Arc<Semaphore>>,
+  runtime_coordinator: Arc<RuntimeCoordinator>,
 ) -> ExecutorResult<String> {
   let TaskRuntime {
     plugin_manager,
@@ -816,11 +863,12 @@ async fn execute_deferred_action<
     plugin_manager,
     action.plan.clone(),
     ExecutorConfig {
-      silent: true,
+      emit_run_events: false,
       failfast: false,
       concurrency,
       console,
       run_id: Some(run_id),
+      runtime_coordinator,
     },
     Some(cache),
     fingerprint,
@@ -1034,7 +1082,7 @@ mod tests {
         Arc::new(PluginManager::new(plugin_dir.path())),
         plan,
         ExecutorConfig {
-          silent: false,
+          emit_run_events: true,
           console,
           run_id: Some(7),
           ..ExecutorConfig::default()
@@ -1120,7 +1168,7 @@ mod tests {
       plan,
       ExecutorConfig {
         console: Arc::new(Console::new(RejectFirstScope(AtomicBool::new(false)))),
-        silent: false,
+        emit_run_events: true,
         ..ExecutorConfig::default()
       },
       None,
@@ -1158,7 +1206,7 @@ mod tests {
       ),
       ExecutorConfig {
         console,
-        silent: false,
+        emit_run_events: true,
         ..ExecutorConfig::default()
       },
       None,
@@ -1197,7 +1245,7 @@ mod tests {
       ExecutionPlan::new(dag, HashMap::new(), vec![scope.clone()]),
       ExecutorConfig {
         console,
-        silent: false,
+        emit_run_events: true,
         ..ExecutorConfig::default()
       },
       None,

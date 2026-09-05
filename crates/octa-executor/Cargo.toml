@@ -19,6 +19,7 @@ octa-plugin-manager = { version = "0.3.0", path = "../octa-plugin-manager" }
 octa-output = { version = "0.3.0", path = "../octa-output" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+crossterm = { workspace = true }
 dunce = "1.0.5"
 dotenvy = "0.15.7"
 indexmap = { workspace = true }
@@ -40,8 +41,11 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 regex = { workspace = true }
+tempfile = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-tempfile = "3.27"
 tracing-test = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["fs"] }

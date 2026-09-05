@@ -12,10 +12,32 @@ pub struct Version {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Schema {
   pub key: String,
+  /// Whether this plugin can run commands inside an interactive PTY.
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub supports_raw: bool,
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub capabilities: Vec<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub validation_schema: Option<Map<String, Value>>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticLevel {
+  Trace,
+  Debug,
+  Info,
+  Warn,
+  Error,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct SourceLocation {
+  pub file: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub line: Option<u64>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub column: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -36,9 +58,25 @@ pub enum OctaCommand {
     /// Hides the complete plugin payload from diagnostics for secret-producing evaluations.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     redact_params: bool,
+    /// Requests byte-oriented output suitable for an exclusive terminal session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    raw: bool,
     dry: bool,
   },
   Cancel {
+    id: String,
+  },
+  Stdin {
+    id: String,
+    #[serde(with = "base64_bytes")]
+    bytes: Vec<u8>,
+  },
+  Resize {
+    id: String,
+    rows: u16,
+    cols: u16,
+  },
+  CloseStdin {
     id: String,
   },
   Shutdown,
@@ -49,17 +87,70 @@ pub enum OctaCommand {
 pub enum PluginResponse {
   Hello(Version),
   Schema(Schema),
-  Started { id: String },
-  Stdout { id: String, line: String },
-  Stderr { id: String, line: String },
-  ExitStatus { id: String, code: i32 },
-  Error { id: String, message: String },
-  Shutdown { message: String },
+  Started {
+    id: String,
+  },
+  Stdout {
+    id: String,
+    line: String,
+  },
+  Stderr {
+    id: String,
+    line: String,
+  },
+  StdoutBytes {
+    id: String,
+    #[serde(with = "base64_bytes")]
+    bytes: Vec<u8>,
+  },
+  StderrBytes {
+    id: String,
+    #[serde(with = "base64_bytes")]
+    bytes: Vec<u8>,
+  },
+  Diagnostic {
+    id: String,
+    level: DiagnosticLevel,
+    message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    location: Option<SourceLocation>,
+  },
+  ExitStatus {
+    id: String,
+    code: i32,
+  },
+  Error {
+    id: String,
+    message: String,
+  },
+  Shutdown {
+    message: String,
+  },
+}
+
+mod base64_bytes {
+  use base64::{engine::general_purpose::STANDARD, Engine as _};
+  use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+  pub fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+  where
+    S: Serializer,
+  {
+    serializer.serialize_str(&STANDARD.encode(bytes))
+  }
+
+  pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let encoded = String::deserialize(deserializer)?;
+    STANDARD.decode(encoded).map_err(D::Error::custom)
+  }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{OctaCommand, Schema};
+  use super::{OctaCommand, PluginResponse, Schema};
 
   #[test]
   fn schema_without_validation_schema_is_backward_compatible() {
@@ -67,8 +158,24 @@ mod tests {
 
     assert_eq!(schema.key, "shell");
     assert!(schema.capabilities.is_empty());
+    assert!(!schema.supports_raw);
     assert!(schema.validation_schema.is_none());
     assert_eq!(serde_json::to_string(&schema).unwrap(), r#"{"key":"shell"}"#);
+  }
+
+  #[test]
+  fn byte_payloads_are_base64_strings_instead_of_json_integer_arrays() {
+    let response = PluginResponse::StdoutBytes {
+      id: "command".to_owned(),
+      bytes: vec![0, 1, 255],
+    };
+    let json = serde_json::to_string(&response).unwrap();
+
+    assert!(json.contains(r#""bytes":"AAH/""#));
+    let PluginResponse::StdoutBytes { bytes, .. } = serde_json::from_str(&json).unwrap() else {
+      panic!("expected bytes response");
+    };
+    assert_eq!(bytes, [0, 1, 255]);
   }
 
   #[test]
@@ -88,6 +195,7 @@ mod tests {
     let OctaCommand::Execute {
       secret_vars,
       redact_params,
+      raw,
       ..
     } = command
     else {
@@ -95,5 +203,6 @@ mod tests {
     };
     assert!(secret_vars.is_empty());
     assert!(!redact_params);
+    assert!(!raw);
   }
 }

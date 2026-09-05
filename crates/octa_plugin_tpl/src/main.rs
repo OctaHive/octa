@@ -1,6 +1,5 @@
 use std::{
   borrow::Cow,
-  collections::HashMap,
   env,
   path::{Path, PathBuf},
   sync::Arc,
@@ -11,7 +10,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use octa_plugin::{logger::Logger, protocol::PluginResponse, serve_plugin, Plugin, PluginSchema};
+use octa_plugin::{logger::Logger, protocol::PluginResponse, serve_plugin, Plugin, PluginCommand, PluginSchema};
 use tera::{Context as TeraContext, Tera};
 use tokio::{
   io::{AsyncWrite, AsyncWriteExt},
@@ -30,6 +29,7 @@ struct TemplateFile {
 fn plugin_schema() -> PluginSchema {
   PluginSchema {
     key: "tpl".to_owned(),
+    supports_raw: false,
     capabilities: Vec::new(),
     validation_schema: serde_json::json!({
       "oneOf": [
@@ -72,17 +72,19 @@ impl Plugin for TemplatePlugin {
 
   async fn execute_command(
     &self,
-    id: String,
-    _dry: bool,
-    command: String,
-    _args: Vec<String>,
-    dir: PathBuf,
-    vars: HashMap<String, Value>,
-    envs: HashMap<String, String>,
+    request: PluginCommand,
     writer: Arc<Mutex<impl AsyncWrite + Send + 'static + std::marker::Unpin>>,
     logger: Arc<impl Logger>,
     _cancel_token: CancellationToken,
   ) -> anyhow::Result<()> {
+    let PluginCommand {
+      id,
+      command,
+      dir,
+      vars,
+      envs,
+      ..
+    } = request;
     logger.log("Start processing template command")?;
 
     let mut tera = Tera::default();
@@ -143,7 +145,7 @@ async fn main() -> anyhow::Result<()> {
 mod tests {
   use super::*;
   use octa_plugin::logger::{Logger, MockLogger};
-  use std::{io, time::Duration};
+  use std::{collections::HashMap, io, time::Duration};
   use tempfile::tempdir;
   use tokio::sync::Mutex;
 
@@ -219,13 +221,17 @@ mod tests {
 
     let result = plugin
       .execute_command(
-        "test-id".to_string(),
-        false,
-        "{{ name }}".to_owned(),
-        vec![],
-        dir,
-        HashMap::from([("name".to_owned(), Value::String("Hello, World!".to_owned()))]),
-        HashMap::new(),
+        PluginCommand {
+          id: "test-id".to_string(),
+          dry: false,
+          command: "{{ name }}".to_owned(),
+          args: vec![],
+          dir,
+          vars: HashMap::from([("name".to_owned(), Value::String("Hello, World!".to_owned()))]),
+          envs: HashMap::new(),
+          raw: false,
+          input: tokio::sync::mpsc::unbounded_channel().1,
+        },
         writer.clone(),
         logger.clone(),
         cancel_token,
@@ -271,13 +277,17 @@ mod tests {
 
     TemplatePlugin {}
       .execute_command(
-        "test-id".to_string(),
-        false,
-        serde_json::json!({ "file": "greeting.tpl" }).to_string(),
-        vec![],
-        dir,
-        HashMap::from([("name".to_owned(), Value::String("World".to_owned()))]),
-        HashMap::new(),
+        PluginCommand {
+          id: "test-id".to_string(),
+          dry: false,
+          command: serde_json::json!({ "file": "greeting.tpl" }).to_string(),
+          args: vec![],
+          dir,
+          vars: HashMap::from([("name".to_owned(), Value::String("World".to_owned()))]),
+          envs: HashMap::new(),
+          raw: false,
+          input: tokio::sync::mpsc::unbounded_channel().1,
+        },
         writer.clone(),
         logger,
         CancellationToken::new(),
@@ -304,13 +314,17 @@ mod tests {
 
     let error = TemplatePlugin {}
       .execute_command(
-        "test-id".to_string(),
-        false,
-        serde_json::json!({ "file": "missing.tpl" }).to_string(),
-        vec![],
-        dir,
-        HashMap::new(),
-        HashMap::new(),
+        PluginCommand {
+          id: "test-id".to_string(),
+          dry: false,
+          command: serde_json::json!({ "file": "missing.tpl" }).to_string(),
+          args: vec![],
+          dir,
+          vars: HashMap::new(),
+          envs: HashMap::new(),
+          raw: false,
+          input: tokio::sync::mpsc::unbounded_channel().1,
+        },
         writer,
         logger,
         CancellationToken::new(),

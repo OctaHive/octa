@@ -8,11 +8,15 @@ pub mod executor;
 mod freshness;
 mod graph;
 mod hash_source;
+mod interactive_scope_tracker;
 mod output;
+mod output_capture;
 mod path_hash;
 mod path_pattern;
 mod platform;
 mod plugin;
+mod raw_terminal;
+mod runtime_coordinator;
 mod source;
 mod source_strategy;
 pub mod summary;
@@ -24,6 +28,8 @@ mod timestamp_source;
 mod variable_enum;
 pub mod vars;
 pub mod watcher;
+
+pub use runtime_coordinator::RuntimeCoordinator;
 
 #[cfg(test)]
 mod builder_tests;
@@ -51,9 +57,9 @@ use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
 use octa_octafile::{
   AllowedRun, CommandOptions, CommandPayload, ConditionEvaluation, Deps, EnvValue, ExecuteMode, Octafile,
-  PluginCommand, SourceStrategies, Task, TaskCommand,
+  PluginCommand, SourceStrategies, Task, TaskCommand, TaskOutputMode,
 };
-use octa_output::{ConsoleScope, ConsoleScopeAllocator};
+use octa_output::{ConsoleScope, ConsoleScopeAllocator, RenderMode};
 use source_strategy::SourceStrategyRegistry;
 pub use source_strategy::{SourceMethod, SourceStrategy};
 pub use task::TaskNode;
@@ -80,6 +86,7 @@ struct InvocationContext {
   conditions: ConditionScope,
   freshness: Option<Arc<FreshnessState>>,
   output_scope: Option<ConsoleScope>,
+  interactive_session: Option<String>,
 }
 
 impl InvocationContext {
@@ -96,6 +103,7 @@ impl InvocationContext {
       conditions,
       freshness: None,
       output_scope: None,
+      interactive_session: None,
     }
   }
 
@@ -118,6 +126,7 @@ impl InvocationContext {
       // outputs, dotenv files, and dynamic variables.
       freshness: None,
       output_scope: None,
+      interactive_session: self.interactive_session.clone(),
     }
   }
 }
@@ -182,6 +191,9 @@ pub struct TaskGraphBuilder {
   variable_resolver: Option<Arc<dyn VariableResolver>>,
   source_strategies: SourceStrategyRegistry,
   scope_allocator: Arc<ConsoleScopeAllocator>,
+  force_quiet: bool,
+  force_silence: Option<octa_octafile::Silence>,
+  force_raw: bool,
   scopes: Mutex<Vec<ConsoleScope>>,
   os_arch: String,          // Operating system architecture
   os_type: String,          // Operating system type
@@ -206,6 +218,9 @@ impl TaskGraphBuilder {
       variable_resolver: None,
       source_strategies: SourceStrategyRegistry::default(),
       scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
+      force_quiet: false,
+      force_silence: None,
+      force_raw: false,
       scopes: Mutex::new(Vec::new()),
       os_arch,
       os_type,
@@ -229,6 +244,14 @@ impl TaskGraphBuilder {
   /// Shares ordered output-scope allocation with every plan built for one CLI run.
   pub fn with_scope_allocator(mut self, allocator: Arc<ConsoleScopeAllocator>) -> Self {
     self.scope_allocator = allocator;
+    self
+  }
+
+  /// Applies process-wide output visibility and raw transport overrides.
+  pub fn with_output_overrides(mut self, quiet: bool, silence: Option<octa_octafile::Silence>, raw: bool) -> Self {
+    self.force_quiet = quiet;
+    self.force_silence = silence;
+    self.force_raw = raw;
     self
   }
 

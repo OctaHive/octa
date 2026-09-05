@@ -1,6 +1,6 @@
 use std::io;
 
-use super::{ConsoleEntry, ConsolePayload, ConsoleRecord, ConsoleRenderer, ExecutionEvent};
+use super::{ConsoleEntry, ConsolePayload, ConsoleRecord, ConsoleRenderer, ConsoleScope, ExecutionEvent};
 
 /// Prefixes line-oriented task output while preserving the wrapped renderer's presentation.
 pub struct PrefixedRenderer<R> {
@@ -33,6 +33,26 @@ impl<R: ConsoleRenderer> ConsoleRenderer for PrefixedRenderer<R> {
       payload: ConsolePayload::Line(format!("[{}] {line}", scope.prefix())),
     }));
     self.renderer.render(&entry)
+  }
+
+  fn supports_raw_terminal(&self) -> bool {
+    self.renderer.supports_raw_terminal()
+  }
+
+  fn tick(&mut self) -> io::Result<()> {
+    self.renderer.tick()
+  }
+
+  fn set_parallel(&mut self, parallel: bool) -> io::Result<()> {
+    self.renderer.set_parallel(parallel)
+  }
+
+  fn begin_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    self.renderer.begin_raw(scope)
+  }
+
+  fn end_raw(&mut self, scope: &ConsoleScope) -> io::Result<()> {
+    self.renderer.end_raw(scope)
   }
 }
 

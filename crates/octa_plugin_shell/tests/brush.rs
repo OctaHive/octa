@@ -24,6 +24,7 @@ fn request(command: &str) -> PluginExecutionRequest {
     envs: HashMap::new(),
     secret_vars: Vec::new(),
     redact_params: false,
+    raw: false,
   }
 }
 
@@ -34,12 +35,53 @@ async fn collect(mut execution: PluginExecution) -> (String, String, i32) {
     match execution.receive_output(&CancellationToken::new()).await.unwrap() {
       Some(PluginResponse::Stdout { line, .. }) => stdout.push_str(&line),
       Some(PluginResponse::Stderr { line, .. }) => stderr.push_str(&line),
+      Some(PluginResponse::StdoutBytes { bytes, .. }) => stdout.push_str(&String::from_utf8_lossy(&bytes)),
+      Some(PluginResponse::StderrBytes { bytes, .. }) => stderr.push_str(&String::from_utf8_lossy(&bytes)),
       Some(PluginResponse::ExitStatus { code, .. }) => return (stdout, stderr, code),
       Some(PluginResponse::Error { message, .. }) => panic!("Plugin command failed: {message}"),
       Some(_) => {},
       None => panic!("Plugin response stream closed before ExitStatus"),
     }
   }
+}
+
+#[tokio::test]
+async fn raw_execution_uses_a_pty_and_preserves_byte_output() {
+  let (manager, plugin_name) = plugin_manager();
+  manager.start_plugin(&plugin_name).await.unwrap();
+  let client = manager.get_client("shell").await.unwrap();
+  let mut command = request("if [[ -t 1 ]]; then printf 'pty\\rraw'; else printf pipe; fi");
+  command.raw = true;
+  let execution = client.start_execution(command, CancellationToken::new()).await.unwrap();
+
+  let (stdout, stderr, code) = tokio::time::timeout(Duration::from_secs(5), collect(execution))
+    .await
+    .expect("raw PTY command timed out");
+  assert!(stdout.contains("pty"), "{stdout:?}");
+  assert!(stdout.contains("raw"), "{stdout:?}");
+  assert!(stderr.is_empty());
+  assert_eq!(code, 0);
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn raw_execution_receives_host_input_over_the_plugin_protocol() {
+  let (manager, plugin_name) = plugin_manager();
+  let schema = manager.start_plugin(&plugin_name).await.unwrap();
+  assert!(schema.supports_raw);
+  let client = manager.get_client("shell").await.unwrap();
+  let mut command = request("read value; printf 'input=%s' \"$value\"");
+  command.raw = true;
+  let execution = client.start_execution(command, CancellationToken::new()).await.unwrap();
+  execution.terminal_input().write(b"hello\n".to_vec()).await.unwrap();
+
+  let (stdout, stderr, code) = tokio::time::timeout(Duration::from_secs(5), collect(execution))
+    .await
+    .expect("raw PTY input command timed out");
+  assert!(stdout.contains("input=hello"), "{stdout:?}");
+  assert!(stderr.is_empty());
+  assert_eq!(code, 0);
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
 }
 
 #[tokio::test]

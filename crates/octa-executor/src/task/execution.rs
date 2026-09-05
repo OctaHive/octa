@@ -14,7 +14,10 @@ impl TaskNode {
       envs: config.envs,
       dir: config.dir,
       ignore_errors: config.ignore_errors,
-      silent: config.silent,
+      silence: config.silence,
+      quiet: config.quiet,
+      raw: config.raw,
+      interactive_session: config.interactive_session,
       failfast: config.failfast,
       deps_res: Arc::new(Mutex::new(HashMap::default())),
       action: config.action,
@@ -23,6 +26,7 @@ impl TaskNode {
       preconditions: config.preconditions,
       timeout: config.timeout,
       output_scope: config.output_scope,
+      prefix_template: config.prefix_template,
       plugin: config.plugin,
     }
   }
@@ -40,6 +44,11 @@ impl TaskNode {
   #[cfg(test)]
   pub(crate) fn output_scope(&self) -> Option<&ConsoleScope> {
     self.output_scope.as_ref()
+  }
+
+  #[cfg(test)]
+  pub(crate) fn interactive_session(&self) -> Option<&str> {
+    self.interactive_session.as_deref()
   }
 
   pub fn watch_target(&self) -> Option<WatchTarget> {
@@ -202,7 +211,7 @@ impl TaskNode {
   }
 
   async fn log_info(&self, output: &ConsoleTarget, message: String) -> ExecutorResult<()> {
-    if self.action.is_command() {
+    if self.action.is_command() && !self.quiet {
       output.message(ConsoleLevel::Info, message).await?;
     }
     Ok(())
@@ -350,6 +359,7 @@ impl TaskNode {
           redact_params: false,
         },
         output: None,
+        raw: false,
       };
       match invoker.invoke(request, cancel_token.clone()).await {
         Ok(output) if output.code == 0 => {},
@@ -469,7 +479,7 @@ impl TaskNode {
       dry,
       force,
     } = runtime;
-    let console_target = ConsoleTarget::new(console, run_id, self.output_scope.clone());
+    let console_target = ConsoleTarget::with_silence(console, run_id, self.output_scope.clone(), self.silence);
     let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::new(plugin_manager.clone()));
 
     if !self.condition_runtime.should_run(&self.name)? {
@@ -496,6 +506,16 @@ impl TaskNode {
     let RuntimeContext { vars, envs, dir } = self
       .resolve_runtime_context(evaluator.clone(), dry, cancel_token.clone())
       .await?;
+    if let Some(scope) = &self.output_scope {
+      let mut values = vars.to_merged_hashmap();
+      values.insert("TASK".to_owned(), serde_json::Value::String(self.name.clone()));
+      scope.set_template_values(values.clone());
+      if let Some(template) = &self.prefix_template {
+        let prefix = octa_output::render_output_template(template, &values)
+          .map_err(|error| ExecutorError::ValueExpandError(template.clone(), error.to_string()))?;
+        scope.set_prefix(Some(prefix));
+      }
+    }
     let condition_passed = self
       .check_condition(plugin_manager.clone(), dry, cancel_token.clone(), &vars, &envs, &dir)
       .await?;
@@ -573,7 +593,8 @@ impl TaskNode {
         dry,
         redact_params: false,
       },
-      output: (!self.silent).then(|| console_target.clone()),
+      output: Some(console_target.clone()),
+      raw: self.raw,
     };
     let result = match PluginInvoker::new(plugin_manager)
       .invoke(request, cancel_token.clone())
@@ -652,7 +673,12 @@ impl Executable<TaskNode> for TaskNode {
 
     // A child token limits cancellation to this command while preserving the caller's token.
     let command_token = cancel_token.child_token();
-    let output = ConsoleTarget::new(runtime.console.clone(), runtime.run_id, self.output_scope.clone());
+    let output = ConsoleTarget::with_silence(
+      runtime.console.clone(),
+      runtime.run_id,
+      self.output_scope.clone(),
+      self.silence,
+    );
     let execution = self.execute_inner(runtime, command_token.clone());
     tokio::pin!(execution);
 

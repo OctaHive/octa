@@ -28,12 +28,14 @@ use octa_executor::{
   summary::Summary,
   vars::{VariablePrompt, VariableResolver},
   watcher::{SourceWatcher, WatchTarget},
-  Executor, TaskGraphBuilder, TaskNode,
+  Executor, RuntimeCoordinator, TaskGraphBuilder, TaskNode,
 };
 use octa_finder::OctaFinder;
-use octa_octafile::{Octafile, SyntheticInclude, WatchInterval};
+use octa_octafile::{
+  Octafile, OctafileError, OutputConfig, OutputMode, PresentationConfig, Silence, SyntheticInclude, WatchInterval,
+};
 use octa_output::{CliDocument, Console, ConsoleLevel, ConsoleScopeAllocator, SummaryItem, TaskListItem};
-use presentation::{terminal_console, CiMode, OutputMode};
+use presentation::{terminal_console, CiMode};
 
 mod error;
 mod logger;
@@ -102,8 +104,20 @@ pub(crate) struct Cli {
   pub parallel: bool,
 
   /// Control how concurrent task output is presented
-  #[arg(long, value_enum, default_value_t)]
-  output: OutputMode,
+  #[arg(long, value_name = "MODE", env = "TASK_OUTPUT")]
+  output: Option<OutputMode>,
+
+  /// Template printed before a grouped task (supports task variables).
+  #[arg(long, value_name = "TEMPLATE", env = "TASK_OUTPUT_GROUP_BEGIN")]
+  output_group_begin: Option<String>,
+
+  /// Template printed after a grouped task (supports task variables).
+  #[arg(long, value_name = "TEMPLATE", env = "TASK_OUTPUT_GROUP_END")]
+  output_group_end: Option<String>,
+
+  /// Print grouped output only for failed or cancelled tasks.
+  #[arg(long, value_name = "BOOL", env = "TASK_OUTPUT_GROUP_ERROR_ONLY")]
+  output_group_error_only: Option<bool>,
 
   /// Emit annotations understood by the selected CI provider
   #[arg(long, value_enum, default_value_t)]
@@ -115,6 +129,25 @@ pub(crate) struct Cli {
 
   #[arg(short, long, default_value_t = false)]
   pub verbose: bool,
+
+  /// Suppress Octa's own non-error task messages.
+  #[arg(short = 'q', long, env = "TASK_QUIET", default_value_t = false)]
+  pub quiet: bool,
+
+  /// Suppress both task streams, or only stdout/stderr when specified.
+  #[arg(
+    long,
+    value_name = "STREAM",
+    num_args = 0..=1,
+    default_missing_value = "true",
+    require_equals = true,
+    env = "TASK_SILENT"
+  )]
+  pub silent: Option<Silence>,
+
+  /// Connect task stdin/stdout/stderr through an exclusive PTY session.
+  #[arg(short = 'r', long, env = "TASK_RAW", default_value_t = false)]
+  pub raw: bool,
 
   #[arg(short, long, default_value_t = false)]
   pub list_tasks: bool,
@@ -232,6 +265,9 @@ struct ExecutionOptions {
   failfast: bool,
   vars: Vec<(String, String)>,
   task_args: Vec<String>,
+  quiet: bool,
+  silence: Option<Silence>,
+  raw: bool,
 }
 
 #[derive(Clone)]
@@ -244,6 +280,7 @@ struct ExecutionContext {
   variable_resolver: Option<Arc<dyn VariableResolver>>,
   console: Arc<Console>,
   scope_allocator: Arc<ConsoleScopeAllocator>,
+  runtime_coordinator: Arc<RuntimeCoordinator>,
 }
 
 fn concurrency_limiter(cli: Option<NonZeroUsize>, configured: Option<NonZeroUsize>) -> Option<Arc<Semaphore>> {
@@ -486,20 +523,24 @@ async fn build_execute_items(
 ) -> OctaResult<(Vec<ExecuteItem>, Vec<WatchTarget>)> {
   let mut tasks = Vec::with_capacity(commands.len());
   let mut watch_targets = Vec::new();
+  let mut plan_is_parallel = options.parallel;
 
   for command in commands {
-    context
-      .console
-      .message(
-        ConsoleLevel::Info,
-        format!(
-          "Building DAG for command {} with provided args {:?}",
-          command, options.task_args
-        ),
-      )
-      .await?;
+    if !(options.quiet || context.octafile.quiet.unwrap_or(false)) {
+      context
+        .console
+        .message(
+          ConsoleLevel::Info,
+          format!(
+            "Building DAG for command {} with provided args {:?}",
+            command, options.task_args
+          ),
+        )
+        .await?;
+    }
     let mut builder = TaskGraphBuilder::new(context.plugin_manager.clone())?
       .with_scope_allocator(context.scope_allocator.clone())
+      .with_output_overrides(options.quiet, options.silence, options.raw)
       .with_variable_overrides(options.vars.clone());
     if let Some(resolver) = &context.variable_resolver {
       builder = builder.with_variable_resolver(resolver.clone());
@@ -513,17 +554,20 @@ async fn build_execute_items(
       )
       .await?;
 
+    plan_is_parallel |= !dag.is_linear()?;
+
     watch_targets.extend(dag.nodes().iter().filter_map(|node| node.watch_target()));
 
     let executor = Executor::new(
       context.plugin_manager.clone(),
       dag,
       ExecutorConfig {
-        silent: false,
+        emit_run_events: !(options.quiet || context.octafile.quiet.unwrap_or(false)),
         failfast: options.failfast,
         concurrency: context.concurrency.clone(),
         console: context.console.clone(),
         run_id: None,
+        runtime_coordinator: context.runtime_coordinator.clone(),
       },
       None,
       Arc::clone(&context.fingerprint),
@@ -536,6 +580,15 @@ async fn build_execute_items(
       command: command.clone(),
     });
   }
+
+  let concurrency_is_one = context
+    .concurrency
+    .as_ref()
+    .is_some_and(|limiter| limiter.available_permits() == 1);
+  context
+    .console
+    .set_parallel(plan_is_parallel && !options.raw && !concurrency_is_one)
+    .await?;
 
   Ok((tasks, watch_targets))
 }
@@ -635,13 +688,39 @@ async fn execute_watch(
 
 pub async fn run() -> OctaResult<()> {
   let args = Cli::parse();
-  run_with_console_and_diagnostics(terminal_console(args.output, args.ci), args).await
+  let presentation = configured_presentation(&args)?;
+  let console = terminal_console(
+    presentation.output,
+    args.ci,
+    presentation.quiet,
+    presentation.force_output_mode,
+    presentation.adaptive_output,
+  );
+  run_with_console_and_diagnostics(console, args).await
 }
 
 /// Runs the CLI and reports its terminal error through the same output pipeline.
 pub async fn run_and_report() -> bool {
   let args = Cli::parse();
-  let console = terminal_console(args.output, args.ci);
+  let presentation = match configured_presentation(&args) {
+    Ok(config) => config,
+    Err(error) => {
+      let console = terminal_console(OutputConfig::default(), args.ci, args.quiet, false, true);
+      let _ = console
+        .document(CliDocument::Failure {
+          message: error.to_string(),
+        })
+        .await;
+      return false;
+    },
+  };
+  let console = terminal_console(
+    presentation.output,
+    args.ci,
+    presentation.quiet,
+    presentation.force_output_mode,
+    presentation.adaptive_output,
+  );
   match run_with_console_and_diagnostics(console.clone(), args).await {
     Ok(()) => true,
     Err(error) => {
@@ -653,6 +732,69 @@ pub async fn run_and_report() -> bool {
       false
     },
   }
+}
+
+struct ConfiguredPresentation {
+  output: OutputConfig,
+  quiet: bool,
+  force_output_mode: bool,
+  adaptive_output: bool,
+}
+
+fn configured_presentation(args: &Cli) -> OctaResult<ConfiguredPresentation> {
+  let configured = match Octafile::resolve_path(args.octafile.clone(), args.global, args.dir.clone()) {
+    Ok(path) => Octafile::read_presentation_config(path)?,
+    Err(OctafileError::NotSearchedError | OctafileError::NotFoundError(_)) => PresentationConfig::default(),
+    Err(error) => return Err(error.into()),
+  };
+  let adaptive_output = configured.output.is_none() && args.output.is_none();
+  let mut output = configured.output.unwrap_or_else(|| OutputConfig {
+    mode: if args.parallel && !args.raw {
+      OutputMode::Prefixed
+    } else {
+      OutputMode::Interleaved
+    },
+    ..OutputConfig::default()
+  });
+  if let Some(mode) = args.output {
+    output.mode = mode;
+  }
+  let has_group_override =
+    args.output_group_begin.is_some() || args.output_group_end.is_some() || args.output_group_error_only.is_some();
+  if has_group_override && output.mode != OutputMode::Group {
+    return Err(OctaError::InvalidOutputConfig(
+      "group begin/end/error-only options require '--output group'".to_owned(),
+    ));
+  }
+  if let Some(begin) = &args.output_group_begin {
+    output.group.begin = Some(begin.clone());
+  }
+  if let Some(end) = &args.output_group_end {
+    output.group.end = Some(end.clone());
+  }
+  if let Some(error_only) = args.output_group_error_only {
+    output.group.error_only = error_only;
+  }
+  if output.mode == OutputMode::Group {
+    for template in [output.group.begin.as_deref(), output.group.end.as_deref()]
+      .into_iter()
+      .flatten()
+    {
+      octa_output::validate_output_template(template)
+        .map_err(|error| OctaError::InvalidOutputConfig(error.to_string()))?;
+    }
+  }
+  if args.raw && output.mode == OutputMode::Json {
+    return Err(OctaError::InvalidOutputConfig(
+      "raw/PTY mode cannot be combined with JSON output".to_owned(),
+    ));
+  }
+  Ok(ConfiguredPresentation {
+    output,
+    quiet: args.quiet || configured.quiet.unwrap_or(false),
+    force_output_mode: args.output.is_some(),
+    adaptive_output,
+  })
 }
 
 /// Runs the CLI with an injected renderer and leaves the process-global tracing subscriber untouched.
@@ -815,12 +957,15 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
   }
 
   let options = ExecutionOptions {
-    parallel: args.parallel,
+    parallel: args.parallel && !args.raw,
     dry: args.dry,
     force: args.force,
     failfast: args.failfast,
     vars: args.vars,
     task_args: args.task_args,
+    quiet: args.quiet,
+    silence: args.silent,
+    raw: args.raw,
   };
   let summary = Arc::new(Summary::new());
   let variable_resolver: Option<Arc<dyn VariableResolver>> =
@@ -835,6 +980,7 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
     variable_resolver,
     console,
     scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
+    runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
   };
   let watch = args.watch || tasks_request_watch(&octafile, &commands);
 
@@ -1148,6 +1294,9 @@ tasks:
         failfast: false,
         vars: Vec::new(),
         task_args: Vec::new(),
+        quiet: false,
+        silence: None,
+        raw: false,
       };
       execute_watch(
         ExecutionContext {
@@ -1159,6 +1308,7 @@ tasks:
           variable_resolver: None,
           console: Arc::new(Console::default()),
           scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
+          runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
         },
         &commands,
         &options,
@@ -1205,6 +1355,9 @@ tasks:
       failfast: false,
       vars: Vec::new(),
       task_args: Vec::new(),
+      quiet: false,
+      silence: None,
+      raw: false,
     };
     let result = execute_watch(
       ExecutionContext {
@@ -1216,6 +1369,7 @@ tasks:
         variable_resolver: None,
         console: Arc::new(Console::default()),
         scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
+        runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
       },
       &["build".to_string()],
       &options,
@@ -1274,6 +1428,7 @@ tasks:
           variable_resolver: None,
           console,
           scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
+          runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
         },
         &commands,
         &ExecutionOptions {
@@ -1283,6 +1438,9 @@ tasks:
           failfast: false,
           vars: Vec::new(),
           task_args: Vec::new(),
+          quiet: false,
+          silence: None,
+          raw: false,
         },
         Duration::from_millis(25),
         watch_cancel_token,
@@ -1420,6 +1578,7 @@ tasks:
         "custom-shell-executable".to_string(),
         Schema {
           key: "shell-command".to_string(),
+          supports_raw: true,
           capabilities: vec![SHELL_CAPABILITY.to_owned()],
           validation_schema: None,
         },
@@ -1428,6 +1587,7 @@ tasks:
         "custom".to_string(),
         Schema {
           key: "docker".to_string(),
+          supports_raw: false,
           capabilities: Vec::new(),
           validation_schema: None,
         },
@@ -1445,6 +1605,7 @@ tasks:
       SHELL_PLUGIN_NAME.to_owned(),
       Schema {
         key: "legacy-shell".to_owned(),
+        supports_raw: false,
         capabilities: Vec::new(),
         validation_schema: None,
       },
@@ -1478,18 +1639,63 @@ tasks:
   #[test]
   fn test_cli_output_mode() {
     let default = Cli::parse_from(["octa", "build"]);
-    assert_eq!(default.output, OutputMode::Interleaved);
+    assert_eq!(default.output, None);
 
     let grouped = Cli::parse_from(["octa", "--output", "group", "build"]);
-    assert_eq!(grouped.output, OutputMode::Group);
+    assert_eq!(grouped.output, Some(OutputMode::Group));
 
     let prefixed = Cli::parse_from(["octa", "--output", "prefixed", "build"]);
-    assert_eq!(prefixed.output, OutputMode::Prefixed);
+    assert_eq!(prefixed.output, Some(OutputMode::Prefixed));
 
     let on_error = Cli::parse_from(["octa", "--output", "on-error", "build"]);
-    assert_eq!(on_error.output, OutputMode::OnError);
+    assert_eq!(on_error.output, Some(OutputMode::OnError));
+
+    let keep_order = Cli::parse_from(["octa", "--output", "keep-order", "build"]);
+    assert_eq!(keep_order.output, Some(OutputMode::KeepOrder));
+
+    let replacing = Cli::parse_from(["octa", "--output", "replacing", "build"]);
+    assert_eq!(replacing.output, Some(OutputMode::Replacing));
+
+    let timed = Cli::parse_from(["octa", "--output", "timed", "build"]);
+    assert_eq!(timed.output, Some(OutputMode::Timed));
+
+    let json = Cli::parse_from(["octa", "--output", "jsonl", "build"]);
+    assert_eq!(json.output, Some(OutputMode::Json));
 
     assert!(Cli::try_parse_from(["octa", "--output", "unknown", "build"]).is_err());
+  }
+
+  #[test]
+  fn test_cli_group_output_overrides() {
+    let cli = Cli::parse_from([
+      "octa",
+      "--output",
+      "group",
+      "--output-group-begin",
+      "begin {{.TASK}}",
+      "--output-group-end",
+      "end",
+      "--output-group-error-only",
+      "true",
+      "build",
+    ]);
+    assert_eq!(cli.output_group_begin.as_deref(), Some("begin {{.TASK}}"));
+    assert_eq!(cli.output_group_end.as_deref(), Some("end"));
+    assert_eq!(cli.output_group_error_only, Some(true));
+  }
+
+  #[test]
+  fn test_cli_visibility_and_raw_modes() {
+    let all = Cli::parse_from(["octa", "--quiet", "--silent", "--raw", "build"]);
+    assert!(all.quiet);
+    assert_eq!(all.silent, Some(Silence::All));
+    assert!(all.raw);
+
+    let stdout = Cli::parse_from(["octa", "--silent=stdout", "build"]);
+    assert_eq!(stdout.silent, Some(Silence::Stdout));
+
+    let stderr = Cli::parse_from(["octa", "--silent=stderr", "build"]);
+    assert_eq!(stderr.silent, Some(Silence::Stderr));
   }
 
   #[test]
