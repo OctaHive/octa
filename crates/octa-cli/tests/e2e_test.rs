@@ -2693,6 +2693,7 @@ fn test_raw_mode_runs_through_the_pty_without_a_terminal() -> Result<(), Box<dyn
     .args(["--raw", "interactive"])
     .env("OCTA_CACHE_DIR", tmp_dir.path().join("cache"))
     .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+    .timeout(std::time::Duration::from_secs(10))
     .assert()
     .success()
     .stdout(predicate::str::contains("raw-output"));

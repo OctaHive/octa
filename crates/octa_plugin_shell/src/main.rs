@@ -11,6 +11,8 @@ use async_trait::async_trait;
 use octa_plugin::logger::Logger;
 use octa_plugin::{protocol::PluginResponse, serve_plugin, Plugin, PluginCommand, PluginInput};
 use octa_plugin::{PluginSchema, SHELL_CAPABILITY};
+#[cfg(windows)]
+use portable_pty::MasterPty;
 use portable_pty::{native_pty_system, PtySize};
 #[cfg(test)]
 use serde_json::Value;
@@ -117,6 +119,16 @@ struct RawPtyCommand {
   input: mpsc::UnboundedReceiver<PluginInput>,
 }
 
+#[cfg(windows)]
+fn close_pty_master(master: &mut Option<Box<dyn MasterPty + Send>>) -> tokio::task::JoinHandle<()> {
+  // Closing ConPTY may emit a final frame and block until its output pipe is drained.
+  // Keep the reader task active while ClosePseudoConsole runs on a blocking thread.
+  master
+    .take()
+    .map(|master| tokio::task::spawn_blocking(move || drop(master)))
+    .expect("PTY master is available until the child exits")
+}
+
 async fn execute_raw_pty(
   request: RawPtyCommand,
   coreutils_path: &std::path::Path,
@@ -132,8 +144,12 @@ async fn execute_raw_pty(
   } = request;
   let size = PtySize::default();
   let pair = native_pty_system().openpty(size)?;
+  #[cfg(windows)]
+  let mut master = Some(pair.master);
+  #[cfg(not(windows))]
+  let master = Some(pair.master);
   #[cfg(unix)]
-  let process_group = pair.master.process_group_leader();
+  let process_group = master.as_ref().and_then(|master| master.process_group_leader());
   let spawned = pair
     .slave
     .spawn_command(brush::pty_command(&command, &dir, envs, coreutils_path)?)?;
@@ -143,8 +159,12 @@ async fn execute_raw_pty(
   let mut child = PtyChildGuard::new(spawned);
   drop(pair.slave);
 
-  let mut reader = pair.master.try_clone_reader()?;
-  let mut pty_writer = Some(Arc::new(StdMutex::new(pair.master.take_writer()?)));
+  let mut reader = master.as_ref().expect("PTY master is available").try_clone_reader()?;
+  let mut pty_writer = Some(Arc::new(StdMutex::new(
+    master.as_ref().expect("PTY master is available").take_writer()?,
+  )));
+  #[cfg(windows)]
+  let mut master_close = None;
   let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(32);
   let reader_task = tokio::task::spawn_blocking(move || {
     let mut buffer = vec![0; 8192];
@@ -185,18 +205,28 @@ async fn execute_raw_pty(
               }).await??;
             }
           },
-          Some(PluginInput::Resize { rows, cols }) => pair.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-          })?,
+          Some(PluginInput::Resize { rows, cols }) => {
+            master
+              .as_ref()
+              .expect("PTY master remains open while the child is running")
+              .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+              })?;
+          },
           Some(PluginInput::Close) | None => pty_writer = None,
         }
       },
       _ = cancel_token.cancelled(), if code.is_none() => {
         child.terminate();
         code = Some(-1);
+        pty_writer = None;
+        #[cfg(windows)]
+        {
+          master_close = Some(close_pty_master(&mut master));
+        }
       },
       _ = tokio::time::sleep(Duration::from_millis(20)), if code.is_none() => {
         let status = child.child.lock().unwrap().try_wait()?;
@@ -204,12 +234,20 @@ async fn execute_raw_pty(
           code = Some(status.exit_code() as i32);
           child.finished();
           pty_writer = None;
+          #[cfg(windows)]
+          {
+            master_close = Some(close_pty_master(&mut master));
+          }
         }
       },
     }
   }
 
   let _ = reader_task.await;
+  #[cfg(windows)]
+  if let Some(master_close) = master_close {
+    let _ = master_close.await;
+  }
   let response = PluginResponse::ExitStatus {
     id,
     code: code.unwrap_or(-1),
