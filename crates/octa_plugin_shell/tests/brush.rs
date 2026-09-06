@@ -53,7 +53,7 @@ async fn raw_execution_uses_a_pty_and_preserves_byte_output() {
   let (manager, plugin_name) = plugin_manager();
   manager.start_plugin(&plugin_name).await.unwrap();
   let client = manager.get_client("shell").await.unwrap();
-  let mut command = request("if [[ -t 1 ]]; then printf 'pty\\rraw'; else printf pipe; fi");
+  let mut command = request("if [[ -t 1 ]]; then printf 'pty\\nraw'; else printf pipe; fi");
   command.raw = true;
   let execution = client.start_execution(command, CancellationToken::new()).await.unwrap();
   #[cfg(windows)]
@@ -86,6 +86,9 @@ async fn raw_execution_receives_host_input_over_the_plugin_protocol() {
   #[cfg(windows)]
   input.write(CONPTY_CURSOR_POSITION_RESPONSE.to_vec()).await.unwrap();
   input.resize(40, 100).await.unwrap();
+  #[cfg(windows)]
+  input.write(b"hello\r".to_vec()).await.unwrap();
+  #[cfg(not(windows))]
   input.write(b"hello\n".to_vec()).await.unwrap();
   #[cfg(not(windows))]
   input.close().await.unwrap();
