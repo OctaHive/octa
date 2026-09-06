@@ -1,8 +1,9 @@
 use std::{collections::HashMap, io};
 
 use super::{
-  ConsoleEntry, ConsoleRecord, ConsoleRenderer, ConsoleScope, ExecutionEvent, GroupRenderer, JsonLinesRenderer,
-  KeepOrderRenderer, OnErrorRenderer, PrefixedRenderer, RenderMode, ReplacingRenderer, TerminalRenderer, TimedRenderer,
+  ConsoleEntry, ConsoleRecord, ConsoleRenderer, ConsoleScope, ConsoleStream, ExecutionEvent, GroupRenderer,
+  JsonLinesRenderer, KeepOrderRenderer, OnErrorRenderer, PrefixedRenderer, RenderMode, ReplacingRenderer,
+  TerminalRenderer, TimedRenderer,
 };
 
 /// Routes each task scope to its selected presentation strategy while keeping
@@ -141,6 +142,21 @@ impl ConsoleRenderer for OutputRouterRenderer {
     let mode = self.effective_mode(self.selected_mode(Some(scope)));
     if mode == RenderMode::Replacing {
       self.replacing.update_progress(scope, message)
+    } else {
+      Ok(())
+    }
+  }
+
+  fn update_progress_bytes(
+    &mut self,
+    scope: &ConsoleScope,
+    command_id: &str,
+    stream: ConsoleStream,
+    bytes: &[u8],
+  ) -> io::Result<()> {
+    let mode = self.effective_mode(self.selected_mode(Some(scope)));
+    if mode == RenderMode::Replacing {
+      self.replacing.update_progress_bytes(scope, command_id, stream, bytes)
     } else {
       Ok(())
     }
@@ -288,6 +304,13 @@ mod tests {
         run_id: 1,
         scope: progress_scope.clone(),
       }))
+      .unwrap();
+    router.update_progress(&progress_scope, "working").unwrap();
+    router
+      .update_progress_bytes(&progress_scope, "command", ConsoleStream::Stdout, b"partial")
+      .unwrap();
+    router
+      .update_progress_bytes(&plain_scope, "command", ConsoleStream::Stdout, b"ignored")
       .unwrap();
     router
       .render(&event(ExecutionEvent::Output {

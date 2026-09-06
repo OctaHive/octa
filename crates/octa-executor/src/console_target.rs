@@ -74,6 +74,12 @@ impl ConsoleTarget {
     if matches!(stream, ConsoleStream::Stdout) && self.silence.hides_stdout()
       || matches!(stream, ConsoleStream::Stderr) && self.silence.hides_stderr()
     {
+      if let Some(binding) = &self.binding {
+        self
+          .console
+          .update_progress_bytes(binding.scope().clone(), command_id, stream, bytes)
+          .await?;
+      }
       return Ok(());
     }
     self
@@ -159,10 +165,13 @@ mod tests {
 
   use super::*;
 
+  type RecordedProgressBytes = (ConsoleScope, String, ConsoleStream, Vec<u8>);
+
   #[derive(Clone, Default)]
   struct Recording {
     records: Arc<Mutex<Vec<ConsoleRecord>>>,
     progress: Arc<Mutex<Vec<(ConsoleScope, String)>>>,
+    progress_bytes: Arc<Mutex<Vec<RecordedProgressBytes>>>,
   }
 
   impl ConsoleRenderer for Recording {
@@ -173,6 +182,21 @@ mod tests {
 
     fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
       self.progress.lock().unwrap().push((scope.clone(), message.to_owned()));
+      Ok(())
+    }
+
+    fn update_progress_bytes(
+      &mut self,
+      scope: &ConsoleScope,
+      command_id: &str,
+      stream: ConsoleStream,
+      bytes: &[u8],
+    ) -> io::Result<()> {
+      self
+        .progress_bytes
+        .lock()
+        .unwrap()
+        .push((scope.clone(), command_id.to_owned(), stream, bytes.to_vec()));
       Ok(())
     }
 
@@ -222,6 +246,18 @@ mod tests {
     assert!(!stderr_hidden.hides(ConsoleStream::Stdout));
     assert!(stderr_hidden.hides(ConsoleStream::Stderr));
     assert_eq!(records.records.lock().unwrap().len(), 2);
+    assert_eq!(
+      *records.progress_bytes.lock().unwrap(),
+      [
+        (
+          scope.clone(),
+          "command".to_owned(),
+          ConsoleStream::Stdout,
+          b"hidden".to_vec()
+        ),
+        (scope, "command".to_owned(), ConsoleStream::Stderr, b"hidden".to_vec())
+      ]
+    );
   }
 
   #[tokio::test]

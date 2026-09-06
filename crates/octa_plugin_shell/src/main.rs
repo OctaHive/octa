@@ -19,7 +19,7 @@ use serde_json::Value;
 use tera::{Context as TeraContext, Tera};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::{
-  io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+  io::{AsyncReadExt, AsyncWriteExt},
   sync::{mpsc, Mutex},
 };
 use tokio_util::sync::CancellationToken;
@@ -81,31 +81,25 @@ async fn forward_output(
   logger: Arc<impl Logger>,
   cancel_token: CancellationToken,
 ) {
-  let mut reader = BufReader::new(stream);
-  let mut buffer = String::new();
+  let mut stream = stream;
+  let mut buffer = vec![0; 8 * 1024];
   loop {
     let read = tokio::select! {
-      read = reader.read_line(&mut buffer) => read,
+      read = stream.read(&mut buffer) => read,
       _ = cancel_token.cancelled() => break,
     };
     match read {
       Ok(0) | Err(_) => break,
-      Ok(_) => {
+      Ok(count) => {
+        let bytes = buffer[..count].to_vec();
         let response = if stdout {
-          PluginResponse::Stdout {
-            id: id.clone(),
-            line: buffer.clone(),
-          }
+          PluginResponse::StdoutBytes { id: id.clone(), bytes }
         } else {
-          PluginResponse::Stderr {
-            id: id.clone(),
-            line: buffer.clone(),
-          }
+          PluginResponse::StderrBytes { id: id.clone(), bytes }
         };
         let response_json = serde_json::to_string(&response).unwrap() + "\n";
-        let _ = tx.send(response_json.clone()).await;
         let _ = logger.log(&response_json);
-        buffer.clear();
+        let _ = tx.send(response_json).await;
       },
     }
   }

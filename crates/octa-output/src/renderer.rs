@@ -1,6 +1,6 @@
 use std::io;
 
-use super::{ConsoleEntry, ConsoleScope};
+use super::{ConsoleEntry, ConsoleScope, ConsoleStream};
 
 /// Presents structured output records in a concrete format.
 pub trait ConsoleRenderer: Send + 'static {
@@ -24,6 +24,17 @@ pub trait ConsoleRenderer: Send + 'static {
 
   /// Updates presentation-only progress without creating a runtime output record.
   fn update_progress(&mut self, _scope: &ConsoleScope, _message: &str) -> io::Result<()> {
+    Ok(())
+  }
+
+  /// Updates progress from a byte chunk without requiring a complete UTF-8 line.
+  fn update_progress_bytes(
+    &mut self,
+    _scope: &ConsoleScope,
+    _command_id: &str,
+    _stream: ConsoleStream,
+    _bytes: &[u8],
+  ) -> io::Result<()> {
     Ok(())
   }
 
@@ -69,6 +80,16 @@ impl<R: ConsoleRenderer + ?Sized> ConsoleRenderer for Box<R> {
     (**self).update_progress(scope, message)
   }
 
+  fn update_progress_bytes(
+    &mut self,
+    scope: &ConsoleScope,
+    command_id: &str,
+    stream: ConsoleStream,
+    bytes: &[u8],
+  ) -> io::Result<()> {
+    (**self).update_progress_bytes(scope, command_id, stream, bytes)
+  }
+
   fn supports_progress_updates(&self) -> bool {
     (**self).supports_progress_updates()
   }
@@ -93,5 +114,29 @@ pub struct NullRenderer;
 impl ConsoleRenderer for NullRenderer {
   fn render(&mut self, _entry: &ConsoleEntry) -> io::Result<()> {
     Ok(())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::ConsoleScopeAllocator;
+
+  #[test]
+  fn boxed_renderers_delegate_progress_and_default_lifecycle_methods() {
+    let scope = ConsoleScopeAllocator::default().scope("build");
+    let mut renderer: Box<dyn ConsoleRenderer> = Box::new(NullRenderer);
+
+    renderer.tick().unwrap();
+    assert!(!renderer.wants_tick());
+    renderer.set_parallel(true).unwrap();
+    renderer.update_progress(&scope, "working").unwrap();
+    renderer
+      .update_progress_bytes(&scope, "command", ConsoleStream::Stdout, b"partial")
+      .unwrap();
+    assert!(!renderer.supports_progress_updates());
+    renderer.begin_raw(&scope).unwrap();
+    renderer.end_raw(&scope).unwrap();
+    assert!(renderer.supports_raw_terminal());
   }
 }

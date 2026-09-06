@@ -36,6 +36,36 @@ fn plugin(key: &str, value: impl Into<Value>) -> Option<PluginInvocation> {
   Some(PluginInvocation::new(key.to_owned(), value.into()))
 }
 
+fn recorded_output(
+  events: &[octa_output::ConsoleRecord],
+  scope: &ConsoleScope,
+  stream: octa_output::ConsoleStream,
+) -> Vec<u8> {
+  let mut output = Vec::new();
+  for event in events {
+    let octa_output::ConsoleRecord::Execution(octa_output::ExecutionEvent::Output {
+      scope: event_scope,
+      stream: event_stream,
+      payload,
+      ..
+    }) = event
+    else {
+      continue;
+    };
+    if event_scope.as_ref() != Some(scope) || *event_stream != stream {
+      continue;
+    }
+    match payload {
+      octa_output::ConsolePayload::Line(line) => {
+        output.extend_from_slice(line.as_bytes());
+        output.push(b'\n');
+      },
+      octa_output::ConsolePayload::Bytes(bytes) | octa_output::ConsolePayload::RawBytes(bytes) => output.extend(bytes),
+    }
+  }
+  output
+}
+
 struct UnscopedTaskItem;
 
 struct LegacyScopedTaskItem(ConsoleScope);
@@ -476,26 +506,14 @@ async fn plugin_stdout_and_stderr_are_routed_as_structured_events() {
 
   {
     let events = events.lock().unwrap();
-    assert!(events.iter().any(|event| matches!(
-      event,
-      octa_output::ConsoleRecord::Execution(octa_output::ExecutionEvent::Output {
-        run_id: 7,
-        scope: event_scope,
-        stream: octa_output::ConsoleStream::Stdout,
-        payload: octa_output::ConsolePayload::Line(line),
-        ..
-      }) if event_scope.as_ref() == Some(&scope) && line == "stdout"
-    )));
-    assert!(events.iter().any(|event| matches!(
-      event,
-      octa_output::ConsoleRecord::Execution(octa_output::ExecutionEvent::Output {
-        run_id: 7,
-        scope: event_scope,
-        stream: octa_output::ConsoleStream::Stderr,
-        payload: octa_output::ConsolePayload::Line(line),
-        ..
-      }) if event_scope.as_ref() == Some(&scope) && line == "stderr"
-    )));
+    assert_eq!(
+      recorded_output(&events, &scope, octa_output::ConsoleStream::Stdout),
+      b"stdout\n"
+    );
+    assert_eq!(
+      recorded_output(&events, &scope, octa_output::ConsoleStream::Stderr),
+      b"stderr\n"
+    );
   }
   plugin_manager.shutdown_all().await;
 }

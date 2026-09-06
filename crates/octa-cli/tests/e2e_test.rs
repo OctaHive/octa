@@ -6,6 +6,7 @@ use std::{
 };
 
 use assert_cmd::Command;
+use octa_output::{ConsoleEntry, ConsolePayload, ConsoleRecord, ConsoleStream, ExecutionEvent};
 use predicates::prelude::{predicate, PredicateBooleanExt};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -30,6 +31,33 @@ fn validation_plugins_dir() -> PathBuf {
       .canonicalize()
       .unwrap()
   }
+}
+
+fn json_task_output(entries: &[serde_json::Value], task: &str) -> Vec<u8> {
+  let mut output = Vec::new();
+  for entry in entries {
+    let entry = serde_json::from_value::<ConsoleEntry>(entry.clone()).unwrap();
+    let ConsoleRecord::Execution(ExecutionEvent::Output {
+      scope: Some(scope),
+      stream: ConsoleStream::Stdout,
+      payload,
+      ..
+    }) = entry.record()
+    else {
+      continue;
+    };
+    if scope.label() != task {
+      continue;
+    }
+    match payload {
+      ConsolePayload::Line(line) => {
+        output.extend_from_slice(line.as_bytes());
+        output.push(b'\n');
+      },
+      ConsolePayload::Bytes(bytes) | ConsolePayload::RawBytes(bytes) => output.extend(bytes),
+    }
+  }
+  output
 }
 
 #[test]
@@ -2650,6 +2678,35 @@ tasks:
 }
 
 #[test]
+fn test_normal_output_preserves_an_unterminated_fragment() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+output: interleaved
+quiet: true
+
+tasks:
+  build:
+    shell: printf partial
+"#,
+  )?;
+
+  let mut command = Command::cargo_bin("octa")?;
+  command
+    .current_dir(tmp_dir.path())
+    .arg("build")
+    .env("OCTA_CACHE_DIR", tmp_dir.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+    .assert()
+    .success()
+    .stdout(predicate::eq(b"partial".as_slice()));
+
+  Ok(())
+}
+
+#[test]
 fn test_octafile_output_and_environment_json_override() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   fs::write(
@@ -2698,11 +2755,7 @@ tasks:
       .collect::<Vec<_>>(),
     (1..=entries.len() as u64).collect::<Vec<_>>()
   );
-  assert!(entries.iter().any(|entry| {
-    entry["category"] == "execution"
-      && entry["data"]["type"] == "output"
-      && entry["data"]["payload"]["data"] == "configured-output"
-  }));
+  assert!(String::from_utf8(json_task_output(&entries, "build"))?.contains("configured-output"));
   let build_id = entries
     .iter()
     .find_map(|entry| {
@@ -2721,9 +2774,10 @@ tasks:
     .map(|entry| entry["data"]["step"]["id"].as_u64().unwrap())
     .collect::<Vec<_>>();
   assert_eq!(declared_step_ids.len(), 2);
+  assert!(String::from_utf8(json_task_output(&entries, "child"))?.contains("nested-output"));
   assert!(entries.iter().any(|entry| {
     entry["data"]["type"] == "output"
-      && entry["data"]["payload"]["data"] == "nested-output"
+      && entry["data"]["scope"]["label"] == "child"
       && declared_step_ids.contains(&entry["data"]["step_id"].as_u64().unwrap())
   }));
   for step_id in declared_step_ids {

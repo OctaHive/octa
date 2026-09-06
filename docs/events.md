@@ -46,6 +46,12 @@ run (`run_id`)
   `command_id` identifies the concrete plugin-protocol execution and is intentionally separate from
   the plan-level step ID.
 
+An output payload with `format: "bytes"` carries a base64-encoded chunk from an ordinary stdout or
+stderr pipe. Chunks are ordered but may split lines and UTF-8 characters; consumers must concatenate
+bytes per `command_id` and stream before decoding when complete text is required. `format:
+"raw_bytes"` is reserved for an exclusive raw/PTY session. The number and boundaries of chunks are
+not stable API behavior.
+
 Scope and step declarations are emitted in plan declaration order before scheduling. A scope starts
 when its first DAG node is considered for execution. A step starts only after it has acquired
 scheduler capacity; condition, freshness, and cache evaluation are part of the started step. A

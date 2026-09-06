@@ -164,15 +164,27 @@ still subject to these transport and result limits even though it bypasses prese
 
 ## Output, diagnostics, and completion
 
-Normal line-oriented commands use `Stdout` and `Stderr`:
+Plugins should use `StdoutBytes` and `StderrBytes` for streaming command output. `bytes` is base64
+encoded by the protocol serializer, and a chunk may end anywhere: it does not need to contain a
+newline or complete UTF-8 character. Send chunks promptly rather than retaining them until a line
+ending or command exit:
+
+```json
+{"type":"StdoutBytes","payload":{"id":"command-id","bytes":"Y29tcGlsaW5n"}}
+{"type":"StderrBytes","payload":{"id":"command-id","bytes":"d2FybmluZzog"}}
+```
+
+`Stdout` and `Stderr` remain supported for plugins that naturally produce complete UTF-8 lines:
 
 ```json
 {"type":"Stdout","payload":{"id":"command-id","line":"compiled crate"}}
 {"type":"Stderr","payload":{"id":"command-id","line":"warning: unused value"}}
 ```
 
-The `line` value does not need a trailing newline. Octa normalizes line endings and applies the
-selected output renderer, prefixes, buffering, and stream suppression.
+The `line` value does not need a trailing newline; Octa supplies its logical line ending. Do not use
+the line variants for partial output because Octa cannot expose that data before the response is
+sent. Both forms pass through the selected output renderer, prefixes, buffering, and stream
+suppression. The Rust SDK's `stream_output` helper uses byte responses and does not wait for newline.
 
 A plugin can report a structured diagnostic instead of making Octa parse arbitrary stderr text:
 
@@ -209,8 +221,10 @@ either response, Octa removes the command ID; sending later output for it is a p
 
 ## Raw and PTY execution
 
-A plugin must declare `supports_raw: true` before Octa will send `Execute.raw: true`. Raw mode keeps
-terminal data byte-oriented and uses base64 in JSON so arbitrary bytes survive the UTF-8 transport:
+A plugin must declare `supports_raw: true` before Octa will send `Execute.raw: true`. Raw mode uses
+the same byte response variants as normal streaming, but treats them as an exclusive terminal
+protocol and bypasses presentation transforms. Base64 lets arbitrary bytes survive the UTF-8
+transport:
 
 ```json
 {"type":"StdoutBytes","payload":{"id":"command-id","bytes":"G1sySg=="}}
@@ -332,4 +346,5 @@ async fn main() -> Result<()> {
 ```
 
 For raw support, consume `PluginCommand.input`, emit `StdoutBytes`/`StderrBytes`, and set
-`PluginSchema.supports_raw` to `true`. Use the built-in shell plugin as the reference implementation.
+`PluginSchema.supports_raw` to `true`. Normal commands should also prefer byte responses when output
+can be incremental. Use the built-in shell plugin as the reference implementation.

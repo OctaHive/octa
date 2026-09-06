@@ -32,7 +32,7 @@ enum WriterRequest {
   },
   UpdateProgress {
     scope: ConsoleScope,
-    message: String,
+    update: ProgressUpdate,
     completed: oneshot::Sender<io::Result<()>>,
   },
   BeginRaw {
@@ -42,6 +42,15 @@ enum WriterRequest {
   EndRaw {
     scope: ConsoleScope,
     entries: Vec<ConsoleEntry>,
+  },
+}
+
+enum ProgressUpdate {
+  Line(String),
+  Bytes {
+    command_id: String,
+    stream: ConsoleStream,
+    bytes: Vec<u8>,
   },
 }
 
@@ -471,6 +480,30 @@ impl Console {
 
   /// Sends a presentation-only progress update in the same order as runtime records.
   pub async fn update_progress(&self, scope: ConsoleScope, message: impl Into<String>) -> io::Result<()> {
+    self.send_progress(scope, ProgressUpdate::Line(message.into())).await
+  }
+
+  /// Sends a byte-oriented progress update without waiting for a line ending.
+  pub async fn update_progress_bytes(
+    &self,
+    scope: ConsoleScope,
+    command_id: impl Into<String>,
+    stream: ConsoleStream,
+    bytes: Vec<u8>,
+  ) -> io::Result<()> {
+    self
+      .send_progress(
+        scope,
+        ProgressUpdate::Bytes {
+          command_id: command_id.into(),
+          stream,
+          bytes,
+        },
+      )
+      .await
+  }
+
+  async fn send_progress(&self, scope: ConsoleScope, update: ProgressUpdate) -> io::Result<()> {
     if !self.progress_updates_supported {
       return Ok(());
     }
@@ -480,7 +513,7 @@ impl Console {
       .writer
       .send(WriterRequest::UpdateProgress {
         scope,
-        message: message.into(),
+        update,
         completed,
       })
       .await?;
@@ -623,10 +656,17 @@ fn render_loop(
       },
       WriterRequest::UpdateProgress {
         scope,
-        message,
+        update,
         completed,
       } => {
-        let result = renderer.update_progress(&scope, &message);
+        let result = match update {
+          ProgressUpdate::Line(message) => renderer.update_progress(&scope, &message),
+          ProgressUpdate::Bytes {
+            command_id,
+            stream,
+            bytes,
+          } => renderer.update_progress_bytes(&scope, &command_id, stream, &bytes),
+        };
         if let Err(Err(error)) = completed.send(result) {
           store_background_error(&background_error, error);
         }
@@ -675,12 +715,15 @@ mod tests {
   use super::*;
   use crate::{ConsoleRecord, ConsoleRenderer, ConsoleScopeAllocator};
 
+  type RecordedProgressBytes = (ConsoleScope, String, ConsoleStream, Vec<u8>);
+
   #[derive(Default)]
   struct RecordingRenderer {
     records: StdMutex<Vec<ConsoleRecord>>,
     sequences: StdMutex<Vec<u64>>,
     threads: StdMutex<Vec<thread::ThreadId>>,
     progress: StdMutex<Vec<(ConsoleScope, String)>>,
+    progress_bytes: StdMutex<Vec<RecordedProgressBytes>>,
   }
 
   impl ConsoleRenderer for Arc<RecordingRenderer> {
@@ -693,6 +736,21 @@ mod tests {
 
     fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
       self.progress.lock().unwrap().push((scope.clone(), message.to_owned()));
+      Ok(())
+    }
+
+    fn update_progress_bytes(
+      &mut self,
+      scope: &ConsoleScope,
+      command_id: &str,
+      stream: ConsoleStream,
+      bytes: &[u8],
+    ) -> io::Result<()> {
+      self
+        .progress_bytes
+        .lock()
+        .unwrap()
+        .push((scope.clone(), command_id.to_owned(), stream, bytes.to_vec()));
       Ok(())
     }
 
@@ -784,8 +842,17 @@ mod tests {
     let scope = ConsoleScopeAllocator::default().scope("build");
 
     console.update_progress(scope.clone(), "compiling").await.unwrap();
+    console
+      .update_progress_bytes(scope.clone(), "command", ConsoleStream::Stderr, b"partial".to_vec())
+      .await
+      .unwrap();
 
     assert_eq!(*renderer.progress.lock().unwrap(), [(scope, "compiling".to_owned())]);
+    assert!(matches!(
+      renderer.progress_bytes.lock().unwrap().as_slice(),
+      [(_, command_id, ConsoleStream::Stderr, bytes)]
+        if command_id == "command" && bytes == b"partial"
+    ));
     assert!(renderer.records.lock().unwrap().is_empty());
   }
 

@@ -5,7 +5,7 @@ use std::{
 
 use super::{
   CliDocument, ConsoleDiagnostic, ConsoleEntry, ConsoleLevel, ConsoleRecord, ConsoleRenderer, ConsoleScope,
-  ConsoleStatus, ExecutionEvent, SourceLocation,
+  ConsoleStatus, ConsoleStream, ExecutionEvent, SourceLocation,
 };
 
 /// Emits a GitHub Actions error annotation for a failed CLI invocation.
@@ -100,6 +100,16 @@ impl<R: ConsoleRenderer> ConsoleRenderer for GithubActionsRenderer<R> {
 
   fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
     self.renderer.update_progress(scope, message)
+  }
+
+  fn update_progress_bytes(
+    &mut self,
+    scope: &ConsoleScope,
+    command_id: &str,
+    stream: ConsoleStream,
+    bytes: &[u8],
+  ) -> io::Result<()> {
+    self.renderer.update_progress_bytes(scope, command_id, stream, bytes)
   }
 
   fn supports_progress_updates(&self) -> bool {
@@ -374,5 +384,16 @@ mod tests {
   #[test]
   fn escapes_annotation_properties() {
     assert_eq!(escape_property("title: build, test%"), "title%3A build%2C test%25");
+  }
+
+  #[test]
+  fn delegates_progress_updates() {
+    let scope = crate::ConsoleScopeAllocator::default().scope("build");
+    let mut renderer = GithubActionsRenderer::with_writer(RecordingRenderer::default(), Box::new(Vec::new()));
+
+    renderer.update_progress(&scope, "working").unwrap();
+    renderer
+      .update_progress_bytes(&scope, "command", ConsoleStream::Stdout, b"partial")
+      .unwrap();
   }
 }

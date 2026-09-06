@@ -60,18 +60,20 @@ impl CaptureBuffer {
 
   async fn into_string(self) -> io::Result<String> {
     match self {
-      Self::Memory(buffer) => {
-        String::from_utf8(buffer).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-      },
+      Self::Memory(buffer) => Ok(decode_output(buffer)),
       Self::Disk { mut file, .. } => {
         file.flush().await?;
         file.get_mut().seek(SeekFrom::Start(0)).await?;
-        let mut output = String::new();
-        file.get_mut().read_to_string(&mut output).await?;
-        Ok(output)
+        let mut output = Vec::new();
+        file.get_mut().read_to_end(&mut output).await?;
+        Ok(decode_output(output))
       },
     }
   }
+}
+
+fn decode_output(bytes: Vec<u8>) -> String {
+  String::from_utf8(bytes).unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
 }
 
 /// Captures the task result with a shared stdout/stderr byte budget.
@@ -148,6 +150,27 @@ mod tests {
     let (stdout, stderr) = capture.into_strings().await.unwrap();
     assert_eq!(stdout, "hello");
     assert_eq!(stderr, "error");
+  }
+
+  #[tokio::test]
+  async fn reassembles_utf8_split_across_byte_chunks() {
+    let mut capture = OutputCapture::with_limits(64, 64);
+    let value = "сборка".as_bytes();
+    capture.append(ConsoleStream::Stdout, &value[..1]).await.unwrap();
+    capture.append(ConsoleStream::Stdout, &value[1..]).await.unwrap();
+
+    let (stdout, stderr) = capture.into_strings().await.unwrap();
+    assert_eq!(stdout, "сборка");
+    assert!(stderr.is_empty());
+  }
+
+  #[tokio::test]
+  async fn replaces_invalid_bytes_only_after_reassembling_the_stream() {
+    let mut capture = OutputCapture::with_limits(64, 64);
+    capture.append(ConsoleStream::Stdout, &[0xff]).await.unwrap();
+
+    let (stdout, _) = capture.into_strings().await.unwrap();
+    assert_eq!(stdout, "�");
   }
 
   #[tokio::test]

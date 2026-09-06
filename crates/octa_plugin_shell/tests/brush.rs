@@ -49,6 +49,46 @@ async fn collect(mut execution: PluginExecution) -> (String, String, i32) {
 }
 
 #[tokio::test]
+async fn normal_execution_streams_both_outputs_before_a_newline_or_exit() {
+  let (manager, plugin_name) = plugin_manager();
+  manager.start_plugin(&plugin_name).await.unwrap();
+  let client = manager.get_client("shell").await.unwrap();
+  let mut execution = client
+    .start_execution(
+      request("printf partial; printf warning >&2; sleep 10"),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+  let (stdout, stderr) = tokio::time::timeout(Duration::from_secs(2), async {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    while stdout != b"partial" || stderr != b"warning" {
+      match execution.receive_output(&CancellationToken::new()).await.unwrap() {
+        Some(PluginResponse::StdoutBytes { bytes, .. }) => stdout.extend(bytes),
+        Some(PluginResponse::StderrBytes { bytes, .. }) => stderr.extend(bytes),
+        Some(PluginResponse::ExitStatus { .. } | PluginResponse::Error { .. }) | None => {
+          panic!("command completed before streaming its partial output")
+        },
+        Some(_) => {},
+      }
+    }
+    (stdout, stderr)
+  })
+  .await
+  .expect("partial output was held until a newline or process exit");
+
+  assert_eq!(stdout, b"partial");
+  assert_eq!(stderr, b"warning");
+  tokio::time::timeout(Duration::from_secs(5), execution.cancel_and_wait())
+    .await
+    .expect("normal command cancellation timed out")
+    .unwrap();
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
 async fn raw_execution_uses_a_pty_and_preserves_byte_output() {
   let (manager, plugin_name) = plugin_manager();
   manager.start_plugin(&plugin_name).await.unwrap();

@@ -9,7 +9,7 @@ pub const EVENT_SCHEMA_VERSION: u16 = 1;
 /// JSON Schema for [`ConsoleEntry`] version 1.
 pub const EVENT_SCHEMA_V1: &str = include_str!("../schema/events-v1.schema.json");
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsoleStream {
   Stdout,

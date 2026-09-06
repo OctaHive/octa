@@ -249,18 +249,18 @@ async fn route_plugin_response(
         .map_err(|error| capture_error(plugin_name, error))?;
     },
     PluginResponse::StdoutBytes { id, bytes } if id == command_id => {
-      route_bytes(target, raw_session, command_id, ConsoleStream::Stdout, bytes.clone()).await?;
       output
-        .append(ConsoleStream::Stdout, String::from_utf8_lossy(&bytes).as_bytes())
+        .append(ConsoleStream::Stdout, &bytes)
         .await
         .map_err(|error| capture_error(plugin_name, error))?;
+      route_bytes(target, raw_session, command_id, ConsoleStream::Stdout, bytes).await?;
     },
     PluginResponse::StderrBytes { id, bytes } if id == command_id => {
-      route_bytes(target, raw_session, command_id, ConsoleStream::Stderr, bytes.clone()).await?;
       output
-        .append(ConsoleStream::Stderr, String::from_utf8_lossy(&bytes).as_bytes())
+        .append(ConsoleStream::Stderr, &bytes)
         .await
         .map_err(|error| capture_error(plugin_name, error))?;
+      route_bytes(target, raw_session, command_id, ConsoleStream::Stderr, bytes).await?;
     },
     PluginResponse::Diagnostic {
       id,

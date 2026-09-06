@@ -951,17 +951,23 @@ default, while a concurrency limit of one keeps output interleaved.
 | Mode | Behavior | Best suited for |
 | --- | --- | --- |
 | `interleaved` (`interleave`) | Writes stdout and stderr as records arrive, without prefixes | Sequential work or direct log consumption |
-| `prefixed` (`prefix`) | Streams each complete line as `[prefix] line` | Parallel work where full logs must remain live |
+| `prefixed` (`prefix`) | Streams output immediately and inserts `[prefix] ` at the start of each logical line | Parallel work where full logs must remain live |
 | `group` | Buffers each task invocation and prints it as one contiguous block | Readable CI logs and non-interleaved failures |
 | `on-error` | Buffers task output, discards it on success, and prints it on failure or cancellation | Quiet successful CI runs |
 | `keep-order` | Streams the first declared unfinished task; buffers later tasks and replays them in declaration order | Deterministic parallel logs with one live task |
 | `replacing` | Maintains one updating progress row per task and leaves a final status with elapsed time | Interactive local runs |
-| `timed` | Prints a stdout line only if it remains the current line for at least one second; stderr stays live | Hiding short-lived progress chatter |
+| `timed` | Prints stdout only when its current logical line survives for one second (or reaches the bounded buffer limit); stderr stays live | Hiding short-lived progress chatter |
 | `json` (`jsonl`) | Emits every structured console entry as one JSON object per line | Automation, log ingestion, and editor integrations |
 
 `group`, `on-error`, and `keep-order` use a bounded in-memory spool and spill large buffered output
 to a temporary file. Raw/PTY bytes always bypass buffering because delayed terminal traffic would
 break interactive programs.
+
+Normal, non-PTY commands are byte-streamed too: an unterminated stdout or stderr fragment reaches
+the selected live renderer without waiting for a newline or process exit. Renderers that promise
+grouping or declaration order still spool those chunks, while `timed` holds at most 64 KiB for one
+logical stdout line before revealing it. UTF-8 characters split between transport chunks are kept
+intact in captured task results and progress text.
 
 ## Group templates
 
@@ -1003,8 +1009,8 @@ tasks:
     shell: ./deploy.sh
 ```
 
-This renders command output as `[deploy-production] ...`. Prefixes apply only to line-oriented
-output. Raw byte streams pass through unchanged.
+This renders command output as `[deploy-production] ...`. Prefixes are inserted at logical line
+boundaries without delaying incomplete lines. Raw/PTY terminal bytes pass through unchanged.
 
 Use `presentation.output` for a task-specific human-readable style. The extra `presentation` level
 avoids colliding with the task's artifact `output` list:
@@ -1073,11 +1079,13 @@ extended task-reference/dependency levels where applicable. CLI/environment over
 `--quiet`/`TASK_QUIET` and `--silent[=stdout|stderr]`/`TASK_SILENT`.
 
 With `replacing`, a fully silent task still keeps its progress row. It starts with `running`, then
-uses the latest non-empty stdout or stderr line as its progress text without emitting that line as
-normal command output. Without `silent`, stdout and stderr remain visible in full above the live panel
-while their latest non-empty line also updates the task's progress text. Scoped informational messages
-are absorbed by the progress UI; structured warnings and errors remain visible. Each declared task owns
-one stable row; completed rows remain in declaration order until the whole run finishes.
+uses the latest non-empty stdout or stderr text as its progress message, including an unfinished
+line, without emitting that output normally. Partial lines are tracked independently per command
+and stream, so interleaved stdout and stderr cannot be concatenated into a bogus status. Without
+`silent`, stdout and stderr remain visible in full above the live panel while their latest content
+also updates the task's progress text. Scoped informational messages are absorbed by the progress
+UI; structured warnings and errors remain visible. Each declared task owns one stable row;
+completed rows remain in declaration order until the whole run finishes.
 
 For example, this keeps prefixed compiler output but hides Octa's own lifecycle messages:
 

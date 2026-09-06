@@ -1,7 +1,8 @@
 use std::{collections::HashMap, io};
 
 use super::{
-  spool::EntrySpool, ConsoleEntry, ConsoleRecord, ConsoleRenderer, ConsoleScope, ConsoleStatus, ExecutionEvent,
+  spool::EntrySpool, ConsoleEntry, ConsoleRecord, ConsoleRenderer, ConsoleScope, ConsoleStatus, ConsoleStream,
+  ExecutionEvent,
 };
 
 #[derive(Clone, Copy)]
@@ -165,6 +166,16 @@ impl<R: ConsoleRenderer> ConsoleRenderer for GroupRenderer<R> {
     self.0.renderer.update_progress(scope, message)
   }
 
+  fn update_progress_bytes(
+    &mut self,
+    scope: &ConsoleScope,
+    command_id: &str,
+    stream: ConsoleStream,
+    bytes: &[u8],
+  ) -> io::Result<()> {
+    self.0.renderer.update_progress_bytes(scope, command_id, stream, bytes)
+  }
+
   fn supports_progress_updates(&self) -> bool {
     self.0.renderer.supports_progress_updates()
   }
@@ -178,7 +189,7 @@ impl<R: ConsoleRenderer> ConsoleRenderer for GroupRenderer<R> {
   }
 }
 
-/// Buffers line-oriented task output and renders only failed or cancelled invocations.
+/// Buffers task output and renders only failed or cancelled invocations.
 /// Unscoped records and raw interactive streams remain live.
 pub struct OnErrorRenderer<R>(BufferedRenderer<R>);
 
@@ -211,6 +222,16 @@ impl<R: ConsoleRenderer> ConsoleRenderer for OnErrorRenderer<R> {
 
   fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
     self.0.renderer.update_progress(scope, message)
+  }
+
+  fn update_progress_bytes(
+    &mut self,
+    scope: &ConsoleScope,
+    command_id: &str,
+    stream: ConsoleStream,
+    bytes: &[u8],
+  ) -> io::Result<()> {
+    self.0.renderer.update_progress_bytes(scope, command_id, stream, bytes)
   }
 
   fn supports_progress_updates(&self) -> bool {
@@ -607,6 +628,10 @@ mod tests {
     assert!(group.supports_raw_terminal());
     group.tick().unwrap();
     group.set_parallel(true).unwrap();
+    group.update_progress(&scope, "working").unwrap();
+    group
+      .update_progress_bytes(&scope, "command", ConsoleStream::Stdout, b"partial")
+      .unwrap();
     group.begin_raw(&scope).unwrap();
     // Starting the same raw scope twice is idempotent at the buffering layer.
     group.begin_raw(&scope).unwrap();
@@ -619,6 +644,10 @@ mod tests {
     assert!(on_error.supports_raw_terminal());
     on_error.tick().unwrap();
     on_error.set_parallel(false).unwrap();
+    on_error.update_progress(&scope, "working").unwrap();
+    on_error
+      .update_progress_bytes(&scope, "command", ConsoleStream::Stderr, b"partial")
+      .unwrap();
     on_error.begin_raw(&scope).unwrap();
     on_error.end_raw(&scope).unwrap();
     assert_eq!(on_error.0.renderer.ticks, 1);

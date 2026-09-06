@@ -5,10 +5,11 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use super::{
   ConsoleEntry, ConsoleLevel, ConsolePayload, ConsoleRecord, ConsoleRenderer, ConsoleScope, ConsoleStatus,
-  ExecutionEvent,
+  ConsoleStream, ExecutionEvent,
 };
 
 const SPINNER_TICKS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const PROGRESS_LINE_LIMIT: usize = 16 * 1024;
 
 #[derive(Clone, Copy)]
 enum RowPhase {
@@ -21,6 +22,7 @@ struct ProgressRow {
   phase: RowPhase,
   message: String,
   started: Instant,
+  streamed_lines: HashMap<ConsoleStream, HashMap<String, StreamedLine>>,
 }
 
 impl ProgressRow {
@@ -29,8 +31,95 @@ impl ProgressRow {
       phase: RowPhase::Waiting,
       message: "waiting".to_owned(),
       started: Instant::now(),
+      streamed_lines: HashMap::new(),
     }
   }
+
+  fn complete_line(&mut self, command_id: &str, stream: ConsoleStream, line: &str) -> Option<String> {
+    if let Some(lines) = self.streamed_lines.get_mut(&stream) {
+      lines.remove(command_id);
+    }
+    normalized_message(line)
+  }
+
+  fn push_bytes(&mut self, command_id: &str, stream: ConsoleStream, bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+      return None;
+    }
+    let lines = self.streamed_lines.entry(stream).or_default();
+    if !lines.contains_key(command_id) {
+      lines.insert(command_id.to_owned(), StreamedLine::default());
+    }
+    let message = lines
+      .get_mut(command_id)
+      .expect("streamed line was inserted above")
+      .push(bytes);
+    if bytes.last() == Some(&b'\n') {
+      lines.remove(command_id);
+    }
+    message
+  }
+}
+
+#[derive(Default)]
+struct StreamedLine {
+  bytes: Vec<u8>,
+}
+
+impl StreamedLine {
+  fn push(&mut self, bytes: &[u8]) -> Option<String> {
+    let mut message = None;
+    for segment in bytes.split_inclusive(|byte| *byte == b'\n') {
+      let complete = segment.last() == Some(&b'\n');
+      let content = if complete {
+        &segment[..segment.len().saturating_sub(1)]
+      } else {
+        segment
+      };
+      self.extend_bounded(content);
+      if let Some(current) = display_message(&self.bytes) {
+        message = Some(current);
+      }
+      if complete {
+        self.bytes.clear();
+      }
+    }
+    message
+  }
+
+  fn extend_bounded(&mut self, bytes: &[u8]) {
+    if bytes.len() >= PROGRESS_LINE_LIMIT {
+      self.bytes.clear();
+      self
+        .bytes
+        .extend_from_slice(&bytes[bytes.len() - PROGRESS_LINE_LIMIT..]);
+      return;
+    }
+    let excess = self
+      .bytes
+      .len()
+      .saturating_add(bytes.len())
+      .saturating_sub(PROGRESS_LINE_LIMIT);
+    if excess != 0 {
+      self.bytes.drain(..excess);
+    }
+    self.bytes.extend_from_slice(bytes);
+  }
+}
+
+fn display_message(bytes: &[u8]) -> Option<String> {
+  let text = match std::str::from_utf8(bytes) {
+    Ok(text) => Cow::Borrowed(text),
+    Err(error) if error.error_len().is_none() => {
+      Cow::Borrowed(std::str::from_utf8(&bytes[..error.valid_up_to()]).expect("valid UTF-8 prefix was reported"))
+    },
+    Err(_) => String::from_utf8_lossy(bytes),
+  };
+  normalized_message(&text)
+}
+
+fn normalized_message(message: &str) -> Option<String> {
+  (!message.trim().is_empty()).then(|| message.replace('\r', ""))
 }
 
 /// Atomically redraws one multi-line progress frame containing one row per task.
@@ -138,6 +227,7 @@ impl<R> ReplacingRenderer<R> {
   fn finish_scope(&mut self, scope: &ConsoleScope, status: ConsoleStatus) {
     if let Some(row) = self.rows.get_mut(scope) {
       row.phase = RowPhase::Finished(status);
+      row.streamed_lines.clear();
     }
     if self.raw_scope.as_ref() == Some(scope) {
       self.raw_scope = None;
@@ -201,11 +291,26 @@ impl<R: ConsoleRenderer> ConsoleRenderer for ReplacingRenderer<R> {
       },
       ConsoleRecord::Execution(ExecutionEvent::Output {
         scope: Some(scope),
+        command_id,
+        stream,
         payload: ConsolePayload::Line(line),
         ..
       }) if self.raw_scope.is_none() => {
-        if !line.trim().is_empty() {
-          self.row(scope).message = line.replace('\r', "");
+        if let Some(message) = self.row(scope).complete_line(command_id, *stream, line) {
+          self.row(scope).message = message;
+          self.draw();
+        }
+        self.render_around_progress(entry)
+      },
+      ConsoleRecord::Execution(ExecutionEvent::Output {
+        scope: Some(scope),
+        command_id,
+        stream,
+        payload: ConsolePayload::Bytes(bytes),
+        ..
+      }) if self.raw_scope.is_none() => {
+        if let Some(message) = self.row(scope).push_bytes(command_id, *stream, bytes) {
+          self.row(scope).message = message;
           self.draw();
         }
         self.render_around_progress(entry)
@@ -266,10 +371,31 @@ impl<R: ConsoleRenderer> ConsoleRenderer for ReplacingRenderer<R> {
   }
 
   fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
-    if self.raw_scope.is_none() && !message.trim().is_empty() {
+    if self.raw_scope.is_none() {
       if let Some(row) = self.rows.get_mut(scope) {
-        row.message = message.replace('\r', "");
-        self.draw();
+        row.streamed_lines.clear();
+        if let Some(message) = normalized_message(message) {
+          row.message = message;
+          self.draw();
+        }
+      }
+    }
+    Ok(())
+  }
+
+  fn update_progress_bytes(
+    &mut self,
+    scope: &ConsoleScope,
+    command_id: &str,
+    stream: ConsoleStream,
+    bytes: &[u8],
+  ) -> io::Result<()> {
+    if self.raw_scope.is_none() {
+      if let Some(row) = self.rows.get_mut(scope) {
+        if let Some(message) = row.push_bytes(command_id, stream, bytes) {
+          row.message = message;
+          self.draw();
+        }
       }
     }
     Ok(())
@@ -376,6 +502,49 @@ mod tests {
   }
 
   #[test]
+  fn streamed_bytes_update_the_current_line_without_corrupting_split_utf8() {
+    let scope = ConsoleScopeAllocator::default().scope("build");
+    let mut renderer = renderer();
+    renderer.row(&scope).phase = RowPhase::Running;
+    let text = "сборка".as_bytes();
+
+    for bytes in [&text[..1], &text[1..4], &text[4..]] {
+      renderer
+        .render(&ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
+          run_id: 1,
+          scope: Some(scope.clone()),
+          step_id: None,
+          command_id: "build".to_owned(),
+          stream: ConsoleStream::Stdout,
+          payload: ConsolePayload::Bytes(bytes.to_vec()),
+        })))
+        .unwrap();
+    }
+
+    assert_eq!(renderer.rows[&scope].message, "сборка");
+    assert_eq!(renderer.renderer.0.len(), 3);
+  }
+
+  #[test]
+  fn keeps_partial_stdout_and_stderr_lines_independent() {
+    let scope = ConsoleScopeAllocator::default().scope("build");
+    let mut renderer = renderer();
+    renderer.row(&scope).phase = RowPhase::Running;
+
+    renderer
+      .update_progress_bytes(&scope, "command", ConsoleStream::Stdout, b"out")
+      .unwrap();
+    renderer
+      .update_progress_bytes(&scope, "command", ConsoleStream::Stderr, b"warning")
+      .unwrap();
+    renderer
+      .update_progress_bytes(&scope, "command", ConsoleStream::Stdout, b"put")
+      .unwrap();
+
+    assert_eq!(renderer.rows[&scope].message, "output");
+  }
+
+  #[test]
   fn tracks_silent_tasks_without_exposing_their_output() {
     let scope = ConsoleScopeAllocator::default().scope_with_options("build", None, true, true);
     let mut renderer = renderer();
@@ -400,11 +569,26 @@ mod tests {
     assert_eq!(renderer.rows[&scope].message, "running");
     renderer.update_progress(&scope, "compiling\r").unwrap();
     assert_eq!(renderer.rows[&scope].message, "compiling");
+    renderer
+      .update_progress_bytes(&scope, "build", ConsoleStream::Stdout, b"link")
+      .unwrap();
+    renderer
+      .update_progress_bytes(&scope, "build", ConsoleStream::Stdout, b"ing\npack")
+      .unwrap();
+    assert_eq!(renderer.rows[&scope].message, "pack");
     assert!(renderer
       .renderer
       .0
       .iter()
       .all(|record| !matches!(record, ConsoleRecord::Execution(ExecutionEvent::Output { .. }))));
+  }
+
+  #[test]
+  fn streamed_progress_retains_only_a_bounded_line_tail() {
+    let mut line = StreamedLine::default();
+    line.push(&vec![b'a'; PROGRESS_LINE_LIMIT + 10]);
+
+    assert_eq!(line.bytes.len(), PROGRESS_LINE_LIMIT);
   }
 
   #[test]

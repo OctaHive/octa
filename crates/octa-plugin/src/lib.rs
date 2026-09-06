@@ -2,7 +2,6 @@ use std::{collections::HashMap, ffi::OsStr, io, path::PathBuf, sync::Arc, time::
 
 use async_trait::async_trait;
 use clap::Parser;
-use futures::StreamExt;
 use interprocess::local_socket::{
   tokio::{prelude::*, Stream},
   ListenerOptions,
@@ -10,16 +9,13 @@ use interprocess::local_socket::{
 use logger::{collect_value_redactions, redact, Logger, LoggerSystem, RedactingLogger};
 use serde_json::{Map, Value};
 use socket::interpret_local_socket_name;
-use tokio::io::{AsyncWrite, ReadHalf};
+use tokio::io::{AsyncReadExt, AsyncWrite, ReadHalf};
 use tokio::{
-  io::{split, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, WriteHalf},
+  io::{split, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader},
   sync::{mpsc, oneshot, Mutex},
   task::JoinHandle,
 };
-use tokio_util::{
-  codec::{FramedRead, LinesCodec},
-  sync::CancellationToken,
-};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use protocol::{OctaCommand, PluginResponse, Schema, Version};
@@ -93,37 +89,45 @@ struct ActiveCommand {
 
 type ActiveCommands = Arc<Mutex<HashMap<String, ActiveCommand>>>;
 
-pub async fn stream_output(
-  stream: impl AsyncRead + Unpin,
+pub async fn stream_output<W>(
+  mut stream: impl AsyncRead + Unpin,
   output_type: &str,
-  writer: Arc<Mutex<WriteHalf<Stream>>>,
+  writer: Arc<Mutex<W>>,
   id: String,
-) -> io::Result<()> {
-  let mut reader = FramedRead::new(stream, LinesCodec::new());
-
-  while let Some(line_result) = reader.next().await {
-    match line_result {
-      Ok(line) => {
-        let response = match output_type {
-          "stdout" => PluginResponse::Stdout { id: id.clone(), line },
-          "stderr" => PluginResponse::Stderr { id: id.clone(), line },
-          _ => unreachable!(),
+) -> io::Result<()>
+where
+  W: AsyncWrite + Send + Unpin,
+{
+  if !matches!(output_type, "stdout" | "stderr") {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidInput,
+      format!("unsupported output stream: {output_type}"),
+    ));
+  }
+  let mut buffer = vec![0; 8 * 1024];
+  loop {
+    let count = match stream.read(&mut buffer).await {
+      Ok(0) => return Ok(()),
+      Ok(count) => count,
+      Err(error) => {
+        let response = PluginResponse::Error {
+          id,
+          message: format!("Failed to read {output_type}: {error}"),
         };
-
         let response_json = serde_json::to_string(&response)? + "\n";
         writer.lock().await.write_all(response_json.as_bytes()).await?;
+        return Ok(());
       },
-      Err(e) => {
-        let error = PluginResponse::Error {
-          id: id.clone(),
-          message: format!("Failed to read {}: {}", output_type, e),
-        };
-        let error_json = serde_json::to_string(&error)? + "\n";
-        writer.lock().await.write_all(error_json.as_bytes()).await?;
-      },
-    }
+    };
+    let bytes = buffer[..count].to_vec();
+    let response = if output_type == "stdout" {
+      PluginResponse::StdoutBytes { id: id.clone(), bytes }
+    } else {
+      PluginResponse::StderrBytes { id: id.clone(), bytes }
+    };
+    let response_json = serde_json::to_string(&response)? + "\n";
+    writer.lock().await.write_all(response_json.as_bytes()).await?;
   }
-  Ok(())
 }
 
 async fn handle_command<W>(
@@ -698,6 +702,46 @@ mod tests {
       responses.push(serde_json::from_str(&line).unwrap());
     }
     responses
+  }
+
+  #[tokio::test]
+  async fn stream_output_forwards_bytes_before_newline_or_eof() {
+    let (mut source_writer, source_reader) = tokio::io::duplex(1024);
+    let (sink_reader, sink_writer) = tokio::io::duplex(4096);
+    let writer = Arc::new(Mutex::new(sink_writer));
+    let forwarder = tokio::spawn(stream_output(source_reader, "stdout", writer, "command".to_owned()));
+    let mut responses = BufReader::new(sink_reader).lines();
+
+    source_writer.write_all(b"partial").await.unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(1), responses.next_line())
+      .await
+      .expect("partial output was buffered")
+      .unwrap()
+      .unwrap();
+
+    assert!(matches!(
+      serde_json::from_str::<PluginResponse>(&response).unwrap(),
+      PluginResponse::StdoutBytes { id, bytes } if id == "command" && bytes == b"partial"
+    ));
+    drop(source_writer);
+    forwarder.await.unwrap().unwrap();
+  }
+
+  #[tokio::test]
+  async fn stream_output_rejects_an_unknown_stream() {
+    let (_, source_reader) = tokio::io::duplex(16);
+    let (_, sink_writer) = tokio::io::duplex(16);
+
+    let error = stream_output(
+      source_reader,
+      "log",
+      Arc::new(Mutex::new(sink_writer)),
+      "command".to_owned(),
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
   }
 
   #[tokio::test]

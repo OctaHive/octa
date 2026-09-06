@@ -1,6 +1,6 @@
 use std::io;
 
-use super::{ConsoleEntry, ConsoleLevel, ConsoleRecord, ConsoleRenderer, ConsoleScope, ExecutionEvent};
+use super::{ConsoleEntry, ConsoleLevel, ConsoleRecord, ConsoleRenderer, ConsoleScope, ConsoleStream, ExecutionEvent};
 
 /// Suppresses informational presentation while leaving task streams and warnings untouched.
 pub struct QuietRenderer<R> {
@@ -46,6 +46,16 @@ impl<R: ConsoleRenderer> ConsoleRenderer for QuietRenderer<R> {
 
   fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
     self.renderer.update_progress(scope, message)
+  }
+
+  fn update_progress_bytes(
+    &mut self,
+    scope: &ConsoleScope,
+    command_id: &str,
+    stream: ConsoleStream,
+    bytes: &[u8],
+  ) -> io::Result<()> {
+    self.renderer.update_progress_bytes(scope, command_id, stream, bytes)
   }
 
   fn supports_progress_updates(&self) -> bool {
@@ -143,6 +153,10 @@ mod tests {
     assert!(renderer.supports_progress_updates());
     renderer.tick().unwrap();
     renderer.set_parallel(true).unwrap();
+    renderer.update_progress(&scope, "working").unwrap();
+    renderer
+      .update_progress_bytes(&scope, "command", ConsoleStream::Stdout, b"partial")
+      .unwrap();
     renderer.begin_raw(&scope).unwrap();
     renderer.end_raw(&scope).unwrap();
 

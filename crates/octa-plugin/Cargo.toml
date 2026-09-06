@@ -24,8 +24,7 @@ lazy_static = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-futures = "0.3"
-tokio-util = { version = "0.7", features = ["codec"] }
+tokio-util = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
