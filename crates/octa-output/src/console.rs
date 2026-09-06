@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, Mutex, OwnedMutexGuard};
 
 use super::{
   CliDocument, ConsoleDiagnostic, ConsoleEntry, ConsoleLevel, ConsolePayload, ConsoleRecord, ConsoleRenderer,
-  ConsoleScope, ConsoleStream, ExecutionEvent, NullRenderer,
+  ConsoleScope, ConsoleStream, EventSink, ExecutionEvent, NullEventSink, NullRenderer,
 };
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(0);
@@ -145,7 +145,7 @@ impl Drop for WriterHandle {
   }
 }
 
-/// Orders output from concurrent tasks and delegates blocking presentation to one writer thread.
+/// Orders records from concurrent tasks and delegates observation and presentation to one writer thread.
 pub struct Console {
   writer: WriterHandle,
   render_lock: Arc<Mutex<()>>,
@@ -158,6 +158,11 @@ pub struct Console {
 
 impl Console {
   pub fn new(renderer: impl ConsoleRenderer) -> Self {
+    Self::with_event_sink(renderer, NullEventSink)
+  }
+
+  /// Creates a console with independent presentation and structured event consumers.
+  pub fn with_event_sink(renderer: impl ConsoleRenderer, event_sink: impl EventSink) -> Self {
     let raw_terminal_supported = renderer.supports_raw_terminal();
     let progress_updates_supported = renderer.supports_progress_updates();
     let (sender, receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
@@ -168,7 +173,7 @@ impl Console {
       .spawn({
         let background_error = background_error.clone();
         let raw_ticks_paused = raw_ticks_paused.clone();
-        move || render_loop(renderer, receiver, background_error, raw_ticks_paused)
+        move || render_loop(renderer, event_sink, receiver, background_error, raw_ticks_paused)
       })
       .expect("failed to start output writer thread");
     let waker = writer.thread().clone();
@@ -608,6 +613,7 @@ impl Drop for RawConsoleSession {
 
 fn render_loop(
   mut renderer: impl ConsoleRenderer,
+  mut event_sink: impl EventSink,
   mut receiver: mpsc::Receiver<WriterRequest>,
   background_error: Arc<StdMutex<Option<io::Error>>>,
   raw_ticks_paused: Arc<AtomicBool>,
@@ -639,7 +645,7 @@ fn render_loop(
       WriterRequest::Render { mut entry, completed } => {
         entry.assign_sequence(next_sequence);
         next_sequence += 1;
-        let result = renderer.render(&entry);
+        let result = publish_entry(&mut renderer, &mut event_sink, &entry);
         if let Some(completed) = completed {
           if let Err(Err(error)) = completed.send(result) {
             store_background_error(&background_error, error);
@@ -681,7 +687,7 @@ fn render_loop(
         for mut entry in entries {
           entry.assign_sequence(next_sequence);
           next_sequence += 1;
-          if let Err(error) = renderer.render(&entry) {
+          if let Err(error) = publish_entry(&mut renderer, &mut event_sink, &entry) {
             store_background_error(&background_error, error);
           }
         }
@@ -691,6 +697,16 @@ fn render_loop(
       },
     }
   }
+}
+
+fn publish_entry(
+  renderer: &mut impl ConsoleRenderer,
+  event_sink: &mut impl EventSink,
+  entry: &ConsoleEntry,
+) -> io::Result<()> {
+  let event_result = event_sink.emit(entry);
+  let render_result = renderer.render(entry);
+  event_result.and(render_result)
 }
 
 fn store_background_error(slot: &StdMutex<Option<io::Error>>, error: io::Error) {
@@ -763,6 +779,91 @@ mod tests {
     let renderer = Arc::new(RecordingRenderer::default());
     let console = Arc::new(Console::new(renderer.clone()));
     (console, renderer)
+  }
+
+  #[derive(Default)]
+  struct RecordingEventSink {
+    entries: StdMutex<Vec<ConsoleEntry>>,
+    threads: StdMutex<Vec<thread::ThreadId>>,
+  }
+
+  impl EventSink for Arc<RecordingEventSink> {
+    fn emit(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
+      self.entries.lock().unwrap().push(entry.clone());
+      self.threads.lock().unwrap().push(thread::current().id());
+      Ok(())
+    }
+  }
+
+  #[tokio::test]
+  async fn event_sink_observes_sequenced_entries_without_a_presentation_renderer() {
+    let caller = thread::current().id();
+    let sink = Arc::new(RecordingEventSink::default());
+    let console = Console::with_event_sink(NullRenderer, sink.clone());
+
+    console.message(ConsoleLevel::Info, "first").await.unwrap();
+    console.message(ConsoleLevel::Warn, "second").await.unwrap();
+
+    let entries = sink.entries.lock().unwrap();
+    assert_eq!(entries.iter().map(ConsoleEntry::sequence).collect::<Vec<_>>(), [1, 2]);
+    assert!(matches!(
+      entries[1].record(),
+      ConsoleRecord::Diagnostic(ConsoleDiagnostic { level: ConsoleLevel::Warn, message, .. })
+        if message == "second"
+    ));
+    assert!(sink.threads.lock().unwrap().iter().all(|thread| *thread != caller));
+  }
+
+  #[tokio::test]
+  async fn event_sink_observes_entries_before_grouped_presentation_flushes() {
+    let scope = ConsoleScopeAllocator::default().scope("build");
+    let renderer = Arc::new(RecordingRenderer::default());
+    let sink = Arc::new(RecordingEventSink::default());
+    let console = Console::with_event_sink(crate::GroupRenderer::new(renderer.clone()), sink.clone());
+
+    console
+      .event(ExecutionEvent::ScopeStarted {
+        run_id: 7,
+        scope: scope.clone(),
+      })
+      .await
+      .unwrap();
+    console
+      .event(ExecutionEvent::Output {
+        run_id: 7,
+        scope: Some(scope),
+        step_id: None,
+        command_id: "command".to_owned(),
+        stream: ConsoleStream::Stdout,
+        payload: ConsolePayload::Line("output".to_owned()),
+      })
+      .await
+      .unwrap();
+
+    assert_eq!(sink.entries.lock().unwrap().len(), 2);
+    assert!(renderer.records.lock().unwrap().is_empty());
+  }
+
+  struct FailingEventSink;
+
+  impl EventSink for FailingEventSink {
+    fn emit(&mut self, _entry: &ConsoleEntry) -> io::Result<()> {
+      Err(io::Error::other("event sink failed"))
+    }
+  }
+
+  #[tokio::test]
+  async fn event_sink_failure_is_reported_after_presentation_is_attempted() {
+    let renderer = Arc::new(RecordingRenderer::default());
+    let console = Console::with_event_sink(renderer.clone(), FailingEventSink);
+
+    let error = console.message(ConsoleLevel::Info, "visible").await.unwrap_err();
+
+    assert_eq!(error.to_string(), "event sink failed");
+    assert!(matches!(
+      renderer.records.lock().unwrap().as_slice(),
+      [ConsoleRecord::Diagnostic(ConsoleDiagnostic { message, .. })] if message == "visible"
+    ));
   }
 
   #[tokio::test]

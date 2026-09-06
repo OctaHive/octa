@@ -3,6 +3,7 @@
 mod buffered;
 mod console;
 mod document;
+mod event_sink;
 mod github_actions;
 mod json_lines;
 mod keep_order;
@@ -22,6 +23,7 @@ mod timed;
 pub use buffered::{GroupRenderer, OnErrorRenderer};
 pub use console::{Console, RawConsoleSession};
 pub use document::{CliDocument, SummaryItem, TaskListItem};
+pub use event_sink::{EventSink, NullEventSink};
 pub use github_actions::GithubActionsRenderer;
 pub use json_lines::JsonLinesRenderer;
 pub use keep_order::KeepOrderRenderer;

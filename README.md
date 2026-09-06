@@ -1038,14 +1038,15 @@ combined with raw/PTY mode.
 
 ## Embedding the executor
 
-The Rust API returns a complete terminal snapshot from the existing execution entry point:
+The Rust API can start an execution and return a handle for cancellation and its terminal result:
 
 ```rust
-let result: octa_executor::ExecutionResult = executor.execute(cancel_token, "build").await?;
+let handle = executor.start("build");
+let result = handle.wait().await?;
 ```
 
-The result contains the run conclusion and ordered task and step results. It uses the same IDs as
-the live event stream; details are documented in the
+Attach an `EventSink` with `Console::with_event_sink` to receive structured entries independently
+of terminal presentation. The result uses the same IDs as the live event stream; details are in the
 [runtime event documentation](docs/events.md#terminal-result-for-embedded-callers).
 
 ## Quiet and silent

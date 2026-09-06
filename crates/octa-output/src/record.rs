@@ -187,7 +187,7 @@ pub enum ConsoleRecord {
   Document(CliDocument),
 }
 
-/// A timestamped record delivered to renderers in global output order.
+/// A timestamped record delivered to event sinks and renderers in global output order.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConsoleEntry {
   schema_version: u16,

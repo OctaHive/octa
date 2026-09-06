@@ -89,6 +89,16 @@ JSON Lines stream.
 
 ## Terminal result for embedded callers
 
+Structured observation and presentation are separate. `Console::with_event_sink` accepts an
+`EventSink` alongside its `ConsoleRenderer`. The sink receives every fully sequenced
+`ConsoleEntry` in global order, whether or not the renderer displays it. Presentation-only updates
+used by interactive renderers are not runtime records and do not reach the sink.
+
+The sink executes on the console writer thread. It should return promptly; an application that
+sends events over a network should enqueue them into its own bounded channel and choose an explicit
+backpressure policy. A sink error is returned to the event producer, but the corresponding renderer
+call is still attempted.
+
 The live event stream and the Rust `ExecutionResult` use the same `run_id`, task IDs, and step IDs.
 Events are the streaming observation interface; the result returned by `Executor::execute` is the
 authoritative terminal snapshot with timestamps and structured conclusions for the run, its tasks,
@@ -100,3 +110,9 @@ Each returned task has a `main` or `deferred` role. A failed deferred task remai
 changing an otherwise successful run conclusion; failure to form or publish its terminal result is
 an `ExecutorError`. A declared task that was never scheduled because a dependency failed has a
 `skipped` conclusion.
+
+`Executor::start` consumes an executor and returns an `ExecutionHandle`. The handle exposes
+the run ID, a clonable `CancellationToken`, idempotent `cancel`, and `wait`/`cancel_and_wait` methods.
+Dropping a live handle requests cooperative cancellation instead of detaching work silently. Use
+`start_with_token` when the execution must be a child of an application-owned cancellation tree;
+the handle owns a child token, so cancelling it never cancels its parent or sibling executions.

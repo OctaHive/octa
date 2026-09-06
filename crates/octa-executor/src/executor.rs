@@ -29,6 +29,7 @@ use tracing::{debug, info_span, Instrument};
 use crate::{
   console_scope_tracker::ConsoleScopeTracker,
   error::{ExecutorError, ExecutorResult},
+  execution_handle::ExecutionHandle,
   execution_result::{conclusion, ExecutionFailure, ExecutionResult, TaskResult, TaskRole},
   interactive_scope_tracker::InteractiveScopeTracker,
   runtime_coordinator::RuntimeCoordinator,
@@ -68,6 +69,7 @@ struct PlanExecution {
   outputs: Vec<String>,
   nested_tasks: Vec<TaskResult>,
   failure: Option<ExecutorError>,
+  cancelled: bool,
 }
 
 struct NodeExecution {
@@ -308,6 +310,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
         outputs: Vec::new(),
         nested_tasks: Vec::new(),
         failure: Some(error),
+        cancelled: false,
       },
     };
     let deferred_exit_code = plan.failure.as_ref().and_then(ExecutorError::command_exit_code);
@@ -318,9 +321,10 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       ConsoleStatus::Failed
     } else {
       match &plan.failure {
-        None => self.scope_tracker.successful_run_status().await,
         Some(ExecutorError::TaskCancelled(_)) => ConsoleStatus::Cancelled,
         Some(_) => ConsoleStatus::Failed,
+        None if plan.cancelled => ConsoleStatus::Cancelled,
+        None => self.scope_tracker.successful_run_status().await,
       }
     };
     let finish_result = self.scope_tracker.finish_remaining(status).await;
@@ -363,6 +367,31 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       tasks,
       outputs: plan.outputs,
     })
+  }
+
+  /// Starts execution on the current Tokio runtime and returns its cancellation handle.
+  ///
+  /// Dropping the handle requests cooperative cancellation. Use [`ExecutionHandle::wait`] to keep
+  /// the execution alive until its terminal result and cleanup have completed.
+  pub fn start(self, command: impl Into<String>) -> ExecutionHandle {
+    self.spawn_execution(CancellationToken::new(), command.into())
+  }
+
+  /// Starts execution as a child of a token owned by the embedding application.
+  pub fn start_with_token(
+    self,
+    parent_cancellation: &CancellationToken,
+    command: impl Into<String>,
+  ) -> ExecutionHandle {
+    self.spawn_execution(parent_cancellation.child_token(), command.into())
+  }
+
+  fn spawn_execution(self, cancellation: CancellationToken, command: String) -> ExecutionHandle {
+    let run_id = self.run_id;
+    let execution_command = command.clone();
+    let execution_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move { self.execute(execution_cancellation, &execution_command).await });
+    ExecutionHandle::new(run_id, command, cancellation, task)
   }
 
   /// Publishes run and scope declarations before a later call to [`Self::execute`].
@@ -680,6 +709,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       outputs: indexed_outputs.into_iter().map(|(_, output)| output).collect(),
       nested_tasks,
       failure: first_error,
+      cancelled: false,
     })
   }
 
@@ -706,6 +736,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
           outputs: Vec::new(),
           nested_tasks: Vec::new(),
           failure: Some(ExecutorError::ShutdownTimeout),
+          cancelled: true,
         })
       },
     }
@@ -739,6 +770,7 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
       outputs,
       nested_tasks,
       failure: first_error,
+      cancelled: true,
     })
   }
 
@@ -1324,6 +1356,74 @@ mod tests {
       None,
     )
     .unwrap()
+  }
+
+  #[tokio::test]
+  async fn execution_handle_exposes_identity_and_terminal_result() {
+    let mut dag = DAG::new();
+    dag.add_node(Arc::new(test_task("task")));
+    let executor = test_executor(dag, ExecutorConfig::default());
+    let expected_run_id = executor.run_id;
+
+    let handle = executor.start("build");
+
+    assert_eq!(handle.run_id(), expected_run_id);
+    assert_eq!(handle.command(), "build");
+    assert!(!handle.is_finished());
+    assert!(!handle.cancellation_token().is_cancelled());
+    let result = handle.wait().await.unwrap();
+    assert_eq!(result.run_id, expected_run_id);
+    assert_eq!(result.command, "build");
+    assert!(result.is_success());
+  }
+
+  #[tokio::test]
+  async fn execution_handle_cancels_and_waits_for_a_terminal_result() {
+    let mut dag = DAG::new();
+    dag.add_node(Arc::new(test_task("task")));
+    let parent_cancellation = CancellationToken::new();
+    let handle = test_executor(dag, ExecutorConfig::default()).start_with_token(&parent_cancellation, "build");
+    let execution_cancellation = handle.cancellation_token();
+
+    let result = handle.cancel_and_wait().await.unwrap();
+
+    assert!(execution_cancellation.is_cancelled());
+    assert!(!parent_cancellation.is_cancelled());
+    assert!(matches!(result.conclusion, ExecutionConclusion::Cancelled(_)));
+  }
+
+  #[tokio::test]
+  async fn execution_handle_inherits_parent_cancellation() {
+    let mut dag = DAG::new();
+    dag.add_node(Arc::new(test_task("task")));
+    let parent_cancellation = CancellationToken::new();
+    let handle = test_executor(dag, ExecutorConfig::default()).start_with_token(&parent_cancellation, "build");
+
+    parent_cancellation.cancel();
+    let result = handle.wait().await.unwrap();
+
+    assert!(matches!(result.conclusion, ExecutionConclusion::Cancelled(_)));
+  }
+
+  #[tokio::test]
+  async fn dropping_execution_handle_requests_cancellation() {
+    let handle = test_executor(DAG::new(), ExecutorConfig::default()).start("build");
+    let cancellation = handle.cancellation_token();
+
+    drop(handle);
+
+    assert!(cancellation.is_cancelled());
+  }
+
+  #[tokio::test]
+  async fn dropping_execution_wait_requests_cancellation() {
+    let handle = test_executor(DAG::new(), ExecutorConfig::default()).start("build");
+    let cancellation = handle.cancellation_token();
+
+    let wait = handle.wait();
+    drop(wait);
+
+    assert!(cancellation.is_cancelled());
   }
 
   struct DropSignal(Arc<AtomicBool>);
