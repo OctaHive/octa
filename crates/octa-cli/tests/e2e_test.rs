@@ -347,6 +347,52 @@ tasks:
 }
 
 #[test]
+fn test_condition_skipped_task_does_not_resolve_required_variables() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(tmp_dir.path().join(".env.ready"), "VALUE=loaded\n")?;
+  fs::write(
+    tmp_dir.path().join("octafile.yml"),
+    r#"
+version: 1
+
+tasks:
+  parent:
+    if:
+      before_deps: exit 1
+    deps: [child]
+    shell: echo parent > parent.txt
+
+  child:
+    vars:
+      PROFILE:
+        required: prompt
+    dotenv: ['.env.{{ PROFILE }}']
+    shell: echo $VALUE > child.txt
+"#,
+  )?;
+
+  let mut skipped = Command::cargo_bin("octa")?;
+  skipped
+    .current_dir(tmp_dir.path())
+    .args(["parent", "--non-interactive"])
+    .env_remove("PROFILE")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  skipped.assert().success();
+  assert!(!tmp_dir.path().join("parent.txt").exists());
+  assert!(!tmp_dir.path().join("child.txt").exists());
+
+  let mut selected = Command::cargo_bin("octa")?;
+  selected
+    .current_dir(tmp_dir.path())
+    .args(["child", "PROFILE=ready", "--non-interactive"])
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+  selected.assert().success();
+  assert_eq!(fs::read_to_string(tmp_dir.path().join("child.txt"))?.trim(), "loaded");
+
+  Ok(())
+}
+
+#[test]
 fn test_task_condition_phases_and_evaluation_frequency() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   fs::write(tmp_dir.path().join("condition.tpl"), "condition passed")?;

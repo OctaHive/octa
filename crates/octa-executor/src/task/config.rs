@@ -52,45 +52,20 @@ impl FreshnessRuntime {
   pub(super) fn is_managed(&self) -> bool {
     self.state.is_some()
   }
-
-  pub(super) fn shared_runtime_context(&self) -> Option<RuntimeContext> {
-    self.state.as_ref().and_then(|state| state.runtime_context())
-  }
 }
 
 /// Shared result of a task-level condition evaluated by a condition gate node.
-#[derive(Debug, Clone)]
-struct ConditionOutcome {
-  passed: bool,
-  runtime_context: Option<RuntimeContext>,
-}
-
 #[derive(Debug, Default)]
-pub(crate) struct ConditionState(OnceLock<ConditionOutcome>);
+pub(crate) struct ConditionState(OnceLock<bool>);
 
 impl ConditionState {
-  fn set(&self, passed: bool, runtime_context: Option<RuntimeContext>) {
-    let _ = self.0.set(ConditionOutcome {
-      passed,
-      runtime_context,
-    });
+  fn set(&self, passed: bool) {
+    let _ = self.0.set(passed);
   }
 
   fn passed(&self) -> Option<bool> {
-    self.0.get().map(|outcome| outcome.passed)
+    self.0.get().copied()
   }
-
-  fn runtime_context(&self) -> Option<RuntimeContext> {
-    self.0.get().and_then(|outcome| outcome.runtime_context.clone())
-  }
-}
-
-#[derive(Debug, Clone, Default)]
-enum SharedConditionState {
-  #[default]
-  None,
-  Publish(Arc<ConditionState>),
-  Reuse(Arc<ConditionState>),
 }
 
 /// A normalized plugin invocation shared by task commands and conditions.
@@ -123,19 +98,15 @@ impl PluginInvocation {
 pub(crate) struct ConditionRuntime {
   conditions: Vec<PluginInvocation>,
   guards: Vec<Arc<ConditionState>>,
-  shared_state: SharedConditionState,
+  publish_state: Option<Arc<ConditionState>>,
 }
 
 impl ConditionRuntime {
-  pub(crate) fn command(
-    conditions: Vec<PluginInvocation>,
-    guards: Vec<Arc<ConditionState>>,
-    runtime_context: Option<Arc<ConditionState>>,
-  ) -> Self {
+  pub(crate) fn command(conditions: Vec<PluginInvocation>, guards: Vec<Arc<ConditionState>>) -> Self {
     Self {
       conditions,
       guards,
-      shared_state: runtime_context.map_or(SharedConditionState::None, SharedConditionState::Reuse),
+      publish_state: None,
     }
   }
 
@@ -147,7 +118,7 @@ impl ConditionRuntime {
     Self {
       conditions: vec![condition],
       guards,
-      shared_state: SharedConditionState::Publish(state),
+      publish_state: Some(state),
     }
   }
 
@@ -160,7 +131,7 @@ impl ConditionRuntime {
       match guard.passed() {
         Some(true) => {},
         Some(false) => {
-          self.publish(false, None);
+          self.publish(false);
           return Ok(false);
         },
         None => {
@@ -174,16 +145,9 @@ impl ConditionRuntime {
     Ok(true)
   }
 
-  pub(super) fn publish(&self, passed: bool, runtime_context: Option<RuntimeContext>) {
-    if let SharedConditionState::Publish(state) = &self.shared_state {
-      state.set(passed, runtime_context);
-    }
-  }
-
-  pub(super) fn shared_runtime_context(&self) -> Option<RuntimeContext> {
-    match &self.shared_state {
-      SharedConditionState::Reuse(state) => state.runtime_context(),
-      SharedConditionState::None | SharedConditionState::Publish(_) => None,
+  pub(super) fn publish(&self, passed: bool) {
+    if let Some(state) = &self.publish_state {
+      state.set(passed);
     }
   }
 }
@@ -220,6 +184,7 @@ pub struct TaskConfig {
   pub run_mode: RunMode, // Run mode
   pub vars: Vars,        // Task variables
   pub envs: Envs,        // Task environments
+  pub(super) invocation_runtime: Option<Arc<InvocationRuntime>>,
   pub(super) standalone_freshness: Option<FreshnessConfig>,
   pub(super) condition_runtime: ConditionRuntime, // Conditions attached to this graph node
   pub(super) freshness_runtime: FreshnessRuntime, // Task-level source and output state
@@ -255,6 +220,7 @@ pub struct TaskConfigBuilder {
   pub run_mode: Option<RunMode>,
   pub vars: Option<Vars>,
   pub envs: Option<Envs>,
+  invocation_runtime: Option<Arc<InvocationRuntime>>,
   pub sources: Option<Vec<String>>,
   pub output: Option<Vec<String>>,
   pub octafile_root: Option<PathBuf>,
@@ -340,6 +306,11 @@ impl TaskConfigBuilder {
 
   pub fn vars(mut self, vars: Vars) -> Self {
     self.vars = Some(vars);
+    self
+  }
+
+  pub(crate) fn invocation_runtime(mut self, runtime: Option<Arc<InvocationRuntime>>) -> Self {
+    self.invocation_runtime = runtime;
     self
   }
 
@@ -445,6 +416,7 @@ impl TaskConfigBuilder {
       run_mode: self.run_mode.unwrap_or(RunMode::Always),
       vars: self.vars.unwrap_or_default(),
       envs: self.envs.unwrap_or_default(),
+      invocation_runtime: self.invocation_runtime,
       standalone_freshness,
       condition_runtime: self.condition_runtime,
       freshness_runtime: self.freshness_runtime,

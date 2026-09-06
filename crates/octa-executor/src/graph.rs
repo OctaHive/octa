@@ -51,6 +51,14 @@ impl TaskGraphBuilder {
       .map_err(|error| ExecutorError::LockError(error.to_string()))?
       .push(scope.clone());
     request.context.output_scope = Some(scope);
+    let collected_vars = self.collect_vars_with_identity(command, request.context.vars.clone())?;
+    let environment = self.collect_environment_plan(command, request.context.envs.clone())?;
+    request.context.runtime = Some(Arc::new(task::InvocationRuntime::new(
+      collected_vars.runtime,
+      environment,
+      collected_vars.identity_names,
+      self.variable_resolver.clone(),
+    )));
     let interactive = command.task.interactive.unwrap_or(false);
     let mut prepared = self.prepare_invocation(dag, command, request).await?;
     if interactive && prepared.context.interactive_session.is_none() {
@@ -69,14 +77,10 @@ impl TaskGraphBuilder {
     parents: Vec<ArcNode>,
     run_parallel: Option<bool>,
   ) -> ExecutorResult<Option<ArcNode>> {
-    let collected_vars = self.collect_vars_with_identity(command, context.vars.clone())?;
-    let envs = self.collect_envs(command, context.envs.clone(), &collected_vars.runtime)?;
-    let (context, parents, freshness) =
-      self.add_freshness_gate(dag, command, context, parents, &collected_vars, &envs)?;
-    let vars = collected_vars.runtime;
+    let (context, parents, freshness) = self.add_freshness_gate(dag, command, context, parents)?;
 
     let Some(commands) = &command.task.cmds else {
-      let task = self.create_task_node(dag, command, &context, &vars, &envs, None)?;
+      let task = self.create_task_node(dag, command, &context, None)?;
       Self::connect_parents(dag, &parents, &task)?;
       return self.add_freshness_commit(dag, command, &context, freshness, vec![task]);
     };
@@ -151,14 +155,7 @@ impl TaskGraphBuilder {
         },
         CommandPayload::Plugin(plugin) => {
           let simple = self.create_simple_command(plugin, command, &command_item.options);
-          let task = self.create_task_node(
-            dag,
-            &simple,
-            &context,
-            &vars,
-            &envs,
-            command_item.options.condition.clone(),
-          )?;
+          let task = self.create_task_node(dag, &simple, &context, command_item.options.condition.clone())?;
           Self::connect_parents(dag, &entries, &task)?;
           vec![task]
         },
@@ -206,14 +203,16 @@ impl TaskGraphBuilder {
     command: &FindResult,
     mut context: InvocationContext,
     parents: Vec<ArcNode>,
-    vars: &CollectedVars,
-    envs: &Envs,
   ) -> ExecutorResult<(InvocationContext, Vec<ArcNode>, Option<Arc<FreshnessState>>)> {
     if command.task.sources.is_none() && command.task.output.is_none() {
       return Ok((context, parents, None));
     }
 
     let state = Arc::new(FreshnessState::default());
+    let runtime = context
+      .runtime
+      .clone()
+      .ok_or(ExecutorError::TaskConfigFieldMissing("invocation_runtime"))?;
     let method = Self::task_source_strategy(command)
       .map(SourceMethod::from)
       .unwrap_or(SourceMethod::Hash);
@@ -237,20 +236,17 @@ impl TaskGraphBuilder {
       strategy,
     )
     .spec(identity)
-    .track_variables(vars.identity_names.clone());
+    .track_variables(runtime.identity_names().clone());
     let name = format!("Check freshness for {}", command.name);
     let task = TaskConfig::builder()
       .id(Uuid::new_v4())
       .name(name.clone())
       .dep_name(command.name.clone())
       .dir(command.task.dir.clone().unwrap_or(command.octafile.dir.clone()))
-      .vars(vars.runtime.clone())
-      .envs(envs.clone())
-      .condition_runtime(ConditionRuntime::command(
-        Vec::new(),
-        context.conditions.guards.clone(),
-        context.conditions.runtime_context.clone(),
-      ))
+      .vars(runtime.vars().clone())
+      .envs(runtime.configured_envs())
+      .invocation_runtime(Some(runtime))
+      .condition_runtime(ConditionRuntime::command(Vec::new(), context.conditions.guards.clone()))
       .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
       .output_scope(context.output_scope.clone())
       .interactive_session(context.interactive_session.clone())
@@ -479,8 +475,6 @@ impl TaskGraphBuilder {
     dag: &mut DagNode,
     cmd: &FindResult,
     context: &InvocationContext,
-    vars: &Vars,
-    envs: &Envs,
     command_condition: Option<PluginCommand>,
   ) -> ExecutorResult<ArcNode> {
     let plugin = cmd.task.plugin.clone().map(plugin_invocation).transpose()?;
@@ -489,19 +483,20 @@ impl TaskGraphBuilder {
     if let Some(condition) = command_condition {
       conditions.push(plugin_invocation(condition)?);
     }
+    let runtime = context
+      .runtime
+      .clone()
+      .ok_or(ExecutorError::TaskConfigFieldMissing("invocation_runtime"))?;
 
     let task_config = TaskConfig::builder()
       .id(Uuid::new_v4())
       .name(cmd.name.clone())
       .dep_name(context.dep_name.clone())
       .dir(cmd.task.dir.clone().unwrap_or(cmd.octafile.dir.clone()))
-      .vars(vars.clone())
-      .envs(envs.clone())
-      .condition_runtime(ConditionRuntime::command(
-        conditions,
-        context.conditions.guards.clone(),
-        context.conditions.runtime_context.clone(),
-      ))
+      .vars(runtime.vars().clone())
+      .envs(runtime.configured_envs())
+      .invocation_runtime(Some(runtime))
+      .condition_runtime(ConditionRuntime::command(conditions, context.conditions.guards.clone()))
       .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
       .preconditions(cmd.task.preconditions.clone())
       .timeout(cmd.task.timeout)
@@ -539,8 +534,11 @@ impl TaskGraphBuilder {
     command: &FindResult,
     mut request: GateRequest,
   ) -> ExecutorResult<(InvocationContext, ArcNode)> {
-    let vars = self.collect_vars(command, request.context.vars.clone())?;
-    let envs = self.collect_envs(command, request.context.envs.clone(), &vars)?;
+    let runtime = request
+      .context
+      .runtime
+      .clone()
+      .ok_or(ExecutorError::TaskConfigFieldMissing("invocation_runtime"))?;
     let state = Arc::new(ConditionState::default());
     let name = format!("{} condition for {}", request.phase.label(), command.name);
     let task = TaskConfig::builder()
@@ -548,8 +546,9 @@ impl TaskGraphBuilder {
       .name(name.clone())
       .dep_name(name)
       .dir(command.task.dir.clone().unwrap_or(command.octafile.dir.clone()))
-      .vars(vars)
-      .envs(envs)
+      .vars(runtime.vars().clone())
+      .envs(runtime.configured_envs())
+      .invocation_runtime(Some(runtime))
       .condition_runtime(ConditionRuntime::gate(
         request.condition,
         state.clone(),
@@ -570,9 +569,6 @@ impl TaskGraphBuilder {
       dag.add_dependency(&parent, &task)?;
     }
 
-    if matches!(request.phase, ConditionPhase::AfterDependencies) {
-      request.context.conditions.runtime_context = Some(state.clone());
-    }
     request.context.conditions.guards.push(state);
     Ok((request.context, task))
   }
@@ -582,10 +578,8 @@ impl TaskGraphBuilder {
     &self,
     dag: &mut DagNode,
     command: &FindResult,
-    mut request: InvocationRequest,
+    request: InvocationRequest,
   ) -> ExecutorResult<PreparedInvocation> {
-    // Runtime values may be shared inside one task, but never across a nested task invocation.
-    request.context.conditions.runtime_context = None;
     let mut context = request.context;
     let mut parent = None;
 

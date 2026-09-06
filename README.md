@@ -609,16 +609,18 @@ tasks:
     shell: ./deploy.sh
 ```
 
-Prompts are resolved while Octa builds the selected execution graph, before any command starts.
-Consequently, a reachable task may request its variables even when a later `if` condition skips it.
+Required variables are resolved when their task reaches runtime. A task suppressed by an inherited
+condition or freshness gate therefore does not validate or prompt for values it will never use.
+A task's own condition or freshness check still resolves that task's variables before the check,
+because the variables are part of its evaluation context and freshness identity.
 
 A required variable cannot define `value` or `sh`. CLI variables, process environment variables,
 include variables, and variables passed by another task can satisfy the requirement. Validation is
-performed after all variable layers have been merged while Octa builds the selected execution
-graph; listing tasks does not trigger it. Missing, null, whitespace-only, and empty collection values
-fail with an error. Supplied values must be concrete rather than `sh` or template expressions,
-which makes them available while configured variables are expanded. `secret: true` also redacts a
-value supplied by another layer.
+performed after all variable layers have been merged when the task reaches runtime; listing tasks
+and tasks skipped by an inherited gate do not trigger it. Missing, null, whitespace-only, and empty
+collection values fail with an error. Supplied values must be concrete rather than `sh` or template
+expressions, which makes them available while configured variables are expanded. `secret: true`
+also redacts a value supplied by another layer.
 
 When evaluating variables for a task, Octa applies them in the following order, from highest to
 lowest priority:

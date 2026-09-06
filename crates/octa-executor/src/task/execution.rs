@@ -24,6 +24,14 @@ impl TaskNode {
   }
 
   pub fn new(config: TaskConfig) -> Self {
+    let invocation_runtime = config.invocation_runtime.unwrap_or_else(|| {
+      Arc::new(InvocationRuntime::new(
+        config.vars.clone(),
+        EnvironmentPlan::from_envs(&config.envs),
+        HashSet::new(),
+        None,
+      ))
+    });
     Self {
       id: config.id,
       name: config.name,
@@ -32,6 +40,7 @@ impl TaskNode {
       standalone_freshness: config.standalone_freshness,
       vars: config.vars,
       envs: config.envs,
+      invocation_runtime,
       dir: config.dir,
       ignore_errors: config.ignore_errors,
       silence: config.silence,
@@ -182,60 +191,64 @@ impl TaskNode {
   }
 
   /// Resolves the values shared by conditions, cache checks, and the task command once.
-  async fn resolve_runtime_context(
+  pub(super) async fn resolve_runtime_context(
     &self,
     evaluator: Arc<dyn PluginEvaluator>,
     dry: bool,
     cancel_token: CancellationToken,
     deferred_exit_code: Option<i32>,
   ) -> ExecutorResult<RuntimeContext> {
-    if let Some(mut context) = self.freshness_runtime.shared_runtime_context() {
-      Self::expose_deferred_exit_code(&mut context.vars, deferred_exit_code);
-      return Ok(context);
-    }
-    if let Some(mut context) = self.condition_runtime.shared_runtime_context() {
-      Self::expose_deferred_exit_code(&mut context.vars, deferred_exit_code);
-      return Ok(context);
-    }
+    let context = self
+      .invocation_runtime
+      .context
+      .get_or_try_init(|| async {
+        let dir_is_template = {
+          let value = self.dir.to_string_lossy();
+          value.contains("{{") && value.contains("}}")
+        };
 
-    let dir_is_template = {
-      let value = self.dir.to_string_lossy();
-      value.contains("{{") && value.contains("}}")
-    };
+        // Static task directories must exist before a shell-backed value uses them as its cwd.
+        let prepared_dir = if dir_is_template {
+          None
+        } else {
+          Some(self.ensure_dir(self.dir.clone(), dry).await?)
+        };
 
-    // Static task directories must exist before a shell-backed value uses them as its cwd.
-    let prepared_dir = if dir_is_template {
-      None
-    } else {
-      Some(self.ensure_dir(self.dir.clone(), dry).await?)
-    };
+        let mut vars = self.invocation_runtime.vars.clone();
+        vars
+          .resolve_required(self.invocation_runtime.resolver.as_deref())
+          .await?;
+        vars
+          .expand_with_evaluator_and_overrides(
+            evaluator.clone(),
+            dry,
+            cancel_token.clone(),
+            Self::deferred_variable_overrides(deferred_exit_code),
+          )
+          .await?;
 
-    let mut vars = self.vars.clone();
-    vars
-      .expand_with_evaluator_and_overrides(
-        evaluator.clone(),
-        dry,
-        cancel_token.clone(),
-        Self::deferred_variable_overrides(deferred_exit_code),
-      )
+        // A templated directory can only be created after its variables have been expanded.
+        let dir = match prepared_dir {
+          Some(dir) => dir,
+          None => {
+            self
+              .prepare_runtime_dir(&vars, evaluator.clone(), dry, cancel_token.clone())
+              .await?
+          },
+        };
+
+        let mut environment = self.invocation_runtime.environment.clone();
+        // Task-level shell-backed environment values must run from the final task directory.
+        environment.set_last_dir(dir.clone());
+        let envs = environment.resolve(&vars, Some(evaluator), dry, cancel_token).await?;
+
+        Ok::<RuntimeContext, ExecutorError>(RuntimeContext { vars, envs, dir })
+      })
       .await?;
 
-    // A templated directory can only be created after its variables have been expanded.
-    let dir = match prepared_dir {
-      Some(dir) => dir,
-      None => {
-        self
-          .prepare_runtime_dir(&vars, evaluator.clone(), dry, cancel_token.clone())
-          .await?
-      },
-    };
-
-    let mut envs = self.envs.clone();
-    // Task-level shell-backed environment values must run from the final task directory.
-    envs.set_dir(dir.clone());
-    envs.expand_with_evaluator(&vars, evaluator, dry, cancel_token).await?;
-
-    Ok(RuntimeContext { vars, envs, dir })
+    let mut context = context.clone();
+    Self::expose_deferred_exit_code(&mut context.vars, deferred_exit_code);
+    Ok(context)
   }
 
   async fn log_info(&self, output: &ConsoleTarget, message: String) -> ExecutorResult<()> {
@@ -256,7 +269,7 @@ impl TaskNode {
     if !self.freshness_runtime.should_run()? {
       // A skipped condition gate must still publish a result so descendants do not observe an
       // unevaluated gate when an ancestor freshness check suppresses the whole invocation.
-      self.condition_runtime.publish(false, None);
+      self.condition_runtime.publish(false);
       if let NodeAction::FreshnessCheck { state, .. } = &self.action {
         state.publish_skipped()?;
       }
@@ -286,7 +299,7 @@ impl TaskNode {
           )
           .await?;
         let should_run = outcome.should_run();
-        state.publish(outcome, runtime_context)?;
+        state.publish(outcome)?;
         if !should_run {
           output
             .message(ConsoleLevel::Info, format!("Task {} is up to date", self.dep_name))
@@ -554,14 +567,7 @@ impl TaskNode {
     let condition_passed = self
       .check_condition(plugin_manager.clone(), dry, cancel_token.clone(), &vars, &envs, &dir)
       .await?;
-    self.condition_runtime.publish(
-      condition_passed,
-      Some(RuntimeContext {
-        vars: vars.clone(),
-        envs: envs.clone(),
-        dir: dir.clone(),
-      }),
-    );
+    self.condition_runtime.publish(condition_passed);
     if !condition_passed {
       self.freshness_runtime.mark_condition_skipped();
       self

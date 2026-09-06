@@ -1,8 +1,25 @@
 use super::*;
-use std::{fs, sync::Mutex as StdMutex, time::Duration};
+use std::{
+  fs,
+  sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex as StdMutex,
+  },
+  time::Duration,
+};
 use tempfile::TempDir;
 
 struct ConstantSourceStrategy;
+
+struct CountingResolver(AtomicUsize);
+
+#[async_trait]
+impl VariableResolver for CountingResolver {
+  async fn resolve(&self, _prompt: &crate::vars::VariablePrompt) -> Result<String, String> {
+    self.0.fetch_add(1, Ordering::SeqCst);
+    Ok("resolved".to_owned())
+  }
+}
 
 #[async_trait]
 impl SourceStrategy for ConstantSourceStrategy {
@@ -43,6 +60,51 @@ fn task_items_are_unscoped_by_default() {
   assert!(!task.failfast());
   assert!(task.requires_concurrency_permit());
   assert_eq!(task.output_scope(), None);
+}
+
+#[tokio::test]
+async fn invocation_nodes_resolve_required_variables_once() {
+  let temp_dir = TempDir::new().unwrap();
+  let configured = serde_yml::from_str("VALUE:\n  required: prompt\n").unwrap();
+  let resolver = Arc::new(CountingResolver(AtomicUsize::new(0)));
+  let invocation = Arc::new(InvocationRuntime::new(
+    Vars::with_variables(configured),
+    EnvironmentPlan::default(),
+    HashSet::new(),
+    Some(resolver.clone()),
+  ));
+  let make_task = |id: &str| {
+    TaskNode::new(
+      TaskConfig::builder()
+        .id(id)
+        .name(id)
+        .dep_name(id)
+        .dir(temp_dir.path())
+        .invocation_runtime(Some(invocation.clone()))
+        .build()
+        .unwrap(),
+    )
+  };
+  let first = make_task("first");
+  let second = make_task("second");
+  let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::new(Arc::new(PluginManager::new(
+    temp_dir.path(),
+  ))));
+
+  let (first_context, second_context) = tokio::join!(
+    first.resolve_runtime_context(evaluator.clone(), false, CancellationToken::new(), None),
+    second.resolve_runtime_context(evaluator, false, CancellationToken::new(), None),
+  );
+
+  assert_eq!(
+    first_context.unwrap().vars.get("VALUE"),
+    Some(&Value::String("resolved".to_owned()))
+  );
+  assert_eq!(
+    second_context.unwrap().vars.get("VALUE"),
+    Some(&Value::String("resolved".to_owned()))
+  );
+  assert_eq!(resolver.0.load(Ordering::SeqCst), 1);
 }
 
 // Helper function to create a test TaskNode

@@ -32,6 +32,27 @@ pub struct Envs {
   expanded: bool,            // Indicates that all inherited values have been expanded
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct EnvironmentPlan {
+  layers: Vec<EnvironmentLayer>,
+}
+
+#[derive(Clone)]
+struct EnvironmentLayer {
+  context: EnvContext,
+  dir: Option<PathBuf>,
+  dotenv: Option<Vec<String>>,
+}
+
+impl Debug for EnvironmentPlan {
+  fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("EnvironmentPlan")
+      .field("layers", &self.layers.len())
+      .finish()
+  }
+}
+
 // Environment values may contain secrets rendered from task variables. Debug output therefore
 // exposes only structural information, even though Envs itself does not own sensitivity metadata.
 impl Debug for Envs {
@@ -189,11 +210,10 @@ impl Envs {
       return Ok(());
     }
 
-    let contexts = self.collect_context_chain();
-    let processed_context = self
-      .process_context_chain(contexts, vars, evaluator, dry, cancel_token)
-      .await?;
+    let plan = EnvironmentPlan::from_envs(self);
+    let processed_context = plan.resolve_context(vars, evaluator, dry, cancel_token).await?;
     self.context = processed_context;
+    self.parent = None;
     self.expanded = true;
 
     Ok(())
@@ -210,10 +230,78 @@ impl Envs {
 
     contexts.into_iter().rev().collect()
   }
+}
 
-  async fn process_context_chain(
+impl EnvironmentPlan {
+  pub(crate) fn push_layer(
+    &mut self,
+    context: Option<EnvContext>,
+    dir: impl Into<PathBuf>,
+    dotenv: Option<Vec<String>>,
+  ) {
+    self.layers.push(EnvironmentLayer {
+      context: context.unwrap_or_default(),
+      dir: Some(dir.into()),
+      dotenv,
+    });
+  }
+
+  pub(crate) fn extend_last(&mut self, context: EnvContext) {
+    if let Some(layer) = self.layers.last_mut() {
+      layer.context.extend(context);
+    }
+  }
+
+  pub(crate) fn configured_envs(&self) -> Envs {
+    let mut result = None;
+    for layer in &self.layers {
+      let mut envs = result.map_or_else(Envs::new, Envs::with_parent);
+      if let Some(dir) = &layer.dir {
+        envs.set_dir(dir.clone());
+      }
+      envs.set_value(layer.context.clone());
+      result = Some(envs);
+    }
+    result.unwrap_or_default()
+  }
+
+  pub(crate) fn from_envs(envs: &Envs) -> Self {
+    let layers = envs
+      .collect_context_chain()
+      .into_iter()
+      .map(|(context, dir)| EnvironmentLayer {
+        context,
+        dir,
+        dotenv: None,
+      })
+      .collect();
+    Self { layers }
+  }
+
+  pub(crate) fn set_last_dir(&mut self, dir: PathBuf) {
+    if let Some(layer) = self.layers.last_mut() {
+      layer.dir = Some(dir);
+    }
+  }
+
+  pub(crate) async fn resolve(
     &self,
-    contexts: Vec<(EnvContext, Option<PathBuf>)>,
+    vars: &Vars,
+    evaluator: Option<Arc<dyn PluginEvaluator>>,
+    dry: bool,
+    cancel_token: CancellationToken,
+  ) -> ExecutorResult<Envs> {
+    let context = self.resolve_context(vars, evaluator, dry, cancel_token).await?;
+    Ok(Envs {
+      context,
+      parent: None,
+      dir: self.layers.last().and_then(|layer| layer.dir.clone()),
+      expanded: true,
+    })
+  }
+
+  async fn resolve_context(
+    &self,
     vars: &Vars,
     evaluator: Option<Arc<dyn PluginEvaluator>>,
     dry: bool,
@@ -222,23 +310,35 @@ impl Envs {
     let mut accumulated = EnvContext::new();
 
     // Parent layers are processed first so every child layer can override and reference them.
-    for (context, dir) in contexts {
-      let current_dir = match dir {
-        Some(dir) => dir,
-        None => env::current_dir()?,
-      };
+    let mut template_environment = env::vars().collect::<ResolvedEnvContext>();
+    for layer in &self.layers {
+      let patterns = layer.dotenv.clone();
+      let dir = layer.dir.clone().map_or_else(env::current_dir, Ok)?;
+      let dotenv_dir = dir.clone();
+      let dotenv_vars = vars.clone();
+      let environment = template_environment.clone();
+      let dotenv = tokio::task::spawn_blocking(move || {
+        crate::dotenv::load(patterns.as_deref(), &dotenv_dir, &dotenv_vars, &environment)
+      })
+      .await??;
+      let context = dotenv
+        .into_iter()
+        .map(|(key, value)| (key, EnvValue::String(value)))
+        .chain(layer.context.clone())
+        .collect();
       let processed = self
         .process_single_context(
           context,
           &accumulated,
           vars,
-          &current_dir,
+          &dir,
           evaluator.clone(),
           dry,
           cancel_token.clone(),
         )
         .await?;
       accumulated.extend(processed);
+      template_environment.extend(resolved_environment(&accumulated));
     }
 
     Ok(accumulated)

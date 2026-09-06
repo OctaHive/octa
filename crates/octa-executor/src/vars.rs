@@ -6,6 +6,7 @@ use std::{
   sync::Arc,
 };
 
+use async_trait::async_trait;
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use octa_octafile::{RequiredMode, VariableEnum, VariableSource, Vars as OctafileVars};
@@ -85,8 +86,9 @@ pub struct VariablePrompt {
 }
 
 /// Resolves interactive input without coupling the executor to a terminal implementation.
+#[async_trait]
 pub trait VariableResolver: Send + Sync {
-  fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String>;
+  async fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String>;
 }
 
 impl PartialEq for Vars {
@@ -239,8 +241,8 @@ impl Vars {
     self.values.iter().map(|(key, value)| (key.clone(), value.clone()))
   }
 
-  /// Resolves prompt-backed requirements while the execution plan is being built.
-  pub(crate) fn resolve_required(&mut self, resolver: Option<&dyn VariableResolver>) -> ExecutorResult<()> {
+  /// Resolves and validates requirements when an executable node reaches runtime.
+  pub(crate) async fn resolve_required(&mut self, resolver: Option<&dyn VariableResolver>) -> ExecutorResult<()> {
     let contexts = self.collect_context_chain();
     let required_vars = resolve_required_vars(&contexts, collect_required_vars(&contexts))?;
     let supplied = collect_supplied_required_vars(&contexts, &required_vars);
@@ -278,6 +280,7 @@ impl Vars {
       let value = Value::String(
         resolver
           .resolve(&prompt)
+          .await
           .map_err(|message| ExecutorError::VariablePromptFailed(name.clone(), message))?,
       );
       validate_required_value(&name, required.enum_values.as_deref(), &value)?;
@@ -854,8 +857,9 @@ mod tests {
     }
   }
 
+  #[async_trait]
   impl VariableResolver for FixedResolver {
-    fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String> {
+    async fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String> {
       self.prompts.lock().unwrap().push(prompt.clone());
       Ok(self.value.clone())
     }
@@ -1140,7 +1144,7 @@ mod tests {
     let resolver = FixedResolver::new("production");
     let mut vars = Vars::with_variables(configured);
 
-    vars.resolve_required(Some(&resolver)).unwrap();
+    vars.resolve_required(Some(&resolver)).await.unwrap();
     vars.expand(true).await.unwrap();
 
     assert_eq!(vars.get("ENVIRONMENT"), Some(&json!("production")));
@@ -1157,8 +1161,8 @@ mod tests {
     );
   }
 
-  #[test]
-  fn resolves_enum_from_another_variable() {
+  #[tokio::test]
+  async fn resolves_enum_from_another_variable() {
     let configured: octa_octafile::Vars = serde_yml::from_str(
       r#"
       ENVIRONMENTS: [development, production]
@@ -1171,7 +1175,7 @@ mod tests {
     let resolver = FixedResolver::new("production");
     let mut vars = Vars::with_variables(configured);
 
-    vars.resolve_required(Some(&resolver)).unwrap();
+    vars.resolve_required(Some(&resolver)).await.unwrap();
 
     assert_eq!(vars.get("ENVIRONMENT"), Some(&json!("production")));
     assert_eq!(
@@ -1180,8 +1184,8 @@ mod tests {
     );
   }
 
-  #[test]
-  fn expands_templates_in_literal_enum_options() {
+  #[tokio::test]
+  async fn expands_templates_in_literal_enum_options() {
     let configured: octa_octafile::Vars = serde_yml::from_str(
       r#"
       DEFAULT_ENVIRONMENT: development
@@ -1194,7 +1198,7 @@ mod tests {
     let resolver = FixedResolver::new("development");
     let mut vars = Vars::with_variables(configured);
 
-    vars.resolve_required(Some(&resolver)).unwrap();
+    vars.resolve_required(Some(&resolver)).await.unwrap();
 
     assert_eq!(
       resolver.prompts.lock().unwrap()[0].enum_values,
@@ -1202,8 +1206,8 @@ mod tests {
     );
   }
 
-  #[test]
-  fn rejects_enum_references_that_are_not_string_lists() {
+  #[tokio::test]
+  async fn rejects_enum_references_that_are_not_string_lists() {
     let configured: octa_octafile::Vars = serde_yml::from_str(
       r#"
       ENVIRONMENTS: development
@@ -1216,20 +1220,20 @@ mod tests {
     let mut vars = Vars::with_variables(configured);
 
     assert!(matches!(
-      vars.resolve_required(Some(&FixedResolver::new("development"))),
+      vars.resolve_required(Some(&FixedResolver::new("development"))).await,
       Err(ExecutorError::RequiredVariableEnumError(name, message))
         if name == "ENVIRONMENT" && message == "value must be a list of strings"
     ));
   }
 
-  #[test]
-  fn generates_default_questions_and_rejects_unavailable_input() {
+  #[tokio::test]
+  async fn generates_default_questions_and_rejects_unavailable_input() {
     let configured: octa_octafile::Vars =
       serde_yml::from_str("ENVIRONMENT:\n  required: prompt\n  enum: [development, production]\n").unwrap();
     let resolver = FixedResolver::new("development");
     let mut vars = Vars::with_variables(configured.clone());
 
-    vars.resolve_required(Some(&resolver)).unwrap();
+    vars.resolve_required(Some(&resolver)).await.unwrap();
     assert_eq!(
       resolver.prompts.lock().unwrap()[0].question,
       "Select a value for 'ENVIRONMENT'"
@@ -1237,19 +1241,19 @@ mod tests {
 
     let mut vars = Vars::with_variables(configured);
     assert!(matches!(
-      vars.resolve_required(None),
+      vars.resolve_required(None).await,
       Err(ExecutorError::VariablePromptUnavailable(name)) if name == "ENVIRONMENT"
     ));
   }
 
-  #[test]
-  fn generates_default_text_questions_and_rejects_empty_answers() {
+  #[tokio::test]
+  async fn generates_default_text_questions_and_rejects_empty_answers() {
     let configured: octa_octafile::Vars = serde_yml::from_str("TOKEN:\n  required: prompt\n").unwrap();
     let resolver = FixedResolver::new("");
     let mut vars = Vars::with_variables(configured);
 
     assert!(matches!(
-      vars.resolve_required(Some(&resolver)),
+      vars.resolve_required(Some(&resolver)).await,
       Err(ExecutorError::RequiredVariableMissing(name)) if name == "TOKEN"
     ));
     assert_eq!(
@@ -1258,36 +1262,36 @@ mod tests {
     );
   }
 
-  #[test]
-  fn inherited_secret_requirement_cannot_be_downgraded() {
+  #[tokio::test]
+  async fn inherited_secret_requirement_cannot_be_downgraded() {
     let parent: octa_octafile::Vars = serde_yml::from_str("TOKEN:\n  required: prompt\n  secret: true\n").unwrap();
     let child: octa_octafile::Vars = serde_yml::from_str("TOKEN:\n  required: prompt\n").unwrap();
     let resolver = FixedResolver::new("hidden");
     let parent = Vars::with_variables(parent);
     let mut vars = Vars::with_variables_and_parent(child, parent);
 
-    vars.resolve_required(Some(&resolver)).unwrap();
+    vars.resolve_required(Some(&resolver)).await.unwrap();
 
     assert!(resolver.prompts.lock().unwrap()[0].secret);
     assert_eq!(vars.secret_names(), vec!["TOKEN"]);
   }
 
-  #[test]
-  fn validates_enum_values_from_non_interactive_sources() {
+  #[tokio::test]
+  async fn validates_enum_values_from_non_interactive_sources() {
     let required: octa_octafile::Vars =
       serde_yml::from_str("ENVIRONMENT:\n  required: true\n  enum: [development, production]\n").unwrap();
     let parent = Vars::with_variables(required);
     let mut vars = Vars::with_value_and_parent(json!({ "ENVIRONMENT": "testing" }), parent);
 
     assert!(matches!(
-      vars.resolve_required(None),
+      vars.resolve_required(None).await,
       Err(ExecutorError::RequiredVariableNotAllowed(name, allowed))
         if name == "ENVIRONMENT" && allowed == "development, production"
     ));
   }
 
-  #[test]
-  fn validates_strict_requirements_before_prompting() {
+  #[tokio::test]
+  async fn validates_strict_requirements_before_prompting() {
     let configured: octa_octafile::Vars = serde_yml::from_str(
       r#"
       ENVIRONMENT:
@@ -1301,7 +1305,7 @@ mod tests {
     let mut vars = Vars::with_variables(configured);
 
     assert!(matches!(
-      vars.resolve_required(Some(&resolver)),
+      vars.resolve_required(Some(&resolver)).await,
       Err(ExecutorError::RequiredVariableMissing(name)) if name == "TOKEN"
     ));
     assert!(resolver.prompts.lock().unwrap().is_empty());

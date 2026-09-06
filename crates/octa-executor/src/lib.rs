@@ -44,7 +44,7 @@ use std::{
   },
 };
 
-use envs::Envs;
+use envs::EnvironmentPlan;
 use octa_plugin_manager::plugin_manager::PluginManager;
 use tracing::debug;
 use uuid::Uuid;
@@ -56,8 +56,8 @@ use freshness::{FreshnessConfig, FreshnessIdentity, FreshnessState};
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
 use octa_octafile::{
-  AllowedRun, CommandOptions, CommandPayload, ConditionEvaluation, Deps, EnvValue, ExecuteMode, Octafile,
-  PluginCommand, SourceStrategies, Task, TaskCommand, TaskOutputMode,
+  AllowedRun, CommandOptions, CommandPayload, ConditionEvaluation, Deps, ExecuteMode, Octafile, PluginCommand,
+  SourceStrategies, Task, TaskCommand, TaskOutputMode,
 };
 use octa_output::{ConsoleScope, ConsoleScopeAllocator, RenderMode};
 use source_strategy::SourceStrategyRegistry;
@@ -75,7 +75,6 @@ type ArcNode = Arc<TaskNode>;
 struct ConditionScope {
   guards: Vec<Arc<ConditionState>>,
   per_command: Vec<PluginInvocation>,
-  runtime_context: Option<Arc<ConditionState>>,
 }
 
 #[derive(Clone)]
@@ -84,6 +83,7 @@ struct InvocationContext {
   vars: Option<octa_octafile::Vars>,
   envs: Option<octa_octafile::Envs>,
   conditions: ConditionScope,
+  runtime: Option<Arc<task::InvocationRuntime>>,
   freshness: Option<Arc<FreshnessState>>,
   output_scope: Option<ConsoleScope>,
   interactive_session: Option<String>,
@@ -101,6 +101,7 @@ impl InvocationContext {
       vars,
       envs,
       conditions,
+      runtime: None,
       freshness: None,
       output_scope: None,
       interactive_session: None,
@@ -121,6 +122,7 @@ impl InvocationContext {
       vars,
       envs,
       conditions: self.conditions.clone(),
+      runtime: None,
       // Every referenced task owns its freshness boundary. Carrying the caller's
       // decision across this boundary would hide changes to the child's sources,
       // outputs, dotenv files, and dynamic variables.

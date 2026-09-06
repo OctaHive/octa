@@ -327,20 +327,9 @@ impl FreshnessOutcome {
   }
 }
 
-/// Values resolved once and reused throughout one task invocation.
-#[derive(Clone, Debug)]
-pub(crate) struct RuntimeContext {
-  pub(crate) vars: Vars,
-  pub(crate) envs: Envs,
-  pub(crate) dir: PathBuf,
-}
-
 #[derive(Clone, Debug)]
 enum FreshnessDecision {
-  Evaluated {
-    outcome: FreshnessOutcome,
-    runtime_context: Box<RuntimeContext>,
-  },
+  Evaluated(FreshnessOutcome),
   Skipped,
 }
 
@@ -353,13 +342,10 @@ pub(crate) struct FreshnessState {
 }
 
 impl FreshnessState {
-  pub(crate) fn publish(&self, outcome: FreshnessOutcome, runtime_context: RuntimeContext) -> ExecutorResult<()> {
+  pub(crate) fn publish(&self, outcome: FreshnessOutcome) -> ExecutorResult<()> {
     self
       .decision
-      .set(FreshnessDecision::Evaluated {
-        outcome,
-        runtime_context: Box::new(runtime_context),
-      })
+      .set(FreshnessDecision::Evaluated(outcome))
       .map_err(|_| ExecutorError::FreshnessStateAlreadyPublished)
   }
 
@@ -375,7 +361,7 @@ impl FreshnessState {
       .decision
       .get()
       .map(|decision| match decision {
-        FreshnessDecision::Evaluated { outcome, .. } => outcome.should_run,
+        FreshnessDecision::Evaluated(outcome) => outcome.should_run,
         FreshnessDecision::Skipped => false,
       })
       .ok_or_else(|| ExecutorError::FreshnessStateUnavailable("freshness check has not completed".to_owned()))
@@ -385,19 +371,12 @@ impl FreshnessState {
     self.condition_skipped.store(true, Ordering::Release);
   }
 
-  pub(crate) fn runtime_context(&self) -> Option<RuntimeContext> {
-    match self.decision.get()? {
-      FreshnessDecision::Evaluated { runtime_context, .. } => Some(runtime_context.as_ref().clone()),
-      FreshnessDecision::Skipped => None,
-    }
-  }
-
   pub(crate) fn commit(&self, database: &Db) -> ExecutorResult<()> {
     let decision = self
       .decision
       .get()
       .ok_or_else(|| ExecutorError::FreshnessStateUnavailable("freshness check has not completed".to_owned()))?;
-    let FreshnessDecision::Evaluated { outcome, .. } = decision else {
+    let FreshnessDecision::Evaluated(outcome) = decision else {
       return Ok(());
     };
     if outcome.should_run && !self.condition_skipped.load(Ordering::Acquire) {
@@ -475,16 +454,7 @@ mod tests {
   }
 
   fn publish(state: &FreshnessState, outcome: FreshnessOutcome) {
-    state
-      .publish(
-        outcome,
-        RuntimeContext {
-          vars: Vars::new(),
-          envs: Envs::new(),
-          dir: PathBuf::new(),
-        },
-      )
-      .unwrap();
+    state.publish(outcome).unwrap();
   }
 
   #[test]

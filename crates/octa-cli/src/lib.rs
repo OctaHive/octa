@@ -5,9 +5,10 @@ use std::{
   io::{self, IsTerminal, Read},
   num::NonZeroUsize,
   path::{Path, PathBuf},
-  sync::{Arc, Mutex},
+  sync::Arc,
 };
 
+use async_trait::async_trait;
 use clap::{CommandFactory, Parser};
 use clap_complete::aot::{generate, Generator, Shell};
 use dialoguer::{Input, Password, Select};
@@ -18,7 +19,10 @@ use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Deserialize;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Duration};
-use tokio::{signal, sync::Semaphore};
+use tokio::{
+  signal,
+  sync::{Mutex, Semaphore},
+};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
@@ -290,16 +294,19 @@ fn concurrency_limiter(cli: Option<NonZeroUsize>, configured: Option<NonZeroUsiz
 struct TerminalVariableResolver {
   // Equivalent requirements reuse answers across dependencies, commands and watch rebuilds.
   values: Mutex<HashMap<VariablePrompt, String>>,
+  // Terminal dialogs are blocking and must never overlap.
+  prompt: Mutex<()>,
 }
 
 impl TerminalVariableResolver {
   fn new() -> Self {
     Self {
       values: Mutex::new(HashMap::new()),
+      prompt: Mutex::new(()),
     }
   }
 
-  fn read(&self, prompt: &VariablePrompt) -> Result<String, String> {
+  fn read(prompt: &VariablePrompt) -> Result<String, String> {
     // Enum options are already part of the Octafile, so selecting one does not expose a runtime secret.
     if let Some(enum_values) = &prompt.enum_values {
       let selected = Select::new()
@@ -324,15 +331,24 @@ impl TerminalVariableResolver {
   }
 }
 
+#[async_trait]
 impl VariableResolver for TerminalVariableResolver {
-  fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String> {
-    let mut values = self.values.lock().map_err(|error| error.to_string())?;
-    if let Some(value) = values.get(prompt) {
-      return Ok(value.clone());
+  async fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String> {
+    if let Some(value) = self.values.lock().await.get(prompt).cloned() {
+      return Ok(value);
     }
 
-    let value = self.read(prompt)?;
-    values.insert(prompt.clone(), value.clone());
+    let _prompt_guard = self.prompt.lock().await;
+    if let Some(value) = self.values.lock().await.get(prompt).cloned() {
+      return Ok(value);
+    }
+
+    let prompt_key = prompt.clone();
+    let dialog_prompt = prompt.clone();
+    let value = tokio::task::spawn_blocking(move || Self::read(&dialog_prompt))
+      .await
+      .map_err(|error| error.to_string())??;
+    self.values.lock().await.insert(prompt_key, value.clone());
     Ok(value)
   }
 }
@@ -1170,8 +1186,8 @@ mod tests {
     assert_eq!(qualify_monorepo_commands(vec!["build".to_owned()], None), ["build"]);
   }
 
-  #[test]
-  fn terminal_variable_resolver_reuses_values() {
+  #[tokio::test]
+  async fn terminal_variable_resolver_reuses_values() {
     let prompt = VariablePrompt {
       name: "ENVIRONMENT".to_owned(),
       question: "Select environment".to_owned(),
@@ -1182,15 +1198,15 @@ mod tests {
     resolver
       .values
       .lock()
-      .unwrap()
+      .await
       .insert(prompt.clone(), "production".to_owned());
-    assert_eq!(resolver.resolve(&prompt), Ok("production".to_owned()));
+    assert_eq!(resolver.resolve(&prompt).await, Ok("production".to_owned()));
 
     let constrained = VariablePrompt {
       enum_values: Some(vec!["development".to_owned(), "production".to_owned()]),
       ..prompt
     };
-    assert!(!resolver.values.lock().unwrap().contains_key(&constrained));
+    assert!(!resolver.values.lock().await.contains_key(&constrained));
   }
 
   #[test]

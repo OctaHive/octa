@@ -1,5 +1,5 @@
 use std::{
-  collections::HashMap,
+  collections::{HashMap, HashSet},
   env,
   hash::{Hash, Hasher},
   io,
@@ -16,7 +16,10 @@ use serde::Serialize;
 use serde_json::Value;
 use sled::Db;
 use tera::Context;
-use tokio::{sync::Mutex, time};
+use tokio::{
+  sync::{Mutex, OnceCell},
+  time,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, enabled, Level};
 
@@ -26,13 +29,13 @@ use octa_output::{Console, ConsoleLevel, ConsoleScope, ConsoleStatus};
 
 use crate::{
   console_target::ConsoleTarget,
-  envs::Envs,
+  envs::{EnvironmentPlan, Envs},
   error::{ExecutorError, ExecutorResult},
-  freshness::{FreshnessConfig, FreshnessIdentity, FreshnessOutcome, FreshnessSpec, FreshnessState, RuntimeContext},
+  freshness::{FreshnessConfig, FreshnessIdentity, FreshnessOutcome, FreshnessSpec, FreshnessState},
   plugin::{ManagerPluginEvaluator, PluginEvaluator, PluginExecutionContext, PluginInvoker, PluginRequest},
   source_strategy::{SourceStrategyHandle, SourceStrategyRegistry},
   template::{PluginTemplateContext, TemplateRenderer},
-  vars::Vars,
+  vars::{VariableResolver, Vars},
   watcher::WatchTarget,
 };
 
@@ -131,6 +134,62 @@ pub enum RunMode {
   Changed,
 }
 
+/// Values resolved once and reused throughout one task invocation.
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeContext {
+  vars: Vars,
+  envs: Envs,
+  dir: PathBuf,
+}
+
+/// Lazily resolved values shared by every graph node in one logical task invocation.
+pub(crate) struct InvocationRuntime {
+  vars: Vars,
+  environment: EnvironmentPlan,
+  identity_names: HashSet<String>,
+  resolver: Option<Arc<dyn VariableResolver>>,
+  context: OnceCell<RuntimeContext>,
+}
+
+impl InvocationRuntime {
+  pub(crate) fn new(
+    vars: Vars,
+    environment: EnvironmentPlan,
+    identity_names: HashSet<String>,
+    resolver: Option<Arc<dyn VariableResolver>>,
+  ) -> Self {
+    Self {
+      vars,
+      environment,
+      identity_names,
+      resolver,
+      context: OnceCell::new(),
+    }
+  }
+
+  pub(crate) fn vars(&self) -> &Vars {
+    &self.vars
+  }
+
+  pub(crate) fn configured_envs(&self) -> Envs {
+    self.environment.configured_envs()
+  }
+
+  pub(crate) fn identity_names(&self) -> &HashSet<String> {
+    &self.identity_names
+  }
+}
+
+impl std::fmt::Debug for InvocationRuntime {
+  fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    formatter
+      .debug_struct("InvocationRuntime")
+      .field("initialized", &self.context.get().is_some())
+      .field("identity_names", &self.identity_names)
+      .finish_non_exhaustive()
+  }
+}
+
 impl From<AllowedRun> for RunMode {
   fn from(value: AllowedRun) -> Self {
     match value {
@@ -166,6 +225,7 @@ pub struct TaskNode {
   pub run_mode: RunMode, // Run mode
   pub vars: Vars,        // Task variables
   pub envs: Envs,        // Task environments
+  invocation_runtime: Arc<InvocationRuntime>,
   standalone_freshness: Option<FreshnessConfig>,
   condition_runtime: ConditionRuntime,    // Conditions attached to this graph node
   freshness_runtime: FreshnessRuntime,    // Task-level source and output state

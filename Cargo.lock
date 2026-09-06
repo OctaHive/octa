@@ -2173,6 +2173,7 @@ name = "octa-cli"
 version = "0.3.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "clap",
  "clap_complete",
  "dialoguer",

@@ -24,8 +24,9 @@ impl SourceStrategy for TestSourceStrategy {
   }
 }
 
+#[async_trait::async_trait]
 impl VariableResolver for TestVariableResolver {
-  fn resolve(&self, _prompt: &VariablePrompt) -> Result<String, String> {
+  async fn resolve(&self, _prompt: &VariablePrompt) -> Result<String, String> {
     Ok("value".to_owned())
   }
 }
@@ -828,10 +829,13 @@ async fn test_dotenv_layers_and_search() -> ExecutorResult<()> {
   let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
   let mut builder = TaskGraphBuilder::new(plugin_manager)?;
   builder.dir = temp_dir.path().to_path_buf();
-  let plan = builder.build(octafile, "test", true, vec![]).await?;
-  let task = plan.nodes().iter().find(|task| task.name == "test").unwrap();
-  let mut envs = task.envs.clone();
-  envs.expand().await?;
+  let command = builder.find_and_filter_commands(&octafile, "test")?.remove(0);
+  let mut vars = builder.collect_vars_with_identity(&command, None)?.runtime;
+  vars.expand(false).await?;
+  let envs = builder
+    .collect_environment_plan(&command, None)?
+    .resolve(&vars, None, false, CancellationToken::new())
+    .await?;
 
   assert_eq!(envs.get("ROOT_PRIORITY"), Some(&"first".to_string()));
   assert_eq!(envs.get("ROOT_DOTENV"), Some(&"loaded".to_string()));
