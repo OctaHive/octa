@@ -40,6 +40,22 @@ pub struct SourceLocation {
   pub column: Option<u64>,
 }
 
+/// Transient command progress. It is intentionally separate from stdout/stderr.
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+pub struct ProgressUpdate {
+  /// Human-readable description of the current activity.
+  pub message: String,
+  /// Completed amount, when the operation exposes a measurable position.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub current: Option<u64>,
+  /// Total amount, when it is known.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub total: Option<u64>,
+  /// Unit for `current` and `total`, for example `files` or `bytes`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub unit: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type", content = "payload")]
 pub enum OctaCommand {
@@ -115,6 +131,10 @@ pub enum PluginResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     location: Option<SourceLocation>,
   },
+  Progress {
+    id: String,
+    progress: ProgressUpdate,
+  },
   ExitStatus {
     id: String,
     code: i32,
@@ -150,7 +170,7 @@ mod base64_bytes {
 
 #[cfg(test)]
 mod tests {
-  use super::{OctaCommand, PluginResponse, Schema};
+  use super::{OctaCommand, PluginResponse, ProgressUpdate, Schema};
 
   #[test]
   fn schema_without_validation_schema_is_backward_compatible() {
@@ -176,6 +196,34 @@ mod tests {
       panic!("expected bytes response");
     };
     assert_eq!(bytes, [0, 1, 255]);
+  }
+
+  #[test]
+  fn structured_progress_round_trips_without_output_payloads() {
+    let response = PluginResponse::Progress {
+      id: "command".to_owned(),
+      progress: ProgressUpdate {
+        message: "Compiling".to_owned(),
+        current: Some(3),
+        total: Some(10),
+        unit: Some("files".to_owned()),
+      },
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    let decoded = serde_json::from_str::<PluginResponse>(&json).unwrap();
+
+    assert!(matches!(
+      decoded,
+      PluginResponse::Progress {
+        id,
+        progress: ProgressUpdate {
+          current: Some(3),
+          total: Some(10),
+          ..
+        }
+      } if id == "command"
+    ));
+    assert!(!json.contains("stdout"));
   }
 
   #[test]

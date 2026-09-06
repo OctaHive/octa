@@ -30,7 +30,7 @@ pub use prefixed::PrefixedRenderer;
 pub use quiet::QuietRenderer;
 pub use record::{
   ConsoleDiagnostic, ConsoleEntry, ConsoleLevel, ConsolePayload, ConsoleRecord, ConsoleStatus, ConsoleStream,
-  ExecutionEvent, SourceLocation, EVENT_SCHEMA_V1, EVENT_SCHEMA_VERSION,
+  ExecutionEvent, ProgressUpdate, SourceLocation, EVENT_SCHEMA_V1, EVENT_SCHEMA_V2, EVENT_SCHEMA_VERSION,
 };
 pub use renderer::{ConsoleRenderer, NullRenderer};
 pub use replacing::ReplacingRenderer;

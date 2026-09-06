@@ -5,9 +5,9 @@ parse human output: terminal renderers may change their wording or layout withou
 contract.
 
 Every line is one UTF-8 JSON object described by the checked-in
-[version 1 JSON Schema](../crates/octa-output/schema/events-v1.schema.json). The same schema is
-embedded in the `octa-output` crate as `EVENT_SCHEMA_V1`; `EVENT_SCHEMA_VERSION` is the version
-written to every entry.
+[version 2 JSON Schema](../crates/octa-output/schema/events-v2.schema.json). The current schema and
+the frozen version 1 schema are embedded in the `octa-output` crate as `EVENT_SCHEMA_V2` and
+`EVENT_SCHEMA_V1`; `EVENT_SCHEMA_VERSION` is written to every new entry.
 
 ## Envelope and ordering
 
@@ -15,7 +15,7 @@ Every entry contains:
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Event contract version; currently `1` |
+| `schema_version` | Event contract version; currently `2` |
 | `sequence` | Strictly increasing position in this Octa process's output stream |
 | `timestamp` | RFC 3339 emission time |
 | `category` | `execution`, `diagnostic`, or `document` |
@@ -32,7 +32,8 @@ The execution hierarchy is explicit:
 run (`run_id`)
 └── task invocation (`scope.id`, optional `scope.parent_task_id`)
     └── executable step (`step.id`, `step.parent_task_id`)
-        └── streamed output (`step_id`, `command_id`)
+        ├── streamed output (`step_id`, `command_id`)
+        └── transient progress (`step_id`, `command_id`)
 ```
 
 - A run is one invocation of the executor and is bounded by `run_started` and `run_finished`.
@@ -45,6 +46,14 @@ run (`run_id`)
 - An output or task-specific diagnostic carries `step_id` when it came from a particular step.
   `command_id` identifies the concrete plugin-protocol execution and is intentionally separate from
   the plan-level step ID.
+
+A `progress` event carries a human-readable `message` plus optional `current`, `total`, and `unit`.
+It is transient command state, not stdout/stderr, and is therefore not included in output capture or
+`ExecutionResult.outputs`. Consumers may display or store progress events, but must not require one
+before accepting a terminal step event. If a producer outpaces its consumer, Octa coalesces pending
+updates per command and preserves the newest value; progress delivery is best-effort and never
+delays terminal output. Plugins that do not support structured progress continue to work; the
+`replacing` renderer falls back to the latest output line.
 
 An output payload with `format: "bytes"` carries a base64-encoded chunk from an ordinary stdout or
 stderr pipe. Chunks are ordered but may split lines and UTF-8 characters; consumers must concatenate
@@ -65,8 +74,9 @@ cleanup boundary.
 
 ## Versioning policy
 
-Version 1 is frozen as an exact external contract. Renaming or removing a field, changing a field's
-type or requiredness, adding a field or event variant, or changing an enum value requires a new
+Versions 1 and 2 are frozen as exact external contracts. Version 2 adds the `progress` execution
+event; version 1 remains available unchanged. Renaming or removing a field, changing a field's type
+or requiredness, adding a field or event variant, or changing an enum value requires a new
 `schema_version` and a new immutable schema file. Corrections that only clarify prose do not.
 
 Consumers should reject schema versions they do not support and validate records against the
@@ -76,3 +86,17 @@ schema version change; those values are data, not protocol structure.
 
 JSON output cannot be combined with raw/PTY mode because terminal control bytes would corrupt the
 JSON Lines stream.
+
+## Terminal result for embedded callers
+
+The live event stream and the Rust `ExecutionResult` use the same `run_id`, task IDs, and step IDs.
+Events are the streaming observation interface; the result returned by `Executor::execute` is the
+authoritative terminal snapshot with timestamps and structured conclusions for the run, its tasks,
+and their steps. `OutputReference` points back to matching output events instead of retaining a
+second copy of their payloads. Expected execution failures are represented in the snapshot, while
+an `ExecutorError` return means a complete snapshot could not be formed or published.
+
+Each returned task has a `main` or `deferred` role. A failed deferred task remains visible without
+changing an otherwise successful run conclusion; failure to form or publish its terminal result is
+an `ExecutorError`. A declared task that was never scheduled because a dependency failed has a
+`skipped` conclusion.

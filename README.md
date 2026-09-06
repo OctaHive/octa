@@ -910,10 +910,8 @@ tasks:
 
 # Output modes
 
-Octa routes command output, executor diagnostics, progress, and machine-readable events through one
-ordered output pipeline. Output style and visibility are separate choices: `output` decides how
-records are presented, `quiet` hides Octa's informational messages, and `silent` hides command
-streams.
+Octa can present command output in several styles. `output` selects the style, `quiet` hides Octa's
+informational messages, and `silent` hides command output.
 
 ## Selecting a mode
 
@@ -942,9 +940,9 @@ An explicit CLI or environment mode applies to every task. A task-specific prese
 override the root mode, but not a CLI/environment override. `json` is deliberately global-only so
 human-readable text can never be mixed into a JSON Lines stream.
 
-When no mode is configured, Octa examines the built execution graph. It uses `prefixed` if work can
-run concurrently and `interleaved` for a linear plan. `--parallel` also selects the parallel
-default, while a concurrency limit of one keeps output interleaved.
+When no mode is configured, Octa uses `prefixed` for concurrent work and `interleaved` for
+sequential work. `--parallel` selects the parallel default, while a concurrency limit of one keeps
+output interleaved.
 
 ## Mode reference
 
@@ -952,22 +950,16 @@ default, while a concurrency limit of one keeps output interleaved.
 | --- | --- | --- |
 | `interleaved` (`interleave`) | Writes stdout and stderr as records arrive, without prefixes | Sequential work or direct log consumption |
 | `prefixed` (`prefix`) | Streams output immediately and inserts `[prefix] ` at the start of each logical line | Parallel work where full logs must remain live |
-| `group` | Buffers each task invocation and prints it as one contiguous block | Readable CI logs and non-interleaved failures |
+| `group` | Prints each task as one contiguous block | Readable CI logs and non-interleaved failures |
 | `on-error` | Buffers task output, discards it on success, and prints it on failure or cancellation | Quiet successful CI runs |
 | `keep-order` | Streams the first declared unfinished task; buffers later tasks and replays them in declaration order | Deterministic parallel logs with one live task |
 | `replacing` | Maintains one updating progress row per task and leaves a final status with elapsed time | Interactive local runs |
-| `timed` | Prints stdout only when its current logical line survives for one second (or reaches the bounded buffer limit); stderr stays live | Hiding short-lived progress chatter |
+| `timed` | Prints stdout only when its current line remains unchanged for one second; stderr stays live | Hiding short-lived progress chatter |
 | `json` (`jsonl`) | Emits every structured console entry as one JSON object per line | Automation, log ingestion, and editor integrations |
 
-`group`, `on-error`, and `keep-order` use a bounded in-memory spool and spill large buffered output
-to a temporary file. Raw/PTY bytes always bypass buffering because delayed terminal traffic would
-break interactive programs.
-
-Normal, non-PTY commands are byte-streamed too: an unterminated stdout or stderr fragment reaches
-the selected live renderer without waiting for a newline or process exit. Renderers that promise
-grouping or declaration order still spool those chunks, while `timed` holds at most 64 KiB for one
-logical stdout line before revealing it. UTF-8 characters split between transport chunks are kept
-intact in captured task results and progress text.
+Live modes show incomplete lines without waiting for a newline or process exit. Modes that promise
+grouping or declaration order may delay output until its task can be shown. Raw/PTY output always
+remains live.
 
 ## Group templates
 
@@ -1029,40 +1021,32 @@ Task presentation accepts `interleaved`/`interleave`, `group`, `prefixed`/`prefi
 
 ## JSON Lines
 
-Select `json` or `jsonl` to serialize the same records consumed by terminal renderers:
+Select `json` or `jsonl` for machine-readable output:
 
 ```bash
 octa --output jsonl build | jq -c 'select(.category == "execution")'
 ```
 
-Each entry contains:
+JSON Lines includes run, task, and step lifecycle events, command output, progress, and diagnostics.
+Version 2 is the current stable contract. See the
+[JSON Schema](crates/octa-output/schema/events-v2.schema.json) and
+[runtime event documentation](docs/events.md) for the complete field reference and compatibility
+policy.
 
-- `schema_version`: currently `1`;
-- `sequence`: a monotonically increasing number assigned by the single output writer;
-- `timestamp`: an RFC 3339 timestamp;
-- `category`: `execution`, `diagnostic`, or `document`;
-- `data`: the category-specific payload.
+All JSONL records, including stderr events, are written to process stdout. JSON output cannot be
+combined with raw/PTY mode.
 
-Execution records expose the complete `run → task invocation → executable step` hierarchy. A task
-scope contains an `id` and, when nested, `parent_task_id`; a step contains its own `id` and the
-containing task's ID. Output and task-specific diagnostics carry `step_id` when available. Separate
-`run_started`/`run_finished`, scope lifecycle, and step lifecycle events make it unnecessary to
-infer execution state from console text.
+## Embedding the executor
 
-Version 1 is frozen as an external contract and has a checked-in
-[JSON Schema](crates/octa-output/schema/events-v1.schema.json). The complete field reference,
-lifecycle guarantees, identifier semantics, and compatibility policy are in the
-[runtime event stream documentation](docs/events.md).
+The Rust API returns a complete terminal snapshot from the existing execution entry point:
 
-Byte payloads are base64 strings. Diagnostics can carry `file`, `line`, and `column`. All records,
-including logical stderr, are written as JSONL to process stdout. GitHub workflow commands are
-disabled in this mode. JSON output cannot be combined with raw/PTY mode because doing so would
-change terminal semantics and corrupt the machine-readable stream.
+```rust
+let result: octa_executor::ExecutionResult = executor.execute(cancel_token, "build").await?;
+```
 
-Plugin output is bounded independently of the selected renderer. Each command has a bounded
-response mailbox, capture spills to disk after 1 MiB, and stdout plus stderr may contribute at most
-64 MiB to the task result. Exceeding either runtime bound fails and cancels only that command rather
-than blocking other commands sharing the plugin connection.
+The result contains the run conclusion and ordered task and step results. It uses the same IDs as
+the live event stream; details are documented in the
+[runtime event documentation](docs/events.md#terminal-result-for-embedded-callers).
 
 ## Quiet and silent
 
@@ -1078,14 +1062,10 @@ than blocking other commands sharing the plugin connection.
 extended task-reference/dependency levels where applicable. CLI/environment overrides are
 `--quiet`/`TASK_QUIET` and `--silent[=stdout|stderr]`/`TASK_SILENT`.
 
-With `replacing`, a fully silent task still keeps its progress row. It starts with `running`, then
-uses the latest non-empty stdout or stderr text as its progress message, including an unfinished
-line, without emitting that output normally. Partial lines are tracked independently per command
-and stream, so interleaved stdout and stderr cannot be concatenated into a bogus status. Without
-`silent`, stdout and stderr remain visible in full above the live panel while their latest content
-also updates the task's progress text. Scoped informational messages are absorbed by the progress
-UI; structured warnings and errors remain visible. Each declared task owns one stable row;
-completed rows remain in declaration order until the whole run finishes.
+With `replacing`, a silent task still keeps its progress row. Structured plugin progress is shown
+when available; otherwise the row uses the latest non-empty stdout or stderr text. Without `silent`,
+command output also remains visible in full. Each task keeps one row from `waiting` through its
+final status.
 
 For example, this keeps prefixed compiler output but hides Octa's own lifecycle messages:
 
@@ -1100,14 +1080,12 @@ asks the selected plugin for raw execution, forwards stdin, terminal resize, and
 passes byte output without line processing. The built-in shell plugin provides a real PTY. Plugins
 must advertise `supports_raw`; otherwise Octa rejects the task before execution.
 
-A raw command holds exclusive command and output locks for its lifetime. Global raw mode also
-disables parallel top-level scheduling. Raw output bypasses prefixes, redrawing, and buffering.
+A raw command runs without other commands competing for its terminal. Global raw mode also disables
+parallel top-level scheduling. Raw output bypasses prefixes and other presentation modes.
 
-Set `interactive: true` on a task when its complete command body must have uninterrupted terminal
-ownership. Interactive tasks use the same PTY transport as raw commands, but keep a separate
-task-runtime exclusive lock from the first body node through the last; unrelated tasks cannot run
-between commands. Dependencies run before this lock is acquired, while task references inside the
-command body inherit the interactive session.
+Set `interactive: true` when a task's complete command body must run without unrelated tasks between
+its commands. Dependencies run first, while task references inside the command body remain part of
+the same interactive session.
 
 ## CI annotations
 

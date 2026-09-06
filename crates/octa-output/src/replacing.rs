@@ -5,7 +5,7 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use super::{
   ConsoleEntry, ConsoleLevel, ConsolePayload, ConsoleRecord, ConsoleRenderer, ConsoleScope, ConsoleStatus,
-  ConsoleStream, ExecutionEvent,
+  ConsoleStream, ExecutionEvent, ProgressUpdate,
 };
 
 const SPINNER_TICKS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -22,6 +22,7 @@ struct ProgressRow {
   phase: RowPhase,
   message: String,
   started: Instant,
+  structured_progress: bool,
   streamed_lines: HashMap<ConsoleStream, HashMap<String, StreamedLine>>,
 }
 
@@ -31,6 +32,7 @@ impl ProgressRow {
       phase: RowPhase::Waiting,
       message: "waiting".to_owned(),
       started: Instant::now(),
+      structured_progress: false,
       streamed_lines: HashMap::new(),
     }
   }
@@ -120,6 +122,23 @@ fn display_message(bytes: &[u8]) -> Option<String> {
 
 fn normalized_message(message: &str) -> Option<String> {
   (!message.trim().is_empty()).then(|| message.replace('\r', ""))
+}
+
+fn formatted_progress(progress: &ProgressUpdate) -> Option<String> {
+  let message = normalized_message(&progress.message);
+  let unit = progress.unit.as_deref().map(str::trim).filter(|unit| !unit.is_empty());
+  let amount = progress.current.map(|current| {
+    let value = progress
+      .total
+      .map_or_else(|| current.to_string(), |total| format!("{current}/{total}"));
+    unit.map_or(value.clone(), |unit| format!("{value} {unit}"))
+  });
+  match (message, amount) {
+    (Some(message), Some(amount)) => Some(format!("{message} — {amount}")),
+    (Some(message), None) => Some(message),
+    (None, Some(amount)) => Some(amount),
+    (None, None) => None,
+  }
 }
 
 /// Atomically redraws one multi-line progress frame containing one row per task.
@@ -289,6 +308,10 @@ impl<R: ConsoleRenderer> ConsoleRenderer for ReplacingRenderer<R> {
         self.draw();
         Ok(())
       },
+      ConsoleRecord::Execution(ExecutionEvent::StepStarted { scope, .. }) => {
+        self.row(scope).structured_progress = false;
+        self.render_around_progress(entry)
+      },
       ConsoleRecord::Execution(ExecutionEvent::Output {
         scope: Some(scope),
         command_id,
@@ -296,9 +319,11 @@ impl<R: ConsoleRenderer> ConsoleRenderer for ReplacingRenderer<R> {
         payload: ConsolePayload::Line(line),
         ..
       }) if self.raw_scope.is_none() => {
-        if let Some(message) = self.row(scope).complete_line(command_id, *stream, line) {
-          self.row(scope).message = message;
-          self.draw();
+        if !self.row(scope).structured_progress {
+          if let Some(message) = self.row(scope).complete_line(command_id, *stream, line) {
+            self.row(scope).message = message;
+            self.draw();
+          }
         }
         self.render_around_progress(entry)
       },
@@ -309,9 +334,11 @@ impl<R: ConsoleRenderer> ConsoleRenderer for ReplacingRenderer<R> {
         payload: ConsolePayload::Bytes(bytes),
         ..
       }) if self.raw_scope.is_none() => {
-        if let Some(message) = self.row(scope).push_bytes(command_id, *stream, bytes) {
-          self.row(scope).message = message;
-          self.draw();
+        if !self.row(scope).structured_progress {
+          if let Some(message) = self.row(scope).push_bytes(command_id, *stream, bytes) {
+            self.row(scope).message = message;
+            self.draw();
+          }
         }
         self.render_around_progress(entry)
       },
@@ -324,6 +351,19 @@ impl<R: ConsoleRenderer> ConsoleRenderer for ReplacingRenderer<R> {
           self.activate_raw(scope);
         }
         self.renderer.render(entry)
+      },
+      ConsoleRecord::Execution(ExecutionEvent::Progress {
+        scope: Some(scope),
+        progress,
+        ..
+      }) if self.raw_scope.is_none() => {
+        if let Some(message) = formatted_progress(progress) {
+          let row = self.row(scope);
+          row.message = message;
+          row.structured_progress = true;
+          self.draw();
+        }
+        self.render_around_progress(entry)
       },
       ConsoleRecord::Execution(ExecutionEvent::ScopeFinished { scope, status, .. }) => {
         self.finish_scope(scope, *status);
@@ -373,10 +413,12 @@ impl<R: ConsoleRenderer> ConsoleRenderer for ReplacingRenderer<R> {
   fn update_progress(&mut self, scope: &ConsoleScope, message: &str) -> io::Result<()> {
     if self.raw_scope.is_none() {
       if let Some(row) = self.rows.get_mut(scope) {
-        row.streamed_lines.clear();
-        if let Some(message) = normalized_message(message) {
-          row.message = message;
-          self.draw();
+        if !row.structured_progress {
+          row.streamed_lines.clear();
+          if let Some(message) = normalized_message(message) {
+            row.message = message;
+            self.draw();
+          }
         }
       }
     }
@@ -392,9 +434,11 @@ impl<R: ConsoleRenderer> ConsoleRenderer for ReplacingRenderer<R> {
   ) -> io::Result<()> {
     if self.raw_scope.is_none() {
       if let Some(row) = self.rows.get_mut(scope) {
-        if let Some(message) = row.push_bytes(command_id, stream, bytes) {
-          row.message = message;
-          self.draw();
+        if !row.structured_progress {
+          if let Some(message) = row.push_bytes(command_id, stream, bytes) {
+            row.message = message;
+            self.draw();
+          }
         }
       }
     }
@@ -499,6 +543,85 @@ mod tests {
     assert_eq!(renderer.rows[&first].message, "compiling");
     assert_eq!(renderer.rows[&second].message, "waiting");
     assert_eq!(renderer.renderer.0, [output]);
+  }
+
+  #[test]
+  fn structured_progress_updates_the_row_and_remains_an_event() {
+    let allocator = ConsoleScopeAllocator::default();
+    let scope = allocator.scope_with_options("build", None, true, true);
+    let next_step = allocator.step(&scope, "link");
+    let mut renderer = renderer();
+    let progress = ConsoleRecord::Execution(ExecutionEvent::Progress {
+      run_id: 1,
+      scope: Some(scope.clone()),
+      step_id: Some(4),
+      command_id: "compiler".to_owned(),
+      progress: ProgressUpdate {
+        message: "Compiling".to_owned(),
+        current: Some(3),
+        total: Some(10),
+        unit: Some("files".to_owned()),
+      },
+    });
+
+    renderer.render(&ConsoleEntry::new(progress.clone())).unwrap();
+
+    renderer
+      .render(&ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
+        run_id: 1,
+        scope: Some(scope.clone()),
+        step_id: Some(4),
+        command_id: "compiler".to_owned(),
+        stream: ConsoleStream::Stdout,
+        payload: ConsolePayload::Line("less specific output".to_owned()),
+      })))
+      .unwrap();
+
+    assert_eq!(renderer.rows[&scope].message, "Compiling — 3/10 files");
+    assert_eq!(renderer.renderer.0.first(), Some(&progress));
+
+    renderer
+      .render(&ConsoleEntry::new(ConsoleRecord::Execution(
+        ExecutionEvent::StepStarted {
+          run_id: 1,
+          scope: scope.clone(),
+          step: next_step,
+        },
+      )))
+      .unwrap();
+    renderer.update_progress(&scope, "Linking").unwrap();
+    assert_eq!(renderer.rows[&scope].message, "Linking");
+  }
+
+  #[test]
+  fn structured_progress_formats_partial_updates_without_empty_rows() {
+    assert_eq!(
+      formatted_progress(&ProgressUpdate {
+        message: String::new(),
+        current: Some(7),
+        total: None,
+        unit: Some("bytes".to_owned()),
+      }),
+      Some("7 bytes".to_owned())
+    );
+    assert_eq!(
+      formatted_progress(&ProgressUpdate {
+        message: "Waiting".to_owned(),
+        current: None,
+        total: Some(10),
+        unit: None,
+      }),
+      Some("Waiting".to_owned())
+    );
+    assert_eq!(
+      formatted_progress(&ProgressUpdate {
+        message: " \r".to_owned(),
+        current: None,
+        total: None,
+        unit: None,
+      }),
+      None
+    );
   }
 
   #[test]

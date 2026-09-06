@@ -48,6 +48,11 @@ impl ConsoleScope {
     self.parent_task_id
   }
 
+  /// Returns whether both scopes were allocated in the same execution identity domain.
+  pub fn shares_allocator_with(&self, other: &Self) -> bool {
+    self.allocator_id == other.allocator_id
+  }
+
   pub fn prefix(&self) -> String {
     self
       .metadata
@@ -262,21 +267,29 @@ impl ConsoleScopeAllocator {
 
   /// Allocates an executable step owned by `parent_task`.
   pub fn step(&self, parent_task: &ConsoleScope, label: impl Into<String>) -> ConsoleStep {
-    ConsoleStep::new(self.next_step_id.fetch_add(1, Ordering::Relaxed), parent_task, label)
+    ConsoleStep::new(
+      self.id,
+      self.next_step_id.fetch_add(1, Ordering::Relaxed),
+      parent_task,
+      label,
+    )
   }
 }
 
 /// Identifies one executable command inside a task invocation.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct ConsoleStep {
+  #[serde(skip, default)]
+  allocator_id: u64,
   id: u64,
   parent_task_id: u64,
   label: String,
 }
 
 impl ConsoleStep {
-  fn new(id: u64, parent_task: &ConsoleScope, label: impl Into<String>) -> Self {
+  fn new(allocator_id: u64, id: u64, parent_task: &ConsoleScope, label: impl Into<String>) -> Self {
     Self {
+      allocator_id,
       id,
       parent_task_id: parent_task.id(),
       label: label.into(),
@@ -291,6 +304,11 @@ impl ConsoleStep {
   /// Identifier of the task invocation that owns this step.
   pub fn parent_task_id(&self) -> u64 {
     self.parent_task_id
+  }
+
+  /// Returns whether this step was allocated for the supplied task scope.
+  pub fn belongs_to(&self, scope: &ConsoleScope) -> bool {
+    self.allocator_id == scope.allocator_id && self.parent_task_id == scope.id
   }
 
   /// Human-readable plugin label; it is not a stable identifier.
@@ -332,6 +350,18 @@ mod tests {
     let second = ConsoleScopeAllocator::default().scope("build");
     assert_eq!(first.id(), second.id());
     assert_ne!(first, second);
+  }
+
+  #[test]
+  fn steps_cannot_be_rebound_to_a_scope_from_another_allocator() {
+    let first_allocator = ConsoleScopeAllocator::default();
+    let second_allocator = ConsoleScopeAllocator::default();
+    let first = first_allocator.scope("first");
+    let second = second_allocator.scope("second");
+    let step = first_allocator.step(&first, "shell");
+
+    assert!(step.belongs_to(&first));
+    assert!(!step.belongs_to(&second));
   }
 
   #[test]

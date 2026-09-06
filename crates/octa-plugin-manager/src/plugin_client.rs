@@ -11,11 +11,11 @@ use semver::{Version as SemVersion, VersionReq};
 use serde_json::Value;
 use tokio::{
   io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
-  sync::{mpsc, oneshot, Mutex},
+  sync::{mpsc, oneshot, watch, Mutex},
 };
 use tokio_util::sync::CancellationToken;
 
-use octa_plugin::protocol::{OctaCommand, PluginResponse, Schema, Version};
+use octa_plugin::protocol::{OctaCommand, PluginResponse, ProgressUpdate, Schema, Version};
 
 const CONTROL_RESPONSE_CAPACITY: usize = 16;
 const COMMAND_RESPONSE_CAPACITY: usize = 32;
@@ -103,6 +103,7 @@ struct PluginClientInner {
 #[derive(Debug)]
 struct CommandRoute {
   sender: Option<mpsc::Sender<PluginResponse>>,
+  progress: watch::Sender<Option<ProgressUpdate>>,
   overflowed: CancellationToken,
   completed: CancellationToken,
 }
@@ -119,6 +120,7 @@ impl Drop for PluginClient {
 pub struct PluginExecution {
   id: String,
   response_rx: mpsc::Receiver<PluginResponse>,
+  progress_rx: watch::Receiver<Option<ProgressUpdate>>,
   overflowed: CancellationToken,
   completed: CancellationToken,
   client: PluginClient,
@@ -181,6 +183,13 @@ impl PluginExecution {
         capacity: COMMAND_RESPONSE_CAPACITY,
       }),
       response = self.response_rx.recv() => Ok(response),
+      changed = self.progress_rx.changed() => {
+        changed.map_err(|_| PluginClientError::ConnectionClosed)?;
+        Ok(self.progress_rx.borrow_and_update().clone().map(|progress| PluginResponse::Progress {
+          id: self.id.clone(),
+          progress,
+        }))
+      },
     }
   }
 
@@ -371,12 +380,14 @@ impl PluginClient {
         return true;
       };
       let (response_tx, response_rx) = mpsc::channel(COMMAND_RESPONSE_CAPACITY);
+      let (progress_tx, progress_rx) = watch::channel(None);
       let overflowed = CancellationToken::new();
       let completed = CancellationToken::new();
       inner.commands.lock().await.insert(
         id.clone(),
         CommandRoute {
           sender: Some(response_tx),
+          progress: progress_tx,
           overflowed: overflowed.clone(),
           completed: completed.clone(),
         },
@@ -384,6 +395,7 @@ impl PluginClient {
       let execution = PluginExecution {
         id: id.clone(),
         response_rx,
+        progress_rx,
         overflowed,
         completed,
         client: PluginClient { inner: inner.clone() },
@@ -392,6 +404,13 @@ impl PluginClient {
         tokio::spawn(async move {
           let _ = execution.cancel_and_wait().await;
         });
+      }
+      return true;
+    }
+
+    if let PluginResponse::Progress { id, progress } = response {
+      if let Some(route) = inner.commands.lock().await.get(&id) {
+        route.progress.send_replace(Some(progress));
       }
       return true;
     }
@@ -1089,7 +1108,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn routes_interleaved_outputs_to_their_commands() {
+  async fn routes_outputs_and_coalesces_progress_per_command() {
     let server = TestServer::new().await;
     let listener = Arc::clone(&server.listener);
     let server_handle = tokio::spawn(async move {
@@ -1121,6 +1140,22 @@ mod tests {
             tokio::spawn(async move {
               let delay = if params == "first" { 80 } else { 10 };
               tokio::time::sleep(Duration::from_millis(delay)).await;
+              for current in 0..COMMAND_RESPONSE_CAPACITY * 4 {
+                write_response(
+                  &writer,
+                  PluginResponse::Progress {
+                    id: params.clone(),
+                    progress: ProgressUpdate {
+                      message: "working".to_owned(),
+                      current: Some(current as u64),
+                      total: Some((COMMAND_RESPONSE_CAPACITY * 4) as u64),
+                      unit: None,
+                    },
+                  },
+                )
+                .await;
+              }
+              tokio::time::sleep(Duration::from_millis(20)).await;
               write_response(
                 &writer,
                 PluginResponse::Stdout {
@@ -1154,10 +1189,12 @@ mod tests {
       client.start_execution(execution_request("second"), CancellationToken::new())
     );
 
-    async fn output(mut execution: PluginExecution) -> String {
+    async fn output(mut execution: PluginExecution) -> (Option<u64>, String) {
+      let mut latest_progress = None;
       loop {
         match execution.receive_output(&CancellationToken::new()).await.unwrap() {
-          Some(PluginResponse::Stdout { line, .. }) => return line,
+          Some(PluginResponse::Progress { progress, .. }) => latest_progress = progress.current,
+          Some(PluginResponse::Stdout { line, .. }) => return (latest_progress, line),
           Some(_) => {},
           None => panic!("command response stream closed"),
         }
@@ -1165,8 +1202,9 @@ mod tests {
     }
 
     let (first, second) = tokio::join!(output(first.unwrap()), output(second.unwrap()));
-    assert_eq!(first, "first-output");
-    assert_eq!(second, "second-output");
+    let expected_progress = Some((COMMAND_RESPONSE_CAPACITY * 4 - 1) as u64);
+    assert_eq!(first, (expected_progress, "first-output".to_owned()));
+    assert_eq!(second, (expected_progress, "second-output".to_owned()));
 
     client.shutdown().await.unwrap();
     server_handle.await.unwrap();

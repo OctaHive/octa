@@ -1,0 +1,313 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/OctaHive/octa/main/crates/octa-output/schema/events-v2.schema.json",
+  "title": "Octa event stream v2",
+  "type": "object",
+  "required": ["schema_version", "sequence", "timestamp", "category", "data"],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "sequence": { "type": "integer", "minimum": 0 },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "category": { "enum": ["execution", "diagnostic", "document"] },
+    "data": {}
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "category": { "const": "execution" },
+        "data": { "$ref": "#/$defs/execution_event" }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "diagnostic" },
+        "data": { "$ref": "#/$defs/diagnostic" }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "document" },
+        "data": { "$ref": "#/$defs/document" }
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "status": {
+      "enum": ["skipped", "success", "cancelled", "failed"]
+    },
+    "scope": {
+      "type": "object",
+      "required": ["id", "label"],
+      "properties": {
+        "id": { "type": "integer", "minimum": 0 },
+        "parent_task_id": { "type": "integer", "minimum": 0 },
+        "label": { "type": "string" },
+        "prefix": { "type": "string" },
+        "output_mode": {
+          "enum": ["interleaved", "group", "prefixed", "on-error", "keep-order", "replacing", "timed", "json"]
+        },
+        "hide_stdout": { "type": "boolean" },
+        "hide_stderr": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "step": {
+      "type": "object",
+      "required": ["id", "parent_task_id", "label"],
+      "properties": {
+        "id": { "type": "integer", "minimum": 0 },
+        "parent_task_id": { "type": "integer", "minimum": 0 },
+        "label": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "payload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["format", "data"],
+          "properties": {
+            "format": { "const": "line" },
+            "data": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["format", "data"],
+          "properties": {
+            "format": { "enum": ["bytes", "raw_bytes"] },
+            "data": { "type": "string", "contentEncoding": "base64" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "progress_update": {
+      "type": "object",
+      "required": ["message"],
+      "properties": {
+        "message": { "type": "string" },
+        "current": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 },
+        "unit": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "run_started": {
+      "type": "object",
+      "required": ["type", "run_id", "command"],
+      "properties": {
+        "type": { "const": "run_started" },
+        "run_id": { "type": "integer", "minimum": 0 },
+        "command": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "run_finished": {
+      "type": "object",
+      "required": ["type", "run_id", "command", "status"],
+      "properties": {
+        "type": { "const": "run_finished" },
+        "run_id": { "type": "integer", "minimum": 0 },
+        "command": { "type": "string" },
+        "status": { "$ref": "#/$defs/status" }
+      },
+      "additionalProperties": false
+    },
+    "scope_event": {
+      "type": "object",
+      "required": ["type", "run_id", "scope"],
+      "properties": {
+        "type": { "enum": ["scope_declared", "scope_started"] },
+        "run_id": { "type": "integer", "minimum": 0 },
+        "scope": { "$ref": "#/$defs/scope" }
+      },
+      "additionalProperties": false
+    },
+    "scope_finished": {
+      "type": "object",
+      "required": ["type", "run_id", "scope", "status"],
+      "properties": {
+        "type": { "const": "scope_finished" },
+        "run_id": { "type": "integer", "minimum": 0 },
+        "scope": { "$ref": "#/$defs/scope" },
+        "status": { "$ref": "#/$defs/status" }
+      },
+      "additionalProperties": false
+    },
+    "step_event": {
+      "type": "object",
+      "required": ["type", "run_id", "scope", "step"],
+      "properties": {
+        "type": { "enum": ["step_declared", "step_started"] },
+        "run_id": { "type": "integer", "minimum": 0 },
+        "scope": { "$ref": "#/$defs/scope" },
+        "step": { "$ref": "#/$defs/step" }
+      },
+      "additionalProperties": false
+    },
+    "step_finished": {
+      "type": "object",
+      "required": ["type", "run_id", "scope", "step", "status"],
+      "properties": {
+        "type": { "const": "step_finished" },
+        "run_id": { "type": "integer", "minimum": 0 },
+        "scope": { "$ref": "#/$defs/scope" },
+        "step": { "$ref": "#/$defs/step" },
+        "status": { "$ref": "#/$defs/status" }
+      },
+      "additionalProperties": false
+    },
+    "output": {
+      "type": "object",
+      "required": ["type", "run_id", "scope", "command_id", "stream", "payload"],
+      "properties": {
+        "type": { "const": "output" },
+        "run_id": { "type": "integer", "minimum": 0 },
+        "scope": { "oneOf": [{ "$ref": "#/$defs/scope" }, { "type": "null" }] },
+        "step_id": { "type": "integer", "minimum": 0 },
+        "command_id": { "type": "string" },
+        "stream": { "enum": ["stdout", "stderr"] },
+        "payload": { "$ref": "#/$defs/payload" }
+      },
+      "dependentSchemas": {
+        "step_id": {
+          "properties": { "scope": { "$ref": "#/$defs/scope" } }
+        }
+      },
+      "additionalProperties": false
+    },
+    "progress": {
+      "type": "object",
+      "required": ["type", "run_id", "scope", "command_id", "progress"],
+      "properties": {
+        "type": { "const": "progress" },
+        "run_id": { "type": "integer", "minimum": 0 },
+        "scope": { "oneOf": [{ "$ref": "#/$defs/scope" }, { "type": "null" }] },
+        "step_id": { "type": "integer", "minimum": 0 },
+        "command_id": { "type": "string" },
+        "progress": { "$ref": "#/$defs/progress_update" }
+      },
+      "dependentSchemas": {
+        "step_id": {
+          "properties": { "scope": { "$ref": "#/$defs/scope" } }
+        }
+      },
+      "additionalProperties": false
+    },
+    "execution_event": {
+      "oneOf": [
+        { "$ref": "#/$defs/run_started" },
+        { "$ref": "#/$defs/run_finished" },
+        { "$ref": "#/$defs/scope_event" },
+        { "$ref": "#/$defs/scope_finished" },
+        { "$ref": "#/$defs/step_event" },
+        { "$ref": "#/$defs/step_finished" },
+        { "$ref": "#/$defs/output" },
+        { "$ref": "#/$defs/progress" }
+      ]
+    },
+    "source_location": {
+      "type": "object",
+      "required": ["file"],
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer", "minimum": 0 },
+        "column": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "diagnostic": {
+      "type": "object",
+      "required": ["run_id", "scope", "level", "message"],
+      "properties": {
+        "run_id": { "type": ["integer", "null"], "minimum": 0 },
+        "scope": { "oneOf": [{ "$ref": "#/$defs/scope" }, { "type": "null" }] },
+        "step_id": { "type": "integer", "minimum": 0 },
+        "level": { "enum": ["trace", "debug", "info", "warn", "error"] },
+        "message": { "type": "string" },
+        "location": { "oneOf": [{ "$ref": "#/$defs/source_location" }, { "type": "null" }] }
+      },
+      "dependentSchemas": {
+        "step_id": {
+          "properties": { "scope": { "$ref": "#/$defs/scope" } }
+        }
+      },
+      "additionalProperties": false
+    },
+    "duration": {
+      "type": "object",
+      "required": ["secs", "nanos"],
+      "properties": {
+        "secs": { "type": "integer", "minimum": 0 },
+        "nanos": { "type": "integer", "minimum": 0, "maximum": 999999999 }
+      },
+      "additionalProperties": false
+    },
+    "document": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "tasks"],
+          "properties": {
+            "type": { "const": "task_list" },
+            "tasks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "description"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "description": { "type": ["string", "null"] }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "text"],
+          "properties": {
+            "type": { "enum": ["help", "completion"] },
+            "text": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "message"],
+          "properties": {
+            "type": { "const": "failure" },
+            "message": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "tasks", "total"],
+          "properties": {
+            "type": { "const": "summary" },
+            "tasks": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "duration"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "duration": { "$ref": "#/$defs/duration" }
+                },
+                "additionalProperties": false
+              }
+            },
+            "total": { "$ref": "#/$defs/duration" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

@@ -220,7 +220,8 @@ fn record_scope(record: &ConsoleRecord) -> Option<&ConsoleScope> {
     | ConsoleRecord::Execution(ExecutionEvent::StepDeclared { scope, .. })
     | ConsoleRecord::Execution(ExecutionEvent::StepStarted { scope, .. })
     | ConsoleRecord::Execution(ExecutionEvent::StepFinished { scope, .. })
-    | ConsoleRecord::Execution(ExecutionEvent::Output { scope: Some(scope), .. }) => Some(scope),
+    | ConsoleRecord::Execution(ExecutionEvent::Output { scope: Some(scope), .. })
+    | ConsoleRecord::Execution(ExecutionEvent::Progress { scope: Some(scope), .. }) => Some(scope),
     ConsoleRecord::Diagnostic(diagnostic) => diagnostic.scope.as_ref(),
     _ => None,
   }

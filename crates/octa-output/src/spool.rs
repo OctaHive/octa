@@ -90,6 +90,17 @@ fn estimated_memory(entry: &ConsoleEntry) -> usize {
         };
         scope.as_ref().map_or(0, |scope| scope.label().len()) + command_id.len() + payload
       },
+      ExecutionEvent::Progress {
+        scope,
+        command_id,
+        progress,
+        ..
+      } => {
+        scope.as_ref().map_or(0, |scope| scope.label().len())
+          + command_id.len()
+          + progress.message.len()
+          + progress.unit.as_ref().map_or(0, String::len)
+      },
     },
     ConsoleRecord::Diagnostic(diagnostic) => {
       diagnostic.message.len()
@@ -176,7 +187,7 @@ mod tests {
 
   #[test]
   fn estimates_dynamic_memory_for_each_record_shape() {
-    use crate::{CliDocument, ConsoleDiagnostic, ConsoleLevel, ConsoleScopeAllocator, ConsoleStatus};
+    use crate::{CliDocument, ConsoleDiagnostic, ConsoleLevel, ConsoleScopeAllocator, ConsoleStatus, ProgressUpdate};
 
     let scope = ConsoleScopeAllocator::default().scope("scope");
     let records = [
@@ -192,6 +203,18 @@ mod tests {
       ConsoleRecord::Execution(ExecutionEvent::ScopeStarted {
         run_id: 1,
         scope: scope.clone(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::Progress {
+        run_id: 1,
+        scope: Some(scope.clone()),
+        step_id: None,
+        command_id: "command".to_owned(),
+        progress: ProgressUpdate {
+          message: "working".to_owned(),
+          current: Some(1),
+          total: Some(2),
+          unit: Some("files".to_owned()),
+        },
       }),
       ConsoleRecord::Diagnostic(ConsoleDiagnostic {
         run_id: Some(1),

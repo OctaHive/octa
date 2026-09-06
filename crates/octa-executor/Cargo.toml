@@ -20,6 +20,7 @@ octa-output = { version = "0.3.0", path = "../octa-output" }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 crossterm = { workspace = true }
+chrono = { version = "0.4.45", features = ["serde"] }
 dunce = "1.0.5"
 dotenvy = "0.15.7"
 indexmap = { workspace = true }

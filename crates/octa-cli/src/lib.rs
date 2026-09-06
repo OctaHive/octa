@@ -504,6 +504,11 @@ async fn execute_tasks(
   let batch_token = cancel_token.child_token();
 
   if parallel {
+    // Declare every run and scope before scheduling work so renderers such as keep-order observe
+    // the same order as the command line even when Tokio polls spawned executions differently.
+    for task in &tasks {
+      task.executor.prepare(&task.command).await?;
+    }
     let mut handles = JoinSet::new();
     let mut first_error = None;
 
@@ -515,7 +520,10 @@ async fn execute_tasks(
     // Join in completion order so the first failure can interrupt siblings immediately.
     while let Some(result) = handles.join_next().await {
       let error = match result {
-        Ok(Ok(_)) => continue,
+        Ok(Ok(result)) => match result.into_failure() {
+          Some(failure) => OctaError::ExecutionFailed(Box::new(failure)),
+          None => continue,
+        },
         Ok(Err(error)) => OctaError::ExecutionError(error),
         Err(error) => OctaError::Runtime(error.to_string()),
       };
@@ -533,7 +541,10 @@ async fn execute_tasks(
     }
   } else {
     for task in tasks {
-      task.executor.execute(batch_token.clone(), &task.command).await?;
+      let result = task.executor.execute(batch_token.clone(), &task.command).await?;
+      if let Some(failure) = result.into_failure() {
+        return Err(Box::new(failure).into());
+      }
     }
   }
   Ok(())

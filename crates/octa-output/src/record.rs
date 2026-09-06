@@ -4,10 +4,12 @@ use serde::{Deserialize, Serialize};
 use super::{CliDocument, ConsoleScope, ConsoleStep};
 
 /// Version of the externally supported JSON Lines event contract.
-pub const EVENT_SCHEMA_VERSION: u16 = 1;
+pub const EVENT_SCHEMA_VERSION: u16 = 2;
 
 /// JSON Schema for [`ConsoleEntry`] version 1.
 pub const EVENT_SCHEMA_V1: &str = include_str!("../schema/events-v1.schema.json");
+/// JSON Schema for [`ConsoleEntry`] version 2.
+pub const EVENT_SCHEMA_V2: &str = include_str!("../schema/events-v2.schema.json");
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +70,22 @@ pub enum ConsoleLevel {
   Error,
 }
 
+/// Transient progress reported by a concrete plugin command.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProgressUpdate {
+  /// Human-readable description of the current activity.
+  pub message: String,
+  /// Completed amount, when the operation exposes a measurable position.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub current: Option<u64>,
+  /// Total amount, when it is known.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub total: Option<u64>,
+  /// Unit for `current` and `total`, for example `files` or `bytes`.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub unit: Option<String>,
+}
+
 /// Runtime state transitions and command output produced while executing a plan.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -119,6 +137,16 @@ pub enum ExecutionEvent {
     command_id: String,
     stream: ConsoleStream,
     payload: ConsolePayload,
+  },
+  /// Reports transient structured progress without treating it as command output.
+  Progress {
+    run_id: u64,
+    scope: Option<ConsoleScope>,
+    /// Plan-level command identity, present when `scope` identifies its owning task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step_id: Option<u64>,
+    command_id: String,
+    progress: ProgressUpdate,
   },
 }
 
@@ -234,7 +262,7 @@ mod tests {
     .unwrap();
 
     assert!(value["timestamp"].as_str().is_some());
-    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["schema_version"], EVENT_SCHEMA_VERSION);
     assert_eq!(value["sequence"], 0);
     assert_eq!(value["category"], "execution");
     assert_eq!(value["data"]["type"], "output");
@@ -293,14 +321,14 @@ mod tests {
       command: "build".to_owned(),
     }));
     entry.assign_sequence(42);
-    assert_eq!(entry.schema_version(), 1);
+    assert_eq!(entry.schema_version(), EVENT_SCHEMA_VERSION);
     assert_eq!(entry.sequence(), 42);
     assert!(*entry.timestamp() <= Utc::now());
   }
 
   #[test]
-  fn version_one_schema_validates_every_public_record_shape() {
-    let schema = serde_json::from_str(EVENT_SCHEMA_V1).unwrap();
+  fn current_schema_validates_every_public_record_shape() {
+    let schema = serde_json::from_str(EVENT_SCHEMA_V2).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     let allocator = ConsoleScopeAllocator::default();
     let parent = allocator.scope("build");
@@ -369,6 +397,18 @@ mod tests {
         stream: ConsoleStream::Stdout,
         payload: ConsolePayload::Line("output".to_owned()),
       }),
+      ConsoleRecord::Execution(ExecutionEvent::Progress {
+        run_id: 1,
+        scope: Some(scope.clone()),
+        step_id: Some(step.id()),
+        command_id: "plugin-command-4".to_owned(),
+        progress: ProgressUpdate {
+          message: "Compiling".to_owned(),
+          current: Some(3),
+          total: Some(10),
+          unit: Some("files".to_owned()),
+        },
+      }),
       ConsoleRecord::Diagnostic(ConsoleDiagnostic {
         run_id: Some(1),
         scope: Some(scope.clone()),
@@ -415,8 +455,30 @@ mod tests {
 
     for record in records {
       let value = serde_json::to_value(ConsoleEntry::new(record)).unwrap();
-      assert!(validator.is_valid(&value), "event does not match v1 schema: {value}");
+      assert!(validator.is_valid(&value), "event does not match v2 schema: {value}");
     }
+  }
+
+  #[test]
+  fn version_one_schema_remains_frozen_and_rejects_progress() {
+    let schema: serde_json::Value = serde_json::from_str(EVENT_SCHEMA_V1).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let progress = serde_json::json!({
+      "schema_version": 1,
+      "sequence": 0,
+      "timestamp": Utc::now(),
+      "category": "execution",
+      "data": {
+        "type": "progress",
+        "run_id": 1,
+        "scope": null,
+        "command_id": "command-1",
+        "progress": { "message": "Compiling", "current": 1, "total": 2 }
+      }
+    });
+
+    assert_eq!(schema["properties"]["schema_version"]["const"], 1);
+    assert!(!validator.is_valid(&progress));
   }
 
   #[test]
@@ -442,8 +504,8 @@ mod tests {
   }
 
   #[test]
-  fn version_one_schema_rejects_mismatched_categories_and_unknown_fields() {
-    let schema = serde_json::from_str(EVENT_SCHEMA_V1).unwrap();
+  fn current_schema_rejects_mismatched_categories_and_unknown_fields() {
+    let schema = serde_json::from_str(EVENT_SCHEMA_V2).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     let mut value = serde_json::to_value(ConsoleEntry::new(ConsoleRecord::Execution(
       ExecutionEvent::RunStarted {
@@ -460,7 +522,7 @@ mod tests {
     assert!(!validator.is_valid(&value));
 
     let unscoped_step_output = serde_json::json!({
-      "schema_version": 1,
+      "schema_version": EVENT_SCHEMA_VERSION,
       "sequence": 1,
       "timestamp": Utc::now(),
       "category": "execution",

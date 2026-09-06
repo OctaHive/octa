@@ -59,6 +59,14 @@ impl<R: ConsoleRenderer> BufferedRenderer<R> {
   }
 
   fn render(&mut self, entry: &ConsoleEntry) -> io::Result<()> {
+    // Progress is transient presentation state. Replaying it after a buffered task completes is
+    // both misleading and unnecessary, so pass it through without adding it to the spool.
+    if matches!(
+      entry.record(),
+      ConsoleRecord::Execution(ExecutionEvent::Progress { .. })
+    ) {
+      return self.renderer.render(entry);
+    }
     if let ConsoleRecord::Execution(ExecutionEvent::ScopeFinished { scope, status, .. }) = entry.record() {
       return match self.scopes.remove(scope) {
         Some(ScopeOutput::Buffered(entries)) if self.policy.should_flush(*status) => {
@@ -298,7 +306,7 @@ fn group_entry(reference: &ConsoleEntry, scope: &ConsoleScope, template: &str) -
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{ConsoleDiagnostic, ConsoleLevel, ConsolePayload, ConsoleScopeAllocator, ConsoleStream};
+  use crate::{ConsoleDiagnostic, ConsoleLevel, ConsolePayload, ConsoleScopeAllocator, ConsoleStream, ProgressUpdate};
 
   #[derive(Default)]
   struct RecordingRenderer {
@@ -374,6 +382,21 @@ mod tests {
     }))
   }
 
+  fn progress(scope: ConsoleScope, current: u64) -> ConsoleEntry {
+    entry(ConsoleRecord::Execution(ExecutionEvent::Progress {
+      run_id: 7,
+      scope: Some(scope),
+      step_id: None,
+      command_id: "command".to_owned(),
+      progress: ProgressUpdate {
+        message: "working".to_owned(),
+        current: Some(current),
+        total: Some(2),
+        unit: None,
+      },
+    }))
+  }
+
   fn finished(scope: ConsoleScope, status: ConsoleStatus) -> ConsoleEntry {
     entry(ConsoleRecord::Execution(ExecutionEvent::ScopeFinished {
       run_id: 7,
@@ -422,6 +445,29 @@ mod tests {
       &records[5],
       ConsoleRecord::Execution(ExecutionEvent::Output { command_id, .. }) if command_id == "slow-2"
     ));
+  }
+
+  #[test]
+  fn group_passes_progress_through_without_replaying_it() {
+    let scope = ConsoleScopeAllocator::default().scope("build");
+    let mut renderer = GroupRenderer::new(RecordingRenderer::default());
+    let progress = progress(scope.clone(), 1);
+
+    renderer.render(&started(scope.clone())).unwrap();
+    renderer.render(&progress).unwrap();
+    assert_eq!(renderer.0.renderer.records, [progress.record().clone()]);
+
+    renderer.render(&finished(scope, ConsoleStatus::Success)).unwrap();
+    assert_eq!(
+      renderer
+        .0
+        .renderer
+        .records
+        .iter()
+        .filter(|record| matches!(record, ConsoleRecord::Execution(ExecutionEvent::Progress { .. })))
+        .count(),
+      1
+    );
   }
 
   #[test]

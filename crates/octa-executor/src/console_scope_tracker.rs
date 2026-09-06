@@ -1,15 +1,23 @@
-use std::{io, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc};
 
+use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use octa_output::{Console, ConsoleScope, ConsoleStatus, ConsoleStep, ExecutionEvent};
 use tokio::sync::Mutex;
 
-use crate::task::ExecutionBinding;
+use crate::{
+  execution_result::{conclusion, ExecutionFailure, OutputReference, StepResult, TaskResult, TaskRole},
+  task::ExecutionBinding,
+};
 
 struct ScopeState {
   remaining: usize,
   status: ConsoleStatus,
   lifecycle: LifecycleState,
+  started_at: Option<DateTime<Utc>>,
+  finished_at: Option<DateTime<Utc>>,
+  failure: Option<ExecutionFailure>,
+  failure_at: Option<DateTime<Utc>>,
 }
 
 impl Default for ScopeState {
@@ -18,6 +26,10 @@ impl Default for ScopeState {
       remaining: 0,
       status: ConsoleStatus::Skipped,
       lifecycle: LifecycleState::Planned,
+      started_at: None,
+      finished_at: None,
+      failure: None,
+      failure_at: None,
     }
   }
 }
@@ -64,12 +76,17 @@ struct PendingStepFinish {
 struct StepState {
   scope: ConsoleScope,
   lifecycle: LifecycleState,
+  status: ConsoleStatus,
+  started_at: Option<DateTime<Utc>>,
+  finished_at: Option<DateTime<Utc>>,
+  failure: Option<ExecutionFailure>,
 }
 
 /// Tracks output-group completion separately from DAG scheduling and task payloads.
 pub(crate) struct ConsoleScopeTracker {
   console: Arc<Console>,
   run_id: u64,
+  declaration: Mutex<()>,
   states: Mutex<IndexMap<ConsoleScope, ScopeState>>,
   steps: Mutex<IndexMap<ConsoleStep, StepState>>,
 }
@@ -95,6 +112,10 @@ impl ConsoleScopeTracker {
           StepState {
             scope,
             lifecycle: LifecycleState::Planned,
+            status: ConsoleStatus::Skipped,
+            started_at: None,
+            finished_at: None,
+            failure: None,
           },
         );
       }
@@ -102,13 +123,22 @@ impl ConsoleScopeTracker {
     Self {
       console,
       run_id,
+      declaration: Mutex::new(()),
       states: Mutex::new(states),
       steps: Mutex::new(steps),
     }
   }
 
   pub(crate) async fn declare(&self) -> io::Result<()> {
-    let scopes = self.states.lock().await.keys().cloned().collect::<Vec<_>>();
+    let _declaration = self.declaration.lock().await;
+    let scopes = self
+      .states
+      .lock()
+      .await
+      .iter()
+      .filter(|(_, state)| state.lifecycle == LifecycleState::Planned)
+      .map(|(scope, _)| scope.clone())
+      .collect::<Vec<_>>();
     for scope in scopes {
       self
         .console
@@ -132,6 +162,7 @@ impl ConsoleScopeTracker {
       .lock()
       .await
       .iter()
+      .filter(|(_, state)| state.lifecycle == LifecycleState::Planned)
       .map(|(step, state)| (step.clone(), state.scope.clone()))
       .collect::<Vec<_>>();
     for (step, scope) in steps {
@@ -172,7 +203,9 @@ impl ConsoleScopeTracker {
           scope: scope.clone(),
         })
         .await?;
-      states.get_mut(scope).expect("scope was validated above").lifecycle = LifecycleState::Started;
+      let state = states.get_mut(scope).expect("scope was validated above");
+      state.lifecycle = LifecycleState::Started;
+      state.started_at = Some(Utc::now());
     }
     Ok(())
   }
@@ -195,11 +228,18 @@ impl ConsoleScopeTracker {
       })
       .await?;
     state.lifecycle = LifecycleState::Started;
+    state.started_at = Some(Utc::now());
     Ok(())
   }
 
-  pub(crate) async fn complete(&self, binding: &ExecutionBinding, status: ConsoleStatus) -> io::Result<()> {
+  pub(crate) async fn complete(
+    &self,
+    binding: &ExecutionBinding,
+    status: ConsoleStatus,
+    failure: Option<ExecutionFailure>,
+  ) -> io::Result<()> {
     let scope = binding.scope();
+    let failure_at = failure.as_ref().map(|_| Utc::now());
     {
       let states = self.states.lock().await;
       let Some(state) = states.get(scope) else {
@@ -218,7 +258,7 @@ impl ConsoleScopeTracker {
         )));
       }
     }
-    self.finish_step(binding.step(), status).await?;
+    self.finish_step(binding.step(), status, failure.clone()).await?;
     let finished = {
       let mut states = self.states.lock().await;
       let Some(state) = states.get_mut(scope) else {
@@ -237,6 +277,7 @@ impl ConsoleScopeTracker {
         )));
       }
       state.status = state.status.max(status);
+      record_timed_failure(&mut state.failure, &mut state.failure_at, failure, failure_at);
       state.remaining -= 1;
       if state.remaining == 0 {
         state.lifecycle = LifecycleState::PublishingFinish;
@@ -265,7 +306,8 @@ impl ConsoleScopeTracker {
         .map(|(scope, state)| {
           let previous = state.lifecycle;
           state.lifecycle = LifecycleState::PublishingFinish;
-          state.status = state.status.max(status);
+          let terminal_status = remaining_status(status, previous);
+          state.status = state.status.max(terminal_status);
           PendingScopeFinish {
             scope: scope.clone(),
             status: state.status,
@@ -284,7 +326,12 @@ impl ConsoleScopeTracker {
     first_error.map_or(Ok(()), Err)
   }
 
-  async fn finish_step(&self, step: Option<&ConsoleStep>, status: ConsoleStatus) -> io::Result<()> {
+  async fn finish_step(
+    &self,
+    step: Option<&ConsoleStep>,
+    status: ConsoleStatus,
+    failure: Option<ExecutionFailure>,
+  ) -> io::Result<()> {
     let Some(step) = step else {
       return Ok(());
     };
@@ -299,10 +346,12 @@ impl ConsoleScopeTracker {
       }
       let previous = state.lifecycle;
       state.lifecycle = LifecycleState::PublishingFinish;
+      state.status = state.status.max(status);
+      record_failure(&mut state.failure, failure);
       PendingStepFinish {
         step: step.clone(),
         scope: state.scope.clone(),
-        status,
+        status: state.status,
         previous,
       }
     };
@@ -318,10 +367,12 @@ impl ConsoleScopeTracker {
         .map(|(step, state)| {
           let previous = state.lifecycle;
           state.lifecycle = LifecycleState::PublishingFinish;
+          let terminal_status = remaining_status(status, previous);
+          state.status = state.status.max(terminal_status);
           PendingStepFinish {
             step: step.clone(),
             scope: state.scope.clone(),
-            status,
+            status: state.status,
             previous,
           }
         })
@@ -363,11 +414,12 @@ impl ConsoleScopeTracker {
       .await;
     let mut states = self.states.lock().await;
     let state = states.get_mut(&finish.scope).expect("scope was validated above");
-    state.lifecycle = if result.is_ok() {
-      LifecycleState::Finished
+    if result.is_ok() {
+      state.lifecycle = LifecycleState::Finished;
+      state.finished_at = Some(Utc::now());
     } else {
-      finish.previous
-    };
+      state.lifecycle = finish.previous;
+    }
     result
   }
 
@@ -381,18 +433,63 @@ impl ConsoleScopeTracker {
         status: finish.status,
       })
       .await;
-    self
-      .steps
-      .lock()
-      .await
-      .get_mut(&finish.step)
-      .expect("step was validated above")
-      .lifecycle = if result.is_ok() {
-      LifecycleState::Finished
+    let mut steps = self.steps.lock().await;
+    let state = steps.get_mut(&finish.step).expect("step was validated above");
+    if result.is_ok() {
+      state.lifecycle = LifecycleState::Finished;
+      state.finished_at = Some(Utc::now());
     } else {
-      finish.previous
-    };
+      state.lifecycle = finish.previous;
+    }
     result
+  }
+
+  pub(crate) async fn results(&self) -> io::Result<Vec<TaskResult>> {
+    let steps = self.steps.lock().await;
+    let mut steps_by_scope = HashMap::new();
+    for (step, state) in steps.iter() {
+      let finished_at = state
+        .finished_at
+        .ok_or_else(|| io::Error::other(format!("console step {} has no terminal result", step.id())))?;
+      steps_by_scope
+        .entry(state.scope.id())
+        .or_insert_with(Vec::new)
+        .push(StepResult {
+          step_id: step.id(),
+          label: step.label().to_owned(),
+          started_at: state.started_at,
+          finished_at,
+          conclusion: conclusion(
+            state.status,
+            state.failure.clone(),
+            Some(state.scope.id()),
+            Some(step.id()),
+          ),
+          output: OutputReference::step(self.run_id, state.scope.id(), step.id()),
+        });
+    }
+    drop(steps);
+
+    let states = self.states.lock().await;
+    states
+      .iter()
+      .map(|(scope, state)| {
+        let finished_at = state
+          .finished_at
+          .ok_or_else(|| io::Error::other(format!("console scope {} has no terminal result", scope.id())))?;
+        Ok(TaskResult {
+          task_id: scope.id(),
+          parent_task_id: scope.parent_task_id(),
+          label: scope.label().to_owned(),
+          role: TaskRole::Main,
+          started_at: state.started_at,
+          finished_at,
+          conclusion: conclusion(state.status, state.failure.clone(), Some(scope.id()), None),
+          output: OutputReference::task(self.run_id, scope.id()),
+          steps: steps_by_scope.remove(&scope.id()).unwrap_or_default(),
+        })
+      })
+      .collect()
   }
 
   pub(crate) async fn successful_run_status(&self) -> ConsoleStatus {
@@ -404,6 +501,63 @@ impl ConsoleScopeTracker {
       .values()
       .fold(ConsoleStatus::Skipped, |status, state| status.max(state.status))
   }
+
+  pub(crate) async fn failure(&self) -> Option<ExecutionFailure> {
+    let states = self.states.lock().await;
+    let first_failure = states
+      .values()
+      .filter_map(|state| Some((state.failure_at?, state.failure.as_ref()?)))
+      .filter(|(_, failure)| failure.kind != crate::ExecutionFailureKind::Cancelled)
+      .min_by_key(|(recorded_at, _)| *recorded_at)
+      .map(|(_, failure)| failure);
+    first_failure
+      .or_else(|| {
+        states
+          .values()
+          .filter_map(|state| Some((state.failure_at?, state.failure.as_ref()?)))
+          .min_by_key(|(recorded_at, _)| *recorded_at)
+          .map(|(_, failure)| failure)
+      })
+      .cloned()
+  }
+}
+
+fn remaining_status(status: ConsoleStatus, lifecycle: LifecycleState) -> ConsoleStatus {
+  if status == ConsoleStatus::Failed && lifecycle == LifecycleState::Declared {
+    ConsoleStatus::Skipped
+  } else {
+    status
+  }
+}
+
+fn record_timed_failure(
+  recorded: &mut Option<ExecutionFailure>,
+  recorded_at: &mut Option<DateTime<Utc>>,
+  failure: Option<ExecutionFailure>,
+  failure_at: Option<DateTime<Utc>>,
+) {
+  let Some(failure) = failure else {
+    return;
+  };
+  if should_record_failure(recorded.as_ref(), &failure) {
+    *recorded = Some(failure);
+    *recorded_at = failure_at;
+  }
+}
+
+fn record_failure(recorded: &mut Option<ExecutionFailure>, failure: Option<ExecutionFailure>) {
+  let Some(failure) = failure else {
+    return;
+  };
+  if should_record_failure(recorded.as_ref(), &failure) {
+    *recorded = Some(failure);
+  }
+}
+
+fn should_record_failure(recorded: Option<&ExecutionFailure>, failure: &ExecutionFailure) -> bool {
+  recorded.is_none()
+    || recorded.is_some_and(|failure| failure.kind == crate::ExecutionFailureKind::Cancelled)
+      && failure.kind != crate::ExecutionFailureKind::Cancelled
 }
 
 fn unknown_scope(scope: &ConsoleScope) -> io::Error {
@@ -493,7 +647,7 @@ mod tests {
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
     tracker.start_step(&binding).await.unwrap();
-    tracker.complete(&binding, ConsoleStatus::Success).await.unwrap();
+    tracker.complete(&binding, ConsoleStatus::Success, None).await.unwrap();
     tracker.finish_remaining(ConsoleStatus::Failed).await.unwrap();
 
     let events = renderer.0.lock().unwrap();
@@ -534,6 +688,103 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn builds_ordered_task_and_step_results_from_lifecycle_state() {
+    let (console, _) = recording_console();
+    let allocator = octa_output::ConsoleScopeAllocator::default();
+    let parent = allocator.scope("build");
+    let child = allocator.scope_with_parent_options("compile", Some(parent.id()), None, false, false);
+    let step = allocator.step(&child, "shell");
+    let binding = ExecutionBinding::for_step(child.clone(), step.clone());
+    let tracker = ConsoleScopeTracker::new(console, 19, vec![parent.clone(), child.clone()], [binding.clone()]);
+
+    tracker.declare().await.unwrap();
+    tracker.start_scope(&binding).await.unwrap();
+    tracker.start_step(&binding).await.unwrap();
+    let failure = ExecutionFailure::from_error(
+      &crate::error::ExecutorError::TaskFailed("compile".to_owned()),
+      Some(&binding),
+    );
+    tracker
+      .complete(&binding, ConsoleStatus::Failed, Some(failure.clone()))
+      .await
+      .unwrap();
+    tracker.finish_remaining(ConsoleStatus::Failed).await.unwrap();
+
+    let results = tracker.results().await.unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].task_id, parent.id());
+    assert_eq!(results[0].started_at, None);
+    assert_eq!(results[0].conclusion, crate::ExecutionConclusion::Skipped);
+    assert_eq!(results[1].task_id, child.id());
+    assert_eq!(results[1].parent_task_id, Some(parent.id()));
+    assert!(results[1].started_at.is_some());
+    assert_eq!(results[1].conclusion.failure(), Some(&failure));
+    assert_eq!(results[1].output, OutputReference::task(19, child.id()));
+    assert_eq!(results[1].steps.len(), 1);
+    assert_eq!(results[1].steps[0].step_id, step.id());
+    assert_eq!(results[1].steps[0].conclusion.failure(), Some(&failure));
+    assert_eq!(
+      results[1].steps[0].output,
+      OutputReference::step(19, child.id(), step.id())
+    );
+  }
+
+  #[tokio::test]
+  async fn run_failure_uses_failure_observation_order_not_declaration_order() {
+    let (console, _) = recording_console();
+    let allocator = octa_output::ConsoleScopeAllocator::default();
+    let declared_first = allocator.scope("first");
+    let failed_first = allocator.scope("second");
+    let first_binding = ExecutionBinding::for_task(declared_first.clone());
+    let second_binding = ExecutionBinding::for_task(failed_first.clone());
+    let tracker = ConsoleScopeTracker::new(
+      console,
+      23,
+      vec![declared_first.clone(), failed_first.clone()],
+      [first_binding.clone(), second_binding.clone()],
+    );
+    tracker.declare().await.unwrap();
+    tracker.start_scope(&first_binding).await.unwrap();
+    tracker.start_scope(&second_binding).await.unwrap();
+    let second_failure = ExecutionFailure::synthetic(
+      crate::ExecutionFailureKind::Task,
+      "second failed first",
+      Some(failed_first.id()),
+      None,
+    );
+    tracker
+      .complete(&second_binding, ConsoleStatus::Failed, Some(second_failure.clone()))
+      .await
+      .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    let first_failure = ExecutionFailure::synthetic(
+      crate::ExecutionFailureKind::Task,
+      "first failed later",
+      Some(declared_first.id()),
+      None,
+    );
+    tracker
+      .complete(&first_binding, ConsoleStatus::Failed, Some(first_failure))
+      .await
+      .unwrap();
+
+    assert_eq!(tracker.failure().await, Some(second_failure));
+  }
+
+  #[tokio::test]
+  async fn rejects_result_snapshot_before_lifecycle_finishes() {
+    let (console, _) = recording_console();
+    let allocator = octa_output::ConsoleScopeAllocator::default();
+    let scope = allocator.scope("build");
+    let binding = ExecutionBinding::for_task(scope.clone());
+    let tracker = ConsoleScopeTracker::new(console, 3, vec![scope], [binding]);
+
+    tracker.declare().await.unwrap();
+
+    assert!(tracker.results().await.is_err());
+  }
+
+  #[tokio::test]
   async fn publishes_step_lifecycle_inside_its_parent_task() {
     let (console, renderer) = recording_console();
     let allocator = octa_output::ConsoleScopeAllocator::default();
@@ -545,7 +796,7 @@ mod tests {
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
     tracker.start_step(&binding).await.unwrap();
-    tracker.complete(&binding, ConsoleStatus::Success).await.unwrap();
+    tracker.complete(&binding, ConsoleStatus::Success, None).await.unwrap();
 
     assert_eq!(
       *renderer.0.lock().unwrap(),
@@ -630,7 +881,7 @@ mod tests {
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
     tracker.start_step(&binding).await.unwrap();
-    assert!(tracker.complete(&binding, ConsoleStatus::Success).await.is_err());
+    assert!(tracker.complete(&binding, ConsoleStatus::Success, None).await.is_err());
     tracker.finish_remaining(ConsoleStatus::Failed).await.unwrap();
 
     assert_eq!(
@@ -654,19 +905,19 @@ mod tests {
     let tracker = ConsoleScopeTracker::new(console, 8, Vec::new(), [binding.clone(), binding.clone()]);
 
     let unknown_binding = ExecutionBinding::for_task(unknown);
-    assert!(tracker.complete(&binding, ConsoleStatus::Success).await.is_err());
+    assert!(tracker.complete(&binding, ConsoleStatus::Success, None).await.is_err());
     assert!(tracker
-      .complete(&unknown_binding, ConsoleStatus::Success)
+      .complete(&unknown_binding, ConsoleStatus::Success, None)
       .await
       .is_err());
 
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
-    tracker.complete(&binding, ConsoleStatus::Success).await.unwrap();
-    tracker.complete(&binding, ConsoleStatus::Skipped).await.unwrap();
+    tracker.complete(&binding, ConsoleStatus::Success, None).await.unwrap();
+    tracker.complete(&binding, ConsoleStatus::Skipped, None).await.unwrap();
 
     assert_eq!(tracker.successful_run_status().await, ConsoleStatus::Success);
-    assert!(tracker.complete(&binding, ConsoleStatus::Success).await.is_err());
+    assert!(tracker.complete(&binding, ConsoleStatus::Success, None).await.is_err());
     assert!(renderer
       .0
       .lock()
@@ -722,5 +973,30 @@ mod tests {
       .collect::<Vec<_>>();
     assert_eq!(finishes.iter().filter(|scope| *scope == &first).count(), 2);
     assert_eq!(finishes.iter().filter(|scope| *scope == &second).count(), 1);
+  }
+
+  #[test]
+  fn originating_failure_replaces_secondary_cancellation() {
+    let mut recorded = Some(ExecutionFailure::synthetic(
+      crate::ExecutionFailureKind::Cancelled,
+      "cancelled",
+      Some(1),
+      None,
+    ));
+    let failure = ExecutionFailure::synthetic(crate::ExecutionFailureKind::Task, "failed", Some(1), None);
+
+    record_failure(&mut recorded, Some(failure.clone()));
+    record_failure(
+      &mut recorded,
+      Some(ExecutionFailure::synthetic(
+        crate::ExecutionFailureKind::Cancelled,
+        "later cancellation",
+        Some(1),
+        None,
+      )),
+    );
+    record_failure(&mut recorded, None);
+
+    assert_eq!(recorded, Some(failure));
   }
 }

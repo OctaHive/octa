@@ -2,7 +2,8 @@ use std::{io, sync::Arc};
 
 use octa_octafile::Silence;
 use octa_output::{
-  Console, ConsoleLevel, ConsolePayload, ConsoleStep, ConsoleStream, ExecutionEvent, RawConsoleSession, SourceLocation,
+  Console, ConsoleLevel, ConsolePayload, ConsoleStep, ConsoleStream, ExecutionEvent, ProgressUpdate, RawConsoleSession,
+  SourceLocation,
 };
 
 #[cfg(test)]
@@ -95,6 +96,23 @@ impl ConsoleTarget {
         command_id: command_id.to_owned(),
         stream,
         payload: ConsolePayload::Bytes(bytes),
+      })
+      .await
+  }
+
+  pub(crate) async fn progress(&self, command_id: &str, progress: ProgressUpdate) -> io::Result<()> {
+    self
+      .console
+      .event(ExecutionEvent::Progress {
+        run_id: self.run_id,
+        scope: self.binding.as_ref().map(|binding| binding.scope().clone()),
+        step_id: self
+          .binding
+          .as_ref()
+          .and_then(ExecutionBinding::step)
+          .map(ConsoleStep::id),
+        command_id: command_id.to_owned(),
+        progress,
       })
       .await
   }
@@ -286,6 +304,45 @@ mod tests {
       [(scope.clone(), "compiling".to_owned()), (scope, "linking".to_owned())]
     );
     assert!(records.records.lock().unwrap().is_empty());
+  }
+
+  #[tokio::test]
+  async fn structured_progress_is_emitted_for_a_silent_step() {
+    let records = Recording::default();
+    let console = Arc::new(Console::new(records.clone()));
+    let allocator = ConsoleScopeAllocator::default();
+    let scope = allocator.scope("task");
+    let step = allocator.step(&scope, "compile");
+    let target = ConsoleTarget::with_silence(
+      console.clone(),
+      7,
+      Some(ExecutionBinding::for_step(scope.clone(), step.clone())),
+      Silence::All,
+    );
+
+    target
+      .progress(
+        "command",
+        ProgressUpdate {
+          message: "Compiling".to_owned(),
+          current: Some(1),
+          total: Some(2),
+          unit: Some("files".to_owned()),
+        },
+      )
+      .await
+      .unwrap();
+    console.drain().await.unwrap();
+
+    assert!(matches!(
+      records.records.lock().unwrap().as_slice(),
+      [ConsoleRecord::Execution(ExecutionEvent::Progress {
+        run_id: 7,
+        scope: Some(actual_scope),
+        step_id: Some(actual_step),
+        ..
+      })] if actual_scope == &scope && *actual_step == step.id()
+    ));
   }
 
   #[tokio::test]

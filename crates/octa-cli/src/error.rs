@@ -1,7 +1,7 @@
 use dotenvy::Error as DotenvError;
 use thiserror::Error;
 
-use octa_executor::error::ExecutorError;
+use octa_executor::{error::ExecutorError, ExecutionFailure};
 use octa_monorepo::MonorepoError;
 use octa_octafile::OctafileError;
 
@@ -45,6 +45,9 @@ pub enum OctaError {
 
   #[error(transparent)]
   ExecutionError(#[from] ExecutorError),
+
+  #[error(transparent)]
+  ExecutionFailed(#[from] Box<ExecutionFailure>),
 
   #[error("Failed to open fingerprint db")]
   OpenFingerprintDbError(#[from] sled::Error),

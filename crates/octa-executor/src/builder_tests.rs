@@ -270,7 +270,8 @@ tasks:
     None,
   )?;
 
-  executor.execute(CancellationToken::new(), "parent").await?;
+  let result = executor.execute(CancellationToken::new(), "parent").await?;
+  assert!(result.is_success());
 
   {
     let events = events.lock().unwrap();
@@ -303,6 +304,11 @@ tasks:
     declared_ids.sort_unstable();
     finished.sort_unstable();
     assert_eq!(finished, declared_ids);
+    assert_eq!(
+      result.tasks.iter().map(|task| task.task_id).collect::<Vec<_>>(),
+      declared_ids
+    );
+    assert!(result.tasks.iter().all(|task| task.output.run_id == result.run_id));
     assert!(started.iter().all(|entry| declared.contains(entry)));
     let parent_id = declared
       .iter()

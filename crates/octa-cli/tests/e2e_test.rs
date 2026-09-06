@@ -6,7 +6,7 @@ use std::{
 };
 
 use assert_cmd::Command;
-use octa_output::{ConsoleEntry, ConsolePayload, ConsoleRecord, ConsoleStream, ExecutionEvent};
+use octa_output::{ConsoleEntry, ConsolePayload, ConsoleRecord, ConsoleStream, ExecutionEvent, EVENT_SCHEMA_VERSION};
 use predicates::prelude::{predicate, PredicateBooleanExt};
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
@@ -2466,6 +2466,36 @@ fn test_parallel_execution() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn test_parallel_execution_propagates_a_structured_failure() -> Result<(), Box<dyn std::error::Error>> {
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    r#"
+version: 1
+tasks:
+  failing:
+    shell: exit 7
+  successful:
+    shell: echo successful
+"#,
+  )?;
+
+  let mut cmd = Command::cargo_bin("octa")?;
+  cmd
+    .current_dir(tmp_dir.path())
+    .env("OCTA_TESTS", "")
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+    .args(["--parallel", "failing", "successful"]);
+
+  cmd
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("failed with exit code 7"));
+
+  Ok(())
+}
+
+#[test]
 fn test_adaptive_output_uses_built_graph_parallelism() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
   fs::write(
@@ -2745,7 +2775,9 @@ tasks:
     .lines()
     .map(serde_json::from_str::<serde_json::Value>)
     .collect::<Result<Vec<_>, _>>()?;
-  assert!(entries.iter().all(|entry| entry["schema_version"] == 1));
+  assert!(entries
+    .iter()
+    .all(|entry| entry["schema_version"] == EVENT_SCHEMA_VERSION));
   assert!(entries.iter().any(|entry| entry["data"]["type"] == "run_started"));
   assert!(entries.iter().any(|entry| entry["data"]["type"] == "run_finished"));
   assert_eq!(

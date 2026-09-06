@@ -3,6 +3,7 @@ use std::time::SystemTimeError;
 use glob::PatternError;
 use octa_dag::error::DAGError;
 use octa_octafile::OctafileError;
+use octa_output::SourceLocation;
 use thiserror::Error;
 use tokio::task;
 
@@ -35,7 +36,12 @@ pub enum ExecutorError {
   PluginOutputTooLarge { plugin: String, limit_mib: usize },
 
   #[error("Plugin '{key}' evaluation failed with status {code}: {stderr}")]
-  PluginEvaluationFailed { key: String, code: i32, stderr: String },
+  PluginEvaluationFailed {
+    key: String,
+    code: i32,
+    stderr: String,
+    location: Option<SourceLocation>,
+  },
 
   #[error("Plugin evaluation is unavailable while resolving '{0}'")]
   PluginEvaluationUnavailable(String),
@@ -62,7 +68,15 @@ pub enum ExecutorError {
   TemplateRenderError(String),
 
   #[error("Task {task} failed with exit code {code}: {stderr}")]
-  CommandFailed { task: String, code: i32, stderr: String },
+  CommandFailed {
+    task: String,
+    code: i32,
+    stderr: String,
+    location: Option<SourceLocation>,
+  },
+
+  #[error("Invalid execution identity: {0}")]
+  ExecutionIdentityError(String),
 
   #[error("Failed to get or set fingerprint db")]
   OpenFingerprintDbError(#[from] sled::Error),
@@ -171,6 +185,7 @@ mod tests {
         task: "build".to_owned(),
         code: 17,
         stderr: String::new(),
+        location: None,
       }
       .command_exit_code(),
       Some(17)
@@ -180,6 +195,7 @@ mod tests {
         key: "shell".to_owned(),
         code: 0,
         stderr: String::new(),
+        location: None,
       }
       .command_exit_code(),
       None

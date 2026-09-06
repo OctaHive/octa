@@ -204,6 +204,31 @@ A plugin can report a structured diagnostic instead of making Octa parse arbitra
 `column` inside it are also optional. When GitHub Actions annotations are enabled, available
 coordinates are forwarded as annotation properties.
 
+A plugin can report transient progress without writing presentation text to stdout or stderr:
+
+```json
+{
+  "type": "Progress",
+  "payload": {
+    "id": "command-id",
+    "progress": {
+      "message": "Compiling",
+      "current": 37,
+      "total": 120,
+      "unit": "files"
+    }
+  }
+}
+```
+
+`message` is required; `current`, `total`, and `unit` are optional. Progress is command-scoped and
+non-terminal: a plugin may send any number of updates before `ExitStatus` or `Error`. Octa forwards
+updates as structured runtime events, but may coalesce pending updates per command when their
+producer outpaces the consumer. A progress burst therefore cannot overflow the command output queue
+or fail the command. The `replacing` renderer displays progress even when task stdout and stderr are
+silent, preferring it over the latest output line. Progress is not appended to captured command
+output and does not alter the task result.
+
 Every started command must finish with exactly one terminal response:
 
 ```json

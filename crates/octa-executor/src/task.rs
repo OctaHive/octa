@@ -130,7 +130,7 @@ impl ExecutionBinding {
   ///
   /// Panics when `step` was allocated for a different task scope.
   pub fn for_step(scope: ConsoleScope, step: ConsoleStep) -> Self {
-    assert_eq!(step.parent_task_id(), scope.id(), "step must belong to its task scope");
+    assert!(step.belongs_to(&scope), "step must belong to its task scope");
     Self {
       scope,
       step: Some(step),

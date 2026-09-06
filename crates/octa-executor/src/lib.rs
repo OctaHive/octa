@@ -4,6 +4,7 @@ mod dotenv;
 /// Module for building and managing task execution graphs
 pub mod envs;
 pub mod error;
+mod execution_result;
 pub mod executor;
 mod freshness;
 mod graph;
@@ -50,6 +51,10 @@ use tracing::debug;
 use uuid::Uuid;
 
 use error::{ExecutorError, ExecutorResult};
+pub use execution_result::{
+  ExecutionConclusion, ExecutionFailure, ExecutionFailureKind, ExecutionResult, OutputReference, StepResult,
+  TaskResult, TaskRole,
+};
 use executor::DeferredAction;
 pub use executor::{ExecutionPlan, Executor};
 use freshness::{FreshnessConfig, FreshnessIdentity, FreshnessState};

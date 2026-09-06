@@ -659,6 +659,7 @@ impl TaskNode {
               task: self.name.clone(),
               code: output.code,
               stderr: output.stderr,
+              location: output.failure_location,
             })
           }
         } else {

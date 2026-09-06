@@ -3,7 +3,7 @@
 use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use octa_output::ConsoleStream;
+use octa_output::{ConsoleStream, ProgressUpdate, SourceLocation};
 use octa_plugin::{
   logger::{collect_value_redactions, redact},
   protocol::{DiagnosticLevel as PluginDiagnosticLevel, PluginResponse},
@@ -63,6 +63,7 @@ pub(crate) struct PluginOutput {
   pub code: i32,
   pub stdout: String,
   pub stderr: String,
+  pub failure_location: Option<SourceLocation>,
 }
 
 impl PluginInvoker {
@@ -162,6 +163,7 @@ impl PluginInvoker {
     let mut terminal_response = false;
     let result: ExecutorResult<PluginOutput> = async {
       let mut output = OutputCapture::default();
+      let mut failure_location = None;
       loop {
         match execution.receive_output(&cancel_token).await {
           Ok(Some(response)) => match route_plugin_response(
@@ -174,11 +176,18 @@ impl PluginInvoker {
           )
           .await?
           {
-            PluginResponseAction::Continue => {},
+            PluginResponseAction::Continue(location) => {
+              failure_location = location.or(failure_location);
+            },
             PluginResponseAction::Exit(code) => {
               terminal_response = true;
               let (stdout, stderr) = output.into_strings().await?;
-              break Ok(PluginOutput { code, stdout, stderr });
+              break Ok(PluginOutput {
+                code,
+                stdout,
+                stderr,
+                failure_location,
+              });
             },
             PluginResponseAction::Error(message) => {
               terminal_response = true;
@@ -218,7 +227,7 @@ impl PluginInvoker {
 
 #[derive(Debug, Eq, PartialEq)]
 enum PluginResponseAction {
-  Continue,
+  Continue(Option<SourceLocation>),
   Exit(i32),
   Error(String),
 }
@@ -262,33 +271,54 @@ async fn route_plugin_response(
         .map_err(|error| capture_error(plugin_name, error))?;
       route_bytes(target, raw_session, command_id, ConsoleStream::Stderr, bytes).await?;
     },
+    PluginResponse::Progress { id, progress } if id == command_id => {
+      // A raw session owns the console render lock until it ends; progress is presentation-only
+      // and cannot be interleaved with its terminal byte stream.
+      if raw_session.is_none() {
+        if let Some(target) = target {
+          target
+            .progress(
+              command_id,
+              ProgressUpdate {
+                message: progress.message,
+                current: progress.current,
+                total: progress.total,
+                unit: progress.unit,
+              },
+            )
+            .await?;
+        }
+      }
+    },
     PluginResponse::Diagnostic {
       id,
       level,
       message,
       location,
     } if id == command_id => {
+      let is_error = matches!(level, PluginDiagnosticLevel::Error);
+      let level = match level {
+        PluginDiagnosticLevel::Trace => octa_output::ConsoleLevel::Trace,
+        PluginDiagnosticLevel::Debug => octa_output::ConsoleLevel::Debug,
+        PluginDiagnosticLevel::Info => octa_output::ConsoleLevel::Info,
+        PluginDiagnosticLevel::Warn => octa_output::ConsoleLevel::Warn,
+        PluginDiagnosticLevel::Error => octa_output::ConsoleLevel::Error,
+      };
+      let location = location.map(|location| SourceLocation {
+        file: location.file,
+        line: location.line,
+        column: location.column,
+      });
       if let Some(target) = target {
-        let level = match level {
-          PluginDiagnosticLevel::Trace => octa_output::ConsoleLevel::Trace,
-          PluginDiagnosticLevel::Debug => octa_output::ConsoleLevel::Debug,
-          PluginDiagnosticLevel::Info => octa_output::ConsoleLevel::Info,
-          PluginDiagnosticLevel::Warn => octa_output::ConsoleLevel::Warn,
-          PluginDiagnosticLevel::Error => octa_output::ConsoleLevel::Error,
-        };
-        let location = location.map(|location| octa_output::SourceLocation {
-          file: location.file,
-          line: location.line,
-          column: location.column,
-        });
-        target.diagnostic(level, message, location).await?;
+        target.diagnostic(level, message, location.clone()).await?;
       }
+      return Ok(PluginResponseAction::Continue(is_error.then_some(location).flatten()));
     },
     PluginResponse::ExitStatus { id, code } if id == command_id => return Ok(PluginResponseAction::Exit(code)),
     PluginResponse::Error { id, message } if id == command_id => return Ok(PluginResponseAction::Error(message)),
     _ => {},
   }
-  Ok(PluginResponseAction::Continue)
+  Ok(PluginResponseAction::Continue(None))
 }
 
 async fn route_line(
@@ -403,6 +433,7 @@ impl PluginEvaluator for ManagerPluginEvaluator {
         key,
         code: output.code,
         stderr: redact(output.stderr.trim(), &redactions),
+        location: output.failure_location,
       })
     }
   }
@@ -460,6 +491,7 @@ impl PluginEvaluator for SystemTestEvaluator {
       key: request.target.name().to_owned(),
       code: output.status.code().unwrap_or(-1),
       stderr: redact(&String::from_utf8_lossy(&output.stderr), &redactions),
+      location: None,
     })
   }
 }
@@ -472,7 +504,7 @@ mod tests {
   use octa_output::{
     Console, ConsoleEntry, ConsolePayload, ConsoleRecord, ConsoleRenderer, ConsoleScopeAllocator, ExecutionEvent,
   };
-  use octa_plugin::protocol::SourceLocation as PluginSourceLocation;
+  use octa_plugin::protocol::{ProgressUpdate as PluginProgressUpdate, SourceLocation as PluginSourceLocation};
 
   use super::*;
 
@@ -532,7 +564,7 @@ mod tests {
         route_plugin_response(response, "command", Some(&target), None, &mut output, "shell")
           .await
           .unwrap(),
-        PluginResponseAction::Continue
+        PluginResponseAction::Continue(None)
       );
     }
 
@@ -543,7 +575,8 @@ mod tests {
       PluginDiagnosticLevel::Warn,
       PluginDiagnosticLevel::Error,
     ] {
-      route_plugin_response(
+      let is_error = matches!(level, PluginDiagnosticLevel::Error);
+      let action = route_plugin_response(
         PluginResponse::Diagnostic {
           id: "command".to_owned(),
           level,
@@ -562,7 +595,37 @@ mod tests {
       )
       .await
       .unwrap();
+      assert_eq!(
+        action,
+        PluginResponseAction::Continue(is_error.then_some(SourceLocation {
+          file: "Octafile.yml".to_owned(),
+          line: Some(3),
+          column: Some(5),
+        }))
+      );
     }
+
+    assert_eq!(
+      route_plugin_response(
+        PluginResponse::Progress {
+          id: "command".to_owned(),
+          progress: PluginProgressUpdate {
+            message: "Compiling".to_owned(),
+            current: Some(3),
+            total: Some(10),
+            unit: Some("files".to_owned()),
+          },
+        },
+        "command",
+        Some(&target),
+        None,
+        &mut output,
+        "shell",
+      )
+      .await
+      .unwrap(),
+      PluginResponseAction::Continue(None)
+    );
 
     assert_eq!(
       route_plugin_response(
@@ -610,7 +673,7 @@ mod tests {
       )
       .await
       .unwrap(),
-      PluginResponseAction::Continue
+      PluginResponseAction::Continue(None)
     );
 
     let (stdout, stderr) = output.into_strings().await.unwrap();
@@ -632,6 +695,18 @@ mod tests {
         .count(),
       5
     );
+    assert!(records.iter().any(|record| matches!(
+      record,
+      ConsoleRecord::Execution(ExecutionEvent::Progress {
+        step_id: Some(actual),
+        progress: ProgressUpdate {
+          current: Some(3),
+          total: Some(10),
+          ..
+        },
+        ..
+      }) if *actual == step_id
+    )));
     assert!(records.iter().all(|record| match record {
       ConsoleRecord::Execution(ExecutionEvent::Output { step_id: actual, .. }) => *actual == Some(step_id),
       ConsoleRecord::Diagnostic(diagnostic) => diagnostic.step_id == Some(step_id),
@@ -673,6 +748,15 @@ mod tests {
         id: "command".to_owned(),
         bytes: b"bytes".to_vec(),
       },
+      PluginResponse::Progress {
+        id: "command".to_owned(),
+        progress: PluginProgressUpdate {
+          message: "ignored during raw execution".to_owned(),
+          current: None,
+          total: None,
+          unit: None,
+        },
+      },
     ] {
       route_plugin_response(
         response,
@@ -707,6 +791,7 @@ mod tests {
     );
     assert!(records.0.lock().unwrap().iter().all(|record| match record {
       ConsoleRecord::Execution(ExecutionEvent::Output { step_id: actual, .. }) => *actual == Some(step_id),
+      ConsoleRecord::Execution(ExecutionEvent::Progress { .. }) => false,
       _ => true,
     }));
   }

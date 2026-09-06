@@ -50,6 +50,14 @@ impl<R: ConsoleRenderer> ConsoleRenderer for KeepOrderRenderer<R> {
       self.scopes.entry(scope.clone()).or_default();
       return self.renderer.render(entry);
     }
+    // Progress describes the current moment and becomes stale if replayed when this scope reaches
+    // the front of the output queue.
+    if matches!(
+      entry.record(),
+      ConsoleRecord::Execution(ExecutionEvent::Progress { .. })
+    ) {
+      return self.renderer.render(entry);
+    }
 
     let Some(scope) = record_scope(entry.record()).cloned() else {
       return self.renderer.render(entry);
@@ -175,7 +183,7 @@ fn record_scope(record: &ConsoleRecord) -> Option<&ConsoleScope> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::{ConsolePayload, ConsoleScopeAllocator, ConsoleStatus, ConsoleStream};
+  use crate::{ConsolePayload, ConsoleScopeAllocator, ConsoleStatus, ConsoleStream, ProgressUpdate};
 
   #[derive(Default)]
   struct Recording {
@@ -231,6 +239,21 @@ mod tests {
     })
   }
 
+  fn progress(scope: ConsoleScope) -> ConsoleEntry {
+    event(ExecutionEvent::Progress {
+      run_id: 1,
+      scope: Some(scope),
+      step_id: None,
+      command_id: "command".to_owned(),
+      progress: ProgressUpdate {
+        message: "working".to_owned(),
+        current: Some(1),
+        total: Some(2),
+        unit: None,
+      },
+    })
+  }
+
   #[test]
   fn streams_the_first_scope_and_replays_later_scopes_in_declaration_order() {
     let allocator = ConsoleScopeAllocator::default();
@@ -277,6 +300,49 @@ mod tests {
     assert_eq!(lines, ["first", "second"]);
     assert!(renderer.order.is_empty());
     assert!(renderer.scopes.is_empty());
+  }
+
+  #[test]
+  fn passes_later_scope_progress_through_without_replaying_it() {
+    let allocator = ConsoleScopeAllocator::default();
+    let first = allocator.scope("first");
+    let second = allocator.scope("second");
+    let mut renderer = KeepOrderRenderer::new(Recording::default());
+    for scope in [&first, &second] {
+      renderer
+        .render(&event(ExecutionEvent::ScopeDeclared {
+          run_id: 1,
+          scope: scope.clone(),
+        }))
+        .unwrap();
+    }
+    let progress = progress(second.clone());
+    renderer.render(&progress).unwrap();
+    assert_eq!(renderer.renderer.records.last(), Some(progress.record()));
+
+    renderer
+      .render(&event(ExecutionEvent::ScopeFinished {
+        run_id: 1,
+        scope: second,
+        status: ConsoleStatus::Success,
+      }))
+      .unwrap();
+    renderer
+      .render(&event(ExecutionEvent::ScopeFinished {
+        run_id: 1,
+        scope: first,
+        status: ConsoleStatus::Success,
+      }))
+      .unwrap();
+    assert_eq!(
+      renderer
+        .renderer
+        .records
+        .iter()
+        .filter(|record| matches!(record, ConsoleRecord::Execution(ExecutionEvent::Progress { .. })))
+        .count(),
+      1
+    );
   }
 
   #[test]
