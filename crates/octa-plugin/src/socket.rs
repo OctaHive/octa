@@ -7,14 +7,17 @@ use std::ffi::{OsStr, OsString};
 /// Windows, this is a name within the `\\.\pipe` namespace.
 #[cfg(unix)]
 pub fn make_local_socket_name(unique_id: &str) -> OsString {
-  // Prefer to put it in OCTA_RUNTIME_DIR if set, since that's user-local
-  let mut base = if let Some(runtime_dir) = std::env::var_os("OCTA_RUNTIME_DIR") {
-    std::path::PathBuf::from(runtime_dir)
-  } else {
-    // Use std::env::temp_dir() for portability, especially since on Android this is probably
-    // not `/tmp`
-    std::env::temp_dir()
-  };
+  let runtime_dir = std::env::var_os("OCTA_RUNTIME_DIR");
+  make_unix_socket_name(unique_id, runtime_dir.as_deref())
+}
+
+#[cfg(unix)]
+fn make_unix_socket_name(unique_id: &str, runtime_dir: Option<&OsStr>) -> OsString {
+  // Prefer OCTA_RUNTIME_DIR when supplied. temp_dir() is the portable fallback, especially on
+  // platforms such as Android where the temporary directory is not necessarily `/tmp`.
+  let mut base = runtime_dir
+    .map(std::path::PathBuf::from)
+    .unwrap_or_else(std::env::temp_dir);
   let socket_name = format!("octa.{}.{}.sock", std::process::id(), unique_id);
   base.push(socket_name);
   base.into()
@@ -94,48 +97,20 @@ mod tests {
   #[cfg(unix)]
   #[test]
   fn test_unix_socket_path_with_runtime_dir() {
-    use std::env;
-
-    // Save current OCTA_RUNTIME_DIR
-    let original_runtime_dir = env::var_os("OCTA_RUNTIME_DIR");
-
-    // Set test runtime dir
     let test_dir = "/test/runtime/dir";
-    env::set_var("OCTA_RUNTIME_DIR", test_dir);
-
-    let socket_name = make_local_socket_name("test123");
+    let socket_name = make_unix_socket_name("test123", Some(OsStr::new(test_dir)));
     let path = PathBuf::from(&socket_name);
 
     assert!(path.starts_with(test_dir));
-
-    // Restore original OCTA_RUNTIME_DIR
-    if let Some(dir) = original_runtime_dir {
-      env::set_var("OCTA_RUNTIME_DIR", dir);
-    } else {
-      env::remove_var("OCTA_RUNTIME_DIR");
-    }
   }
 
   #[cfg(unix)]
   #[test]
   fn test_unix_socket_path_with_temp_dir() {
-    use std::env;
-
-    // Save current OCTA_RUNTIME_DIR
-    let original_runtime_dir = env::var_os("OCTA_RUNTIME_DIR");
-
-    // Remove OCTA_RUNTIME_DIR to test temp dir fallback
-    env::remove_var("OCTA_RUNTIME_DIR");
-
-    let socket_name = make_local_socket_name("test123");
+    let socket_name = make_unix_socket_name("test123", None);
     let path = PathBuf::from(&socket_name);
 
-    assert!(path.starts_with(env::temp_dir()));
-
-    // Restore original OCTA_RUNTIME_DIR
-    if let Some(dir) = original_runtime_dir {
-      env::set_var("OCTA_RUNTIME_DIR", dir);
-    }
+    assert!(path.starts_with(std::env::temp_dir()));
   }
 
   #[test]
