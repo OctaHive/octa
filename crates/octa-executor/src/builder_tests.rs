@@ -278,7 +278,7 @@ tasks:
       .iter()
       .filter_map(|event| match event {
         ConsoleRecord::Execution(ExecutionEvent::ScopeDeclared { scope, .. }) => {
-          Some((scope.id(), scope.label().to_owned()))
+          Some((scope.id(), scope.label().to_owned(), scope.parent_task_id()))
         },
         _ => None,
       })
@@ -287,7 +287,7 @@ tasks:
       .iter()
       .filter_map(|event| match event {
         ConsoleRecord::Execution(ExecutionEvent::ScopeStarted { scope, .. }) => {
-          Some((scope.id(), scope.label().to_owned()))
+          Some((scope.id(), scope.label().to_owned(), scope.parent_task_id()))
         },
         _ => None,
       })
@@ -299,14 +299,66 @@ tasks:
         _ => None,
       })
       .collect::<Vec<_>>();
-    let mut declared_ids = declared.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let mut declared_ids = declared.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
     declared_ids.sort_unstable();
     finished.sort_unstable();
     assert_eq!(finished, declared_ids);
     assert!(started.iter().all(|entry| declared.contains(entry)));
-    assert!(started.iter().any(|(_, label)| label == "parent"));
-    assert!(started.iter().any(|(_, label)| label == "child"));
-    assert!(started.iter().any(|(_, label)| label == "cleanup"));
+    let parent_id = declared
+      .iter()
+      .find_map(|(id, label, _)| (label == "parent").then_some(*id))
+      .unwrap();
+    assert!(declared
+      .iter()
+      .any(|(_, label, parent)| label == "parent" && parent.is_none()));
+    assert!(declared
+      .iter()
+      .any(|(_, label, parent)| label == "child" && *parent == Some(parent_id)));
+    let deferred_id = declared
+      .iter()
+      .find_map(|(id, label, parent)| {
+        (label.starts_with("Deferred command") && *parent == Some(parent_id)).then_some(*id)
+      })
+      .unwrap();
+    assert!(declared
+      .iter()
+      .any(|(_, label, parent)| label == "cleanup" && *parent == Some(deferred_id)));
+
+    let declared_steps = events
+      .iter()
+      .filter_map(|event| match event {
+        ConsoleRecord::Execution(ExecutionEvent::StepDeclared { scope, step, .. }) => {
+          assert_eq!(step.parent_task_id(), scope.id());
+          Some(step.id())
+        },
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    let started_steps = events
+      .iter()
+      .filter_map(|event| match event {
+        ConsoleRecord::Execution(ExecutionEvent::StepStarted { step, .. }) => Some(step.id()),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    let finished_steps = events
+      .iter()
+      .filter_map(|event| match event {
+        ConsoleRecord::Execution(ExecutionEvent::StepFinished { step, .. }) => Some(step.id()),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(started_steps, declared_steps);
+    assert_eq!(finished_steps, declared_steps);
+    let output_steps = events
+      .iter()
+      .filter_map(|event| match event {
+        ConsoleRecord::Execution(ExecutionEvent::Output { step_id, .. }) => *step_id,
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    assert!(!output_steps.is_empty());
+    assert!(output_steps.iter().all(|step_id| declared_steps.contains(step_id)));
   }
   plugin_manager.shutdown_all().await;
 

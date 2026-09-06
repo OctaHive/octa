@@ -2316,6 +2316,7 @@ dependencies = [
  "console",
  "humanize-duration",
  "indicatif",
+ "jsonschema",
  "nu-ansi-term",
  "regex",
  "serde",

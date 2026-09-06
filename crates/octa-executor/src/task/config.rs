@@ -91,6 +91,10 @@ impl PluginInvocation {
   pub(super) fn value(&self) -> Value {
     self.value.clone()
   }
+
+  pub(crate) fn key(&self) -> &str {
+    &self.key
+  }
 }
 
 /// Conditions and shared gate state attached to one executable graph node.
@@ -190,7 +194,7 @@ pub struct TaskConfig {
   pub(super) freshness_runtime: FreshnessRuntime, // Task-level source and output state
   pub preconditions: Option<Vec<String>>,         // Task preconditions
   pub timeout: Option<Timeout>,                   // Maximum task execution time
-  pub(super) output_scope: Option<ConsoleScope>,
+  pub(super) execution_binding: Option<ExecutionBinding>,
   pub(super) prefix_template: Option<String>,
 
   // State management
@@ -230,7 +234,7 @@ pub struct TaskConfigBuilder {
   freshness_runtime: FreshnessRuntime,
   pub preconditions: Option<Vec<String>>,
   pub timeout: Option<Timeout>,
-  output_scope: Option<ConsoleScope>,
+  execution_binding: Option<ExecutionBinding>,
   prefix_template: Option<String>,
   interactive_session: Option<String>,
 
@@ -289,8 +293,8 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub(crate) fn output_scope(mut self, output_scope: Option<ConsoleScope>) -> Self {
-    self.output_scope = output_scope;
+  pub(crate) fn execution_binding(mut self, execution_binding: Option<ExecutionBinding>) -> Self {
+    self.execution_binding = execution_binding;
     self
   }
 
@@ -422,7 +426,7 @@ impl TaskConfigBuilder {
       freshness_runtime: self.freshness_runtime,
       preconditions: self.preconditions,
       timeout: self.timeout,
-      output_scope: self.output_scope,
+      execution_binding: self.execution_binding,
       prefix_template: self.prefix_template,
       action: self.action,
       plugin: self.plugin,

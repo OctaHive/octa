@@ -18,6 +18,7 @@ impl<R: ConsoleRenderer> ConsoleRenderer for PrefixedRenderer<R> {
     let ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id,
       scope: Some(scope),
+      step_id,
       command_id,
       stream,
       payload: ConsolePayload::Line(line),
@@ -28,6 +29,7 @@ impl<R: ConsoleRenderer> ConsoleRenderer for PrefixedRenderer<R> {
     let entry = entry.with_record(ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: *run_id,
       scope: Some(scope.clone()),
+      step_id: *step_id,
       command_id: command_id.clone(),
       stream: *stream,
       payload: ConsolePayload::Line(format!("[{}] {line}", scope.prefix())),
@@ -116,6 +118,7 @@ mod tests {
     ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 7,
       scope,
+      step_id: None,
       command_id: "command-1".to_owned(),
       stream: ConsoleStream::Stdout,
       payload,

@@ -31,8 +31,15 @@ impl TaskGraphBuilder {
       .as_ref()
       .filter(|prefix| !prefix.contains("{{"))
       .cloned();
-    let scope = self.scope_allocator.scope_with_options(
+    let parent_task_id = request
+      .context
+      .output_scope
+      .as_ref()
+      .map(ConsoleScope::id)
+      .or(request.context.parent_task_id);
+    let scope = self.scope_allocator.scope_with_parent_options(
       command.name.clone(),
+      parent_task_id,
       static_prefix,
       silence.hides_stdout(),
       silence.hides_stderr(),
@@ -248,7 +255,7 @@ impl TaskGraphBuilder {
       .invocation_runtime(Some(runtime))
       .condition_runtime(ConditionRuntime::command(Vec::new(), context.conditions.guards.clone()))
       .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
-      .output_scope(context.output_scope.clone())
+      .execution_binding(context.output_scope.clone().map(ExecutionBinding::for_task))
       .interactive_session(context.interactive_session.clone())
       .silent(Some(true))
       .failfast(command.task.failfast.or(command.octafile.failfast))
@@ -285,7 +292,7 @@ impl TaskGraphBuilder {
       .name(name.clone())
       .dep_name(command.name.clone())
       .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
-      .output_scope(context.output_scope.clone())
+      .execution_binding(context.output_scope.clone().map(ExecutionBinding::for_task))
       .interactive_session(context.interactive_session.clone())
       .silent(Some(true))
       .failfast(command.task.failfast.or(command.octafile.failfast))
@@ -488,8 +495,17 @@ impl TaskGraphBuilder {
       .clone()
       .ok_or(ExecutorError::TaskConfigFieldMissing("invocation_runtime"))?;
 
+    let id = Uuid::new_v4().to_string();
+    let execution_binding = context.output_scope.clone().map(|scope| {
+      if let Some(plugin) = &plugin {
+        let step = self.scope_allocator.step(&scope, plugin.key());
+        ExecutionBinding::for_step(scope, step)
+      } else {
+        ExecutionBinding::for_task(scope)
+      }
+    });
     let task_config = TaskConfig::builder()
-      .id(Uuid::new_v4())
+      .id(id)
       .name(cmd.name.clone())
       .dep_name(context.dep_name.clone())
       .dir(cmd.task.dir.clone().unwrap_or(cmd.octafile.dir.clone()))
@@ -500,7 +516,7 @@ impl TaskGraphBuilder {
       .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
       .preconditions(cmd.task.preconditions.clone())
       .timeout(cmd.task.timeout)
-      .output_scope(context.output_scope.clone())
+      .execution_binding(execution_binding)
       .prefix_template(cmd.task.prefix.clone())
       .interactive_session(context.interactive_session.clone())
       .silent(self.force_silence.or(cmd.task.silent).or(cmd.octafile.silent))
@@ -555,7 +571,7 @@ impl TaskGraphBuilder {
         request.context.conditions.guards.clone(),
       ))
       .freshness_runtime(FreshnessRuntime::guarded(request.context.freshness.clone()))
-      .output_scope(request.context.output_scope.clone())
+      .execution_binding(request.context.output_scope.clone().map(ExecutionBinding::for_task))
       .interactive_session(request.context.interactive_session.clone())
       .timeout(command.task.timeout)
       .silent(Some(true))
@@ -924,7 +940,7 @@ impl TaskGraphBuilder {
       .id(Uuid::new_v4())
       .name(name.clone())
       .dep_name(name)
-      .output_scope(Some(output_scope))
+      .execution_binding(Some(ExecutionBinding::for_task(output_scope)))
       .action(NodeAction::Barrier)
       .build()?;
     let task = Arc::new(TaskNode::new(task));

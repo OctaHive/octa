@@ -63,6 +63,7 @@ mod tests {
     let entry = ConsoleEntry::new(ConsoleRecord::Diagnostic(crate::ConsoleDiagnostic {
       run_id: Some(9),
       scope: None,
+      step_id: None,
       level: ConsoleLevel::Info,
       message: "ready".to_owned(),
       location: None,

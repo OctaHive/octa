@@ -38,6 +38,8 @@ fn plugin(key: &str, value: impl Into<Value>) -> Option<PluginInvocation> {
 
 struct UnscopedTaskItem;
 
+struct LegacyScopedTaskItem(ConsoleScope);
+
 impl TaskItem for UnscopedTaskItem {
   fn run_mode(&self) -> RunMode {
     RunMode::Always
@@ -52,6 +54,24 @@ impl TaskItem for UnscopedTaskItem {
   }
 }
 
+impl TaskItem for LegacyScopedTaskItem {
+  fn run_mode(&self) -> RunMode {
+    RunMode::Always
+  }
+
+  fn failfast(&self) -> bool {
+    false
+  }
+
+  fn requires_concurrency_permit(&self) -> bool {
+    true
+  }
+
+  fn output_scope(&self) -> Option<ConsoleScope> {
+    Some(self.0.clone())
+  }
+}
+
 #[test]
 fn task_items_are_unscoped_by_default() {
   let task = UnscopedTaskItem;
@@ -59,7 +79,21 @@ fn task_items_are_unscoped_by_default() {
   assert_eq!(task.run_mode(), RunMode::Always);
   assert!(!task.failfast());
   assert!(task.requires_concurrency_permit());
-  assert_eq!(task.output_scope(), None);
+  assert!(task.output_scope().is_none());
+  assert!(task.execution_binding().is_none());
+}
+
+#[test]
+fn task_level_output_scope_is_upgraded_to_an_execution_binding() {
+  let scope = octa_output::ConsoleScopeAllocator::default().scope("task");
+  let task = LegacyScopedTaskItem(scope.clone());
+
+  assert_eq!(task.run_mode(), RunMode::Always);
+  assert!(!task.failfast());
+  assert!(task.requires_concurrency_permit());
+  let binding = task.execution_binding().unwrap();
+  assert_eq!(binding.scope(), &scope);
+  assert!(binding.step().is_none());
 }
 
 #[tokio::test]
@@ -413,7 +447,7 @@ async fn plugin_stdout_and_stderr_are_routed_as_structured_events() {
       .name("output")
       .dep_name("output")
       .dir(".")
-      .output_scope(Some(scope.clone()))
+      .execution_binding(Some(ExecutionBinding::for_task(scope.clone())))
       .plugin(plugin("shell", "echo stdout && echo stderr 1>&2"))
       .build()
       .unwrap(),

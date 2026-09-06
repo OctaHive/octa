@@ -497,7 +497,16 @@ mod tests {
   async fn routes_every_structured_plugin_response_and_captures_output() {
     let records = Recording::default();
     let console = Arc::new(Console::new(records.clone()));
-    let target = ConsoleTarget::new(console.clone(), 7, Some(ConsoleScopeAllocator::default().scope("task")));
+    let allocator = ConsoleScopeAllocator::default();
+    let scope = allocator.scope("task");
+    let step = allocator.step(&scope, "shell");
+    let step_id = step.id();
+    let target = ConsoleTarget::with_silence(
+      console.clone(),
+      7,
+      Some(crate::task::ExecutionBinding::for_step(scope, step)),
+      Silence::None,
+    );
     let mut output = OutputCapture::default();
 
     let responses = [
@@ -623,14 +632,27 @@ mod tests {
         .count(),
       5
     );
+    assert!(records.iter().all(|record| match record {
+      ConsoleRecord::Execution(ExecutionEvent::Output { step_id: actual, .. }) => *actual == Some(step_id),
+      ConsoleRecord::Diagnostic(diagnostic) => diagnostic.step_id == Some(step_id),
+      _ => true,
+    }));
   }
 
   #[tokio::test]
   async fn raw_routing_preserves_bytes_and_honors_stream_silence() {
     let records = Recording::default();
     let console = Arc::new(Console::new(records.clone()));
-    let scope = ConsoleScopeAllocator::default().scope("raw");
-    let target = ConsoleTarget::with_silence(console.clone(), 1, Some(scope), Silence::Stdout);
+    let allocator = ConsoleScopeAllocator::default();
+    let scope = allocator.scope("raw");
+    let step = allocator.step(&scope, "shell");
+    let step_id = step.id();
+    let target = ConsoleTarget::with_silence(
+      console.clone(),
+      1,
+      Some(crate::task::ExecutionBinding::for_step(scope, step)),
+      Silence::Stdout,
+    );
     let mut session = target.begin_raw("command").await.unwrap().unwrap();
     let mut output = OutputCapture::default();
 
@@ -683,6 +705,10 @@ mod tests {
         ConsolePayload::RawBytes(b"bytes".to_vec())
       ]
     );
+    assert!(records.0.lock().unwrap().iter().all(|record| match record {
+      ConsoleRecord::Execution(ExecutionEvent::Output { step_id: actual, .. }) => *actual == Some(step_id),
+      _ => true,
+    }));
   }
 
   #[test]

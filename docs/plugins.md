@@ -12,6 +12,10 @@ The Rust definitions in [`crates/octa-plugin/src/protocol.rs`](../crates/octa-pl
 are the source of truth. Plugin authors should normally use the `octa-plugin` SDK and
 `serve_plugin`; the wire format is documented here for compatibility and non-Rust implementations.
 
+This private engine-to-plugin transport is distinct from Octa's public
+[runtime event stream](events.md). Plugin command IDs are translated into stable plan-level step IDs
+when events are emitted; event consumers do not need to implement or observe this protocol.
+
 ## Lifecycle
 
 A plugin connection has three phases:

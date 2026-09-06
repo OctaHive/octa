@@ -1037,11 +1037,21 @@ Each entry contains:
 - `category`: `execution`, `diagnostic`, or `document`;
 - `data`: the category-specific payload.
 
-Execution records include run and scope lifecycle events plus stdout/stderr payloads. Byte payloads
-are base64 strings. Diagnostics can carry `file`, `line`, and `column`. All records, including
-logical stderr, are written as JSONL to process stdout. GitHub workflow commands are disabled in
-this mode. JSON output cannot be combined with raw/PTY mode because doing so would change terminal
-semantics and corrupt the machine-readable stream.
+Execution records expose the complete `run → task invocation → executable step` hierarchy. A task
+scope contains an `id` and, when nested, `parent_task_id`; a step contains its own `id` and the
+containing task's ID. Output and task-specific diagnostics carry `step_id` when available. Separate
+`run_started`/`run_finished`, scope lifecycle, and step lifecycle events make it unnecessary to
+infer execution state from console text.
+
+Version 1 is frozen as an external contract and has a checked-in
+[JSON Schema](crates/octa-output/schema/events-v1.schema.json). The complete field reference,
+lifecycle guarantees, identifier semantics, and compatibility policy are in the
+[runtime event stream documentation](docs/events.md).
+
+Byte payloads are base64 strings. Diagnostics can carry `file`, `line`, and `column`. All records,
+including logical stderr, are written as JSONL to process stdout. GitHub workflow commands are
+disabled in this mode. JSON output cannot be combined with raw/PTY mode because doing so would
+change terminal semantics and corrupt the machine-readable stream.
 
 Plugin output is bounded independently of the selected renderer. Each command has a bounded
 response mailbox, capture spills to disk after 1 MiB, and stdout plus stderr may contribute at most

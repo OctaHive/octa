@@ -210,7 +210,9 @@ impl Console {
     message: impl Into<String>,
     location: Option<super::SourceLocation>,
   ) -> io::Result<()> {
-    self.emit_diagnostic(Some(run_id), None, level, message, location).await
+    self
+      .emit_diagnostic(Some(run_id), None, None, level, message, location)
+      .await
   }
 
   /// Publishes a diagnostic associated with a scope inside an execution run.
@@ -233,7 +235,7 @@ impl Console {
     location: Option<super::SourceLocation>,
   ) -> io::Result<()> {
     self
-      .emit_diagnostic(Some(run_id), Some(scope), level, message, location)
+      .emit_diagnostic(Some(run_id), Some(scope), None, level, message, location)
       .await
   }
 
@@ -259,6 +261,7 @@ impl Console {
     let entry = ConsoleEntry::new(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
       run_id,
       scope: None,
+      step_id: None,
       level,
       message: message.into(),
       location: None,
@@ -293,6 +296,17 @@ impl Console {
     scope: ConsoleScope,
     command_id: impl Into<String>,
   ) -> io::Result<RawConsoleSession> {
+    self.begin_raw_for_step(run_id, scope, None, command_id).await
+  }
+
+  /// Reserves output for an interactive command associated with a stable execution step.
+  pub async fn begin_raw_for_step(
+    self: &Arc<Self>,
+    run_id: u64,
+    scope: ConsoleScope,
+    step_id: Option<u64>,
+    command_id: impl Into<String>,
+  ) -> io::Result<RawConsoleSession> {
     if !self.raw_terminal_supported {
       return Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -324,6 +338,7 @@ impl Console {
       console: self.clone(),
       run_id,
       scope,
+      step_id,
       command_id,
       _guard: guard,
     })
@@ -336,13 +351,29 @@ impl Console {
     level: ConsoleLevel,
     message: impl Into<String>,
   ) -> io::Result<()> {
-    self.emit_diagnostic(run_id, scope, level, message, None).await
+    self.emit_diagnostic(run_id, scope, None, level, message, None).await
+  }
+
+  /// Publishes a diagnostic associated with one executable step.
+  pub async fn run_diagnostic_at_step(
+    &self,
+    run_id: u64,
+    scope: ConsoleScope,
+    step_id: u64,
+    level: ConsoleLevel,
+    message: impl Into<String>,
+    location: Option<super::SourceLocation>,
+  ) -> io::Result<()> {
+    self
+      .emit_diagnostic(Some(run_id), Some(scope), Some(step_id), level, message, location)
+      .await
   }
 
   async fn emit_diagnostic(
     &self,
     run_id: Option<u64>,
     scope: Option<ConsoleScope>,
+    step_id: Option<u64>,
     level: ConsoleLevel,
     message: impl Into<String>,
     location: Option<super::SourceLocation>,
@@ -351,6 +382,7 @@ impl Console {
       .emit(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
         run_id,
         scope,
+        step_id,
         level,
         message: message.into(),
         location,
@@ -377,6 +409,7 @@ impl Console {
       .render(ConsoleEntry::new(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
         run_id: None,
         scope: None,
+        step_id: None,
         level: ConsoleLevel::Warn,
         message: format!("Dropped {dropped} diagnostics because the output buffer was full"),
         location: None,
@@ -513,6 +546,7 @@ pub struct RawConsoleSession {
   console: Arc<Console>,
   run_id: u64,
   scope: ConsoleScope,
+  step_id: Option<u64>,
   command_id: String,
   _guard: OwnedMutexGuard<()>,
 }
@@ -524,6 +558,7 @@ impl RawConsoleSession {
       .render(ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
         run_id: self.run_id,
         scope: Some(self.scope.clone()),
+        step_id: self.step_id,
         command_id: self.command_id.clone(),
         stream,
         payload: ConsolePayload::RawBytes(bytes.into()),
@@ -700,6 +735,7 @@ mod tests {
       .event(ExecutionEvent::Output {
         run_id: 7,
         scope: Some(scope.clone()),
+        step_id: None,
         command_id: "command-1".to_owned(),
         stream: ConsoleStream::Stdout,
         payload: ConsolePayload::Line("  value  ".to_owned()),
@@ -712,6 +748,7 @@ mod tests {
       vec![ConsoleRecord::Execution(ExecutionEvent::Output {
         run_id: 7,
         scope: Some(scope),
+        step_id: None,
         command_id: "command-1".to_owned(),
         stream: ConsoleStream::Stdout,
         payload: ConsolePayload::Line("  value  ".to_owned()),
@@ -727,6 +764,7 @@ mod tests {
       .event(ExecutionEvent::Output {
         run_id: 7,
         scope: None,
+        step_id: None,
         command_id: "command-1".to_owned(),
         stream: ConsoleStream::Stdout,
         payload: ConsolePayload::Line("value".to_owned()),
@@ -827,6 +865,7 @@ mod tests {
       ConsoleRecord::Execution(ExecutionEvent::Output {
         run_id: 7,
         scope: Some(scope),
+        step_id: None,
         command_id: "command-1".to_owned(),
         stream: ConsoleStream::Stdout,
         payload: ConsolePayload::RawBytes(b"raw".to_vec()),
@@ -1260,6 +1299,7 @@ mod tests {
         ConsoleRecord::Diagnostic(ConsoleDiagnostic {
           run_id: None,
           scope: None,
+          step_id: None,
           level: ConsoleLevel::Info,
           message: "global".to_owned(),
           location: None,
@@ -1267,6 +1307,7 @@ mod tests {
         ConsoleRecord::Diagnostic(ConsoleDiagnostic {
           run_id: Some(7),
           scope: None,
+          step_id: None,
           level: ConsoleLevel::Debug,
           message: "run".to_owned(),
           location: None,
@@ -1274,6 +1315,7 @@ mod tests {
         ConsoleRecord::Diagnostic(ConsoleDiagnostic {
           run_id: Some(7),
           scope: None,
+          step_id: None,
           level: ConsoleLevel::Warn,
           message: "synchronous run".to_owned(),
           location: None,
@@ -1281,6 +1323,7 @@ mod tests {
         ConsoleRecord::Diagnostic(ConsoleDiagnostic {
           run_id: Some(7),
           scope: Some(scope),
+          step_id: None,
           level: ConsoleLevel::Error,
           message: "run task".to_owned(),
           location: None,

@@ -54,7 +54,7 @@ impl TaskNode {
       freshness_runtime: config.freshness_runtime,
       preconditions: config.preconditions,
       timeout: config.timeout,
-      output_scope: config.output_scope,
+      execution_binding: config.execution_binding,
       prefix_template: config.prefix_template,
       plugin: config.plugin,
     }
@@ -72,7 +72,7 @@ impl TaskNode {
 
   #[cfg(test)]
   pub(crate) fn output_scope(&self) -> Option<&ConsoleScope> {
-    self.output_scope.as_ref()
+    self.execution_binding.as_ref().map(ExecutionBinding::scope)
   }
 
   #[cfg(test)]
@@ -524,7 +524,7 @@ impl TaskNode {
       force,
       deferred_exit_code,
     } = runtime;
-    let console_target = ConsoleTarget::with_silence(console, run_id, self.output_scope.clone(), self.silence);
+    let console_target = ConsoleTarget::with_silence(console, run_id, self.execution_binding.clone(), self.silence);
     let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::new(plugin_manager.clone()));
 
     if !self.condition_runtime.should_run(&self.name)? {
@@ -554,7 +554,7 @@ impl TaskNode {
     let RuntimeContext { vars, envs, dir } = self
       .resolve_runtime_context(evaluator.clone(), dry, cancel_token.clone(), deferred_exit_code)
       .await?;
-    if let Some(scope) = &self.output_scope {
+    if let Some(scope) = self.execution_binding.as_ref().map(ExecutionBinding::scope) {
       let mut values = vars.to_merged_hashmap();
       values.insert("TASK".to_owned(), serde_json::Value::String(self.name.clone()));
       scope.set_template_values(values.clone());
@@ -718,7 +718,7 @@ impl Executable<TaskNode> for TaskNode {
     let output = ConsoleTarget::with_silence(
       runtime.console.clone(),
       runtime.run_id,
-      self.output_scope.clone(),
+      self.execution_binding.clone(),
       self.silence,
     );
     let execution = self.execute_inner(runtime, command_token.clone());

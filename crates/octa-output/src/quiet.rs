@@ -1,8 +1,8 @@
 use std::io;
 
-use super::{ConsoleEntry, ConsoleLevel, ConsoleRecord, ConsoleRenderer, ConsoleScope};
+use super::{ConsoleEntry, ConsoleLevel, ConsoleRecord, ConsoleRenderer, ConsoleScope, ExecutionEvent};
 
-/// Suppresses informational diagnostics while leaving task streams and warnings untouched.
+/// Suppresses informational presentation while leaving task streams and warnings untouched.
 pub struct QuietRenderer<R> {
   renderer: R,
 }
@@ -19,6 +19,9 @@ impl<R: ConsoleRenderer> ConsoleRenderer for QuietRenderer<R> {
       entry.record(),
       ConsoleRecord::Diagnostic(diagnostic)
         if matches!(diagnostic.level, ConsoleLevel::Trace | ConsoleLevel::Debug | ConsoleLevel::Info)
+    ) || matches!(
+      entry.record(),
+      ConsoleRecord::Execution(ExecutionEvent::RunStarted { .. } | ExecutionEvent::RunFinished { .. })
     ) {
       return Ok(());
     }
@@ -110,6 +113,7 @@ mod tests {
     ConsoleEntry::new(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
       run_id: Some(1),
       scope: None,
+      step_id: None,
       level,
       message: "message".to_owned(),
       location: None,
@@ -125,6 +129,14 @@ mod tests {
     for level in [ConsoleLevel::Warn, ConsoleLevel::Error] {
       renderer.render(&diagnostic(level)).unwrap();
     }
+    renderer
+      .render(&ConsoleEntry::new(ConsoleRecord::Execution(
+        ExecutionEvent::RunStarted {
+          run_id: 1,
+          command: "build".to_owned(),
+        },
+      )))
+      .unwrap();
 
     let scope = ConsoleScopeAllocator::default().scope("raw");
     assert!(renderer.supports_raw_terminal());

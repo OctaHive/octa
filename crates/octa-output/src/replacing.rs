@@ -364,6 +364,7 @@ mod tests {
     let output = ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 1,
       scope: Some(first.clone()),
+      step_id: None,
       command_id: "build".to_owned(),
       stream: ConsoleStream::Stderr,
       payload: ConsolePayload::Line("compiling".to_owned()),
@@ -417,6 +418,7 @@ mod tests {
         .render(&ConsoleEntry::new(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
           run_id: Some(1),
           scope: Some(scope.clone()),
+          step_id: None,
           level,
           message: "message".to_owned(),
           location: None,
@@ -442,6 +444,7 @@ mod tests {
       .render(&ConsoleEntry::new(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
         run_id: Some(1),
         scope: Some(scope.clone()),
+        step_id: None,
         level: ConsoleLevel::Warn,
         message: "warning".to_owned(),
         location: None,
@@ -646,6 +649,7 @@ mod tests {
     let raw = ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 1,
       scope: Some(scope.clone()),
+      step_id: None,
       command_id: "shell".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::RawBytes(b"prompt".to_vec()),
@@ -673,6 +677,7 @@ mod tests {
       .render(&ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
         run_id: 1,
         scope: Some(background.clone()),
+        step_id: None,
         command_id: "build".to_owned(),
         stream: ConsoleStream::Stdout,
         payload: ConsolePayload::Line("resumed".to_owned()),
@@ -711,6 +716,7 @@ mod tests {
     let blank = ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 1,
       scope: Some(scope.clone()),
+      step_id: None,
       command_id: "build".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::Line("   ".to_owned()),
@@ -723,6 +729,7 @@ mod tests {
     let diagnostic = ConsoleEntry::new(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
       run_id: Some(1),
       scope: None,
+      step_id: None,
       level: ConsoleLevel::Info,
       message: "raw diagnostic".to_owned(),
       location: None,

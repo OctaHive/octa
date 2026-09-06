@@ -30,12 +30,12 @@ pub use prefixed::PrefixedRenderer;
 pub use quiet::QuietRenderer;
 pub use record::{
   ConsoleDiagnostic, ConsoleEntry, ConsoleLevel, ConsolePayload, ConsoleRecord, ConsoleStatus, ConsoleStream,
-  ExecutionEvent, SourceLocation,
+  ExecutionEvent, SourceLocation, EVENT_SCHEMA_V1, EVENT_SCHEMA_VERSION,
 };
 pub use renderer::{ConsoleRenderer, NullRenderer};
 pub use replacing::ReplacingRenderer;
 pub use router::{OutputRouterConfig, OutputRouterRenderer};
-pub use scope::{ConsoleScope, ConsoleScopeAllocator};
+pub use scope::{ConsoleScope, ConsoleScopeAllocator, ConsoleStep};
 pub use template::{render_output_template, validate_output_template};
 pub use terminal::{TerminalColor, TerminalRenderer};
 pub use timed::TimedRenderer;

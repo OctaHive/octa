@@ -27,17 +27,25 @@ struct ScopeMetadata {
 pub struct ConsoleScope {
   allocator_id: u64,
   id: u64,
+  parent_task_id: Option<u64>,
   label: String,
   metadata: Arc<ScopeMetadata>,
 }
 
 impl ConsoleScope {
+  /// Execution-local task invocation identifier.
   pub fn id(&self) -> u64 {
     self.id
   }
 
+  /// Human-readable invocation label; it is not a stable identifier.
   pub fn label(&self) -> &str {
     &self.label
+  }
+
+  /// Identifier of the task invocation that contains this task, when nested.
+  pub fn parent_task_id(&self) -> Option<u64> {
+    self.parent_task_id
   }
 
   pub fn prefix(&self) -> String {
@@ -105,6 +113,7 @@ impl fmt::Debug for ConsoleScope {
     formatter
       .debug_struct("ConsoleScope")
       .field("id", &self.id)
+      .field("parent_task_id", &self.parent_task_id)
       .field("label", &self.label)
       .field("prefix", &self.prefix())
       .field("render_mode", &self.render_mode())
@@ -130,6 +139,8 @@ impl Hash for ConsoleScope {
 #[derive(Deserialize, Serialize)]
 struct SerializedScope {
   id: u64,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  parent_task_id: Option<u64>,
   label: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   prefix: Option<String>,
@@ -148,6 +159,7 @@ impl Serialize for ConsoleScope {
   {
     SerializedScope {
       id: self.id,
+      parent_task_id: self.parent_task_id,
       label: self.label.clone(),
       prefix: self
         .metadata
@@ -172,6 +184,7 @@ impl<'de> Deserialize<'de> for ConsoleScope {
     Ok(Self {
       allocator_id: 0,
       id: value.id,
+      parent_task_id: value.parent_task_id,
       label: value.label,
       metadata: Arc::new(ScopeMetadata {
         prefix: RwLock::new(value.prefix),
@@ -188,6 +201,7 @@ impl<'de> Deserialize<'de> for ConsoleScope {
 pub struct ConsoleScopeAllocator {
   id: u64,
   next_id: AtomicU64,
+  next_step_id: AtomicU64,
 }
 
 impl Default for ConsoleScopeAllocator {
@@ -195,19 +209,23 @@ impl Default for ConsoleScopeAllocator {
     Self {
       id: NEXT_ALLOCATOR_ID.fetch_add(1, Ordering::Relaxed),
       next_id: AtomicU64::new(0),
+      next_step_id: AtomicU64::new(0),
     }
   }
 }
 
 impl ConsoleScopeAllocator {
+  /// Allocates a root task invocation.
   pub fn scope(&self, label: impl Into<String>) -> ConsoleScope {
     self.scope_with_prefix(label, None)
   }
 
+  /// Allocates a root task invocation with a static display prefix.
   pub fn scope_with_prefix(&self, label: impl Into<String>, prefix: Option<String>) -> ConsoleScope {
     self.scope_with_options(label, prefix, false, false)
   }
 
+  /// Allocates a root task invocation with renderer and stream options.
   pub fn scope_with_options(
     &self,
     label: impl Into<String>,
@@ -215,9 +233,22 @@ impl ConsoleScopeAllocator {
     hide_stdout: bool,
     hide_stderr: bool,
   ) -> ConsoleScope {
+    self.scope_with_parent_options(label, None, prefix, hide_stdout, hide_stderr)
+  }
+
+  /// Allocates a task invocation nested below another task invocation.
+  pub fn scope_with_parent_options(
+    &self,
+    label: impl Into<String>,
+    parent_task_id: Option<u64>,
+    prefix: Option<String>,
+    hide_stdout: bool,
+    hide_stderr: bool,
+  ) -> ConsoleScope {
     ConsoleScope {
       allocator_id: self.id,
       id: self.next_id.fetch_add(1, Ordering::Relaxed),
+      parent_task_id,
       label: label.into(),
       metadata: Arc::new(ScopeMetadata {
         prefix: RwLock::new(prefix),
@@ -227,6 +258,44 @@ impl ConsoleScopeAllocator {
         hide_stderr,
       }),
     }
+  }
+
+  /// Allocates an executable step owned by `parent_task`.
+  pub fn step(&self, parent_task: &ConsoleScope, label: impl Into<String>) -> ConsoleStep {
+    ConsoleStep::new(self.next_step_id.fetch_add(1, Ordering::Relaxed), parent_task, label)
+  }
+}
+
+/// Identifies one executable command inside a task invocation.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct ConsoleStep {
+  id: u64,
+  parent_task_id: u64,
+  label: String,
+}
+
+impl ConsoleStep {
+  fn new(id: u64, parent_task: &ConsoleScope, label: impl Into<String>) -> Self {
+    Self {
+      id,
+      parent_task_id: parent_task.id(),
+      label: label.into(),
+    }
+  }
+
+  /// Execution-local identifier, unique within the owning run.
+  pub fn id(&self) -> u64 {
+    self.id
+  }
+
+  /// Identifier of the task invocation that owns this step.
+  pub fn parent_task_id(&self) -> u64 {
+    self.parent_task_id
+  }
+
+  /// Human-readable plugin label; it is not a stable identifier.
+  pub fn label(&self) -> &str {
+    &self.label
   }
 }
 
@@ -241,6 +310,20 @@ mod tests {
     let allocator = ConsoleScopeAllocator::default();
     assert_eq!(allocator.scope("build").id(), 0);
     assert_eq!(allocator.scope("test").id(), 1);
+  }
+
+  #[test]
+  fn nested_tasks_and_steps_expose_stable_parent_ids() {
+    let allocator = ConsoleScopeAllocator::default();
+    let parent = allocator.scope("build");
+    let child = allocator.scope_with_parent_options("compile", Some(parent.id()), None, false, false);
+    let step = allocator.step(&child, "shell");
+
+    assert_eq!(child.parent_task_id(), Some(parent.id()));
+    assert_eq!(step.id(), 0);
+    assert_eq!(step.parent_task_id(), child.id());
+    assert_eq!(step.label(), "shell");
+    assert_eq!(serde_json::to_value(&child).unwrap()["parent_task_id"], parent.id());
   }
 
   #[test]

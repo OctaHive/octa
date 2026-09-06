@@ -25,7 +25,7 @@ use tracing::{debug, enabled, Level};
 
 use octa_dag::Identifiable;
 use octa_octafile::{AllowedRun, Timeout};
-use octa_output::{Console, ConsoleLevel, ConsoleScope, ConsoleStatus};
+use octa_output::{Console, ConsoleLevel, ConsoleScope, ConsoleStatus, ConsoleStep};
 
 use crate::{
   console_target::ConsoleTarget,
@@ -108,6 +108,44 @@ pub trait Executable<T> {
 
 pub use crate::source_strategy::{SourceMethod, SourceStrategy};
 
+/// Output identity attached to one executable DAG node.
+///
+/// Keeping task and step identity in one value prevents a step from being
+/// emitted without its owning task invocation.
+#[derive(Clone, Debug)]
+pub struct ExecutionBinding {
+  scope: ConsoleScope,
+  step: Option<ConsoleStep>,
+}
+
+impl ExecutionBinding {
+  /// Binds a DAG node to task-level lifecycle and diagnostics.
+  pub fn for_task(scope: ConsoleScope) -> Self {
+    Self { scope, step: None }
+  }
+
+  /// Binds a DAG node to an executable step within `scope`.
+  ///
+  /// # Panics
+  ///
+  /// Panics when `step` was allocated for a different task scope.
+  pub fn for_step(scope: ConsoleScope, step: ConsoleStep) -> Self {
+    assert_eq!(step.parent_task_id(), scope.id(), "step must belong to its task scope");
+    Self {
+      scope,
+      step: Some(step),
+    }
+  }
+
+  pub fn scope(&self) -> &ConsoleScope {
+    &self.scope
+  }
+
+  pub fn step(&self) -> Option<&ConsoleStep> {
+    self.step.as_ref()
+  }
+}
+
 pub trait TaskItem {
   fn run_mode(&self) -> RunMode;
   fn failfast(&self) -> bool;
@@ -121,9 +159,17 @@ pub trait TaskItem {
     self.requires_concurrency_permit()
   }
 
-  /// Associates executable output with its logical task invocation when available.
+  /// Associates this node with a task invocation.
+  ///
+  /// Existing implementations may continue to override this task-level hook;
+  /// [`Self::execution_binding`] upgrades it to a binding without a step.
   fn output_scope(&self) -> Option<ConsoleScope> {
     None
+  }
+
+  /// Associates this node with its task invocation and optional command step.
+  fn execution_binding(&self) -> Option<ExecutionBinding> {
+    self.output_scope().map(ExecutionBinding::for_task)
   }
 }
 
@@ -231,7 +277,7 @@ pub struct TaskNode {
   freshness_runtime: FreshnessRuntime,    // Task-level source and output state
   pub preconditions: Option<Vec<String>>, // Task run preconditions
   pub timeout: Option<Timeout>,           // Maximum task execution time
-  output_scope: Option<ConsoleScope>,
+  execution_binding: Option<ExecutionBinding>,
   prefix_template: Option<String>,
 
   // State management
@@ -300,7 +346,11 @@ impl TaskItem for TaskNode {
   }
 
   fn output_scope(&self) -> Option<ConsoleScope> {
-    self.output_scope.clone()
+    self.execution_binding.as_ref().map(|binding| binding.scope().clone())
+  }
+
+  fn execution_binding(&self) -> Option<ExecutionBinding> {
+    self.execution_binding.clone()
   }
 }
 

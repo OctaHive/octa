@@ -38,7 +38,8 @@ pub(crate) fn terminal_console(
     adaptive_default: adaptive_output,
     force_default: force_output_mode,
   }));
-  let renderer: Box<dyn ConsoleRenderer> = if quiet {
+  // JSON Lines is an event contract, so quiet must not remove lifecycle records from it.
+  let renderer: Box<dyn ConsoleRenderer> = if quiet && mode != RenderMode::Json {
     Box::new(QuietRenderer::new(renderer))
   } else {
     renderer

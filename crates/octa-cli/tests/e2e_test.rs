@@ -2659,7 +2659,11 @@ version: 1
 output: prefixed
 
 tasks:
-  build: echo configured-output
+  child: echo nested-output
+  build:
+    cmds:
+      - echo configured-output
+      - task: child
 "#,
   )?;
 
@@ -2678,13 +2682,15 @@ tasks:
     .success()
     .stdout(predicate::str::contains("[build] configured-output"));
 
-  let output = command()?.env("TASK_OUTPUT", "json").output()?;
+  let output = command()?.env("TASK_OUTPUT", "json").arg("--quiet").output()?;
   assert!(output.status.success());
   let entries = String::from_utf8(output.stdout)?
     .lines()
     .map(serde_json::from_str::<serde_json::Value>)
     .collect::<Result<Vec<_>, _>>()?;
   assert!(entries.iter().all(|entry| entry["schema_version"] == 1));
+  assert!(entries.iter().any(|entry| entry["data"]["type"] == "run_started"));
+  assert!(entries.iter().any(|entry| entry["data"]["type"] == "run_finished"));
   assert_eq!(
     entries
       .iter()
@@ -2697,6 +2703,37 @@ tasks:
       && entry["data"]["type"] == "output"
       && entry["data"]["payload"]["data"] == "configured-output"
   }));
+  let build_id = entries
+    .iter()
+    .find_map(|entry| {
+      (entry["data"]["type"] == "scope_declared" && entry["data"]["scope"]["label"] == "build")
+        .then(|| entry["data"]["scope"]["id"].as_u64().unwrap())
+    })
+    .unwrap();
+  assert!(entries.iter().any(|entry| {
+    entry["data"]["type"] == "scope_declared"
+      && entry["data"]["scope"]["label"] == "child"
+      && entry["data"]["scope"]["parent_task_id"] == build_id
+  }));
+  let declared_step_ids = entries
+    .iter()
+    .filter(|entry| entry["data"]["type"] == "step_declared")
+    .map(|entry| entry["data"]["step"]["id"].as_u64().unwrap())
+    .collect::<Vec<_>>();
+  assert_eq!(declared_step_ids.len(), 2);
+  assert!(entries.iter().any(|entry| {
+    entry["data"]["type"] == "output"
+      && entry["data"]["payload"]["data"] == "nested-output"
+      && declared_step_ids.contains(&entry["data"]["step_id"].as_u64().unwrap())
+  }));
+  for step_id in declared_step_ids {
+    assert!(entries
+      .iter()
+      .any(|entry| { entry["data"]["type"] == "step_started" && entry["data"]["step"]["id"] == step_id }));
+    assert!(entries
+      .iter()
+      .any(|entry| { entry["data"]["type"] == "step_finished" && entry["data"]["step"]["id"] == step_id }));
+  }
 
   Ok(())
 }

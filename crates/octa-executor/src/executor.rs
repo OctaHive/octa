@@ -31,7 +31,7 @@ use crate::{
   interactive_scope_tracker::InteractiveScopeTracker,
   runtime_coordinator::RuntimeCoordinator,
   summary::{Summary, TaskSummaryItem},
-  task::{CacheItem, Executable, TaskItem, TaskOutcome, TaskRuntime},
+  task::{CacheItem, Executable, ExecutionBinding, TaskItem, TaskOutcome, TaskRuntime},
 };
 
 // Add shutdown timeout constant
@@ -184,17 +184,17 @@ impl<T: Eq + Hash + Identifiable + TaskItem + Executable<T> + Send + Sync + Clon
   ) -> ExecutorResult<Self> {
     let plan = plan.into();
     let dag = plan.dag;
-    let node_scopes = dag
+    let node_bindings = dag
       .nodes()
       .iter()
-      .filter_map(|node| node.output_scope())
+      .filter_map(|node| node.execution_binding())
       .collect::<Vec<_>>();
     let run_id = config.run_id.unwrap_or_else(|| config.console.allocate_run_id());
     let scope_tracker = Arc::new(ConsoleScopeTracker::new(
       config.console.clone(),
       run_id,
       plan.scopes,
-      node_scopes,
+      node_bindings,
     ));
     let interactive_tracker = Arc::new(InteractiveScopeTracker::new(
       config.runtime_coordinator.clone(),
@@ -635,10 +635,11 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
     let task_name = self.task.id();
     debug!("Executing task: {}", task_name);
 
-    if let Some(scope) = self.task.output_scope() {
-      if let Err(error) = self.context.scope_tracker.start(&scope).await {
-        let result = self.handle_error(error.into()).await;
-        return self.complete_scope(result).await;
+    let binding = self.task.execution_binding();
+    if let Some(binding) = &binding {
+      if let Err(error) = self.context.scope_tracker.start_scope(binding).await {
+        let result = self.handle_error(error.into(), Some(binding)).await;
+        return self.complete_scope(result, Some(binding)).await;
       }
     }
 
@@ -646,10 +647,19 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
     let _permit = match self.acquire_permit().await {
       Ok(permit) => permit,
       Err(error) => {
-        let result = self.handle_error(error).await;
-        return self.complete_scope(result).await;
+        let result = self.handle_error(error, binding.as_ref()).await;
+        return self.complete_scope(result, binding.as_ref()).await;
       },
     };
+    // A step starts after scheduler capacity has been acquired. Conditions,
+    // freshness and cache checks are part of evaluating that executable step;
+    // a cancellation while queued therefore finishes it without a start event.
+    if let Some(binding) = &binding {
+      if let Err(error) = self.context.scope_tracker.start_step(binding).await {
+        let result = self.handle_error(error.into(), Some(binding)).await;
+        return self.complete_scope(result, Some(binding)).await;
+      }
+    }
     let start_time = SystemTime::now();
     let deferred = self.context.deferred.get(&task_name).cloned();
     let result = if let Some(action) = deferred.as_ref() {
@@ -714,13 +724,17 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
           .await
           .map(TaskOutcome::success)
       },
-      Err(e) => self.handle_error(e).await,
+      Err(e) => self.handle_error(e, binding.as_ref()).await,
     };
-    self.complete_scope(result).await
+    self.complete_scope(result, binding.as_ref()).await
   }
 
-  async fn complete_scope(&self, result: ExecutorResult<TaskOutcome>) -> ExecutorResult<String> {
-    let Some(scope) = self.task.output_scope() else {
+  async fn complete_scope(
+    &self,
+    result: ExecutorResult<TaskOutcome>,
+    binding: Option<&ExecutionBinding>,
+  ) -> ExecutorResult<String> {
+    let Some(binding) = binding else {
       return result.map(TaskOutcome::into_output);
     };
     let status = match &result {
@@ -728,7 +742,7 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
       Err(ExecutorError::TaskCancelled(_)) => ConsoleStatus::Cancelled,
       Err(_) => ConsoleStatus::Failed,
     };
-    let completion = self.context.scope_tracker.complete(&scope, status).await;
+    let completion = self.context.scope_tracker.complete(binding, status).await;
     match result {
       Err(error) => Err(error),
       Ok(outcome) => {
@@ -785,14 +799,23 @@ impl<T: Executable<T> + Identifiable + TaskItem + Hash + Eq + Send + Sync + Clon
     self.process_task_success(output).await
   }
 
-  async fn handle_error(&self, error: ExecutorError) -> ExecutorResult<TaskOutcome> {
+  async fn handle_error(
+    &self,
+    error: ExecutorError,
+    binding: Option<&ExecutionBinding>,
+  ) -> ExecutorResult<TaskOutcome> {
     let message = format!("Task {} failed: {error}", self.task.name());
-    let _ = match self.task.output_scope() {
-      Some(scope) => {
+    let _ = match binding {
+      Some(binding) => {
         self
           .context
           .console
-          .run_message_at(self.context.run_id, scope, ConsoleLevel::Error, message)
+          .run_message_at(
+            self.context.run_id,
+            binding.scope().clone(),
+            ConsoleLevel::Error,
+            message,
+          )
           .await
       },
       None => {
@@ -923,7 +946,7 @@ mod tests {
     completed: Arc<AtomicBool>,
     running: Option<Arc<AtomicUsize>>,
     maximum_running: Option<Arc<AtomicUsize>>,
-    output_scope: Option<ConsoleScope>,
+    execution_binding: Option<ExecutionBinding>,
   }
 
   struct RunningTaskGuard(Arc<AtomicUsize>);
@@ -980,8 +1003,8 @@ mod tests {
       self.requires_permit
     }
 
-    fn output_scope(&self) -> Option<ConsoleScope> {
-      self.output_scope.clone()
+    fn execution_binding(&self) -> Option<ExecutionBinding> {
+      self.execution_binding.clone()
     }
   }
 
@@ -1037,7 +1060,7 @@ mod tests {
       completed: Arc::new(AtomicBool::new(false)),
       running: None,
       maximum_running: None,
-      output_scope: None,
+      execution_binding: None,
     }
   }
 
@@ -1080,7 +1103,7 @@ mod tests {
       let mut task = test_task("task");
       task.fails = fails;
       task.skipped = skipped;
-      task.output_scope = Some(scope.clone());
+      task.execution_binding = Some(ExecutionBinding::for_task(scope.clone()));
       let mut dag = DAG::new();
       dag.add_node(Arc::new(task));
       let events = Arc::new(StdMutex::new(Vec::new()));
@@ -1168,7 +1191,7 @@ mod tests {
     let allocator = octa_output::ConsoleScopeAllocator::default();
     let scope = allocator.scope("main");
     let mut barrier = test_task("barrier");
-    barrier.output_scope = Some(scope.clone());
+    barrier.execution_binding = Some(ExecutionBinding::for_task(scope.clone()));
     let mut dag = DAG::new();
     dag.add_node(Arc::new(barrier));
     let plan = ExecutionPlan::new(dag, HashMap::from([("barrier".to_owned(), action)]), vec![scope]);
@@ -1245,7 +1268,7 @@ mod tests {
     let scope = allocator.scope("build");
     let mut task = test_task("build");
     task.cancelled = true;
-    task.output_scope = Some(scope.clone());
+    task.execution_binding = Some(ExecutionBinding::for_task(scope.clone()));
     let mut dag = DAG::new();
     dag.add_node(Arc::new(task));
     let events = Arc::new(StdMutex::new(Vec::new()));
@@ -1384,23 +1407,51 @@ mod tests {
   #[tokio::test]
   async fn cancellation_interrupts_waiting_for_concurrency_permit() {
     let completed = Arc::new(AtomicBool::new(false));
+    let allocator = octa_output::ConsoleScopeAllocator::default();
+    let scope = allocator.scope("task");
+    let step = allocator.step(&scope, "shell");
     let mut dag = DAG::new();
     let mut task = test_task("task");
     task.completed = completed.clone();
+    task.execution_binding = Some(ExecutionBinding::for_step(scope.clone(), step.clone()));
     dag.add_node(Arc::new(task));
     let concurrency = Arc::new(Semaphore::new(1));
     let _permit = concurrency.clone().acquire_owned().await.unwrap();
-    let executor = test_executor(
-      dag,
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let executor = Executor::new(
+      Arc::new(PluginManager::new(TempDir::new().unwrap().path())),
+      ExecutionPlan::new(dag, HashMap::new(), vec![scope.clone()]),
       ExecutorConfig {
         concurrency: Some(concurrency),
+        console: Arc::new(Console::new(RecordingRenderer { events: events.clone() })),
         ..ExecutorConfig::default()
       },
-    );
+      None,
+      Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      false,
+      false,
+      None,
+    )
+    .unwrap();
+    let run_id = executor.run_id;
     let cancel_token = CancellationToken::new();
     let execution_token = cancel_token.clone();
     let execution = tokio::spawn(async move { executor.execute(execution_token, "test").await });
-    tokio::task::yield_now().await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+      loop {
+        if events.lock().unwrap().iter().any(|event| {
+          matches!(
+            event,
+            ConsoleRecord::Execution(ExecutionEvent::ScopeStarted { scope: started, .. }) if started == &scope
+          )
+        }) {
+          break;
+        }
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .unwrap();
     cancel_token.cancel();
 
     let result = tokio::time::timeout(Duration::from_secs(1), execution)
@@ -1410,6 +1461,22 @@ mod tests {
 
     assert!(result.is_ok());
     assert!(!completed.load(Ordering::SeqCst));
+    let events = events.lock().unwrap();
+    assert!(events.contains(&ConsoleRecord::Execution(ExecutionEvent::StepDeclared {
+      run_id,
+      scope: scope.clone(),
+      step: step.clone(),
+    })));
+    assert!(!events.iter().any(|event| matches!(
+      event,
+      ConsoleRecord::Execution(ExecutionEvent::StepStarted { step: started, .. }) if started == &step
+    )));
+    assert!(events.contains(&ConsoleRecord::Execution(ExecutionEvent::StepFinished {
+      run_id,
+      scope,
+      step,
+      status: ConsoleStatus::Cancelled,
+    })));
   }
 
   #[tokio::test]

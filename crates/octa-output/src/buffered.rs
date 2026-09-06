@@ -229,6 +229,8 @@ impl<R: ConsoleRenderer> ConsoleRenderer for OnErrorRenderer<R> {
 fn record_scope(record: &ConsoleRecord) -> Option<&ConsoleScope> {
   match record {
     ConsoleRecord::Execution(ExecutionEvent::ScopeStarted { scope, .. })
+    | ConsoleRecord::Execution(ExecutionEvent::StepStarted { scope, .. })
+    | ConsoleRecord::Execution(ExecutionEvent::StepFinished { scope, .. })
     | ConsoleRecord::Execution(ExecutionEvent::Output { scope: Some(scope), .. }) => Some(scope),
     ConsoleRecord::Diagnostic(diagnostic) => diagnostic.scope.as_ref(),
     _ => None,
@@ -265,6 +267,7 @@ fn group_entry(reference: &ConsoleEntry, scope: &ConsoleScope, template: &str) -
   Ok(reference.with_record(ConsoleRecord::Execution(ExecutionEvent::Output {
     run_id,
     scope: Some(scope.clone()),
+    step_id: None,
     command_id: "group".to_owned(),
     stream: crate::ConsoleStream::Stdout,
     payload: crate::ConsolePayload::Line(line),
@@ -343,6 +346,7 @@ mod tests {
     entry(ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 7,
       scope: Some(scope),
+      step_id: None,
       command_id: value.to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::Line(value.to_owned()),
@@ -406,6 +410,7 @@ mod tests {
     let global = entry(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
       run_id: Some(7),
       scope: None,
+      step_id: None,
       level: ConsoleLevel::Info,
       message: "global".to_owned(),
       location: None,
@@ -413,6 +418,7 @@ mod tests {
     let scoped = entry(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
       run_id: Some(7),
       scope: Some(scope.clone()),
+      step_id: None,
       level: ConsoleLevel::Info,
       message: "scoped".to_owned(),
       location: None,
@@ -518,6 +524,7 @@ mod tests {
     let raw = entry(ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 7,
       scope: Some(scope.clone()),
+      step_id: None,
       command_id: "shell".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::RawBytes(b"prompt".to_vec()),
@@ -579,6 +586,7 @@ mod tests {
     let raw = entry(ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 7,
       scope: Some(scope.clone()),
+      step_id: None,
       command_id: "interactive".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::RawBytes(b"prompt".to_vec()),

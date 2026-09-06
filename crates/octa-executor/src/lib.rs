@@ -63,7 +63,9 @@ use octa_output::{ConsoleScope, ConsoleScopeAllocator, RenderMode};
 use source_strategy::SourceStrategyRegistry;
 pub use source_strategy::{SourceMethod, SourceStrategy};
 pub use task::TaskNode;
-use task::{ConditionRuntime, ConditionState, FreshnessRuntime, NodeAction, PluginInvocation, TaskConfig};
+use task::{
+  ConditionRuntime, ConditionState, ExecutionBinding, FreshnessRuntime, NodeAction, PluginInvocation, TaskConfig,
+};
 use vars::{VariableResolver, Vars};
 
 // Type aliases for better readability
@@ -85,6 +87,7 @@ struct InvocationContext {
   conditions: ConditionScope,
   runtime: Option<Arc<task::InvocationRuntime>>,
   freshness: Option<Arc<FreshnessState>>,
+  parent_task_id: Option<u64>,
   output_scope: Option<ConsoleScope>,
   interactive_session: Option<String>,
 }
@@ -103,6 +106,7 @@ impl InvocationContext {
       conditions,
       runtime: None,
       freshness: None,
+      parent_task_id: None,
       output_scope: None,
       interactive_session: None,
     }
@@ -127,6 +131,7 @@ impl InvocationContext {
       // decision across this boundary would hide changes to the child's sources,
       // outputs, dotenv files, and dynamic variables.
       freshness: None,
+      parent_task_id: self.output_scope.as_ref().map(ConsoleScope::id),
       output_scope: None,
       interactive_session: self.interactive_session.clone(),
     }

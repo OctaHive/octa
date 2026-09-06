@@ -142,6 +142,7 @@ mod tests {
     ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 1,
       scope: Some(scope),
+      step_id: None,
       command_id: "command".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::Line(value.to_owned()),
@@ -231,6 +232,7 @@ mod tests {
     let raw = ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 1,
       scope: Some(scope.clone()),
+      step_id: None,
       command_id: "raw".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::RawBytes(b"raw".to_vec()),

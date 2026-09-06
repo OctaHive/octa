@@ -69,7 +69,10 @@ impl TerminalRenderer {
       ExecutionEvent::RunFinished { .. }
       | ExecutionEvent::ScopeDeclared { .. }
       | ExecutionEvent::ScopeStarted { .. }
-      | ExecutionEvent::ScopeFinished { .. } => {},
+      | ExecutionEvent::ScopeFinished { .. }
+      | ExecutionEvent::StepDeclared { .. }
+      | ExecutionEvent::StepStarted { .. }
+      | ExecutionEvent::StepFinished { .. } => {},
       ExecutionEvent::Output { stream, payload, .. } => match stream {
         ConsoleStream::Stdout => write_payload(&mut *self.stdout, payload)?,
         ConsoleStream::Stderr => write_payload(&mut *self.stderr, payload)?,
@@ -225,6 +228,7 @@ mod tests {
       .render(&entry(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
         run_id: Some(7),
         scope: None,
+        step_id: None,
         level: ConsoleLevel::Debug,
         message: "diagnostic".to_owned(),
         location: None,
@@ -276,6 +280,7 @@ mod tests {
         .render(&entry(ConsoleRecord::Execution(ExecutionEvent::Output {
           run_id: 7,
           scope: None,
+          step_id: None,
           command_id: "command-1".to_owned(),
           stream,
           payload: ConsolePayload::Line(line.to_owned()),

@@ -2,15 +2,20 @@ use std::{io, sync::Arc};
 
 use octa_octafile::Silence;
 use octa_output::{
-  Console, ConsoleLevel, ConsolePayload, ConsoleScope, ConsoleStream, ExecutionEvent, RawConsoleSession, SourceLocation,
+  Console, ConsoleLevel, ConsolePayload, ConsoleStep, ConsoleStream, ExecutionEvent, RawConsoleSession, SourceLocation,
 };
+
+#[cfg(test)]
+use octa_output::ConsoleScope;
+
+use crate::task::ExecutionBinding;
 
 /// Associates task output and diagnostics with one execution and optional scope.
 #[derive(Clone)]
 pub(crate) struct ConsoleTarget {
   console: Arc<Console>,
   run_id: u64,
-  scope: Option<ConsoleScope>,
+  binding: Option<ExecutionBinding>,
   silence: Silence,
 }
 
@@ -20,7 +25,7 @@ impl ConsoleTarget {
     Self {
       console,
       run_id,
-      scope,
+      binding: scope.map(ExecutionBinding::for_task),
       silence: Silence::None,
     }
   }
@@ -28,13 +33,13 @@ impl ConsoleTarget {
   pub(crate) fn with_silence(
     console: Arc<Console>,
     run_id: u64,
-    scope: Option<ConsoleScope>,
+    binding: Option<ExecutionBinding>,
     silence: Silence,
   ) -> Self {
     Self {
       console,
       run_id,
-      scope,
+      binding,
       silence,
     }
   }
@@ -43,8 +48,8 @@ impl ConsoleTarget {
     if matches!(stream, ConsoleStream::Stdout) && self.silence.hides_stdout()
       || matches!(stream, ConsoleStream::Stderr) && self.silence.hides_stderr()
     {
-      if let Some(scope) = &self.scope {
-        self.console.update_progress(scope.clone(), line).await?;
+      if let Some(binding) = &self.binding {
+        self.console.update_progress(binding.scope().clone(), line).await?;
       }
       return Ok(());
     }
@@ -52,7 +57,12 @@ impl ConsoleTarget {
       .console
       .event(ExecutionEvent::Output {
         run_id: self.run_id,
-        scope: self.scope.clone(),
+        scope: self.binding.as_ref().map(|binding| binding.scope().clone()),
+        step_id: self
+          .binding
+          .as_ref()
+          .and_then(ExecutionBinding::step)
+          .map(ConsoleStep::id),
         command_id: command_id.to_owned(),
         stream,
         payload: ConsolePayload::Line(line),
@@ -70,7 +80,12 @@ impl ConsoleTarget {
       .console
       .event(ExecutionEvent::Output {
         run_id: self.run_id,
-        scope: self.scope.clone(),
+        scope: self.binding.as_ref().map(|binding| binding.scope().clone()),
+        step_id: self
+          .binding
+          .as_ref()
+          .and_then(ExecutionBinding::step)
+          .map(ConsoleStep::id),
         command_id: command_id.to_owned(),
         stream,
         payload: ConsolePayload::Bytes(bytes),
@@ -79,12 +94,17 @@ impl ConsoleTarget {
   }
 
   pub(crate) async fn begin_raw(&self, command_id: &str) -> io::Result<Option<RawConsoleSession>> {
-    let Some(scope) = &self.scope else {
+    let Some(binding) = &self.binding else {
       return Ok(None);
     };
     self
       .console
-      .begin_raw(self.run_id, scope.clone(), command_id)
+      .begin_raw_for_step(
+        self.run_id,
+        binding.scope().clone(),
+        binding.step().map(ConsoleStep::id),
+        command_id,
+      )
       .await
       .map(Some)
   }
@@ -106,11 +126,24 @@ impl ConsoleTarget {
     message: impl Into<String>,
     location: Option<SourceLocation>,
   ) -> io::Result<()> {
-    match &self.scope {
-      Some(scope) => {
+    match &self.binding {
+      Some(binding) if let Some(step) = binding.step() => {
         self
           .console
-          .run_diagnostic_at(self.run_id, scope.clone(), level, message, location)
+          .run_diagnostic_at_step(
+            self.run_id,
+            binding.scope().clone(),
+            step.id(),
+            level,
+            message,
+            location,
+          )
+          .await
+      },
+      Some(binding) => {
+        self
+          .console
+          .run_diagnostic_at(self.run_id, binding.scope().clone(), level, message, location)
           .await
       },
       None => self.console.run_diagnostic(self.run_id, level, message, location).await,
@@ -153,8 +186,18 @@ mod tests {
     let records = Recording::default();
     let console = Arc::new(Console::new(records.clone()));
     let scope = ConsoleScopeAllocator::default().scope("task");
-    let stdout_hidden = ConsoleTarget::with_silence(console.clone(), 7, Some(scope.clone()), Silence::Stdout);
-    let stderr_hidden = ConsoleTarget::with_silence(console.clone(), 7, Some(scope.clone()), Silence::Stderr);
+    let stdout_hidden = ConsoleTarget::with_silence(
+      console.clone(),
+      7,
+      Some(ExecutionBinding::for_task(scope.clone())),
+      Silence::Stdout,
+    );
+    let stderr_hidden = ConsoleTarget::with_silence(
+      console.clone(),
+      7,
+      Some(ExecutionBinding::for_task(scope.clone())),
+      Silence::Stderr,
+    );
 
     stdout_hidden
       .bytes("command", ConsoleStream::Stdout, b"hidden".to_vec())
@@ -186,7 +229,12 @@ mod tests {
     let records = Recording::default();
     let console = Arc::new(Console::new(records.clone()));
     let scope = ConsoleScopeAllocator::default().scope("task");
-    let target = ConsoleTarget::with_silence(console, 7, Some(scope.clone()), Silence::All);
+    let target = ConsoleTarget::with_silence(
+      console,
+      7,
+      Some(ExecutionBinding::for_task(scope.clone())),
+      Silence::All,
+    );
 
     target
       .line("command", ConsoleStream::Stdout, "compiling".to_owned())

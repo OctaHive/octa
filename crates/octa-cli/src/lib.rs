@@ -585,7 +585,9 @@ async fn build_execute_items(
       context.plugin_manager.clone(),
       dag,
       ExecutorConfig {
-        emit_run_events: !(options.quiet || context.octafile.quiet.unwrap_or(false)),
+        // Top-level lifecycle is always produced. Human quiet mode is a renderer concern;
+        // machine output must retain complete run boundaries.
+        emit_run_events: true,
         failfast: options.failfast,
         concurrency: context.concurrency.clone(),
         console: context.console.clone(),

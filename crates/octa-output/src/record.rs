@@ -1,7 +1,13 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{CliDocument, ConsoleScope};
+use super::{CliDocument, ConsoleScope, ConsoleStep};
+
+/// Version of the externally supported JSON Lines event contract.
+pub const EVENT_SCHEMA_VERSION: u16 = 1;
+
+/// JSON Schema for [`ConsoleEntry`] version 1.
+pub const EVENT_SCHEMA_V1: &str = include_str!("../schema/events-v1.schema.json");
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,33 +72,50 @@ pub enum ConsoleLevel {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecutionEvent {
-  RunStarted {
-    run_id: u64,
-    command: String,
-  },
+  /// Opens one executor invocation.
+  RunStarted { run_id: u64, command: String },
+  /// Closes a run after all task scopes have reached terminal states.
   RunFinished {
     run_id: u64,
     command: String,
     status: ConsoleStatus,
   },
   /// Registers a task invocation in declaration order before scheduling starts.
-  ScopeDeclared {
-    run_id: u64,
-    scope: ConsoleScope,
-  },
+  ScopeDeclared { run_id: u64, scope: ConsoleScope },
   /// Marks the first DAG node that actually begins work for the invocation.
-  ScopeStarted {
-    run_id: u64,
-    scope: ConsoleScope,
-  },
+  ScopeStarted { run_id: u64, scope: ConsoleScope },
+  /// Closes a task invocation after all of its DAG nodes have completed.
   ScopeFinished {
     run_id: u64,
     scope: ConsoleScope,
     status: ConsoleStatus,
   },
+  /// Registers an executable command in plan declaration order.
+  StepDeclared {
+    run_id: u64,
+    scope: ConsoleScope,
+    step: ConsoleStep,
+  },
+  /// Marks evaluation of a command after scheduler capacity is acquired.
+  StepStarted {
+    run_id: u64,
+    scope: ConsoleScope,
+    step: ConsoleStep,
+  },
+  /// Closes a command; queued cancellation may produce this without [`Self::StepStarted`].
+  StepFinished {
+    run_id: u64,
+    scope: ConsoleScope,
+    step: ConsoleStep,
+    status: ConsoleStatus,
+  },
+  /// Carries one streaming stdout or stderr chunk from a concrete plugin command.
   Output {
     run_id: u64,
     scope: Option<ConsoleScope>,
+    /// Plan-level command identity, present when `scope` identifies its owning task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step_id: Option<u64>,
     command_id: String,
     stream: ConsoleStream,
     payload: ConsolePayload,
@@ -102,8 +125,13 @@ pub enum ExecutionEvent {
 /// Human-oriented diagnostic enriched with optional execution context.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConsoleDiagnostic {
+  /// Run that produced the diagnostic, or `None` outside execution.
   pub run_id: Option<u64>,
+  /// Task invocation that produced the diagnostic, when known.
   pub scope: Option<ConsoleScope>,
+  /// Executable step within `scope`, when known.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub step_id: Option<u64>,
   pub level: ConsoleLevel,
   pub message: String,
   #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,9 +140,12 @@ pub struct ConsoleDiagnostic {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SourceLocation {
+  /// Source path reported by the plugin or configuration loader.
   pub file: String,
+  /// One-based source line when available.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub line: Option<u64>,
+  /// One-based source column when available.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub column: Option<u64>,
 }
@@ -141,21 +172,24 @@ pub struct ConsoleEntry {
 impl ConsoleEntry {
   pub(crate) fn new(record: ConsoleRecord) -> Self {
     Self {
-      schema_version: 1,
+      schema_version: EVENT_SCHEMA_VERSION,
       sequence: 0,
       timestamp: Utc::now(),
       record,
     }
   }
 
+  /// Time at which the console accepted the record.
   pub fn timestamp(&self) -> &DateTime<Utc> {
     &self.timestamp
   }
 
+  /// Version of the external event contract used by this record.
   pub fn schema_version(&self) -> u16 {
     self.schema_version
   }
 
+  /// Monotonic position in this process's console stream.
   pub fn sequence(&self) -> u64 {
     self.sequence
   }
@@ -164,6 +198,7 @@ impl ConsoleEntry {
     self.sequence = sequence;
   }
 
+  /// Structured record carried by this envelope.
   pub fn record(&self) -> &ConsoleRecord {
     &self.record
   }
@@ -180,8 +215,10 @@ impl ConsoleEntry {
 
 #[cfg(test)]
 mod tests {
+  use std::time::Duration;
+
   use super::*;
-  use crate::{ConsoleScopeAllocator, TaskListItem};
+  use crate::{ConsoleScopeAllocator, SummaryItem, TaskListItem};
 
   #[test]
   fn records_have_stable_category_and_payload_tags() {
@@ -189,6 +226,7 @@ mod tests {
     let value = serde_json::to_value(ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 42,
       scope: Some(scope),
+      step_id: None,
       command_id: "command-1".to_owned(),
       stream: ConsoleStream::Stderr,
       payload: ConsolePayload::Line("failed".to_owned()),
@@ -227,6 +265,7 @@ mod tests {
     let value = serde_json::to_value(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
       run_id: Some(42),
       scope: None,
+      step_id: None,
       level: ConsoleLevel::Error,
       message: "invalid configuration".to_owned(),
       location: None,
@@ -257,5 +296,184 @@ mod tests {
     assert_eq!(entry.schema_version(), 1);
     assert_eq!(entry.sequence(), 42);
     assert!(*entry.timestamp() <= Utc::now());
+  }
+
+  #[test]
+  fn version_one_schema_validates_every_public_record_shape() {
+    let schema = serde_json::from_str(EVENT_SCHEMA_V1).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let allocator = ConsoleScopeAllocator::default();
+    let parent = allocator.scope("build");
+    let scope = allocator.scope_with_parent_options("compile", Some(parent.id()), None, false, false);
+    let step = allocator.step(&scope, "shell");
+    let records = vec![
+      ConsoleRecord::Execution(ExecutionEvent::RunStarted {
+        run_id: 1,
+        command: "build".to_owned(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::RunFinished {
+        run_id: 1,
+        command: "build".to_owned(),
+        status: ConsoleStatus::Success,
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::ScopeDeclared {
+        run_id: 1,
+        scope: scope.clone(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::ScopeStarted {
+        run_id: 1,
+        scope: scope.clone(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::ScopeFinished {
+        run_id: 1,
+        scope: scope.clone(),
+        status: ConsoleStatus::Success,
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::StepDeclared {
+        run_id: 1,
+        scope: scope.clone(),
+        step: step.clone(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::StepStarted {
+        run_id: 1,
+        scope: scope.clone(),
+        step: step.clone(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::StepFinished {
+        run_id: 1,
+        scope: scope.clone(),
+        step: step.clone(),
+        status: ConsoleStatus::Success,
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::Output {
+        run_id: 1,
+        scope: Some(scope.clone()),
+        step_id: Some(step.id()),
+        command_id: "plugin-command-1".to_owned(),
+        stream: ConsoleStream::Stdout,
+        payload: ConsolePayload::Bytes(vec![0, 1, 2]),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::Output {
+        run_id: 1,
+        scope: Some(scope.clone()),
+        step_id: Some(step.id()),
+        command_id: "plugin-command-2".to_owned(),
+        stream: ConsoleStream::Stderr,
+        payload: ConsolePayload::RawBytes(vec![3, 4, 5]),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::Output {
+        run_id: 1,
+        scope: None,
+        step_id: None,
+        command_id: "plugin-command-3".to_owned(),
+        stream: ConsoleStream::Stdout,
+        payload: ConsolePayload::Line("output".to_owned()),
+      }),
+      ConsoleRecord::Diagnostic(ConsoleDiagnostic {
+        run_id: Some(1),
+        scope: Some(scope.clone()),
+        step_id: Some(step.id()),
+        level: ConsoleLevel::Error,
+        message: "failed".to_owned(),
+        location: Some(SourceLocation {
+          file: "src/main.rs".to_owned(),
+          line: Some(12),
+          column: Some(4),
+        }),
+      }),
+      ConsoleRecord::Diagnostic(ConsoleDiagnostic {
+        run_id: None,
+        scope: None,
+        step_id: None,
+        level: ConsoleLevel::Info,
+        message: "ready".to_owned(),
+        location: None,
+      }),
+      ConsoleRecord::Document(CliDocument::TaskList {
+        tasks: vec![TaskListItem {
+          name: "build".to_owned(),
+          description: None,
+        }],
+      }),
+      ConsoleRecord::Document(CliDocument::Help {
+        text: "help".to_owned(),
+      }),
+      ConsoleRecord::Document(CliDocument::Completion {
+        text: "completion".to_owned(),
+      }),
+      ConsoleRecord::Document(CliDocument::Failure {
+        message: "failure".to_owned(),
+      }),
+      ConsoleRecord::Document(CliDocument::Summary {
+        tasks: vec![SummaryItem {
+          name: "build".to_owned(),
+          duration: Duration::from_millis(10),
+        }],
+        total: Duration::from_millis(10),
+      }),
+    ];
+
+    for record in records {
+      let value = serde_json::to_value(ConsoleEntry::new(record)).unwrap();
+      assert!(validator.is_valid(&value), "event does not match v1 schema: {value}");
+    }
+  }
+
+  #[test]
+  fn hierarchy_fields_have_stable_json_names() {
+    let allocator = ConsoleScopeAllocator::default();
+    let parent = allocator.scope("build");
+    let task = allocator.scope_with_parent_options("compile", Some(parent.id()), None, false, false);
+    let step = allocator.step(&task, "shell");
+    let value = serde_json::to_value(ConsoleEntry::new(ConsoleRecord::Execution(
+      ExecutionEvent::StepDeclared {
+        run_id: 9,
+        scope: task,
+        step,
+      },
+    )))
+    .unwrap();
+
+    assert_eq!(value["schema_version"], EVENT_SCHEMA_VERSION);
+    assert_eq!(value["data"]["type"], "step_declared");
+    assert_eq!(value["data"]["scope"]["parent_task_id"], parent.id());
+    assert_eq!(value["data"]["step"]["id"], 0);
+    assert_eq!(value["data"]["step"]["parent_task_id"], value["data"]["scope"]["id"]);
+  }
+
+  #[test]
+  fn version_one_schema_rejects_mismatched_categories_and_unknown_fields() {
+    let schema = serde_json::from_str(EVENT_SCHEMA_V1).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut value = serde_json::to_value(ConsoleEntry::new(ConsoleRecord::Execution(
+      ExecutionEvent::RunStarted {
+        run_id: 1,
+        command: "build".to_owned(),
+      },
+    )))
+    .unwrap();
+
+    value["category"] = serde_json::json!("diagnostic");
+    assert!(!validator.is_valid(&value));
+    value["category"] = serde_json::json!("execution");
+    value["unexpected"] = serde_json::json!(true);
+    assert!(!validator.is_valid(&value));
+
+    let unscoped_step_output = serde_json::json!({
+      "schema_version": 1,
+      "sequence": 1,
+      "timestamp": Utc::now(),
+      "category": "execution",
+      "data": {
+        "type": "output",
+        "run_id": 1,
+        "scope": null,
+        "step_id": 1,
+        "command_id": "command-1",
+        "stream": "stdout",
+        "payload": { "format": "line", "data": "output" }
+      }
+    });
+    assert!(!validator.is_valid(&unscoped_step_output));
   }
 }

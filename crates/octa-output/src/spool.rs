@@ -75,6 +75,9 @@ fn estimated_memory(entry: &ConsoleEntry) -> usize {
       ExecutionEvent::ScopeDeclared { scope, .. }
       | ExecutionEvent::ScopeStarted { scope, .. }
       | ExecutionEvent::ScopeFinished { scope, .. } => scope.label().len(),
+      ExecutionEvent::StepDeclared { scope, step, .. }
+      | ExecutionEvent::StepStarted { scope, step, .. }
+      | ExecutionEvent::StepFinished { scope, step, .. } => scope.label().len() + step.label().len(),
       ExecutionEvent::Output {
         scope,
         command_id,
@@ -139,6 +142,7 @@ mod tests {
     let small = ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 1,
       scope: None,
+      step_id: None,
       command_id: "small".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::Bytes(vec![1, 2, 3]),
@@ -146,6 +150,7 @@ mod tests {
     let large = ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 1,
       scope: None,
+      step_id: None,
       command_id: "large".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::Line("x".repeat(MEMORY_LIMIT + 1)),
@@ -153,6 +158,7 @@ mod tests {
     let tail = ConsoleRecord::Execution(ExecutionEvent::Output {
       run_id: 1,
       scope: None,
+      step_id: None,
       command_id: "tail".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::RawBytes(vec![4, 5, 6]),
@@ -190,6 +196,7 @@ mod tests {
       ConsoleRecord::Diagnostic(ConsoleDiagnostic {
         run_id: Some(1),
         scope: Some(scope),
+        step_id: None,
         level: ConsoleLevel::Warn,
         message: "warning".to_owned(),
         location: None,

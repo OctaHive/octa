@@ -152,6 +152,8 @@ fn record_scope(record: &ConsoleRecord) -> Option<&ConsoleScope> {
   match record {
     ConsoleRecord::Execution(ExecutionEvent::ScopeStarted { scope, .. })
     | ConsoleRecord::Execution(ExecutionEvent::ScopeFinished { scope, .. })
+    | ConsoleRecord::Execution(ExecutionEvent::StepStarted { scope, .. })
+    | ConsoleRecord::Execution(ExecutionEvent::StepFinished { scope, .. })
     | ConsoleRecord::Execution(ExecutionEvent::Output { scope: Some(scope), .. }) => Some(scope),
     ConsoleRecord::Diagnostic(diagnostic) => diagnostic.scope.as_ref(),
     _ => None,
@@ -210,6 +212,7 @@ mod tests {
     event(ExecutionEvent::Output {
       run_id: 1,
       scope: Some(scope),
+      step_id: None,
       command_id: line.to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::Line(line.to_owned()),
@@ -282,6 +285,7 @@ mod tests {
     let raw = event(ExecutionEvent::Output {
       run_id: 1,
       scope: Some(second),
+      step_id: None,
       command_id: "raw".to_owned(),
       stream: ConsoleStream::Stdout,
       payload: ConsolePayload::RawBytes(b"prompt".to_vec()),

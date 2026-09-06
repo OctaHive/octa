@@ -201,6 +201,9 @@ fn record_scope(record: &ConsoleRecord) -> Option<&ConsoleScope> {
     ConsoleRecord::Execution(ExecutionEvent::ScopeDeclared { scope, .. })
     | ConsoleRecord::Execution(ExecutionEvent::ScopeStarted { scope, .. })
     | ConsoleRecord::Execution(ExecutionEvent::ScopeFinished { scope, .. })
+    | ConsoleRecord::Execution(ExecutionEvent::StepDeclared { scope, .. })
+    | ConsoleRecord::Execution(ExecutionEvent::StepStarted { scope, .. })
+    | ConsoleRecord::Execution(ExecutionEvent::StepFinished { scope, .. })
     | ConsoleRecord::Execution(ExecutionEvent::Output { scope: Some(scope), .. }) => Some(scope),
     ConsoleRecord::Diagnostic(diagnostic) => diagnostic.scope.as_ref(),
     _ => None,
@@ -255,6 +258,7 @@ mod tests {
       .render(&event(ExecutionEvent::Output {
         run_id: 1,
         scope: Some(scope),
+        step_id: None,
         command_id: "build".to_owned(),
         stream: ConsoleStream::Stdout,
         payload: ConsolePayload::Line("compiled".to_owned()),
@@ -289,6 +293,7 @@ mod tests {
       .render(&event(ExecutionEvent::Output {
         run_id: 1,
         scope: Some(plain_scope.clone()),
+        step_id: None,
         command_id: "plain".to_owned(),
         stream: ConsoleStream::Stderr,
         payload: ConsolePayload::Line("warning".to_owned()),
@@ -343,6 +348,7 @@ mod tests {
     let diagnostic = ConsoleEntry::new(ConsoleRecord::Diagnostic(crate::ConsoleDiagnostic {
       run_id: None,
       scope: None,
+      step_id: None,
       level: ConsoleLevel::Warn,
       message: "warning".to_owned(),
       location: None,

@@ -211,6 +211,7 @@ mod tests {
     let entry = ConsoleEntry::new(ConsoleRecord::Diagnostic(crate::ConsoleDiagnostic {
       run_id: None,
       scope: None,
+      step_id: None,
       level: ConsoleLevel::Info,
       message: "intermediate error".to_owned(),
       location: None,
@@ -230,6 +231,7 @@ mod tests {
     let entry = ConsoleEntry::new(ConsoleRecord::Diagnostic(crate::ConsoleDiagnostic {
       run_id: Some(4),
       scope: Some(scope.clone()),
+      step_id: None,
       level: ConsoleLevel::Error,
       message: "Octafile /work/Octafile.yml parsing error: bad value at line 12, column 7".to_owned(),
       location: Some(crate::SourceLocation {
@@ -282,6 +284,7 @@ mod tests {
         crate::ConsoleDiagnostic {
           run_id: Some(1),
           scope: Some(scope.clone()),
+          step_id: None,
           level: ConsoleLevel::Error,
           message: "ignored error".to_owned(),
           location: None,
@@ -310,6 +313,7 @@ mod tests {
         crate::ConsoleDiagnostic {
           run_id: Some(1),
           scope: Some(scope.clone()),
+          step_id: None,
           level: ConsoleLevel::Error,
           message: "failed".to_owned(),
           location: None,
@@ -344,6 +348,7 @@ mod tests {
         .render(&ConsoleEntry::new(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
           run_id: Some(1),
           scope: Some(scope.clone()),
+          step_id: None,
           level: ConsoleLevel::Error,
           message: message.to_owned(),
           location: None,
