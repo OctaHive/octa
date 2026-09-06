@@ -592,6 +592,30 @@ mod tests {
   }
 
   #[test]
+  fn streamed_progress_handles_empty_complete_invalid_and_incremental_input() {
+    let mut row = ProgressRow::waiting();
+    assert_eq!(row.push_bytes("command", ConsoleStream::Stdout, b""), None);
+    assert_eq!(
+      row.push_bytes("command", ConsoleStream::Stdout, b"partial"),
+      Some("partial".to_owned())
+    );
+    assert_eq!(
+      row.complete_line("command", ConsoleStream::Stdout, "complete"),
+      Some("complete".to_owned())
+    );
+    assert!(!row.streamed_lines[&ConsoleStream::Stdout].contains_key("command"));
+
+    row.push_bytes("command", ConsoleStream::Stderr, b"warning\n");
+    assert!(!row.streamed_lines[&ConsoleStream::Stderr].contains_key("command"));
+
+    let mut line = StreamedLine::default();
+    line.push(&vec![b'a'; PROGRESS_LINE_LIMIT / 2]);
+    line.push(&vec![b'b'; PROGRESS_LINE_LIMIT / 2 + 1]);
+    assert_eq!(line.bytes.len(), PROGRESS_LINE_LIMIT);
+    assert_eq!(display_message(&[0xff]), Some("�".to_owned()));
+  }
+
+  #[test]
   fn suppresses_scoped_info_but_preserves_warnings_during_progress() {
     let scope = ConsoleScopeAllocator::default().scope("build");
     let mut renderer = renderer();

@@ -629,10 +629,22 @@ pub async fn serve_plugin(plugin: impl Plugin + 'static, schema: PluginSchema) -
 mod tests {
   use super::*;
   use logger::MockLogger;
-  use std::sync::Arc;
-  use std::time::Duration;
+  use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+  };
   use tempfile::tempdir;
-  use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+  use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadBuf};
+
+  struct ErrorReader;
+
+  impl AsyncRead for ErrorReader {
+    fn poll_read(self: Pin<&mut Self>, _context: &mut Context<'_>, _buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+      Poll::Ready(Err(io::Error::other("broken stream")))
+    }
+  }
 
   struct MockPlugin {
     version: String,
@@ -725,6 +737,49 @@ mod tests {
     ));
     drop(source_writer);
     forwarder.await.unwrap().unwrap();
+  }
+
+  #[tokio::test]
+  async fn stream_output_forwards_stderr_bytes() {
+    let (mut source_writer, source_reader) = tokio::io::duplex(1024);
+    let (sink_reader, sink_writer) = tokio::io::duplex(4096);
+    let forwarder = tokio::spawn(stream_output(
+      source_reader,
+      "stderr",
+      Arc::new(Mutex::new(sink_writer)),
+      "command".to_owned(),
+    ));
+    let mut responses = BufReader::new(sink_reader).lines();
+
+    source_writer.write_all(b"warning").await.unwrap();
+    let response = responses.next_line().await.unwrap().unwrap();
+
+    assert!(matches!(
+      serde_json::from_str::<PluginResponse>(&response).unwrap(),
+      PluginResponse::StderrBytes { id, bytes } if id == "command" && bytes == b"warning"
+    ));
+    drop(source_writer);
+    forwarder.await.unwrap().unwrap();
+  }
+
+  #[tokio::test]
+  async fn stream_output_reports_read_errors() {
+    let (sink_reader, sink_writer) = tokio::io::duplex(4096);
+
+    stream_output(
+      ErrorReader,
+      "stdout",
+      Arc::new(Mutex::new(sink_writer)),
+      "command".to_owned(),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+      read_responses(sink_reader).await.as_slice(),
+      [PluginResponse::Error { id, message }]
+        if id == "command" && message == "Failed to read stdout: broken stream"
+    ));
   }
 
   #[tokio::test]
