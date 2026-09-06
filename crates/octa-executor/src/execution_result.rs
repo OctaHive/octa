@@ -262,13 +262,16 @@ pub struct TaskResult {
   pub steps: Vec<StepResult>,
 }
 
-/// Complete structured outcome returned for every execution that reached the scheduler.
+/// Complete structured outcome of one requested execution.
+///
+/// `tasks` is empty when cancellation or configuration failure ends preparation before a plan is
+/// available to the scheduler.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[non_exhaustive]
 pub struct ExecutionResult {
   /// Identifier shared with every event emitted by this run.
   pub run_id: u64,
-  /// Command passed to [`crate::Executor::execute`].
+  /// Requested command.
   pub command: String,
   /// Time execution entered the public API.
   pub started_at: DateTime<Utc>,

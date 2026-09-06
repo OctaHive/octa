@@ -90,7 +90,7 @@ pub struct ProgressUpdate {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ExecutionEvent {
-  /// Opens one executor invocation.
+  /// Opens one execution lifecycle.
   RunStarted { run_id: u64, command: String },
   /// Closes a run after all task scopes have reached terminal states.
   RunFinished {

@@ -4,6 +4,7 @@ mod dotenv;
 /// Module for building and managing task execution graphs
 pub mod envs;
 pub mod error;
+mod execution_engine;
 mod execution_handle;
 mod execution_result;
 pub mod executor;
@@ -52,6 +53,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use error::{ExecutorError, ExecutorResult};
+pub use execution_engine::{ExecutionEngine, ExecutionRequest, PreparedExecution};
 pub use execution_handle::ExecutionHandle;
 pub use execution_result::{
   ExecutionConclusion, ExecutionFailure, ExecutionFailureKind, ExecutionResult, OutputReference, StepResult,
@@ -246,6 +248,16 @@ impl TaskGraphBuilder {
   /// Adds ordered runtime variable overrides that take precedence over every configured layer.
   pub fn with_variable_overrides(mut self, variables: Vec<(String, String)>) -> Self {
     self.variable_overrides = variables;
+    self
+  }
+
+  /// Sets the workspace used to resolve task working directories.
+  pub fn with_working_directory(mut self, directory: PathBuf) -> Self {
+    self.dir = if directory.is_absolute() {
+      directory
+    } else {
+      self.dir.join(directory)
+    };
     self
   }
 

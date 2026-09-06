@@ -1038,16 +1038,17 @@ combined with raw/PTY mode.
 
 ## Embedding the executor
 
-The Rust API can start an execution and return a handle for cancellation and its terminal result:
+The Rust API can build and start a request without duplicating CLI orchestration:
 
 ```rust
-let handle = executor.start("build");
+let handle = engine.start(ExecutionRequest::new("build"));
 let result = handle.wait().await?;
 ```
 
-Attach an `EventSink` with `Console::with_event_sink` to receive structured entries independently
-of terminal presentation. The result uses the same IDs as the live event stream; details are in the
-[runtime event documentation](docs/events.md#terminal-result-for-embedded-callers).
+`ExecutionEngine` is created from a loaded `Octafile`, a running `PluginManager`, the fingerprint
+database, and a `Console`. Attach an `EventSink` with `Console::with_event_sink` to receive
+structured entries independently of terminal presentation. Details are in the
+[runtime event documentation](docs/events.md#embedded-execution-api).
 
 ## Quiet and silent
 

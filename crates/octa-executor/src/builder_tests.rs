@@ -99,6 +99,10 @@ async fn test_task_graph_builder_new() -> ExecutorResult<()> {
   );
   assert_eq!(builder.source_strategies.resolve(&SourceMethod::Hash)?.key(), "test");
   assert!(builder.dir.exists());
+
+  let current_dir = builder.dir.clone();
+  let relative = builder.with_working_directory(PathBuf::from("workspace"));
+  assert_eq!(relative.dir, current_dir.join("workspace"));
   Ok(())
 }
 
@@ -125,6 +129,40 @@ async fn test_build_simple_task() -> ExecutorResult<()> {
   let tasks: Vec<String> = dag.nodes().iter().map(|n| n.name.clone()).collect();
 
   assert!(tasks.contains(&"test".to_owned()));
+  Ok(())
+}
+
+#[tokio::test]
+async fn working_directory_resolves_relative_task_directories_consistently() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let config_dir = temp_dir.path().join("config");
+  fs::create_dir_all(&config_dir)?;
+  fs::write(
+    config_dir.join("Octafile.yml"),
+    r#"
+      version: 1
+      tasks:
+        test:
+          dir: work
+          shell: echo test
+    "#,
+  )?;
+
+  let octafile = Octafile::load(
+    Some(config_dir.join("Octafile.yml")),
+    false,
+    vec!["shell".to_owned()],
+    "shell",
+  )?;
+  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+  let plan = TaskGraphBuilder::new(plugin_manager)?
+    .with_working_directory(temp_dir.path().to_path_buf())
+    .build(octafile, "test", false, Vec::new())
+    .await?;
+
+  let task = plan.nodes().iter().find(|node| !node.is_internal()).unwrap();
+  assert_eq!(task.dir, temp_dir.path().join("work"));
   Ok(())
 }
 

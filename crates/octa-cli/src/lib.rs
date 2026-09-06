@@ -28,11 +28,10 @@ use tracing_subscriber::{prelude::*, EnvFilter};
 
 use error::{OctaError, OctaResult};
 use octa_executor::{
-  executor::ExecutorConfig,
   summary::Summary,
   vars::{VariablePrompt, VariableResolver},
   watcher::{SourceWatcher, WatchTarget},
-  Executor, RuntimeCoordinator, TaskGraphBuilder, TaskNode,
+  ExecutionEngine, ExecutionRequest, PreparedExecution, RuntimeCoordinator,
 };
 use octa_finder::OctaFinder;
 use octa_octafile::{
@@ -257,11 +256,6 @@ fn load_env_files(paths: &[PathBuf]) -> OctaResult<()> {
   Ok(())
 }
 
-struct ExecuteItem {
-  executor: Executor<TaskNode>,
-  command: String,
-}
-
 struct ExecutionOptions {
   parallel: bool,
   dry: bool,
@@ -280,15 +274,24 @@ struct ExecutionContext {
   octafile: Arc<Octafile>,
   fingerprint: Arc<sled::Db>,
   summary: Arc<Summary>,
-  concurrency: Option<Arc<Semaphore>>,
+  concurrency: Option<ConcurrencyLimiter>,
   variable_resolver: Option<Arc<dyn VariableResolver>>,
   console: Arc<Console>,
   scope_allocator: Arc<ConsoleScopeAllocator>,
   runtime_coordinator: Arc<RuntimeCoordinator>,
 }
 
-fn concurrency_limiter(cli: Option<NonZeroUsize>, configured: Option<NonZeroUsize>) -> Option<Arc<Semaphore>> {
-  cli.or(configured).map(|limit| Arc::new(Semaphore::new(limit.get())))
+#[derive(Clone)]
+struct ConcurrencyLimiter {
+  semaphore: Arc<Semaphore>,
+  limit: NonZeroUsize,
+}
+
+fn concurrency_limiter(cli: Option<NonZeroUsize>, configured: Option<NonZeroUsize>) -> Option<ConcurrencyLimiter> {
+  cli.or(configured).map(|limit| ConcurrencyLimiter {
+    semaphore: Arc::new(Semaphore::new(limit.get())),
+    limit,
+  })
 }
 
 struct TerminalVariableResolver {
@@ -494,7 +497,7 @@ fn resolve_default_plugin(configured: Option<String>, schemas: &HashMap<String, 
 
 /// Executes tasks either in parallel or sequentially
 async fn execute_tasks(
-  tasks: Vec<ExecuteItem>,
+  tasks: Vec<PreparedExecution>,
   parallel: bool,
   failfast: bool,
   cancel_token: CancellationToken,
@@ -507,14 +510,14 @@ async fn execute_tasks(
     // Declare every run and scope before scheduling work so renderers such as keep-order observe
     // the same order as the command line even when Tokio polls spawned executions differently.
     for task in &tasks {
-      task.executor.prepare(&task.command).await?;
+      task.declare().await?;
     }
     let mut handles = JoinSet::new();
     let mut first_error = None;
 
     for task in tasks {
       let task_token = batch_token.clone();
-      handles.spawn(async move { task.executor.execute(task_token, &task.command).await });
+      handles.spawn(task.execute(task_token));
     }
 
     // Join in completion order so the first failure can interrupt siblings immediately.
@@ -541,7 +544,7 @@ async fn execute_tasks(
     }
   } else {
     for task in tasks {
-      let result = task.executor.execute(batch_token.clone(), &task.command).await?;
+      let result = task.execute(batch_token.clone()).await?;
       if let Some(failure) = result.into_failure() {
         return Err(Box::new(failure).into());
       }
@@ -554,10 +557,25 @@ async fn build_execute_items(
   context: &ExecutionContext,
   commands: &[String],
   options: &ExecutionOptions,
-) -> OctaResult<(Vec<ExecuteItem>, Vec<WatchTarget>)> {
+) -> OctaResult<(Vec<PreparedExecution>, Vec<WatchTarget>)> {
+  let mut engine = ExecutionEngine::new(
+    context.plugin_manager.clone(),
+    context.octafile.clone(),
+    context.fingerprint.clone(),
+    context.console.clone(),
+  )
+  .with_summary(context.summary.clone())
+  .with_scope_allocator(context.scope_allocator.clone())
+  .with_runtime_coordinator(context.runtime_coordinator.clone());
+  if let Some(concurrency) = &context.concurrency {
+    engine = engine.with_concurrency(concurrency.semaphore.clone());
+  }
+  if let Some(variable_resolver) = &context.variable_resolver {
+    engine = engine.with_variable_resolver(variable_resolver.clone());
+  }
   let mut tasks = Vec::with_capacity(commands.len());
   let mut watch_targets = Vec::new();
-  let mut plan_is_parallel = options.parallel;
+  let mut plan_is_parallel = false;
 
   for command in commands {
     if !(options.quiet || context.octafile.quiet.unwrap_or(false)) {
@@ -572,55 +590,27 @@ async fn build_execute_items(
         )
         .await?;
     }
-    let mut builder = TaskGraphBuilder::new(context.plugin_manager.clone())?
-      .with_scope_allocator(context.scope_allocator.clone())
-      .with_output_overrides(options.quiet, options.silence, options.raw)
-      .with_variable_overrides(options.vars.clone());
-    if let Some(resolver) = &context.variable_resolver {
-      builder = builder.with_variable_resolver(resolver.clone());
-    }
-    let dag = builder
-      .build(
-        Arc::clone(&context.octafile),
-        command,
-        options.parallel,
-        options.task_args.clone(),
-      )
-      .await?;
+    let mut request = ExecutionRequest::new(command);
+    request.parallel = options.parallel;
+    request.dry = options.dry;
+    request.force = options.force;
+    request.failfast = options.failfast;
+    request.variables = options.vars.clone();
+    request.command_args = options.task_args.clone();
+    request.quiet = options.quiet;
+    request.silence = options.silence;
+    request.raw = options.raw;
+    let execution = engine.prepare(request).await?;
 
-    plan_is_parallel |= !dag.is_linear()?;
-
-    watch_targets.extend(dag.nodes().iter().filter_map(|node| node.watch_target()));
-
-    let executor = Executor::new(
-      context.plugin_manager.clone(),
-      dag,
-      ExecutorConfig {
-        // Top-level lifecycle is always produced. Human quiet mode is a renderer concern;
-        // machine output must retain complete run boundaries.
-        emit_run_events: true,
-        failfast: options.failfast,
-        concurrency: context.concurrency.clone(),
-        console: context.console.clone(),
-        run_id: None,
-        runtime_coordinator: context.runtime_coordinator.clone(),
-      },
-      None,
-      Arc::clone(&context.fingerprint),
-      options.dry,
-      options.force,
-      Some(context.summary.clone()),
-    )?;
-    tasks.push(ExecuteItem {
-      executor,
-      command: command.clone(),
-    });
+    plan_is_parallel |= options.parallel || !execution.is_linear();
+    watch_targets.extend_from_slice(execution.watch_targets());
+    tasks.push(execution);
   }
 
   let concurrency_is_one = context
     .concurrency
     .as_ref()
-    .is_some_and(|limiter| limiter.available_permits() == 1);
+    .is_some_and(|limiter| limiter.limit.get() == 1);
   context
     .console
     .set_parallel(plan_is_parallel && !options.raw && !concurrency_is_one)
@@ -1178,16 +1168,13 @@ mod tests {
     let configured = NonZeroUsize::new(2);
     let cli = NonZeroUsize::new(4);
 
+    assert_eq!(concurrency_limiter(None, None).map(|limiter| limiter.limit.get()), None);
     assert_eq!(
-      concurrency_limiter(None, None).map(|limit| limit.available_permits()),
-      None
-    );
-    assert_eq!(
-      concurrency_limiter(None, configured).map(|limit| limit.available_permits()),
+      concurrency_limiter(None, configured).map(|limiter| limiter.limit.get()),
       Some(2)
     );
     assert_eq!(
-      concurrency_limiter(cli, configured).map(|limit| limit.available_permits()),
+      concurrency_limiter(cli, configured).map(|limiter| limiter.limit.get()),
       Some(4)
     );
   }

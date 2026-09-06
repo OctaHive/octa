@@ -87,7 +87,7 @@ schema version change; those values are data, not protocol structure.
 JSON output cannot be combined with raw/PTY mode because terminal control bytes would corrupt the
 JSON Lines stream.
 
-## Terminal result for embedded callers
+## Embedded execution API
 
 Structured observation and presentation are separate. `Console::with_event_sink` accepts an
 `EventSink` alongside its `ConsoleRenderer`. The sink receives every fully sequenced
@@ -116,3 +116,14 @@ the run ID, a clonable `CancellationToken`, idempotent `cancel`, and `wait`/`can
 Dropping a live handle requests cooperative cancellation instead of detaching work silently. Use
 `start_with_token` when the execution must be a child of an application-owned cancellation tree;
 the handle owns a child token, so cancelling it never cancels its parent or sibling executions.
+
+Most applications should use `ExecutionEngine::start(ExecutionRequest)` instead. The engine owns
+the reusable execution dependencies and performs DAG construction before starting the executor.
+Its handle therefore covers both preparation and task execution. Cancellation or configuration
+failure during preparation still produces matching `RunStarted`/`RunFinished` events and a
+structured terminal `ExecutionResult`; infrastructure failures remain `ExecutorError` values.
+
+`ExecutionEngine::prepare` returns a `PreparedExecution` for callers such as the CLI that need to
+declare several plans in order, inspect watch targets, or choose batch presentation before any plan
+starts. Plugin discovery, plugin startup, and loading the `Octafile` are application bootstrap and
+remain outside individual execution requests.
