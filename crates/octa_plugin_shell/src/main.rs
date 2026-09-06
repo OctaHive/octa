@@ -26,6 +26,8 @@ use tokio_util::sync::CancellationToken;
 
 mod brush;
 mod coreutils;
+#[cfg(windows)]
+mod windows_job;
 
 struct ShellPlugin {
   coreutils: coreutils::Coreutils,
@@ -49,18 +51,14 @@ impl PtyChildGuard {
   }
 
   fn finished(&mut self) {
+    #[cfg(unix)]
+    brush::terminate_descendants(self.process_group);
     self.running = false;
   }
 
   fn terminate(&self) {
     #[cfg(unix)]
-    if let Some(process_group) = self.process_group {
-      use nix::{
-        sys::signal::{kill, Signal},
-        unistd::Pid,
-      };
-      let _ = kill(Pid::from_raw(-process_group), Signal::SIGTERM);
-    }
+    brush::terminate_descendants(self.process_group);
     let _ = self.child.lock().unwrap().kill();
   }
 }
@@ -144,9 +142,15 @@ async fn execute_raw_pty(
   let master = Some(pair.master);
   #[cfg(unix)]
   let process_group = master.as_ref().and_then(|master| master.process_group_leader());
-  let spawned = pair
-    .slave
-    .spawn_command(brush::pty_command(&command, &dir, envs, coreutils_path)?)?;
+  let command = brush::pty_command(&command, &dir, envs, coreutils_path)?;
+  #[cfg(windows)]
+  let (command, mut command_job) = {
+    let job = windows_job::CommandJob::create()?;
+    let mut command = command;
+    job.configure_pty_command(&mut command);
+    (command, Some(job))
+  };
+  let spawned = pair.slave.spawn_command(command)?;
   #[cfg(unix)]
   let mut child = PtyChildGuard::new(spawned, process_group);
   #[cfg(not(unix))]
@@ -219,6 +223,7 @@ async fn execute_raw_pty(
         pty_writer = None;
         #[cfg(windows)]
         {
+          drop(command_job.take());
           master_close = Some(close_pty_master(&mut master));
         }
       },
@@ -230,6 +235,7 @@ async fn execute_raw_pty(
           pty_writer = None;
           #[cfg(windows)]
           {
+            drop(command_job.take());
             master_close = Some(close_pty_master(&mut master));
           }
         }
@@ -352,7 +358,14 @@ impl Plugin for ShellPlugin {
     });
 
     let mut command = brush::command(&result, &dir, envs, self.coreutils.path())?;
+    #[cfg(windows)]
+    let command_job = {
+      let job = windows_job::CommandJob::create()?;
+      job.configure_tokio_command(&mut command);
+      job
+    };
     let mut child = command.spawn()?;
+    let process_group = brush::process_group(&child);
 
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
     let stderr = child.stderr.take().context("Failed to capture stderr")?;
@@ -360,17 +373,12 @@ impl Plugin for ShellPlugin {
     let tx_stdout = tx.clone();
     let tx_stderr = tx.clone();
 
-    let (tx_done, mut rx_done) = mpsc::channel::<()>(2);
-    let tx_done_stdout = tx_done.clone();
-    let tx_done_stderr = tx_done.clone();
-
     let stdout_handle = {
       let id = id.clone();
       let logger = logger.clone();
       let cancel_token = cancel_token.clone();
       tokio::spawn(async move {
         forward_output(stdout, id, true, tx_stdout, logger, cancel_token).await;
-        let _ = tx_done_stdout.send(()).await;
       })
     };
 
@@ -380,57 +388,30 @@ impl Plugin for ShellPlugin {
       let cancel_token = cancel_token.clone();
       tokio::spawn(async move {
         forward_output(stderr, id, false, tx_stderr, logger, cancel_token).await;
-        let _ = tx_done_stderr.send(()).await;
       })
     };
 
-    let wait_handle = {
-      let id = id.clone();
-      let tx = tx.clone();
-      let cancel_token = cancel_token.clone();
-      tokio::spawn(async move {
-        // Wait for both stdout and stderr to complete
-        let mut completed = 0;
-        while let Some(()) = rx_done.recv().await {
-          completed += 1;
-          if completed == 2 {
-            break;
-          }
-        }
-
-        tokio::select! {
-          status = child.wait() => {
-            if let Ok(status) = status {
-              let response = PluginResponse::ExitStatus {
-                id: id.clone(),
-                code: status.code().unwrap_or(-1),
-              };
-              let response_json = serde_json::to_string(&response).unwrap() + "\n";
-              let _ = tx.send(response_json.clone()).await;
-              let _ = logger.log(&response_json.to_string());
-            }
-          }
-          _ = cancel_token.cancelled() => {
-            brush::terminate(&mut child);
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-
-            let _ = child.kill().await;
-
-            let response = PluginResponse::ExitStatus {
-              id: id.clone(),
-              code: -1,
-            };
-            let response_json = serde_json::to_string(&response).unwrap() + "\n";
-            let _ = tx.send(response_json.clone()).await;
-            let _ = logger.log(&response_json.to_string());
-          }
-        }
-      })
+    let code = tokio::select! {
+      status = child.wait() => status?.code().unwrap_or(-1),
+      _ = cancel_token.cancelled() => {
+        brush::terminate(&mut child, process_group);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = child.kill().await;
+        -1
+      }
     };
+    brush::terminate_descendants(process_group);
+    // Closing the job after the command leader exits terminates background descendants and lets
+    // inherited stdout/stderr pipes reach EOF before the terminal response is sent.
+    #[cfg(windows)]
+    drop(command_job);
 
-    // Add type annotations for join
-    let _: (Result<(), _>, Result<(), _>, Result<(), _>) = tokio::join!(stdout_handle, stderr_handle, wait_handle);
+    let _: (Result<(), _>, Result<(), _>) = tokio::join!(stdout_handle, stderr_handle);
+
+    let response = PluginResponse::ExitStatus { id, code };
+    let response_json = serde_json::to_string(&response)? + "\n";
+    let _ = tx.send(response_json.clone()).await;
+    let _ = logger.log(&response_json);
 
     drop(tx);
     let _ = writer_handle.await;

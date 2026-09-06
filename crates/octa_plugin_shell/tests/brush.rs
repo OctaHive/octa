@@ -89,11 +89,30 @@ async fn normal_execution_streams_both_outputs_before_a_newline_or_exit() {
 }
 
 #[tokio::test]
+async fn successful_execution_terminates_background_descendants() {
+  let (manager, plugin_name) = plugin_manager();
+  manager.start_plugin(&plugin_name).await.unwrap();
+  let client = manager.get_client("shell").await.unwrap();
+  let execution = client
+    .start_execution(request("sleep 30 & printf done"), CancellationToken::new())
+    .await
+    .unwrap();
+
+  let (stdout, stderr, code) = tokio::time::timeout(Duration::from_secs(5), collect(execution))
+    .await
+    .expect("background descendant retained the command output pipes");
+  assert_eq!(stdout, "done");
+  assert!(stderr.is_empty());
+  assert_eq!(code, 0);
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
 async fn raw_execution_uses_a_pty_and_preserves_byte_output() {
   let (manager, plugin_name) = plugin_manager();
   manager.start_plugin(&plugin_name).await.unwrap();
   let client = manager.get_client("shell").await.unwrap();
-  let mut command = request("if [[ -t 1 ]]; then printf 'pty\\nraw'; else printf pipe; fi");
+  let mut command = request("sleep 30 & if [[ -t 1 ]]; then printf 'pty\\nraw'; else printf pipe; fi");
   command.raw = true;
   let execution = client.start_execution(command, CancellationToken::new()).await.unwrap();
   #[cfg(windows)]
@@ -147,7 +166,7 @@ async fn cancelling_raw_execution_terminates_the_pty_child() {
   let (manager, plugin_name) = plugin_manager();
   manager.start_plugin(&plugin_name).await.unwrap();
   let client = manager.get_client("shell").await.unwrap();
-  let mut command = request("while true; do :; done");
+  let mut command = request("sleep 30 & while true; do :; done");
   command.raw = true;
   let mut execution = client.start_execution(command, CancellationToken::new()).await.unwrap();
 
@@ -185,7 +204,7 @@ async fn cancels_an_isolated_brush_process() {
   manager.start_plugin(&plugin_name).await.unwrap();
   let client = manager.get_client("shell").await.unwrap();
   let mut execution = client
-    .start_execution(request("while true; do :; done"), CancellationToken::new())
+    .start_execution(request("sleep 30 & while true; do :; done"), CancellationToken::new())
     .await
     .unwrap();
 

@@ -64,6 +64,9 @@ pub(crate) async fn run_child() -> anyhow::Result<Option<u8>> {
     .into_string()
     .map_err(|_| anyhow::anyhow!("Brush command is not valid UTF-8"))?;
 
+  #[cfg(windows)]
+  crate::windows_job::CommandJob::join_inherited().context("Failed to join the command Job Object")?;
+
   let mut shell = Shell::builder()
     .default_builtins(BuiltinSet::BashMode)
     .profile(ProfileLoadBehavior::Skip)
@@ -123,27 +126,41 @@ fn configure_process(command: &mut tokio::process::Command) {
 }
 
 #[cfg(unix)]
-pub(crate) fn terminate(child: &mut tokio::process::Child) {
+pub(crate) fn process_group(child: &tokio::process::Child) -> Option<i32> {
+  child.id().map(|id| id as i32)
+}
+
+#[cfg(windows)]
+pub(crate) fn process_group(_child: &tokio::process::Child) -> Option<i32> {
+  None
+}
+
+#[cfg(unix)]
+pub(crate) fn terminate(_child: &mut tokio::process::Child, process_group: Option<i32>) {
   use nix::sys::signal::{kill, Signal};
   use nix::unistd::Pid;
 
-  if let Some(pid) = child.id() {
-    let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGTERM);
+  if let Some(process_group) = process_group {
+    let _ = kill(Pid::from_raw(-process_group), Signal::SIGTERM);
   }
 }
 
 #[cfg(windows)]
-pub(crate) fn terminate(child: &mut tokio::process::Child) {
-  use windows_sys::Win32::Foundation::CloseHandle;
-  use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+pub(crate) fn terminate(child: &mut tokio::process::Child, _process_group: Option<i32>) {
+  let _ = child.start_kill();
+}
 
-  if let Some(pid) = child.id() {
-    unsafe {
-      let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-      if !handle.is_null() {
-        TerminateProcess(handle, 1);
-        CloseHandle(handle);
-      }
-    }
+/// Removes descendants that outlive the isolated shell leader and could retain its output pipes.
+pub(crate) fn terminate_descendants(process_group: Option<i32>) {
+  #[cfg(unix)]
+  if let Some(process_group) = process_group {
+    use nix::{
+      sys::signal::{kill, Signal},
+      unistd::Pid,
+    };
+    let _ = kill(Pid::from_raw(-process_group), Signal::SIGKILL);
   }
+
+  #[cfg(windows)]
+  let _ = process_group;
 }

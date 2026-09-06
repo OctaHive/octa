@@ -285,6 +285,10 @@ Octa cancels one command without shutting down the plugin:
 
 The plugin should stop the command and still send `ExitStatus` or `Error`. The SDK exposes a
 command-scoped `CancellationToken` and waits for the terminal response with a bounded timeout.
+On Windows, the built-in shell plugin places each command tree in a Job Object configured with
+kill-on-close. This provides forced cleanup of command descendants when cooperative cancellation
+does not terminate them itself. Other plugins remain responsible for the processes they launch.
+Unix shell commands continue to use process groups.
 
 ## Shutdown
 
