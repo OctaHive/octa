@@ -73,6 +73,7 @@ async fn invocation_nodes_resolve_required_variables_once() {
     HashSet::new(),
     Some(resolver.clone()),
   ));
+  assert!(format!("{invocation:?}").contains("initialized: false"));
   let make_task = |id: &str| {
     TaskNode::new(
       TaskConfig::builder()
@@ -105,6 +106,7 @@ async fn invocation_nodes_resolve_required_variables_once() {
     Some(&Value::String("resolved".to_owned()))
   );
   assert_eq!(resolver.0.load(Ordering::SeqCst), 1);
+  assert!(format!("{invocation:?}").contains("initialized: true"));
 }
 
 // Helper function to create a test TaskNode

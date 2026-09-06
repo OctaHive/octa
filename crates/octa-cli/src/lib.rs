@@ -329,11 +329,11 @@ impl TerminalVariableResolver {
       .interact_text()
       .map_err(|error| error.to_string())
   }
-}
 
-#[async_trait]
-impl VariableResolver for TerminalVariableResolver {
-  async fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String> {
+  async fn resolve_with<R>(&self, prompt: &VariablePrompt, read: R) -> Result<String, String>
+  where
+    R: FnOnce(VariablePrompt) -> Result<String, String> + Send + 'static,
+  {
     if let Some(value) = self.values.lock().await.get(prompt).cloned() {
       return Ok(value);
     }
@@ -345,11 +345,18 @@ impl VariableResolver for TerminalVariableResolver {
 
     let prompt_key = prompt.clone();
     let dialog_prompt = prompt.clone();
-    let value = tokio::task::spawn_blocking(move || Self::read(&dialog_prompt))
+    let value = tokio::task::spawn_blocking(move || read(dialog_prompt))
       .await
       .map_err(|error| error.to_string())??;
     self.values.lock().await.insert(prompt_key, value.clone());
     Ok(value)
+  }
+}
+
+#[async_trait]
+impl VariableResolver for TerminalVariableResolver {
+  async fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String> {
+    self.resolve_with(prompt, |prompt| Self::read(&prompt)).await
   }
 }
 
@@ -1052,7 +1059,10 @@ mod tests {
   use std::fs::{self, File};
   use std::io::Write;
   use std::path::PathBuf;
-  use std::sync::Mutex as StdMutex;
+  use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Mutex as StdMutex,
+  };
   use tempfile::TempDir;
 
   #[derive(Clone)]
@@ -1207,6 +1217,65 @@ mod tests {
       ..prompt
     };
     assert!(!resolver.values.lock().await.contains_key(&constrained));
+  }
+
+  #[tokio::test]
+  async fn terminal_variable_resolver_serializes_and_caches_prompts() {
+    fn reader(
+      calls: Arc<AtomicUsize>,
+      value: &'static str,
+    ) -> impl FnOnce(VariablePrompt) -> Result<String, String> + Send + 'static {
+      move |_| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        Ok(value.to_owned())
+      }
+    }
+
+    let prompt = VariablePrompt {
+      name: "PROFILE".to_owned(),
+      question: "Select profile".to_owned(),
+      enum_values: None,
+      secret: false,
+    };
+    let resolver = Arc::new(TerminalVariableResolver::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let (first, second) = tokio::join!(
+      resolver.resolve_with(&prompt, reader(calls.clone(), "development")),
+      resolver.resolve_with(&prompt, reader(calls.clone(), "production")),
+    );
+
+    assert_eq!(first.unwrap(), "development");
+    assert_eq!(second.unwrap(), "development");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let terminal_prompt = VariablePrompt {
+      name: "TERMINAL".to_owned(),
+      enum_values: Some(Vec::new()),
+      ..prompt.clone()
+    };
+    assert!(resolver.resolve(&terminal_prompt).await.is_err());
+
+    let failed_prompt = VariablePrompt {
+      name: "FAILED".to_owned(),
+      ..prompt
+    };
+    assert_eq!(
+      resolver
+        .resolve_with(&failed_prompt, |_| Err("input failed".to_owned()))
+        .await,
+      Err("input failed".to_owned())
+    );
+
+    let panicked_prompt = VariablePrompt {
+      name: "PANICKED".to_owned(),
+      ..failed_prompt
+    };
+    let error = resolver
+      .resolve_with(&panicked_prompt, |_| panic!("prompt reader panicked"))
+      .await
+      .unwrap_err();
+    assert!(error.contains("prompt reader panicked"));
   }
 
   #[test]

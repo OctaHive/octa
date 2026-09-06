@@ -83,6 +83,20 @@ async fn test_task_graph_builder_new() -> ExecutorResult<()> {
   assert!(builder.command_args.is_empty());
   assert!(builder.variable_overrides.is_empty());
   assert!(builder.variable_resolver.is_some());
+  assert_eq!(
+    builder
+      .variable_resolver
+      .as_ref()
+      .unwrap()
+      .resolve(&VariablePrompt {
+        name: "TEST".to_owned(),
+        question: "Test".to_owned(),
+        enum_values: None,
+        secret: false,
+      })
+      .await,
+    Ok("value".to_owned())
+  );
   assert_eq!(builder.source_strategies.resolve(&SourceMethod::Hash)?.key(), "test");
   assert!(builder.dir.exists());
   Ok(())
@@ -832,16 +846,22 @@ async fn test_dotenv_layers_and_search() -> ExecutorResult<()> {
   let command = builder.find_and_filter_commands(&octafile, "test")?.remove(0);
   let mut vars = builder.collect_vars_with_identity(&command, None)?.runtime;
   vars.expand(false).await?;
-  let envs = builder
-    .collect_environment_plan(&command, None)?
-    .resolve(&vars, None, false, CancellationToken::new())
-    .await?;
+  let plan = builder
+    .collect_environment_plan(
+      &command,
+      Some(HashMap::from([(
+        "TASK_VALUE".to_owned(),
+        octa_octafile::EnvValue::String("execute".to_owned()),
+      )])),
+    )
+    .unwrap();
+  let envs = plan.resolve(&vars, None, false, CancellationToken::new()).await?;
 
   assert_eq!(envs.get("ROOT_PRIORITY"), Some(&"first".to_string()));
   assert_eq!(envs.get("ROOT_DOTENV"), Some(&"loaded".to_string()));
   assert_eq!(envs.get("EXPLICIT_ROOT"), Some(&"root".to_string()));
   assert_eq!(envs.get("TASK_DOTENV"), Some(&"searched".to_string()));
-  assert_eq!(envs.get("TASK_VALUE"), Some(&"explicit".to_string()));
+  assert_eq!(envs.get("TASK_VALUE"), Some(&"execute".to_string()));
   Ok(())
 }
 

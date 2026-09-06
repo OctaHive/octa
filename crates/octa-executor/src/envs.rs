@@ -598,6 +598,33 @@ mod tests {
   }
 
   #[test]
+  fn environment_plan_debug_is_structural_and_empty_extensions_are_ignored() {
+    let mut plan = EnvironmentPlan::default();
+    plan.extend_last(HashMap::from([(
+      "IGNORED".to_owned(),
+      EnvValue::String("secret-value".to_owned()),
+    )]));
+    plan.push_layer(
+      Some(HashMap::from([(
+        "TOKEN".to_owned(),
+        EnvValue::String("secret-value".to_owned()),
+      )])),
+      ".",
+      None,
+    );
+    plan.extend_last(HashMap::from([(
+      "PROFILE".to_owned(),
+      EnvValue::String("development".to_owned()),
+    )]));
+
+    let debug = format!("{plan:?}");
+    assert_eq!(debug, "EnvironmentPlan { layers: 1 }");
+    assert!(!debug.contains("secret-value"));
+    let configured = plan.configured_envs();
+    assert_eq!(configured.get("PROFILE"), Some(&"development".to_owned()));
+  }
+
+  #[test]
   fn test_with_parent() {
     let parent = Envs::new();
     let envs = Envs::with_parent(parent);
