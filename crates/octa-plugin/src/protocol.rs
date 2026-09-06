@@ -62,6 +62,8 @@ pub enum OctaCommand {
   Hello(Version),
   Schema,
   Execute {
+    /// Host-assigned identity echoed by every response for this command.
+    id: String,
     params: String,
     args: Vec<String>,
     dir: PathBuf,
@@ -234,13 +236,14 @@ mod tests {
   }
 
   #[test]
-  fn execute_without_secret_vars_is_backward_compatible() {
+  fn execute_defaults_optional_fields_without_changing_the_host_id() {
     let command: OctaCommand = serde_json::from_str(
-      r#"{"type":"Execute","payload":{"params":"echo","args":[],"dir":".","envs":{},"vars":{},"dry":false}}"#,
+      r#"{"type":"Execute","payload":{"id":"host-command","params":"echo","args":[],"dir":".","envs":{},"vars":{},"dry":false}}"#,
     )
     .unwrap();
 
     let OctaCommand::Execute {
+      id,
       secret_vars,
       redact_params,
       raw,
@@ -249,8 +252,18 @@ mod tests {
     else {
       panic!("expected execute command");
     };
+    assert_eq!(id, "host-command");
     assert!(secret_vars.is_empty());
     assert!(!redact_params);
     assert!(!raw);
+  }
+
+  #[test]
+  fn execute_requires_a_host_assigned_id() {
+    let command = serde_json::from_str::<OctaCommand>(
+      r#"{"type":"Execute","payload":{"params":"echo","args":[],"dir":".","envs":{},"vars":{},"dry":false}}"#,
+    );
+
+    assert!(command.is_err());
   }
 }

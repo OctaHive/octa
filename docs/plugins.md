@@ -16,6 +16,16 @@ This private engine-to-plugin transport is distinct from Octa's public
 [runtime event stream](events.md). Plugin command IDs are translated into stable plan-level step IDs
 when events are emitted; event consumers do not need to implement or observe this protocol.
 
+## Host-side process launch
+
+`PluginManager::new` uses `LocalPluginLauncher`. Embedded hosts can instead call
+`PluginManager::with_launcher` with an explicit workspace and their own `PluginLauncher`. A launcher
+receives a fully resolved executable, arguments, environment additions, workspace, and socket path
+in a `PluginLaunchRequest`, then
+returns a `PluginProcess` exposing lifecycle control plus stdout and stderr. This keeps local Tokio
+process construction and platform flags outside plugin discovery, handshake, and registry logic.
+Launchers add their transport-specific socket argument but do not reinterpret script types.
+
 ## Lifecycle
 
 A plugin connection has three phases:
@@ -109,6 +119,7 @@ Octa sends an `Execute` request:
 {
   "type": "Execute",
   "payload": {
+    "id": "9e16d0f3-8aba-4d16-a765-755f627b65dc",
     "params": "cargo test",
     "args": ["--release"],
     "dir": "/workspace/project",
@@ -124,6 +135,7 @@ Octa sends an `Execute` request:
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
+| `id` | string | required | Host-assigned command identity; copy it unchanged into every response |
 | `params` | string | required | Plugin value; structured values arrive as compact JSON text |
 | `args` | string array | required | Arguments passed to the selected Octa task |
 | `dir` | path string | required | Effective task working directory |
@@ -134,15 +146,15 @@ Octa sends an `Execute` request:
 | `raw` | boolean | `false` | Request byte-oriented interactive execution |
 | `dry` | boolean | required | Describe/validate work without applying normal side effects |
 
-The SDK assigns a command ID and must acknowledge the request before emitting command output:
+The plugin must acknowledge the host-assigned command ID before emitting command output:
 
 ```json
 {"type":"Started","payload":{"id":"9e16d0f3-8aba-4d16-a765-755f627b65dc"}}
 ```
 
-`Execute` does not contain a client-generated ID. Consequently, when requests arrive concurrently,
-the plugin must send `Started` acknowledgements in the same order as the corresponding `Execute`
-requests. Once acknowledged, messages for different command IDs may be interleaved freely.
+Because each `Execute` already contains its identity, concurrent `Started` acknowledgements and
+later messages may be interleaved freely. A plugin must not replace the ID or reuse it for another
+command.
 
 Plugin implementations must therefore be concurrency-safe. The SDK starts each command in its own
 task and routes later control messages by command ID.

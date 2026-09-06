@@ -2345,16 +2345,15 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "uuid",
 ]
 
 [[package]]
 name = "octa-plugin-manager"
 version = "0.3.0"
 dependencies = [
+ "async-trait",
  "interprocess",
  "jsonschema",
- "nix 0.31.3",
  "octa-plugin",
  "semver",
  "serde",
@@ -2364,7 +2363,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

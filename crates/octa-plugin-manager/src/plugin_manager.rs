@@ -2,26 +2,27 @@ use octa_plugin::protocol::Schema;
 use octa_plugin::socket::{interpret_local_socket_name, make_local_socket_name};
 use std::ffi::OsString;
 use std::{
-  collections::{HashMap, HashSet},
-  path::PathBuf,
-  process::Stdio,
+  collections::{HashMap, HashSet, VecDeque},
+  path::{Path, PathBuf},
   sync::{Arc, Mutex as StdMutex},
 };
 use thiserror::Error;
 use tokio::io::{self, AsyncReadExt};
-use tokio::process::Command;
 use tokio::{
-  process::Child,
   sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
   task::JoinHandle,
   time::{timeout, Duration},
 };
 use uuid::Uuid;
 
-use crate::plugin_client::PluginClient;
+use crate::{
+  plugin_client::PluginClient,
+  plugin_process::{LocalPluginLauncher, PluginLaunchError, PluginLaunchRequest, PluginLauncher, PluginProcess},
+};
 
 const PLUGIN_START_TIMEOUT: Duration = Duration::from_secs(5);
 const PROCESS_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+const STARTUP_DIAGNOSTIC_LIMIT: usize = 64 * 1024;
 
 #[derive(Error, Debug)]
 pub enum PluginManagerError {
@@ -46,6 +47,9 @@ pub enum PluginManagerError {
   #[error("IO error: {0}")]
   Io(#[from] std::io::Error),
 
+  #[error(transparent)]
+  Launch(#[from] PluginLaunchError),
+
   #[error("Socket path error: {0}")]
   SocketPath(String),
 
@@ -56,7 +60,7 @@ pub enum PluginManagerError {
 type Result<T> = std::result::Result<T, PluginManagerError>;
 
 struct PluginInstance {
-  process: Child,
+  process: PluginProcess,
   socket_path: OsString,
   client: PluginClient,
 }
@@ -158,6 +162,8 @@ impl PluginRegistry {
 
 pub struct PluginManager {
   plugins_dir: PathBuf,
+  workspace: PathBuf,
+  launcher: Arc<dyn PluginLauncher>,
   active_plugins: Arc<Mutex<HashMap<String, PluginInstance>>>,
   plugin_registry: Arc<Mutex<PluginRegistry>>,
   starting_plugins: Arc<StdMutex<HashSet<String>>>,
@@ -171,9 +177,37 @@ pub enum PluginExecutionGuard {
 }
 
 impl PluginManager {
+  /// Creates a local plugin manager and captures the current directory as its workspace.
+  /// Embedded hosts serving multiple workspaces should use [`Self::with_workspace`].
   pub fn new(plugins_dir: impl Into<PathBuf>) -> Self {
+    Self::with_workspace(
+      plugins_dir,
+      std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    )
+  }
+
+  /// Creates a local plugin manager rooted in an explicit workspace.
+  pub fn with_workspace(plugins_dir: impl Into<PathBuf>, workspace: impl Into<PathBuf>) -> Self {
+    Self::with_launcher(plugins_dir, workspace, Arc::new(LocalPluginLauncher))
+  }
+
+  /// Creates a manager with an explicit workspace and application-owned process launcher.
+  pub fn with_launcher(
+    plugins_dir: impl Into<PathBuf>,
+    workspace: impl Into<PathBuf>,
+    launcher: Arc<dyn PluginLauncher>,
+  ) -> Self {
+    let workspace = workspace.into();
+    let plugins_dir = plugins_dir.into();
+    let plugins_dir = if plugins_dir.is_absolute() {
+      plugins_dir
+    } else {
+      workspace.join(plugins_dir)
+    };
     Self {
-      plugins_dir: plugins_dir.into(),
+      plugins_dir,
+      workspace,
+      launcher,
       active_plugins: Arc::new(Mutex::new(HashMap::new())),
       plugin_registry: Arc::new(Mutex::new(PluginRegistry::default())),
       starting_plugins: Arc::new(StdMutex::new(HashSet::new())),
@@ -208,13 +242,45 @@ impl PluginManager {
     })
   }
 
-  async fn read_stream_to_string<R>(mut stream: R) -> io::Result<String>
+  async fn read_stream_tail<R>(mut stream: R) -> io::Result<String>
   where
     R: tokio::io::AsyncRead + Unpin,
   {
-    let mut buffer = String::new();
-    stream.read_to_string(&mut buffer).await?;
-    Ok(buffer)
+    let mut buffer = [0; 8 * 1024];
+    let mut tail = VecDeque::with_capacity(STARTUP_DIAGNOSTIC_LIMIT);
+    let mut truncated = false;
+
+    loop {
+      let count = stream.read(&mut buffer).await?;
+      if count == 0 {
+        break;
+      }
+      let overflow = tail
+        .len()
+        .saturating_add(count)
+        .saturating_sub(STARTUP_DIAGNOSTIC_LIMIT);
+      if overflow > 0 {
+        tail.drain(..overflow);
+        truncated = true;
+      }
+      tail.extend(&buffer[..count]);
+    }
+
+    let bytes = tail.into_iter().collect::<Vec<_>>();
+    let output = String::from_utf8_lossy(&bytes);
+    if truncated {
+      Ok(format!("[earlier plugin output truncated]\n{output}"))
+    } else {
+      Ok(output.into_owned())
+    }
+  }
+
+  fn resolve_plugin_command(plugin_path: &Path) -> (PathBuf, Vec<OsString>) {
+    if plugin_path.extension().and_then(|extension| extension.to_str()) == Some("py") {
+      (PathBuf::from("python3"), vec![plugin_path.as_os_str().to_owned()])
+    } else {
+      (plugin_path.to_owned(), Vec::new())
+    }
   }
 
   async fn collect_startup_output(handle: JoinHandle<io::Result<String>>) -> String {
@@ -227,7 +293,7 @@ impl PluginManager {
   }
 
   async fn cleanup_failed_start(
-    process: &mut Child,
+    process: &mut PluginProcess,
     socket_path: &OsString,
     stdout_handle: JoinHandle<io::Result<String>>,
     stderr_handle: JoinHandle<io::Result<String>>,
@@ -291,22 +357,28 @@ impl PluginManager {
     let socket_name =
       interpret_local_socket_name(&socket_path).map_err(|e| PluginManagerError::SocketPath(e.to_string()))?;
 
-    let mut command = self.setup_command(plugin_full_path.clone(), socket_path.clone());
-    let mut process = command.spawn()?;
+    let (executable, arguments) = Self::resolve_plugin_command(&plugin_full_path);
+    let mut process = self
+      .launcher
+      .launch(PluginLaunchRequest {
+        executable,
+        arguments,
+        environment: HashMap::new(),
+        workspace: self.workspace.clone(),
+        socket_path: PathBuf::from(&socket_path),
+      })
+      .await?;
 
     let stdout = process
-      .stdout
-      .take()
+      .take_stdout()
       .ok_or_else(|| PluginManagerError::PipeError("Failed to capture stdout".to_string()))?;
     let stderr = process
-      .stderr
-      .take()
+      .take_stderr()
       .ok_or_else(|| PluginManagerError::PipeError("Failed to capture stderr".to_string()))?;
 
-    // Spawn tasks to collect stdout and stderr
-    // We need it if we get error
-    let stdout_handle = tokio::spawn(Self::read_stream_to_string(stdout));
-    let stderr_handle = tokio::spawn(Self::read_stream_to_string(stderr));
+    // Keep both pipes drained for the plugin lifetime while retaining only a bounded diagnostic tail.
+    let stdout_handle = tokio::spawn(Self::read_stream_tail(stdout));
+    let stderr_handle = tokio::spawn(Self::read_stream_tail(stderr));
 
     let startup = timeout(PLUGIN_START_TIMEOUT, async {
       let client = PluginClient::connect(&socket_name)
@@ -388,51 +460,6 @@ impl PluginManager {
   /// Resolves an execution capability independently of a plugin's task key.
   pub async fn resolve_capability(&self, capability: &str) -> Option<PluginRegistration> {
     self.plugin_registry.lock().await.capabilities.get(capability).cloned()
-  }
-
-  /// Platform-specific command setup for Unix
-  #[cfg(not(windows))]
-  fn setup_command(&self, plugin_path: PathBuf, socket_path: OsString) -> Command {
-    let mut command = self.get_command(plugin_path);
-
-    command
-      .args(["--socket-path", socket_path.to_str().unwrap()])
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .kill_on_drop(true)
-      .process_group(0);
-    command
-  }
-
-  /// Platform-specific command setup for Windows
-  #[cfg(windows)]
-  fn setup_command(&self, plugin_path: PathBuf, socket_path: OsString) -> Command {
-    #[allow(unused_imports)]
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
-    const DETACHED_PROCESS: u32 = 0x00000008;
-
-    let mut command = self.get_command(plugin_path);
-    command
-      .args(["--socket-path", socket_path.to_str().unwrap()])
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
-      .kill_on_drop(true)
-      .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | DETACHED_PROCESS);
-    command
-  }
-
-  fn get_command(&self, plugin_path: PathBuf) -> Command {
-    match plugin_path.extension().and_then(|e| e.to_str()) {
-      Some("py") => {
-        let mut cmd = Command::new("python3");
-        cmd.arg(plugin_path);
-        cmd
-      },
-      _ => Command::new(plugin_path),
-    }
   }
 
   /// Clones a connected client without holding the manager lifecycle lock during execution.
@@ -548,6 +575,8 @@ impl Drop for PluginManager {
 mod tests {
   use std::collections::HashSet;
 
+  use async_trait::async_trait;
+
   use super::*;
   use crate::plugin_client::PluginExecutionRequest;
   use octa_plugin::protocol::PluginResponse;
@@ -557,6 +586,22 @@ mod tests {
   use tokio_util::sync::CancellationToken;
 
   const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+  #[derive(Default)]
+  struct RecordingLauncher {
+    request: StdMutex<Option<PluginLaunchRequest>>,
+  }
+
+  #[async_trait]
+  impl PluginLauncher for RecordingLauncher {
+    async fn launch(&self, request: PluginLaunchRequest) -> std::result::Result<PluginProcess, PluginLaunchError> {
+      *self.request.lock().unwrap() = Some(request);
+      Err(PluginLaunchError::Io(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "launch rejected by test",
+      )))
+    }
+  }
 
   struct TestSetup {
     plugin_manager: PluginManager,
@@ -587,6 +632,73 @@ mod tests {
       .collect::<HashSet<_>>();
 
     assert_eq!(paths.len(), 1_000);
+  }
+
+  #[tokio::test]
+  async fn delegates_process_creation_to_the_configured_launcher() {
+    let directory = TempDir::new().unwrap();
+    let workspace = directory.path().join("workspace");
+    let executable = directory.path().join("custom-plugin");
+    fs::write(&executable, b"plugin").await.unwrap();
+    let launcher = Arc::new(RecordingLauncher::default());
+    let manager = PluginManager::with_launcher(directory.path(), &workspace, launcher.clone());
+
+    let error = manager.start_plugin("custom-plugin").await.unwrap_err();
+
+    assert!(matches!(error, PluginManagerError::Launch(PluginLaunchError::Io(_))));
+    let request = launcher.request.lock().unwrap().take().unwrap();
+    assert_eq!(request.executable, executable);
+    assert!(request.arguments.is_empty());
+    assert!(request.environment.is_empty());
+    assert_eq!(request.workspace, workspace);
+    assert!(request
+      .socket_path
+      .file_name()
+      .unwrap()
+      .to_string_lossy()
+      .starts_with("octa."));
+  }
+
+  #[test]
+  fn resolves_script_interpreters_before_launch() {
+    let python = PathBuf::from("plugin.py");
+    let (executable, arguments) = PluginManager::resolve_plugin_command(&python);
+    assert_eq!(executable, PathBuf::from("python3"));
+    assert_eq!(arguments, [python.into_os_string()]);
+
+    let native = PathBuf::from("octa_plugin_shell");
+    let (executable, arguments) = PluginManager::resolve_plugin_command(&native);
+    assert_eq!(executable, native);
+    assert!(arguments.is_empty());
+  }
+
+  #[tokio::test]
+  async fn retains_only_the_tail_of_plugin_diagnostics() {
+    let (mut writer, reader) = tokio::io::duplex(STARTUP_DIAGNOSTIC_LIMIT * 2);
+    let mut input = vec![b'a'; STARTUP_DIAGNOSTIC_LIMIT];
+    input.extend(vec![b'b'; STARTUP_DIAGNOSTIC_LIMIT]);
+    let write = tokio::spawn(async move {
+      tokio::io::AsyncWriteExt::write_all(&mut writer, &input).await.unwrap();
+    });
+
+    let output = PluginManager::read_stream_tail(reader).await.unwrap();
+
+    write.await.unwrap();
+    assert!(output.starts_with("[earlier plugin output truncated]\n"));
+    let tail = output.split_once('\n').unwrap().1.as_bytes();
+    assert_eq!(tail.len(), STARTUP_DIAGNOSTIC_LIMIT);
+    assert!(tail.iter().all(|byte| *byte == b'b'));
+  }
+
+  #[tokio::test]
+  async fn preserves_short_plugin_diagnostics_without_a_marker() {
+    let (mut writer, reader) = tokio::io::duplex(16);
+    tokio::io::AsyncWriteExt::write_all(&mut writer, b"diagnostic")
+      .await
+      .unwrap();
+    drop(writer);
+
+    assert_eq!(PluginManager::read_stream_tail(reader).await.unwrap(), "diagnostic");
   }
 
   #[test]
@@ -746,7 +858,8 @@ mod tests {
       .await
       .unwrap();
 
-    assert_eq!(execution.id(), "test-execution-id");
+    let execution_id = execution.id().to_owned();
+    assert!(Uuid::parse_str(&execution_id).is_ok());
 
     // Receive output
     let mut received_stdout = false;
@@ -755,12 +868,12 @@ mod tests {
     while let Ok(Some(response)) = execution.receive_output(&cancel_token).await {
       match response {
         PluginResponse::Stdout { id, line } => {
-          assert_eq!(id, "test-execution-id");
+          assert_eq!(id, execution_id);
           assert_eq!(line, "test output");
           received_stdout = true;
         },
         PluginResponse::ExitStatus { id, code } => {
-          assert_eq!(id, "test-execution-id");
+          assert_eq!(id, execution_id);
           assert_eq!(code, 0);
           received_exit = true;
           break;

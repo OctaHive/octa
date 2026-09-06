@@ -1,5 +1,5 @@
 use std::{
-  collections::{HashMap, VecDeque},
+  collections::HashMap,
   io,
   path::PathBuf,
   sync::{Arc, Weak},
@@ -14,12 +14,14 @@ use tokio::{
   sync::{mpsc, oneshot, watch, Mutex},
 };
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use octa_plugin::protocol::{OctaCommand, PluginResponse, ProgressUpdate, Schema, Version};
 
 const CONTROL_RESPONSE_CAPACITY: usize = 16;
 const COMMAND_RESPONSE_CAPACITY: usize = 32;
 const MAX_PLUGIN_FRAME_BYTES: usize = 1024 * 1024;
+const CANCELLED_ROUTE_TTL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum PluginClientError {
@@ -94,7 +96,6 @@ pub struct PluginClient {
 struct PluginClientInner {
   writer: Mutex<Option<WriteHalf<TokioStream>>>,
   control_rx: Mutex<mpsc::Receiver<PluginResponse>>,
-  pending_starts: Mutex<VecDeque<oneshot::Sender<Result<PluginExecution, PluginClientError>>>>,
   commands: Mutex<HashMap<String, CommandRoute>>,
   shutdown_signal: CancellationToken,
   connection_closed: CancellationToken,
@@ -102,10 +103,18 @@ struct PluginClientInner {
 
 #[derive(Debug)]
 struct CommandRoute {
+  state: CommandRouteState,
   sender: Option<mpsc::Sender<PluginResponse>>,
   progress: watch::Sender<Option<ProgressUpdate>>,
   overflowed: CancellationToken,
   completed: CancellationToken,
+}
+
+#[derive(Debug)]
+enum CommandRouteState {
+  AwaitingStart(oneshot::Sender<Result<(), PluginClientError>>),
+  Running,
+  Cancelled,
 }
 
 impl Drop for PluginClient {
@@ -251,7 +260,6 @@ impl PluginClient {
     let inner = Arc::new(PluginClientInner {
       writer: Mutex::new(Some(writer)),
       control_rx: Mutex::new(control_rx),
-      pending_starts: Mutex::new(VecDeque::new()),
       commands: Mutex::new(HashMap::new()),
       shutdown_signal: CancellationToken::new(),
       connection_closed: CancellationToken::new(),
@@ -362,10 +370,12 @@ impl PluginClient {
 
       if let Some(inner) = inner.upgrade() {
         inner.connection_closed.cancel();
-        for pending in inner.pending_starts.lock().await.drain(..) {
-          let _ = pending.send(Err(PluginClientError::ConnectionClosed));
+        for (_, route) in inner.commands.lock().await.drain() {
+          route.completed.cancel();
+          if let CommandRouteState::AwaitingStart(pending) = route.state {
+            let _ = pending.send(Err(PluginClientError::ConnectionClosed));
+          }
         }
-        inner.commands.lock().await.clear();
       }
     });
   }
@@ -376,41 +386,53 @@ impl PluginClient {
     response: PluginResponse,
   ) -> bool {
     if let PluginResponse::Started { id } = &response {
-      let Some(pending) = inner.pending_starts.lock().await.pop_front() else {
-        return true;
+      let pending = {
+        let mut commands = inner.commands.lock().await;
+        let Some(route) = commands.get_mut(id) else {
+          drop(commands);
+          return Self::fail_protocol(inner, format!("Plugin acknowledged unknown command '{id}'")).await;
+        };
+        match std::mem::replace(&mut route.state, CommandRouteState::Running) {
+          CommandRouteState::AwaitingStart(pending) => Some(pending),
+          CommandRouteState::Cancelled => {
+            route.state = CommandRouteState::Cancelled;
+            None
+          },
+          CommandRouteState::Running => {
+            drop(commands);
+            return Self::fail_protocol(inner, format!("Plugin acknowledged command '{id}' more than once")).await;
+          },
+        }
       };
-      let (response_tx, response_rx) = mpsc::channel(COMMAND_RESPONSE_CAPACITY);
-      let (progress_tx, progress_rx) = watch::channel(None);
-      let overflowed = CancellationToken::new();
-      let completed = CancellationToken::new();
-      inner.commands.lock().await.insert(
-        id.clone(),
-        CommandRoute {
-          sender: Some(response_tx),
-          progress: progress_tx,
-          overflowed: overflowed.clone(),
-          completed: completed.clone(),
-        },
-      );
-      let execution = PluginExecution {
-        id: id.clone(),
-        response_rx,
-        progress_rx,
-        overflowed,
-        completed,
-        client: PluginClient { inner: inner.clone() },
-      };
-      if let Err(Ok(mut execution)) = pending.send(Ok(execution)) {
+
+      if pending.is_some_and(|pending| pending.send(Ok(())).is_err()) {
+        let client = PluginClient { inner: inner.clone() };
+        let id = id.clone();
         tokio::spawn(async move {
-          let _ = execution.cancel_and_wait().await;
+          client.mark_cancelled(&id).await;
+          let _ = client.send(&OctaCommand::Cancel { id }).await;
         });
       }
       return true;
     }
 
     if let PluginResponse::Progress { id, progress } = response {
-      if let Some(route) = inner.commands.lock().await.get(&id) {
-        route.progress.send_replace(Some(progress));
+      let mut commands = inner.commands.lock().await;
+      if let Some(route) = commands.get_mut(&id) {
+        match route.state {
+          CommandRouteState::Running => {
+            route.progress.send_replace(Some(progress));
+          },
+          CommandRouteState::Cancelled => {},
+          CommandRouteState::AwaitingStart(_) => {
+            drop(commands);
+            return Self::fail_protocol(
+              inner,
+              format!("Plugin sent progress before acknowledging command '{id}'"),
+            )
+            .await;
+          },
+        }
       }
       return true;
     }
@@ -429,35 +451,52 @@ impl PluginClient {
       if terminal {
         if let Some(mut route) = commands.remove(&id) {
           route.completed.cancel();
-          if let Some(sender) = route.sender.take() {
-            if sender.try_send(response).is_err() {
-              route.overflowed.cancel();
-            }
+          match route.state {
+            CommandRouteState::AwaitingStart(pending) => {
+              let error = match response {
+                PluginResponse::Error { message, .. } => PluginClientError::Protocol(message),
+                _ => PluginClientError::Protocol(format!("Plugin completed command '{id}' before acknowledging it")),
+              };
+              let _ = pending.send(Err(error));
+            },
+            CommandRouteState::Running => {
+              if let Some(sender) = route.sender.take() {
+                if sender.try_send(response).is_err() {
+                  route.overflowed.cancel();
+                }
+              }
+            },
+            CommandRouteState::Cancelled => {},
           }
           return true;
         }
       } else if let Some(route) = commands.get_mut(&id) {
-        if let Some(sender) = &route.sender {
-          match sender.try_send(response) {
-            Ok(()) => {},
-            Err(mpsc::error::TrySendError::Full(_)) => {
-              route.sender.take();
-              route.overflowed.cancel();
-            },
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-              route.sender.take();
-            },
-          }
+        match route.state {
+          CommandRouteState::Running => {
+            if let Some(sender) = &route.sender {
+              match sender.try_send(response) {
+                Ok(()) => {},
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                  route.sender.take();
+                  route.overflowed.cancel();
+                },
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                  route.sender.take();
+                },
+              }
+            }
+          },
+          CommandRouteState::Cancelled => {},
+          CommandRouteState::AwaitingStart(_) => {
+            drop(commands);
+            return Self::fail_protocol(inner, format!("Plugin sent output before acknowledging command '{id}'")).await;
+          },
         }
         return true;
       }
       drop(commands);
 
-      if let PluginResponse::Error { message, .. } = &response {
-        if let Some(pending) = inner.pending_starts.lock().await.pop_front() {
-          let _ = pending.send(Err(PluginClientError::Protocol(message.clone())));
-          return true;
-        }
+      if matches!(response, PluginResponse::Error { .. }) {
         return control_tx.try_send(response).is_ok();
       }
       // Output for an unknown or already completed command cannot be routed and
@@ -468,13 +507,53 @@ impl PluginClient {
     control_tx.try_send(response).is_ok()
   }
 
+  async fn fail_protocol(inner: &Arc<PluginClientInner>, message: String) -> bool {
+    inner.connection_closed.cancel();
+    for (_, route) in inner.commands.lock().await.drain() {
+      route.completed.cancel();
+      if let CommandRouteState::AwaitingStart(pending) = route.state {
+        let _ = pending.send(Err(PluginClientError::Protocol(message.clone())));
+      }
+    }
+    false
+  }
+
+  async fn mark_cancelled(&self, id: &str) {
+    {
+      let mut commands = self.inner.commands.lock().await;
+      let Some(route) = commands.get_mut(id) else {
+        return;
+      };
+      route.state = CommandRouteState::Cancelled;
+    }
+    let inner = self.inner.clone();
+    let id = id.to_owned();
+    tokio::spawn(async move {
+      tokio::time::sleep(CANCELLED_ROUTE_TTL).await;
+      let mut commands = inner.commands.lock().await;
+      if matches!(
+        commands.get(&id).map(|route| &route.state),
+        Some(CommandRouteState::Cancelled)
+      ) {
+        if let Some(route) = commands.remove(&id) {
+          route.completed.cancel();
+        }
+      }
+    });
+  }
+
   /// Starts a command and returns an independently routed response stream.
   pub async fn start_execution(
     &self,
     request: PluginExecutionRequest,
     cancel_token: CancellationToken,
   ) -> Result<PluginExecution, PluginClientError> {
+    if cancel_token.is_cancelled() {
+      return Err(PluginClientError::Protocol("Command cancelled".into()));
+    }
+    let id = Uuid::new_v4().to_string();
     let cmd = OctaCommand::Execute {
+      id: id.clone(),
       params: request.params,
       args: request.args,
       dir: request.dir,
@@ -487,18 +566,51 @@ impl PluginClient {
     };
     let command_json = encode_command(&cmd)?;
     let (started_tx, started_rx) = oneshot::channel();
+    let (response_tx, response_rx) = mpsc::channel(COMMAND_RESPONSE_CAPACITY);
+    let (progress_tx, progress_rx) = watch::channel(None);
+    let overflowed = CancellationToken::new();
+    let completed = CancellationToken::new();
+    let execution = PluginExecution {
+      id: id.clone(),
+      response_rx,
+      progress_rx,
+      overflowed: overflowed.clone(),
+      completed: completed.clone(),
+      client: self.clone(),
+    };
     {
-      // Queue and wire order must match because the protocol assigns the id in Started.
       let mut writer = self.inner.writer.lock().await;
       let writer = writer.as_mut().ok_or(PluginClientError::WriterClosed)?;
-      self.inner.pending_starts.lock().await.push_back(started_tx);
-      writer.write_all(command_json.as_bytes()).await?;
-      writer.flush().await?;
+      self.inner.commands.lock().await.insert(
+        id.clone(),
+        CommandRoute {
+          state: CommandRouteState::AwaitingStart(started_tx),
+          sender: Some(response_tx),
+          progress: progress_tx,
+          overflowed,
+          completed,
+        },
+      );
+      if let Err(error) = writer.write_all(command_json.as_bytes()).await {
+        self.inner.commands.lock().await.remove(&id);
+        return Err(error.into());
+      }
+      if let Err(error) = writer.flush().await {
+        self.inner.commands.lock().await.remove(&id);
+        return Err(error.into());
+      }
     }
 
     tokio::select! {
-      result = started_rx => result.unwrap_or(Err(PluginClientError::ConnectionClosed)),
-      _ = cancel_token.cancelled() => Err(PluginClientError::Protocol("Command cancelled".into())),
+      result = started_rx => {
+        result.unwrap_or(Err(PluginClientError::ConnectionClosed))?;
+        Ok(execution)
+      },
+      _ = cancel_token.cancelled() => {
+        self.mark_cancelled(&id).await;
+        self.send(&OctaCommand::Cancel { id }).await?;
+        Err(PluginClientError::Protocol("Command cancelled".into()))
+      },
     }
   }
 
@@ -686,6 +798,7 @@ mod tests {
   #[test]
   fn rejects_oversized_outbound_protocol_frames() {
     let command = OctaCommand::Execute {
+      id: "command".to_owned(),
       params: "x".repeat(MAX_PLUGIN_FRAME_BYTES),
       args: Vec::new(),
       dir: PathBuf::from("."),
@@ -847,15 +960,35 @@ mod tests {
             validation_schema: None,
           }))
         } else if buffer.contains("Execute") {
-          let id = if handle_type == "multiple" {
-            match serde_json::from_str::<OctaCommand>(&buffer).unwrap() {
-              OctaCommand::Execute { params, .. } => params,
-              _ => unreachable!(),
-            }
-          } else {
-            "test-id".to_owned()
+          let mut id = match serde_json::from_str::<OctaCommand>(&buffer).unwrap() {
+            OctaCommand::Execute { id, .. } => id,
+            _ => unreachable!(),
           };
-          Some(PluginResponse::Started { id })
+          if handle_type == "wrong-id" {
+            id = "plugin-generated-id".to_owned();
+          } else if handle_type == "delayed-start" {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+          }
+          if handle_type == "terminal-before-start" {
+            Some(PluginResponse::ExitStatus { id, code: 0 })
+          } else if handle_type == "progress-before-start" {
+            Some(PluginResponse::Progress {
+              id,
+              progress: ProgressUpdate {
+                message: "early".to_owned(),
+                current: None,
+                total: None,
+                unit: None,
+              },
+            })
+          } else if handle_type == "output-before-start" {
+            Some(PluginResponse::Stdout {
+              id,
+              line: "early".to_owned(),
+            })
+          } else {
+            Some(PluginResponse::Started { id })
+          }
         } else if buffer.contains("Cancel") {
           let OctaCommand::Cancel { id } = serde_json::from_str::<OctaCommand>(&buffer).unwrap() else {
             unreachable!()
@@ -874,6 +1007,11 @@ mod tests {
           println!("Server sending: {}", response_json);
           writer.write_all(response_json.as_bytes()).await.unwrap();
           writer.flush().await.unwrap();
+
+          if handle_type == "duplicate-start" && matches!(response, PluginResponse::Started { .. }) {
+            writer.write_all(response_json.as_bytes()).await.unwrap();
+            writer.flush().await.unwrap();
+          }
 
           if handle_type == "single" || buffer.contains("Shutdown") {
             break;
@@ -929,7 +1067,8 @@ mod tests {
     .expect("Execute timeout")
     .expect("Failed to execute command");
 
-    assert_eq!(execution.id(), "test-id");
+    let execution_id = execution.id().to_owned();
+    assert!(Uuid::parse_str(&execution_id).is_ok());
 
     client.shutdown().await.expect("Failed to shutdown client");
     drop(client);
@@ -945,6 +1084,308 @@ mod tests {
       "No Execute message found in messages: {:?}",
       messages
     );
+    assert!(messages.iter().any(|message| {
+      matches!(
+        serde_json::from_str::<OctaCommand>(message),
+        Ok(OctaCommand::Execute { id, .. }) if id == execution_id
+      )
+    }));
+  }
+
+  #[tokio::test]
+  async fn rejects_a_started_id_that_was_not_assigned_by_the_host() {
+    let mut server = TestServer::new().await;
+    server.start("wrong-id".to_owned()).await;
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let error = client
+      .start_execution(execution_request("test"), CancellationToken::new())
+      .await
+      .unwrap_err();
+
+    assert!(matches!(
+      error,
+      PluginClientError::Protocol(message) if message.contains("unknown command 'plugin-generated-id'")
+    ));
+    let _ = server.stop().await;
+  }
+
+  #[tokio::test]
+  async fn terminal_response_before_started_cleans_up_the_route() {
+    let mut server = TestServer::new().await;
+    server.start("terminal-before-start".to_owned()).await;
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let error = client
+      .start_execution(execution_request("test"), CancellationToken::new())
+      .await
+      .unwrap_err();
+
+    assert!(matches!(
+      error,
+      PluginClientError::Protocol(message) if message.contains("before acknowledging it")
+    ));
+    assert!(client.inner.commands.lock().await.is_empty());
+    client.shutdown().await.unwrap();
+    let _ = server.stop().await;
+  }
+
+  #[tokio::test]
+  async fn rejects_progress_and_output_before_started() {
+    for (mode, expected) in [
+      ("progress-before-start", "sent progress before acknowledging"),
+      ("output-before-start", "sent output before acknowledging"),
+    ] {
+      let mut server = TestServer::new().await;
+      server.start(mode.to_owned()).await;
+
+      let client = PluginClient::connect(server.socket_name()).await.unwrap();
+      client.handshake().await.unwrap();
+      let error = client
+        .start_execution(execution_request("test"), CancellationToken::new())
+        .await
+        .unwrap_err();
+      assert!(matches!(error, PluginClientError::Protocol(message) if message.contains(expected)));
+      client.shutdown().await.unwrap();
+      let _ = server.stop().await;
+    }
+  }
+
+  #[tokio::test]
+  async fn rejects_duplicate_started_responses() {
+    let mut server = TestServer::new().await;
+    server.start("duplicate-start".to_owned()).await;
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let _execution = client
+      .start_execution(execution_request("test"), CancellationToken::new())
+      .await
+      .unwrap();
+    client.inner.connection_closed.cancelled().await;
+
+    client.shutdown().await.unwrap();
+    let _ = server.stop().await;
+  }
+
+  #[tokio::test]
+  async fn routes_out_of_order_started_responses_by_host_id() {
+    let mut server = TestServer::new().await;
+    let listener = server.listener.clone();
+    let (requests_tx, requests_rx) = oneshot::channel();
+    server.server_handle = Some(tokio::spawn(async move {
+      let stream = listener.accept().await.unwrap();
+      let (reader, mut writer) = tokio::io::split(stream);
+      let mut reader = BufReader::new(reader);
+      let mut line = String::new();
+      let mut requests = HashMap::new();
+      while requests.len() < 2 {
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let OctaCommand::Execute { id, params, .. } = serde_json::from_str(line.trim()).unwrap() else {
+          panic!("expected execute request");
+        };
+        requests.insert(params, id);
+      }
+      for params in ["second", "first"] {
+        let response = PluginResponse::Started {
+          id: requests[params].clone(),
+        };
+        writer
+          .write_all((serde_json::to_string(&response).unwrap() + "\n").as_bytes())
+          .await
+          .unwrap();
+      }
+      writer.flush().await.unwrap();
+      requests_tx.send(requests.clone()).unwrap();
+
+      line.clear();
+      reader.read_line(&mut line).await.unwrap();
+      assert!(matches!(
+        serde_json::from_str::<OctaCommand>(line.trim()).unwrap(),
+        OctaCommand::Shutdown
+      ));
+      write_response(
+        &Arc::new(Mutex::new(writer)),
+        PluginResponse::Shutdown {
+          message: "done".to_owned(),
+        },
+      )
+      .await;
+      Vec::new()
+    }));
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    let (first, second) = tokio::join!(
+      client.start_execution(execution_request("first"), CancellationToken::new()),
+      client.start_execution(execution_request("second"), CancellationToken::new())
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    let requests = requests_rx.await.unwrap();
+
+    assert_eq!(first.id(), requests["first"]);
+    assert_eq!(second.id(), requests["second"]);
+    client.shutdown().await.unwrap();
+    let _ = server.stop().await;
+  }
+
+  #[tokio::test]
+  async fn cancellation_before_started_is_sent_with_the_host_id() {
+    let mut server = TestServer::new().await;
+    server.start("delayed-start".to_owned()).await;
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let already_cancelled = CancellationToken::new();
+    already_cancelled.cancel();
+    assert!(matches!(
+      client.start_execution(execution_request("not-sent"), already_cancelled).await,
+      Err(PluginClientError::Protocol(message)) if message == "Command cancelled"
+    ));
+
+    let cancellation = CancellationToken::new();
+    let start = tokio::spawn({
+      let client = client.clone();
+      let cancellation = cancellation.clone();
+      async move { client.start_execution(execution_request("test"), cancellation).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    cancellation.cancel();
+    let error = start.await.unwrap().unwrap_err();
+    assert!(matches!(
+      error,
+      PluginClientError::Protocol(message) if message == "Command cancelled"
+    ));
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.shutdown().await.unwrap();
+    let messages = server.stop().await;
+    let execute_id = messages.iter().find_map(|message| {
+      let Ok(OctaCommand::Execute { id, .. }) = serde_json::from_str(message) else {
+        return None;
+      };
+      Some(id)
+    });
+    assert!(messages.iter().any(|message| {
+      matches!(
+        serde_json::from_str::<OctaCommand>(message),
+        Ok(OctaCommand::Cancel { id }) if Some(id.as_str()) == execute_id.as_deref()
+      )
+    }));
+  }
+
+  #[tokio::test]
+  async fn dropping_a_start_waiter_cancels_the_acknowledged_command() {
+    let mut server = TestServer::new().await;
+    server.start("delayed-start".to_owned()).await;
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let start = tokio::spawn({
+      let client = client.clone();
+      async move {
+        client
+          .start_execution(execution_request("test"), CancellationToken::new())
+          .await
+      }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    start.abort();
+    assert!(start.await.unwrap_err().is_cancelled());
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(client.inner.commands.lock().await.is_empty());
+    client.shutdown().await.unwrap();
+    let messages = server.stop().await;
+    assert!(messages.iter().any(|message| {
+      matches!(
+        serde_json::from_str::<OctaCommand>(message),
+        Ok(OctaCommand::Cancel { .. })
+      )
+    }));
+  }
+
+  #[tokio::test]
+  async fn cancelled_start_route_expires_when_plugin_never_responds() {
+    let mut server = TestServer::new().await;
+    let listener = server.listener.clone();
+    let (execute_tx, execute_rx) = oneshot::channel();
+    server.server_handle = Some(tokio::spawn(async move {
+      let stream = listener.accept().await.unwrap();
+      let (reader, mut writer) = tokio::io::split(stream);
+      let mut reader = BufReader::new(reader);
+      let mut line = String::new();
+
+      reader.read_line(&mut line).await.unwrap();
+      assert!(matches!(
+        serde_json::from_str::<OctaCommand>(line.trim()).unwrap(),
+        OctaCommand::Hello(_)
+      ));
+      let hello = PluginResponse::Hello(Version {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        features: Vec::new(),
+      });
+      writer
+        .write_all((serde_json::to_string(&hello).unwrap() + "\n").as_bytes())
+        .await
+        .unwrap();
+      writer.flush().await.unwrap();
+
+      line.clear();
+      reader.read_line(&mut line).await.unwrap();
+      let OctaCommand::Execute { id, .. } = serde_json::from_str(line.trim()).unwrap() else {
+        panic!("expected execute request");
+      };
+      execute_tx.send(id.clone()).unwrap();
+
+      line.clear();
+      reader.read_line(&mut line).await.unwrap();
+      assert!(matches!(
+        serde_json::from_str::<OctaCommand>(line.trim()).unwrap(),
+        OctaCommand::Cancel { id: cancelled } if cancelled == id
+      ));
+
+      line.clear();
+      reader.read_line(&mut line).await.unwrap();
+      assert!(matches!(
+        serde_json::from_str::<OctaCommand>(line.trim()).unwrap(),
+        OctaCommand::Shutdown
+      ));
+      let shutdown = PluginResponse::Shutdown {
+        message: "done".to_owned(),
+      };
+      writer
+        .write_all((serde_json::to_string(&shutdown).unwrap() + "\n").as_bytes())
+        .await
+        .unwrap();
+      Vec::new()
+    }));
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    tokio::time::pause();
+    let cancellation = CancellationToken::new();
+    let start = tokio::spawn({
+      let client = client.clone();
+      let cancellation = cancellation.clone();
+      async move { client.start_execution(execution_request("test"), cancellation).await }
+    });
+    let id = execute_rx.await.unwrap();
+    cancellation.cancel();
+    assert!(matches!(
+      start.await.unwrap(),
+      Err(PluginClientError::Protocol(message)) if message == "Command cancelled"
+    ));
+
+    tokio::time::advance(CANCELLED_ROUTE_TTL + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(!client.inner.commands.lock().await.contains_key(&id));
+
+    client.shutdown().await.unwrap();
+    let _ = server.stop().await;
   }
 
   #[tokio::test]
@@ -958,6 +1399,7 @@ mod tests {
       .start_execution(execution_request("terminal"), CancellationToken::new())
       .await
       .unwrap();
+    let execution_id = execution.id().to_owned();
     let input = execution.terminal_input();
 
     input.write(vec![1, 2, 3]).await.unwrap();
@@ -972,15 +1414,15 @@ mod tests {
       .collect();
     assert!(commands.iter().any(|command| matches!(
       command,
-      OctaCommand::Stdin { id, bytes } if id == "terminal" && bytes == &[1, 2, 3]
+      OctaCommand::Stdin { id, bytes } if id == &execution_id && bytes == &[1, 2, 3]
     )));
     assert!(commands.iter().any(|command| matches!(
       command,
-      OctaCommand::Resize { id, rows: 24, cols: 80 } if id == "terminal"
+      OctaCommand::Resize { id, rows: 24, cols: 80 } if id == &execution_id
     )));
     assert!(commands.iter().any(|command| matches!(
       command,
-      OctaCommand::CloseStdin { id } if id == "terminal"
+      OctaCommand::CloseStdin { id } if id == &execution_id
     )));
   }
 
@@ -1134,8 +1576,8 @@ mod tests {
             )
             .await;
           },
-          OctaCommand::Execute { params, .. } => {
-            write_response(&writer, PluginResponse::Started { id: params.clone() }).await;
+          OctaCommand::Execute { id, params, .. } => {
+            write_response(&writer, PluginResponse::Started { id: id.clone() }).await;
             let writer = writer.clone();
             tokio::spawn(async move {
               let delay = if params == "first" { 80 } else { 10 };
@@ -1144,7 +1586,7 @@ mod tests {
                 write_response(
                   &writer,
                   PluginResponse::Progress {
-                    id: params.clone(),
+                    id: id.clone(),
                     progress: ProgressUpdate {
                       message: "working".to_owned(),
                       current: Some(current as u64),
@@ -1159,12 +1601,12 @@ mod tests {
               write_response(
                 &writer,
                 PluginResponse::Stdout {
-                  id: params.clone(),
+                  id: id.clone(),
                   line: format!("{params}-output"),
                 },
               )
               .await;
-              write_response(&writer, PluginResponse::ExitStatus { id: params, code: 0 }).await;
+              write_response(&writer, PluginResponse::ExitStatus { id, code: 0 }).await;
             });
           },
           OctaCommand::Shutdown => {
@@ -1237,31 +1679,31 @@ mod tests {
             )
             .await;
           },
-          OctaCommand::Execute { params, .. } if params == "noisy" => {
-            write_response(&writer, PluginResponse::Started { id: params.clone() }).await;
+          OctaCommand::Execute { id, params, .. } if params == "noisy" => {
+            write_response(&writer, PluginResponse::Started { id: id.clone() }).await;
             for index in 0..=COMMAND_RESPONSE_CAPACITY {
               write_response(
                 &writer,
                 PluginResponse::Stdout {
-                  id: params.clone(),
+                  id: id.clone(),
                   line: index.to_string(),
                 },
               )
               .await;
             }
-            write_response(&writer, PluginResponse::ExitStatus { id: params, code: 0 }).await;
+            write_response(&writer, PluginResponse::ExitStatus { id, code: 0 }).await;
           },
-          OctaCommand::Execute { params, .. } => {
-            write_response(&writer, PluginResponse::Started { id: params.clone() }).await;
+          OctaCommand::Execute { id, .. } => {
+            write_response(&writer, PluginResponse::Started { id: id.clone() }).await;
             write_response(
               &writer,
               PluginResponse::Stdout {
-                id: params.clone(),
+                id: id.clone(),
                 line: "ready".to_owned(),
               },
             )
             .await;
-            write_response(&writer, PluginResponse::ExitStatus { id: params, code: 0 }).await;
+            write_response(&writer, PluginResponse::ExitStatus { id, code: 0 }).await;
           },
           OctaCommand::Cancel { id } => {
             write_response(&writer, PluginResponse::ExitStatus { id, code: -1 }).await;

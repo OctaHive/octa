@@ -27,12 +27,13 @@ class CommandHandler:
 
     def handle_execute(self, cmd):
         response = []
+        command_id = cmd["payload"]["id"]
 
         # Send Started
         started = {
             "type": "Started",
             "payload": {
-              "id": "test-execution-id"
+              "id": command_id
             }
         }
         response.append(started)
@@ -41,7 +42,7 @@ class CommandHandler:
         stdout = {
             "type": "Stdout",
             "payload": {
-              "id": "test-execution-id",
+              "id": command_id,
               "line": "test output"
             }
         }
@@ -51,7 +52,7 @@ class CommandHandler:
         exit_status = {
             "type": "ExitStatus",
             "payload": {
-              "id": "test-execution-id",
+              "id": command_id,
               "code": 0
             }
         }

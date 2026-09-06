@@ -7,6 +7,7 @@ use interprocess::local_socket::{
   ListenerOptions,
 };
 use logger::{collect_value_redactions, redact, Logger, LoggerSystem, RedactingLogger};
+use protocol::{OctaCommand, PluginResponse, Schema, Version};
 use serde_json::{Map, Value};
 use socket::interpret_local_socket_name;
 use tokio::io::{AsyncReadExt, AsyncWrite, ReadHalf};
@@ -16,9 +17,6 @@ use tokio::{
   task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
-
-use protocol::{OctaCommand, PluginResponse, Schema, Version};
 
 pub mod logger;
 pub mod protocol;
@@ -143,6 +141,7 @@ where
 {
   match command {
     OctaCommand::Execute {
+      id,
       params,
       args,
       dir,
@@ -153,7 +152,6 @@ where
       raw,
       dry,
     } => {
-      let id = Uuid::new_v4().to_string();
       // Pass values rather than names to the logger because plugin diagnostics contain rendered data.
       let mut redactions = Vec::new();
       for value in secret_vars.iter().filter_map(|name| vars.get(name)) {
@@ -816,6 +814,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
+      id: "command".to_owned(),
       params: "test".to_string(),
       args: vec!["arg1".to_string(), "arg2".to_string()],
       dir: PathBuf::from("/test/dir"),
@@ -849,7 +848,10 @@ mod tests {
 
     let responses = response_handle.await.unwrap();
 
-    assert!(matches!(responses[0], PluginResponse::Started { .. }));
+    assert!(matches!(
+      &responses[0],
+      PluginResponse::Started { id } if id == "command"
+    ));
     assert!(matches!(responses[1], PluginResponse::Stdout { .. }));
     assert!(matches!(responses[2], PluginResponse::Stdout { .. }));
     assert!(matches!(responses[3], PluginResponse::Stdout { .. }));
@@ -874,6 +876,7 @@ mod tests {
     let logger = Arc::new(MockLogger::new());
     let secret = "secret-producing-payload";
     let command = OctaCommand::Execute {
+      id: "command".to_owned(),
       params: secret.to_owned(),
       args: Vec::new(),
       dir: PathBuf::from("."),
@@ -960,6 +963,7 @@ mod tests {
 
     handle_command(
       OctaCommand::Execute {
+        id: "command".to_owned(),
         params: "test".to_string(),
         args: vec![],
         dir: PathBuf::from("."),
@@ -980,6 +984,7 @@ mod tests {
     .unwrap();
 
     let id = active_commands.lock().await.keys().next().unwrap().clone();
+    assert_eq!(id, "command");
     handle_command(
       OctaCommand::Cancel { id: id.clone() },
       writer,
@@ -1067,6 +1072,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
+      id: "command".to_owned(),
       params: "failing_command".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -1120,6 +1126,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
+      id: "command".to_owned(),
       params: "long_running".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -1177,6 +1184,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
+      id: "command".to_owned(),
       params: "to_be_cancelled".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -1280,6 +1288,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
+      id: "command".to_owned(),
       params: "empty_output".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -1336,6 +1345,7 @@ mod tests {
     envs.insert("TEST_VAR2".to_string(), "value2".to_string());
 
     let command = OctaCommand::Execute {
+      id: "command".to_owned(),
       params: "env_test".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -1388,6 +1398,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Execute {
+      id: "command".to_owned(),
       params: "test".to_string(),
       args: vec![],
       dir: PathBuf::from("."),
@@ -1455,6 +1466,7 @@ mod tests {
     let mut handles = vec![];
     for i in 0..3 {
       let command = OctaCommand::Execute {
+        id: format!("command-{i}"),
         params: format!("cmd{}", i),
         args: vec![],
         dir: PathBuf::from("."),
@@ -1585,6 +1597,7 @@ mod tests {
     writer.flush().await.unwrap();
 
     let cmd_command = OctaCommand::Execute {
+      id: "command".to_owned(),
       params: "".to_owned(),
       args: vec!["arg1".to_string(), "arg2".to_string()],
       dir: PathBuf::from("/test/dir"),
