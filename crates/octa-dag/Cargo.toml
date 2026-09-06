@@ -11,13 +11,8 @@ repository.workspace = true
 include = ["src/"]
 
 [dependencies]
-octa-octafile = { version = "0.3.0", path = "../octa-octafile" }
-anyhow = { workspace = true }
-async-trait = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-uuid = { workspace = true }
 
 [dev-dependencies]
 test-log = "0.2"

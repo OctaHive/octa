@@ -1,12 +1,17 @@
+//! Integration-style tests for task-plan expansion and inheritance.
+
 use super::*;
 
-use octa_dag::Identifiable;
 use octa_octafile::Octafile;
 use std::{fs, io, sync::Mutex as StdMutex};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
-use crate::vars::VariablePrompt;
+use crate::{
+  task::{TaskItem, TaskRuntime},
+  terminal::UnsupportedRawTerminal,
+  vars::VariablePrompt,
+};
 use octa_output::{Console, ConsoleRecord, ConsoleRenderer, ExecutionEvent};
 
 struct TestVariableResolver;
@@ -294,18 +299,19 @@ tasks:
     .build(octafile, "parent", false, Vec::new())
     .await?;
   let executor = Executor::new(
-    plugin_manager.clone(),
     plan,
-    crate::executor::ExecutorConfig {
-      emit_run_events: true,
+    crate::executor::ExecutorConfig::default(),
+    TaskRuntime {
+      plugin_manager: plugin_manager.clone(),
+      terminal: Arc::new(UnsupportedRawTerminal),
+      cache: Arc::new(tokio::sync::Mutex::new(indexmap::IndexMap::new())),
+      fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
       console,
-      ..crate::executor::ExecutorConfig::default()
+      run_id: 1,
+      dry: false,
+      force: false,
+      deferred_exit_code: None,
     },
-    None,
-    Arc::new(sled::Config::new().temporary(true).open().unwrap()),
-    false,
-    false,
-    None,
   )?;
 
   let result = executor.execute(CancellationToken::new(), "parent").await?;

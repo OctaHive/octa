@@ -1,3 +1,8 @@
+//! Shared/exclusive isolation for executions using the same runtime services.
+//!
+//! Ordinary nodes take shared guards. Raw or interactive sessions take an
+//! exclusive guard so terminal ownership cannot overlap another task.
+
 use std::sync::Arc;
 
 use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};

@@ -1,3 +1,8 @@
+//! Runtime isolation across the nodes of one interactive task invocation.
+//!
+//! Interactive task bodies expand into several DAG nodes but must hold one
+//! exclusive runtime guard from the first node until the last node completes.
+
 use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::Mutex;

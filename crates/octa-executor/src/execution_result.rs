@@ -1,3 +1,9 @@
+//! Stable, serializable terminal results for runs, tasks, and steps.
+//!
+//! These types deliberately do not expose scheduler or plugin implementation
+//! errors. Embedders can persist them without reconstructing state from the
+//! event stream.
+
 use std::{error::Error, fmt};
 
 use chrono::{DateTime, Utc};
@@ -11,12 +17,19 @@ use crate::{error::ExecutorError, task::ExecutionBinding};
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ExecutionFailureKind {
+  /// Execution was stopped through cooperative cancellation.
   Cancelled,
+  /// A configured execution deadline expired.
   Timeout,
+  /// A command or plugin evaluation returned a non-zero status.
   Command,
+  /// A task failed outside a concrete command invocation.
   Task,
+  /// Plugin discovery, validation, or transport failed.
   Plugin,
+  /// The requested execution could not be planned from its configuration.
   Configuration,
+  /// Executor infrastructure failed independently of task configuration.
   Infrastructure,
 }
 
@@ -160,13 +173,18 @@ impl Error for ExecutionFailure {}
 #[serde(tag = "status", content = "failure", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ExecutionConclusion {
+  /// Work completed successfully.
   Succeeded,
+  /// Work intentionally performed no action.
   Skipped,
+  /// Work ended with the attached failure.
   Failed(ExecutionFailure),
+  /// Work was cancelled for the reason attached to the conclusion.
   Cancelled(ExecutionFailure),
 }
 
 impl ExecutionConclusion {
+  /// Returns the event-layer status represented by this conclusion.
   pub fn status(&self) -> ConsoleStatus {
     match self {
       Self::Succeeded => ConsoleStatus::Success,
@@ -176,6 +194,7 @@ impl ExecutionConclusion {
     }
   }
 
+  /// Returns failure details for failed and cancelled conclusions.
   pub fn failure(&self) -> Option<&ExecutionFailure> {
     match self {
       Self::Failed(failure) | Self::Cancelled(failure) => Some(failure),
@@ -183,6 +202,7 @@ impl ExecutionConclusion {
     }
   }
 
+  /// Returns whether the conclusion permits dependent work to proceed.
   pub fn is_success(&self) -> bool {
     matches!(self, Self::Succeeded | Self::Skipped)
   }

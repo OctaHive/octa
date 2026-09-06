@@ -4,17 +4,12 @@ use std::{
   sync::Arc,
 };
 
-use async_trait::async_trait;
 use tracing::{debug, info};
 
 use crate::error::{DAGError, DAGResult};
 
-#[async_trait]
 pub trait Identifiable {
-  fn id(&self) -> String;
-  fn name(&self) -> String;
-  fn is_internal(&self) -> bool;
-  async fn get_deps_result(&self) -> HashMap<String, String>;
+  fn id(&self) -> &str;
 }
 
 /// Represents a Directed Acyclic Graph (DAG) for task dependencies
@@ -43,20 +38,20 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
   pub fn add_node(&mut self, node: Arc<T>) {
     debug!("Adding node: {}", node.id());
     self.nodes.insert(node.clone());
-    self.edges.entry(node.id().clone()).or_default();
+    self.edges.entry(node.id().to_owned()).or_default();
   }
 
   /// Adds a dependency between two nodes
   pub fn add_dependency(&mut self, from: &Arc<T>, to: &Arc<T>) -> DAGResult<()> {
     if !self.nodes.contains(from) {
-      return Err(DAGError::NodeNotFound(from.id().clone()));
+      return Err(DAGError::NodeNotFound(from.id().to_owned()));
     }
     if !self.nodes.contains(to) {
-      return Err(DAGError::NodeNotFound(to.id().clone()));
+      return Err(DAGError::NodeNotFound(to.id().to_owned()));
     }
 
     debug!("Adding dependency: {} -> {}", from.id(), to.id());
-    self.edges.entry(from.id().clone()).or_default().insert(to.clone());
+    self.edges.entry(from.id().to_owned()).or_default().insert(to.clone());
 
     Ok(())
   }
@@ -79,7 +74,7 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
     let mut ready = self
       .nodes
       .iter()
-      .filter(|node| in_degree[&node.id()] == 0)
+      .filter(|node| in_degree[node.id()] == 0)
       .map(|node| node.id())
       .collect::<Vec<_>>();
     let mut visited = 0;
@@ -90,11 +85,11 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
       }
       let node = ready.pop().expect("ready contains exactly one node");
       visited += 1;
-      if let Some(dependants) = self.edges.get(&node) {
+      if let Some(dependants) = self.edges.get(node) {
         for dependant in dependants {
           let count = in_degree
-            .get_mut(&dependant.id())
-            .ok_or_else(|| DAGError::NodeNotFound(dependant.id()))?;
+            .get_mut(dependant.id())
+            .ok_or_else(|| DAGError::NodeNotFound(dependant.id().to_owned()))?;
           *count -= 1;
           if *count == 0 {
             ready.push(dependant.id());
@@ -116,7 +111,7 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
   pub fn print_graph(&self) {
     info!("DAG Structure:");
     for node in &self.nodes {
-      let deps = self.edges.get(&node.id()).map_or_else(
+      let deps = self.edges.get(node.id()).map_or_else(
         || "(no dependencies)".to_string(),
         |deps| {
           let mut d = deps.iter().map(|n| n.id()).collect::<Vec<_>>();
@@ -132,8 +127,8 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
     let mut queue: Vec<_> = self
       .nodes
       .iter()
-      .filter(|n| in_degree[&n.id()] == 0)
-      .map(|n| n.id().clone())
+      .filter(|n| in_degree[n.id()] == 0)
+      .map(|n| n.id().to_owned())
       .collect();
 
     let mut visited = 0;
@@ -144,11 +139,11 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
       if let Some(deps) = self.edges.get(&node) {
         for dep in deps {
           let count = in_degree
-            .get_mut(&dep.id())
-            .ok_or_else(|| DAGError::NodeNotFound(dep.id()))?;
+            .get_mut(dep.id())
+            .ok_or_else(|| DAGError::NodeNotFound(dep.id().to_owned()))?;
           *count -= 1;
           if *count == 0 {
-            queue.push(dep.id().clone());
+            queue.push(dep.id().to_owned());
           }
         }
       }
@@ -158,11 +153,11 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
   }
 
   fn calculate_in_degrees(&self) -> HashMap<String, usize> {
-    let mut in_degree: HashMap<String, usize> = self.nodes.iter().map(|n| (n.id().clone(), 0)).collect();
+    let mut in_degree: HashMap<String, usize> = self.nodes.iter().map(|n| (n.id().to_owned(), 0)).collect();
 
     for edges in self.edges.values() {
       for node in edges {
-        *in_degree.get_mut(&node.id()).unwrap() += 1;
+        *in_degree.get_mut(node.id()).unwrap() += 1;
       }
     }
     in_degree
@@ -172,45 +167,24 @@ impl<T: Eq + Hash + Identifiable> DAG<T> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::{
-    future::Future,
-    sync::Arc,
-    task::{Context, Poll, Waker},
-  };
+  use std::sync::Arc;
   use test_log::test;
   use tracing_test::traced_test;
 
   #[derive(Debug, Eq, PartialEq, Hash, Clone)]
   struct TestNode {
     id: String,
-    name: String,
   }
 
   impl TestNode {
     fn new(id: &str) -> Arc<Self> {
-      Arc::new(Self {
-        id: id.to_string(),
-        name: id.to_string(),
-      })
+      Arc::new(Self { id: id.to_string() })
     }
   }
 
-  #[async_trait]
   impl Identifiable for TestNode {
-    fn id(&self) -> String {
-      self.id.clone()
-    }
-
-    async fn get_deps_result(&self) -> HashMap<String, String> {
-      HashMap::default()
-    }
-
-    fn name(&self) -> String {
-      self.name.clone()
-    }
-
-    fn is_internal(&self) -> bool {
-      false
+    fn id(&self) -> &str {
+      &self.id
     }
   }
 
@@ -228,24 +202,12 @@ mod tests {
     let mut dag = DAG::new();
     let node = TestNode::new("A");
     dag.add_node(node.clone());
-    dag.edges.remove(&node.id());
+    dag.edges.remove(node.id());
 
     dag.print_graph();
 
     assert!(!dag.has_cycle().unwrap());
     assert!(logs_contain("A -> (no dependencies)"));
-  }
-
-  #[test]
-  fn test_identifiable_values() {
-    let node = TestNode::new("A");
-
-    assert_eq!(node.name(), "A");
-    assert!(!node.is_internal());
-
-    let mut future = Box::pin(node.get_deps_result());
-    let mut context = Context::from_waker(Waker::noop());
-    assert!(matches!(future.as_mut().poll(&mut context), Poll::Ready(result) if result.is_empty()));
   }
 
   #[test]
@@ -257,8 +219,8 @@ mod tests {
 
     assert_eq!(dag.node_count(), 1);
     assert!(dag.nodes().contains(&node));
-    assert!(dag.edges().contains_key(&node.id()));
-    assert!(dag.edges()[&node.id()].is_empty());
+    assert!(dag.edges().contains_key(node.id()));
+    assert!(dag.edges()[node.id()].is_empty());
   }
 
   #[test]
@@ -271,7 +233,7 @@ mod tests {
     dag.add_node(node_b.clone());
 
     assert!(dag.add_dependency(&node_a, &node_b).is_ok());
-    assert!(dag.edges()[&node_a.id()].contains(&node_b));
+    assert!(dag.edges()[node_a.id()].contains(&node_b));
   }
 
   #[test]
@@ -373,7 +335,7 @@ mod tests {
     assert!(!dag.has_cycle().unwrap());
     assert_eq!(dag.node_count(), 3);
     assert!(!dag.is_linear().unwrap());
-    assert!(dag.edges()[&node_c.id()].is_empty());
+    assert!(dag.edges()[node_c.id()].is_empty());
   }
 
   #[test]
@@ -420,9 +382,9 @@ mod tests {
     dag.add_dependency(&node_b, &node_c).unwrap();
 
     let in_degrees = dag.calculate_in_degrees();
-    assert_eq!(in_degrees[&node_a.id()], 0);
-    assert_eq!(in_degrees[&node_b.id()], 1);
-    assert_eq!(in_degrees[&node_c.id()], 2);
+    assert_eq!(in_degrees[node_a.id()], 0);
+    assert_eq!(in_degrees[node_b.id()], 1);
+    assert_eq!(in_degrees[node_c.id()], 2);
   }
 
   #[test]

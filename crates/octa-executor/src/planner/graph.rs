@@ -1,10 +1,24 @@
 //! Expansion of task invocations into executable DAG nodes.
+//!
+//! An Octafile task is hierarchical: it may have conditions, dependencies,
+//! nested task calls, plugin commands, freshness checks, and deferred cleanup.
+//! The scheduler intentionally knows none of those concepts, so this module
+//! lowers them into a flat graph of executable and barrier nodes.
+//!
+//! Every builder method that appends a subgraph returns its terminal node. The
+//! caller connects later work to that terminal, which makes sequential and
+//! parallel composition use the same representation. Barrier nodes join or
+//! order subgraphs without consuming executor concurrency.
 
 use super::*;
 
 impl TaskGraphBuilder {
+  /// Expands one task invocation and returns the node that represents its completion.
+  ///
+  /// The boxed call is the indirection required by recursive async expansion:
+  /// task bodies can invoke other tasks, which enter this method again.
   pub(super) async fn build_invocation(
-    &self,
+    &mut self,
     dag: &mut DagNode,
     command: &FindResult,
     request: InvocationRequest,
@@ -14,12 +28,14 @@ impl TaskGraphBuilder {
   }
 
   async fn _build_invocation(
-    &self,
+    &mut self,
     dag: &mut DagNode,
     command: &FindResult,
     mut request: InvocationRequest,
     run_parallel: Option<bool>,
   ) -> ExecutorResult<Option<ArcNode>> {
+    // A scope identifies an invocation, not merely a task definition. Calling
+    // the same task twice therefore produces distinct lifecycle and output IDs.
     let silence = self
       .force_silence
       .or(command.task.silent)
@@ -52,12 +68,11 @@ impl TaskGraphBuilder {
         .and_then(|presentation| presentation.output)
         .map(task_output_mode),
     );
-    self
-      .scopes
-      .lock()
-      .map_err(|error| ExecutorError::LockError(error.to_string()))?
-      .push(scope.clone());
+    self.scopes.push(scope.clone());
     request.context.output_scope = Some(scope);
+
+    // Variables and environments are collected once per invocation and shared
+    // by all of its condition, freshness, command, and barrier nodes.
     let collected_vars = self.collect_vars_with_identity(command, request.context.vars.clone())?;
     let environment = self.collect_environment_plan(command, request.context.envs.clone())?;
     request.context.runtime = Some(Arc::new(task::InvocationRuntime::new(
@@ -68,6 +83,9 @@ impl TaskGraphBuilder {
     )));
     let interactive = command.task.interactive.unwrap_or(false);
     let mut prepared = self.prepare_invocation(dag, command, request).await?;
+
+    // All nodes in an interactive body share one session ID so the executor
+    // holds a single exclusive runtime guard across the complete invocation.
     if interactive && prepared.context.interactive_session.is_none() {
       prepared.context.interactive_session = Some(Uuid::new_v4().to_string());
     }
@@ -77,21 +95,28 @@ impl TaskGraphBuilder {
   }
 
   async fn build_task_body(
-    &self,
+    &mut self,
     dag: &mut DagNode,
     command: &FindResult,
     context: InvocationContext,
     parents: Vec<ArcNode>,
     run_parallel: Option<bool>,
   ) -> ExecutorResult<Option<ArcNode>> {
+    // Freshness guards the task body after dependencies have completed. Each
+    // dependency owns its own freshness boundary and is evaluated separately.
     let (context, parents, freshness) = self.add_freshness_gate(dag, command, context, parents)?;
 
+    // Shorthand tasks contain one plugin payload directly instead of `cmds`.
     let Some(commands) = &command.task.cmds else {
       let task = self.create_task_node(dag, command, &context, None)?;
       Self::connect_parents(dag, &parents, &task)?;
       return self.add_freshness_commit(dag, command, &context, freshness, vec![task]);
     };
 
+    // Nested task calls publish their own scopes. Explicit outer barriers keep
+    // the containing invocation open around those child lifecycles; a body of
+    // only plugin commands already starts and finishes its scope through those
+    // executable nodes.
     let lifecycle_scope = if commands
       .iter()
       .any(|command| matches!(command.payload, CommandPayload::Task(_)))
@@ -114,10 +139,14 @@ impl TaskGraphBuilder {
     let mut deferred_nodes = Vec::new();
 
     for command_item in commands {
+      // Platform-excluded commands contribute no node and therefore cannot
+      // accidentally block the remaining body.
       if !self.matches_platforms(command_item.options.platforms.as_deref()) {
         continue;
       }
 
+      // Parallel commands share the invocation entry. Sequential commands use
+      // the preceding command's terminal after the first iteration.
       let entries = if run_parallel {
         parents.clone()
       } else {
@@ -127,6 +156,8 @@ impl TaskGraphBuilder {
       };
 
       if command_item.options.deferred {
+        // Registration is defined by reachability: the executor runs this
+        // cleanup only if every entry node below has actually completed.
         let registered_after = entries.iter().map(|task| task.id.clone()).collect();
         deferred_nodes.push(
           self
@@ -173,6 +204,8 @@ impl TaskGraphBuilder {
         &mut terminals,
         format!("Complete command in task {}", command.name),
       )?;
+      // A nested task selector may expand to several matching tasks. Joining
+      // here makes that entire expansion behave like one command in sequence.
       if run_parallel {
         parallel_terminals.extend(terminal);
       } else if terminal.is_some() {
@@ -185,6 +218,8 @@ impl TaskGraphBuilder {
     } else {
       sequential_parent.into_iter().collect()
     };
+    // Parallel bodies need one completion point before freshness commit and
+    // deferred ordering. Sequential bodies already have a single tail.
     let terminal = self.join_nodes(dag, &mut terminals, format!("Complete task {}", command.name))?;
     let predecessors = terminal.map_or(parents, |terminal| vec![terminal]);
     let predecessors = self
@@ -193,6 +228,9 @@ impl TaskGraphBuilder {
       .collect();
 
     let terminal = self.attach_deferred_nodes(dag, deferred_nodes, predecessors)?;
+
+    // The closing scope barrier is required only when the explicit opening
+    // barrier above was inserted for a body containing nested task calls.
     let Some(scope) = lifecycle_scope else {
       return Ok(terminal);
     };
@@ -215,6 +253,8 @@ impl TaskGraphBuilder {
       return Ok((context, parents, None));
     }
 
+    // One decision object is written by the check node and read by every node
+    // in this invocation. It avoids repeated filesystem scans per command.
     let state = Arc::new(FreshnessState::default());
     let runtime = context
       .runtime
@@ -245,6 +285,8 @@ impl TaskGraphBuilder {
     .spec(identity)
     .track_variables(runtime.identity_names().clone());
     let name = format!("Check freshness for {}", command.name);
+    // The check is a real hidden node because it must obey dependency order and
+    // cancellation, but it is silent and shares the invocation lifecycle.
     let task = TaskConfig::builder()
       .id(Uuid::new_v4())
       .name(name.clone())
@@ -272,7 +314,10 @@ impl TaskGraphBuilder {
     Ok((context, vec![task], Some(state)))
   }
 
-  /// Commits the source fingerprint after every non-deferred command in this invocation succeeds.
+  /// Appends the commit node after every non-deferred command in the invocation.
+  ///
+  /// Separating check from commit ensures a failed, skipped, or cancelled body
+  /// never persists a fingerprint for work that did not complete.
   fn add_freshness_commit(
     &self,
     dag: &mut DagNode,
@@ -304,6 +349,7 @@ impl TaskGraphBuilder {
     Ok(Some(task))
   }
 
+  /// Connects every incoming terminal to the first node of a new subgraph.
   fn connect_parents(dag: &mut DagNode, parents: &[ArcNode], task: &ArcNode) -> ExecutorResult<()> {
     for parent in parents {
       dag.add_dependency(parent, task)?;
@@ -311,6 +357,11 @@ impl TaskGraphBuilder {
     Ok(())
   }
 
+  /// Returns one terminal for zero, one, or many parallel branches.
+  ///
+  /// The single-node case is returned directly; only true fan-in allocates a
+  /// barrier. Besides reducing graph size, this preserves the original node as
+  /// the lifecycle endpoint whenever no join is needed.
   fn join_nodes(&self, dag: &mut DagNode, nodes: &mut Vec<ArcNode>, name: String) -> ExecutorResult<Option<ArcNode>> {
     match nodes.len() {
       0 => Ok(None),
@@ -326,15 +377,20 @@ impl TaskGraphBuilder {
   }
 
   /// Compiles a deferred command into a nested execution plan.
+  ///
+  /// The main graph receives only a registration/ordering barrier. The nested
+  /// plan is retained in `DeferredAction` and can therefore run during normal
+  /// traversal or shutdown without teaching the scheduler about command shapes.
   async fn create_deferred_node(
-    &self,
+    &mut self,
     dag: &mut DagNode,
     command: &FindResult,
     deferred: &TaskCommand,
     context: InvocationContext,
     registered_after: Vec<String>,
   ) -> ExecutorResult<ArcNode> {
-    let order = self.defer_order.fetch_add(1, Ordering::SeqCst);
+    let order = self.defer_order;
+    self.defer_order += 1;
     let name = format!("Deferred command {order} for {}", command.name);
 
     // Normalize `defer` into an ordinary one-command task so shell commands, task references,
@@ -366,7 +422,7 @@ impl TaskGraphBuilder {
 
     // Each deferred action owns its nested cleanup scope, including defers declared by a
     // referenced task. This keeps nested cleanup ordering local to that task invocation.
-    let nested_builder = self.nested_builder();
+    let mut nested_builder = self.nested_builder();
     let mut deferred_dag = DAG::new();
     nested_builder
       .build_invocation(
@@ -385,15 +441,7 @@ impl TaskGraphBuilder {
       nested_builder.create_group_node(&mut deferred_dag, Some(AllowedRun::Always), format!("Skipped {name}"))?;
     }
 
-    let deferred = nested_builder
-      .deferred
-      .into_inner()
-      .map_err(|error| ExecutorError::LockError(error.to_string()))?;
-    let scopes = nested_builder
-      .scopes
-      .into_inner()
-      .map_err(|error| ExecutorError::LockError(error.to_string()))?;
-    let plan = ExecutionPlan::new(deferred_dag, deferred, scopes);
+    let plan = ExecutionPlan::new(deferred_dag, nested_builder.deferred, nested_builder.scopes);
 
     // The barrier node preserves ordering in the main DAG. Its executable payload is stored
     // in `DeferredAction`, not in `TaskNode`.
@@ -405,23 +453,20 @@ impl TaskGraphBuilder {
       .build()?;
     let task = Arc::new(TaskNode::new(task));
     dag.add_node(task.clone());
-    self
-      .deferred
-      .lock()
-      .map_err(|error| ExecutorError::LockError(error.to_string()))?
-      .insert(
-        task.id.clone(),
-        Arc::new(DeferredAction {
-          command: name,
-          plan,
-          order,
-          registered_after,
-        }),
-      );
+    self.deferred.insert(
+      task.id.clone(),
+      Arc::new(DeferredAction {
+        command: name,
+        plan,
+        order,
+        registered_after,
+      }),
+    );
 
     Ok(task)
   }
 
+  /// Creates an isolated collector for a nested deferred plan.
   fn nested_builder(&self) -> Self {
     // Runtime context is inherited, while cleanup order and collected actions belong to
     // the nested plan and therefore start from an empty state.
@@ -437,15 +482,19 @@ impl TaskGraphBuilder {
       force_quiet: self.force_quiet,
       force_silence: self.force_silence,
       force_raw: self.force_raw,
-      scopes: Mutex::new(Vec::new()),
+      scopes: Vec::new(),
       os_arch: self.os_arch.clone(),
       os_type: self.os_type.clone(),
-      defer_order: AtomicUsize::new(0),
-      deferred: Mutex::new(HashMap::new()),
+      defer_order: 0,
+      deferred: HashMap::new(),
     }
   }
 
-  /// Connects cleanup barriers after the completed work in their declaration scope.
+  /// Connects cleanup barriers after completed work in reverse declaration order.
+  ///
+  /// Empty predecessors receive a synthetic registration root so a task made
+  /// only of defers still has a reachable graph. Whether an unvisited cleanup is
+  /// eligible during shutdown is decided from `registered_after` by Executor.
   fn attach_deferred_nodes(
     &self,
     dag: &mut DagNode,
@@ -476,7 +525,11 @@ impl TaskGraphBuilder {
     Ok(predecessors.pop())
   }
 
-  /// Creates a task node with the given configuration
+  /// Creates one executable plugin node from normalized task configuration.
+  ///
+  /// A plugin node receives a step binding; internal barrier-like nodes receive
+  /// only the task binding. This is where the `run -> task -> step` identity
+  /// hierarchy becomes attached to executable graph nodes.
   fn create_task_node(
     &self,
     dag: &mut DagNode,
@@ -486,6 +539,8 @@ impl TaskGraphBuilder {
   ) -> ExecutorResult<ArcNode> {
     let plugin = cmd.task.plugin.clone().map(plugin_invocation).transpose()?;
 
+    // Per-command conditions inherited from the invocation are evaluated on
+    // every executable node; an inline command condition is appended last.
     let mut conditions = context.conditions.per_command.clone();
     if let Some(condition) = command_condition {
       conditions.push(plugin_invocation(condition)?);
@@ -544,6 +599,10 @@ impl TaskGraphBuilder {
   }
 
   /// Creates a single-evaluation condition node and adds its result to the task scope.
+  ///
+  /// Descendant nodes receive the same `ConditionState` as a guard. They can
+  /// skip without reevaluating the plugin and fail explicitly if graph ordering
+  /// ever lets them observe an unpublished decision.
   fn add_condition_gate(
     &self,
     dag: &mut DagNode,
@@ -589,9 +648,13 @@ impl TaskGraphBuilder {
     Ok((request.context, task))
   }
 
-  /// Builds the condition and dependency prefix shared by every task invocation.
+  /// Builds the ordered condition/dependency prefix for a task invocation.
+  ///
+  /// The order is fixed: command-call condition, `before_deps`, dependencies,
+  /// then an `after_deps` condition. An `after_deps` condition configured as
+  /// per-command is attached to body nodes instead of becoming a gate.
   async fn prepare_invocation(
-    &self,
+    &mut self,
     dag: &mut DagNode,
     command: &FindResult,
     request: InvocationRequest,
@@ -599,6 +662,8 @@ impl TaskGraphBuilder {
     let mut context = request.context;
     let mut parent = None;
 
+    // A condition placed on a task-reference command belongs outside the
+    // referenced task's own conditions and dependencies.
     if let Some(condition) = request.command_condition {
       let (updated, gate) = self.add_condition_gate(
         dag,
@@ -635,6 +700,8 @@ impl TaskGraphBuilder {
       parent = Some(gate);
     }
 
+    // Dependencies fan out from the latest gate and are joined back into one
+    // terminal before the task body begins.
     let dependency_entries = gate_or_parents(parent.as_ref(), &request.entry_parents);
     let deps = self
       .process_dependencies(dag, command, dependency_entries.clone(), context.clone())
@@ -674,17 +741,13 @@ impl TaskGraphBuilder {
     Ok(PreparedInvocation { context, parents })
   }
 
-  /// Process task dependencies and build the dependency graph
+  /// Expands all declared dependencies and joins their terminal nodes.
   ///
-  /// # Arguments
-  /// * `dag` - The DAG being built
-  /// * `cmd` - The command containing dependencies
-  /// * `parents` - Parent nodes in the graph
-  ///
-  /// # Returns
-  /// Optional group node that contains all dependencies
+  /// Dependencies are siblings: each starts from the same incoming parents.
+  /// Overrides on a complex dependency are applied only to that invocation.
+  /// `None` means no dependency produced a runnable node.
   async fn process_dependencies(
-    &self,
+    &mut self,
     dag: &mut DagNode,
     cmd: &FindResult,
     parents: Vec<ArcNode>,
@@ -711,6 +774,8 @@ impl TaskGraphBuilder {
           dep.interactive,
         ),
       };
+      // One selector can resolve multiple tasks (for example through project
+      // namespaces), so every match becomes a distinct invocation branch.
       let mut dependencies = self.find_and_filter_commands(&cmd.octafile, dep_name)?;
       dependencies = self.filter_command_by_platform(dependencies);
 
@@ -754,7 +819,10 @@ impl TaskGraphBuilder {
     Ok(Some(group))
   }
 
-  /// Generate a unique task name based on frequency map
+  /// Adds a stable ordinal when the same dependency is declared more than once.
+  ///
+  /// The first repeated occurrence is suffixed with `_1`; a dependency that
+  /// appears only once retains its configured name for readable output.
   pub(super) fn generate_unique_task_name(task_name: &str, deps_map: &mut HashMap<&str, (usize, usize)>) -> String {
     if let Some((count, index)) = deps_map.get_mut(task_name) {
       if *count > 1 {
@@ -768,6 +836,7 @@ impl TaskGraphBuilder {
     }
   }
 
+  /// Removes tasks marked internal from wildcard/user-facing lookup results.
   pub(super) fn filter_internal_task(&self, tasks: Vec<FindResult>) -> Vec<FindResult> {
     tasks
       .into_iter()
@@ -775,10 +844,12 @@ impl TaskGraphBuilder {
       .collect()
   }
 
+  /// Resolves task-level run mode with the Octafile default as fallback.
   fn task_run_mode(&self, cmd: &FindResult) -> Option<AllowedRun> {
     cmd.task.run.clone().or_else(|| cmd.octafile.run.clone())
   }
 
+  /// Resolves task-level fingerprint strategy with the Octafile default as fallback.
   fn task_source_strategy(cmd: &FindResult) -> Option<SourceStrategies> {
     cmd
       .task
@@ -787,6 +858,7 @@ impl TaskGraphBuilder {
       .or_else(|| cmd.octafile.source_strategy.clone())
   }
 
+  /// Resolves fail-fast as an effective boolean for inheritance and scheduling.
   fn task_failfast(cmd: &FindResult) -> bool {
     cmd.task.failfast.or(cmd.octafile.failfast).unwrap_or(false)
   }
@@ -808,6 +880,7 @@ impl TaskGraphBuilder {
     }))
   }
 
+  /// Resolves a task-reference selector and applies call-site execution options.
   fn resolve_referenced_tasks(
     &self,
     parent: &FindResult,
@@ -833,7 +906,10 @@ impl TaskGraphBuilder {
     child.task.failfast = Some(Self::task_failfast(parent) || Self::task_failfast(child));
   }
 
-  /// Build a map tracking frequency of each dependency
+  /// Counts dependency names and initializes their emitted-name ordinal.
+  ///
+  /// Each value is `(total_occurrences, emitted_occurrences)`. The second value
+  /// is advanced by [`Self::generate_unique_task_name`].
   pub(super) fn build_deps_frequency_map(deps: &[Deps]) -> HashMap<&str, (usize, usize)> {
     let mut deps_map = HashMap::new();
 
@@ -857,7 +933,10 @@ impl TaskGraphBuilder {
     deps_map
   }
 
-  /// Find and filter commands by platform
+  /// Resolves a task selector and turns an empty result into a planning error.
+  ///
+  /// Platform filtering remains a separate step because dependency and nested
+  /// command call sites apply different overrides before building invocations.
   pub(super) fn find_and_filter_commands(
     &self,
     octafile: &Arc<Octafile>,
@@ -872,7 +951,10 @@ impl TaskGraphBuilder {
     Ok(cmds)
   }
 
-  /// Create a simple command from a complex one
+  /// Normalizes one plugin command into the same task shape as shorthand tasks.
+  ///
+  /// Reusing `create_task_node` after this conversion keeps timeout, silence,
+  /// raw mode, error handling, and template behavior identical across syntaxes.
   fn create_simple_command(
     &self,
     plugin: &PluginCommand,
@@ -909,6 +991,7 @@ impl TaskGraphBuilder {
       .or(task.ignore_error);
   }
 
+  /// Creates a zero-work node used only for graph fan-in or ordering.
   pub(super) fn create_group_node(
     &self,
     dag: &mut DagNode,
@@ -930,6 +1013,10 @@ impl TaskGraphBuilder {
     Ok(arc_task)
   }
 
+  /// Creates a zero-work node that participates in a task scope lifecycle.
+  ///
+  /// These barriers bracket outer task scopes that contain nested task calls;
+  /// ordinary join barriers deliberately remain unscoped.
   fn create_scope_barrier(
     &self,
     dag: &mut DagNode,
@@ -948,6 +1035,7 @@ impl TaskGraphBuilder {
     Ok(task)
   }
 
+  /// Rejects empty plans and dependency cycles before the scheduler sees them.
   pub(super) fn validate_dag(&self, dag: &DagNode, command: &str) -> ExecutorResult<()> {
     if dag.node_count() == 0 {
       return Err(ExecutorError::TaskNotFound(command.to_string()));
@@ -961,6 +1049,7 @@ impl TaskGraphBuilder {
   }
 }
 
+/// Converts parser-level task output configuration into renderer-level mode.
 fn task_output_mode(mode: TaskOutputMode) -> RenderMode {
   match mode {
     TaskOutputMode::Interleaved => RenderMode::Interleaved,

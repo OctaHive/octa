@@ -16,6 +16,7 @@ pub enum SourceMethod {
 }
 
 impl SourceMethod {
+  #[cfg(test)]
   pub fn custom(name: impl Into<String>) -> Self {
     Self::Custom(name.into())
   }

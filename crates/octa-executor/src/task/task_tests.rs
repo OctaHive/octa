@@ -1,3 +1,5 @@
+//! Behavioral tests for executable task nodes and their runtime boundaries.
+
 use super::*;
 use std::{
   fs,
@@ -9,8 +11,6 @@ use std::{
 };
 use tempfile::TempDir;
 
-struct ConstantSourceStrategy;
-
 struct CountingResolver(AtomicUsize);
 
 #[async_trait]
@@ -18,17 +18,6 @@ impl VariableResolver for CountingResolver {
   async fn resolve(&self, _prompt: &crate::vars::VariablePrompt) -> Result<String, String> {
     self.0.fetch_add(1, Ordering::SeqCst);
     Ok("resolved".to_owned())
-  }
-}
-
-#[async_trait]
-impl SourceStrategy for ConstantSourceStrategy {
-  fn key(&self) -> &'static str {
-    "constant"
-  }
-
-  async fn fingerprint(&self, _sources: &[PathBuf], _cancel_token: &CancellationToken) -> ExecutorResult<Vec<u8>> {
-    Ok(vec![1])
   }
 }
 
@@ -70,9 +59,26 @@ struct UnscopedTaskItem;
 
 struct LegacyScopedTaskItem(ConsoleScope);
 
+impl Identifiable for UnscopedTaskItem {
+  fn id(&self) -> &str {
+    "unscoped"
+  }
+}
+
+impl Identifiable for LegacyScopedTaskItem {
+  fn id(&self) -> &str {
+    "legacy"
+  }
+}
+
+#[async_trait]
 impl TaskItem for UnscopedTaskItem {
-  fn run_mode(&self) -> RunMode {
-    RunMode::Always
+  fn name(&self) -> &str {
+    "unscoped"
+  }
+
+  async fn get_deps_result(&self) -> HashMap<String, Arc<str>> {
+    HashMap::new()
   }
 
   fn failfast(&self) -> bool {
@@ -84,9 +90,14 @@ impl TaskItem for UnscopedTaskItem {
   }
 }
 
+#[async_trait]
 impl TaskItem for LegacyScopedTaskItem {
-  fn run_mode(&self) -> RunMode {
-    RunMode::Always
+  fn name(&self) -> &str {
+    "legacy"
+  }
+
+  async fn get_deps_result(&self) -> HashMap<String, Arc<str>> {
+    HashMap::new()
   }
 
   fn failfast(&self) -> bool {
@@ -106,7 +117,6 @@ impl TaskItem for LegacyScopedTaskItem {
 fn task_items_are_unscoped_by_default() {
   let task = UnscopedTaskItem;
 
-  assert_eq!(task.run_mode(), RunMode::Always);
   assert!(!task.failfast());
   assert!(task.requires_concurrency_permit());
   assert!(task.output_scope().is_none());
@@ -118,7 +128,6 @@ fn task_level_output_scope_is_upgraded_to_an_execution_binding() {
   let scope = octa_output::ConsoleScopeAllocator::default().scope("task");
   let task = LegacyScopedTaskItem(scope.clone());
 
-  assert_eq!(task.run_mode(), RunMode::Always);
   assert!(!task.failfast());
   assert!(task.requires_concurrency_permit());
   let binding = task.execution_binding().unwrap();
@@ -201,6 +210,7 @@ fn runtime(
 ) -> TaskRuntime {
   TaskRuntime {
     plugin_manager,
+    terminal: Arc::new(crate::UnsupportedRawTerminal),
     cache,
     fingerprint,
     console: Arc::new(Console::default()),
@@ -290,109 +300,6 @@ async fn test_prepare_dir_rejects_file_path() {
   assert!(matches!(
     prepare_dir(&task, false).await,
     Err(ExecutorError::IoError(_))
-  ));
-}
-
-#[tokio::test]
-async fn standalone_task_config_preserves_source_freshness() {
-  let root = TempDir::new().unwrap();
-  let source = root.path().join("source.txt");
-  fs::write(&source, "initial").unwrap();
-  let task = TaskNode::new(
-    TaskConfig::builder()
-      .id("standalone")
-      .name("standalone")
-      .dep_name("standalone")
-      .dir(root.path())
-      .sources(Some(vec![source.to_string_lossy().into_owned()]))
-      .octafile_root(root.path())
-      .source_strategy(Some(SourceMethod::Hash))
-      .build()
-      .unwrap(),
-  );
-  let database = sled::Config::new().temporary(true).open().unwrap();
-  let vars = Vars::new();
-  let envs = Envs::new();
-  let output = ConsoleTarget::new(Arc::new(Console::default()), 7, None);
-
-  let first = task
-    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new(), &output)
-    .await
-    .unwrap()
-    .unwrap();
-  assert!(first.should_run());
-  first.commit(&database).unwrap();
-  assert!(!task
-    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new(), &output)
-    .await
-    .unwrap()
-    .unwrap()
-    .should_run());
-
-  fs::write(source, "changed").unwrap();
-  assert!(task
-    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new(), &output)
-    .await
-    .unwrap()
-    .unwrap()
-    .should_run());
-}
-
-#[tokio::test]
-async fn standalone_task_uses_an_injected_source_strategy() {
-  let root = TempDir::new().unwrap();
-  let source = root.path().join("source.txt");
-  fs::write(&source, "initial").unwrap();
-  let task = TaskNode::new(
-    TaskConfig::builder()
-      .id("custom-strategy")
-      .name("custom-strategy")
-      .dep_name("custom-strategy")
-      .dir(root.path())
-      .sources(Some(vec![source.to_string_lossy().into_owned()]))
-      .octafile_root(root.path())
-      .source_strategy_provider(SourceMethod::custom("constant"), ConstantSourceStrategy)
-      .build()
-      .unwrap(),
-  );
-  let freshness = task.standalone_freshness.as_ref().unwrap();
-  assert_eq!(freshness.method(), SourceMethod::custom("constant"));
-  assert_eq!(freshness.strategy_key(), "constant");
-  let database = sled::Config::new().temporary(true).open().unwrap();
-  let vars = Vars::new();
-  let envs = Envs::new();
-  let output = ConsoleTarget::new(Arc::new(Console::default()), 7, None);
-
-  let first = task
-    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new(), &output)
-    .await
-    .unwrap()
-    .unwrap();
-  first.commit(&database).unwrap();
-  fs::write(source, "changed").unwrap();
-
-  assert!(!task
-    .standalone_freshness(&database, false, &vars, &envs, &CancellationToken::new(), &output)
-    .await
-    .unwrap()
-    .unwrap()
-    .should_run());
-}
-
-#[test]
-fn standalone_task_rejects_an_unregistered_source_strategy() {
-  let result = TaskConfig::builder()
-    .id("custom-strategy")
-    .name("custom-strategy")
-    .dep_name("custom-strategy")
-    .dir(".")
-    .sources(Some(vec!["source.txt".to_owned()]))
-    .source_strategy(Some(SourceMethod::custom("missing")))
-    .build();
-
-  assert!(matches!(
-    result,
-    Err(ExecutorError::SourceStrategyUnavailable(name)) if name == "missing"
   ));
 }
 
@@ -493,6 +400,7 @@ async fn plugin_stdout_and_stderr_are_routed_as_structured_events() {
   let console = Arc::new(Console::new(RecordingRenderer(events.clone())));
   let runtime = TaskRuntime {
     plugin_manager: plugin_manager.clone(),
+    terminal: Arc::new(crate::UnsupportedRawTerminal),
     cache: Arc::new(Mutex::new(IndexMap::new())),
     fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
     console,
@@ -695,6 +603,7 @@ async fn missing_plugin_errors_can_be_propagated_or_ignored() {
       .execute(
         TaskRuntime {
           plugin_manager: Arc::new(PluginManager::new(TempDir::new().unwrap().path())),
+          terminal: Arc::new(crate::UnsupportedRawTerminal),
           cache: Arc::new(Mutex::new(IndexMap::new())),
           fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
           console: Arc::new(Console::new(RecordingRenderer(events.clone()))),
@@ -893,7 +802,7 @@ async fn test_dependency_results() {
     None,
   );
 
-  task.set_result("dep1".to_string(), "dep_output".to_string()).await;
+  task.set_result("dep1".to_string(), Arc::from("dep_output")).await;
 
   let cache = Arc::new(Mutex::new(IndexMap::new()));
   let fingerprint = Arc::new(db);

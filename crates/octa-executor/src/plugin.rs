@@ -14,10 +14,10 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-  console_target::ConsoleTarget,
   error::{ExecutorError, ExecutorResult},
   output_capture::{CaptureError, OutputCapture, MAX_CAPTURED_OUTPUT_BYTES},
-  raw_terminal::RawTerminalBridge,
+  runtime_output::RuntimeOutput,
+  terminal::{RawTerminalConnector, RawTerminalInput, UnsupportedRawTerminal},
 };
 
 #[derive(Clone)]
@@ -37,6 +37,7 @@ impl PluginTarget {
 #[derive(Clone)]
 pub(crate) struct PluginInvoker {
   manager: Arc<PluginManager>,
+  terminal: Arc<dyn RawTerminalConnector>,
 }
 
 pub(crate) struct PluginRequest {
@@ -44,7 +45,7 @@ pub(crate) struct PluginRequest {
   pub value: Value,
   pub args: Vec<String>,
   pub context: PluginExecutionContext,
-  pub output: Option<ConsoleTarget>,
+  pub output: Option<RuntimeOutput>,
   pub raw: bool,
 }
 
@@ -68,7 +69,14 @@ pub(crate) struct PluginOutput {
 
 impl PluginInvoker {
   pub(crate) fn new(manager: Arc<PluginManager>) -> Self {
-    Self { manager }
+    Self {
+      manager,
+      terminal: Arc::new(UnsupportedRawTerminal),
+    }
+  }
+
+  pub(crate) fn with_terminal(manager: Arc<PluginManager>, terminal: Arc<dyn RawTerminalConnector>) -> Self {
+    Self { manager, terminal }
   }
 
   pub(crate) async fn invoke(
@@ -79,13 +87,7 @@ impl PluginInvoker {
     let plugin_name = request.target.name().to_owned();
     let registration = match &request.target {
       PluginTarget::Key(key) => self.manager.resolve_key(key).await,
-      PluginTarget::Capability(capability) => {
-        match self.manager.resolve_capability(capability).await {
-          Some(registration) => Some(registration),
-          // Before capabilities were added, conventional task keys represented the same behavior.
-          None => self.manager.resolve_key(capability).await,
-        }
-      },
+      PluginTarget::Capability(capability) => self.manager.resolve_capability(capability).await,
     }
     .ok_or_else(|| ExecutorError::PluginUnavailable(request.target.name().to_owned()))?;
     registration
@@ -148,7 +150,11 @@ impl PluginInvoker {
       None
     };
     let mut terminal_bridge = if request.raw {
-      match RawTerminalBridge::start(execution.terminal_input()).await {
+      match self
+        .terminal
+        .connect(RawTerminalInput::new(execution.terminal_input()))
+        .await
+      {
         Ok(bridge) => Some(bridge),
         Err(error) => {
           drop(raw_session);
@@ -235,7 +241,7 @@ enum PluginResponseAction {
 async fn route_plugin_response(
   response: PluginResponse,
   command_id: &str,
-  target: Option<&ConsoleTarget>,
+  target: Option<&RuntimeOutput>,
   raw_session: Option<&mut octa_output::RawConsoleSession>,
   output: &mut OutputCapture,
   plugin_name: &str,
@@ -322,7 +328,7 @@ async fn route_plugin_response(
 }
 
 async fn route_line(
-  target: Option<&ConsoleTarget>,
+  target: Option<&RuntimeOutput>,
   raw_session: Option<&mut octa_output::RawConsoleSession>,
   command_id: &str,
   stream: ConsoleStream,
@@ -341,7 +347,7 @@ async fn route_line(
 }
 
 async fn route_bytes(
-  target: Option<&ConsoleTarget>,
+  target: Option<&RuntimeOutput>,
   raw_session: Option<&mut octa_output::RawConsoleSession>,
   command_id: &str,
   stream: ConsoleStream,
@@ -533,7 +539,7 @@ mod tests {
     let scope = allocator.scope("task");
     let step = allocator.step(&scope, "shell");
     let step_id = step.id();
-    let target = ConsoleTarget::with_silence(
+    let target = RuntimeOutput::with_silence(
       console.clone(),
       7,
       Some(crate::task::ExecutionBinding::for_step(scope, step)),
@@ -722,7 +728,7 @@ mod tests {
     let scope = allocator.scope("raw");
     let step = allocator.step(&scope, "shell");
     let step_id = step.id();
-    let target = ConsoleTarget::with_silence(
+    let target = RuntimeOutput::with_silence(
       console.clone(),
       1,
       Some(crate::task::ExecutionBinding::for_step(scope, step)),

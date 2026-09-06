@@ -1,3 +1,8 @@
+//! Bounded capture of plugin stdout and stderr for terminal task results.
+//!
+//! Small output stays in memory, larger streams spill independently to temporary
+//! files, and one shared hard limit bounds the complete task result.
+
 use std::io::{self, SeekFrom};
 
 use octa_output::ConsoleStream;
@@ -11,8 +16,11 @@ pub(crate) const MAX_CAPTURED_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const CAPTURE_MEMORY_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug)]
+/// Failures that preserve the distinction between resource limits and I/O.
 pub(crate) enum CaptureError {
+  /// The combined stdout/stderr budget was exceeded.
   LimitExceeded,
+  /// Temporary-file or stream access failed.
   Io(io::Error),
 }
 
@@ -22,6 +30,7 @@ impl From<io::Error> for CaptureError {
   }
 }
 
+/// Storage for one stream, promoted from memory to disk at most once.
 enum CaptureBuffer {
   Memory(Vec<u8>),
   Disk {

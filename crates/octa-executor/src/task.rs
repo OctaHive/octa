@@ -1,3 +1,9 @@
+//! Executable DAG nodes and the services available while they run.
+//!
+//! Planning creates immutable [`TaskNode`] values. Runtime execution resolves
+//! their variables and environment, invokes plugins, and publishes output, but
+//! does not perform dependency scheduling or renderer-specific formatting.
+
 use std::{
   collections::{HashMap, HashSet},
   env,
@@ -28,99 +34,103 @@ use octa_octafile::{AllowedRun, Timeout};
 use octa_output::{Console, ConsoleLevel, ConsoleScope, ConsoleStatus, ConsoleStep};
 
 use crate::{
-  console_target::ConsoleTarget,
   envs::{EnvironmentPlan, Envs},
   error::{ExecutorError, ExecutorResult},
-  freshness::{FreshnessConfig, FreshnessIdentity, FreshnessOutcome, FreshnessSpec, FreshnessState},
+  freshness::{FreshnessSpec, FreshnessState},
   plugin::{ManagerPluginEvaluator, PluginEvaluator, PluginExecutionContext, PluginInvoker, PluginRequest},
-  source_strategy::{SourceStrategyHandle, SourceStrategyRegistry},
+  runtime_output::RuntimeOutput,
   template::{PluginTemplateContext, TemplateRenderer},
+  terminal::RawTerminalConnector,
   vars::{VariableResolver, Vars},
   watcher::WatchTarget,
 };
 
 /// Services and execution settings shared by every node in one executor.
 #[derive(Clone)]
-pub struct TaskRuntime {
+pub(crate) struct TaskRuntime {
   /// Registry and live connections used to invoke task plugins.
-  pub plugin_manager: Arc<PluginManager>,
+  pub(crate) plugin_manager: Arc<PluginManager>,
+  /// Host adapter used only by raw interactive commands.
+  pub(crate) terminal: Arc<dyn RawTerminalConnector>,
   /// Per-execution cache shared by nodes in the graph.
-  pub cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
+  pub(crate) cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
   /// Persistent source and output fingerprints.
-  pub fingerprint: Arc<Db>,
+  pub(crate) fingerprint: Arc<Db>,
   /// Destination for command output events.
-  pub console: Arc<Console>,
+  pub(crate) console: Arc<Console>,
   /// Identifier shared by all events emitted for this execution.
-  pub run_id: u64,
+  pub(crate) run_id: u64,
   /// Whether plugins should describe work without changing the filesystem.
-  pub dry: bool,
+  pub(crate) dry: bool,
   /// Whether freshness checks should be bypassed.
-  pub force: bool,
+  pub(crate) force: bool,
   /// Exit code exposed to commands executing as part of a deferred action.
-  pub deferred_exit_code: Option<i32>,
+  pub(crate) deferred_exit_code: Option<i32>,
 }
 
 /// Result of one DAG node, including whether it performed work or was skipped.
 #[derive(Debug, Eq, PartialEq)]
-pub struct TaskOutcome {
-  output: String,
+pub(crate) struct TaskOutcome {
+  output: Arc<str>,
   status: ConsoleStatus,
 }
 
 impl TaskOutcome {
-  pub(crate) fn new(output: String, status: ConsoleStatus) -> Self {
+  pub(crate) fn new(output: Arc<str>, status: ConsoleStatus) -> Self {
     Self { output, status }
   }
 
-  pub fn success(output: impl Into<String>) -> Self {
+  pub(crate) fn success(output: impl Into<Arc<str>>) -> Self {
     Self {
       output: output.into(),
       status: ConsoleStatus::Success,
     }
   }
 
-  pub fn skipped(output: impl Into<String>) -> Self {
+  pub(crate) fn skipped(output: impl Into<Arc<str>>) -> Self {
     Self {
       output: output.into(),
       status: ConsoleStatus::Skipped,
     }
   }
 
-  pub fn status(&self) -> ConsoleStatus {
+  pub(crate) fn status(&self) -> ConsoleStatus {
     self.status
   }
 
-  pub fn output(&self) -> &str {
+  #[cfg(test)]
+  pub(crate) fn output(&self) -> &str {
     &self.output
   }
 
-  pub fn into_output(self) -> String {
+  pub(crate) fn into_output(self) -> Arc<str> {
     self.output
   }
 }
 
 #[async_trait]
-pub trait Executable<T> {
+pub(crate) trait Executable: TaskItem {
   async fn execute(&self, runtime: TaskRuntime, cancel_token: CancellationToken) -> ExecutorResult<TaskOutcome>;
-  async fn set_result(&self, task_name: String, res: String);
-  async fn bypass_result(&self, result: HashMap<String, String>);
+  async fn set_result(&self, task_name: String, result: Arc<str>);
+  async fn bypass_result(&self, result: HashMap<String, Arc<str>>);
 }
 
-pub use crate::source_strategy::{SourceMethod, SourceStrategy};
+#[cfg(test)]
+pub(crate) use crate::source_strategy::SourceMethod;
 
 /// Output identity attached to one executable DAG node.
 ///
 /// Keeping task and step identity in one value prevents a step from being
 /// emitted without its owning task invocation.
 #[derive(Clone, Debug)]
-pub struct ExecutionBinding {
+pub(crate) struct ExecutionBinding {
   scope: ConsoleScope,
   step: Option<ConsoleStep>,
 }
 
 impl ExecutionBinding {
   /// Binds a DAG node to task-level lifecycle and diagnostics.
-  pub fn for_task(scope: ConsoleScope) -> Self {
+  pub(crate) fn for_task(scope: ConsoleScope) -> Self {
     Self { scope, step: None }
   }
 
@@ -129,7 +139,7 @@ impl ExecutionBinding {
   /// # Panics
   ///
   /// Panics when `step` was allocated for a different task scope.
-  pub fn for_step(scope: ConsoleScope, step: ConsoleStep) -> Self {
+  pub(crate) fn for_step(scope: ConsoleScope, step: ConsoleStep) -> Self {
     assert!(step.belongs_to(&scope), "step must belong to its task scope");
     Self {
       scope,
@@ -137,17 +147,24 @@ impl ExecutionBinding {
     }
   }
 
-  pub fn scope(&self) -> &ConsoleScope {
+  pub(crate) fn scope(&self) -> &ConsoleScope {
     &self.scope
   }
 
-  pub fn step(&self) -> Option<&ConsoleStep> {
+  pub(crate) fn step(&self) -> Option<&ConsoleStep> {
     self.step.as_ref()
   }
 }
 
-pub trait TaskItem {
-  fn run_mode(&self) -> RunMode;
+#[async_trait]
+pub(crate) trait TaskItem: Identifiable {
+  fn name(&self) -> &str;
+
+  fn is_internal(&self) -> bool {
+    false
+  }
+
+  async fn get_deps_result(&self) -> HashMap<String, Arc<str>>;
   fn failfast(&self) -> bool;
   fn requires_concurrency_permit(&self) -> bool;
 
@@ -174,7 +191,7 @@ pub trait TaskItem {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub enum RunMode {
+pub(crate) enum RunMode {
   Always,
   Once,
   Changed,
@@ -247,41 +264,42 @@ impl From<AllowedRun> for RunMode {
 }
 
 mod config;
-pub use config::{CacheItem, TaskConfig, TaskConfigBuilder};
+pub(crate) use config::{CacheItem, TaskConfig};
 pub(crate) use config::{ConditionRuntime, ConditionState, FreshnessRuntime, NodeAction, PluginInvocation};
 
 /// Represents a single executable task with its configuration and state.
 #[derive(Debug, Clone)]
-pub struct TaskNode {
+pub(crate) struct TaskNode {
   // Task identification
-  pub id: String,       // Task uniq id
-  pub name: String,     // Task name
-  pub dep_name: String, // Name of task in deps
+  pub(crate) id: String,       // Task uniq id
+  pub(crate) name: String,     // Task name
+  pub(crate) dep_name: String, // Name of task in deps
 
   // Execution configuration
-  pub dir: PathBuf,        // Working directory
-  pub ignore_errors: bool, // Whether to continue on error
-  pub silence: octa_octafile::Silence,
-  pub quiet: bool,
-  pub raw: bool,
+  pub(crate) dir: PathBuf,        // Working directory
+  pub(crate) ignore_errors: bool, // Whether to continue on error
+  pub(crate) silence: octa_octafile::Silence,
+  pub(crate) quiet: bool,
+  pub(crate) raw: bool,
   interactive_session: Option<String>,
-  pub failfast: bool, // Cancel parallel work after the first failure
+  pub(crate) failfast: bool, // Cancel parallel work after the first failure
 
   // Runtime behavior
-  pub run_mode: RunMode, // Run mode
-  pub vars: Vars,        // Task variables
-  pub envs: Envs,        // Task environments
+  pub(crate) run_mode: RunMode, // Run mode
+  #[cfg(test)]
+  pub(crate) vars: Vars, // Task variables
+  #[cfg(test)]
+  pub(crate) envs: Envs, // Task environments
   invocation_runtime: Arc<InvocationRuntime>,
-  standalone_freshness: Option<FreshnessConfig>,
-  condition_runtime: ConditionRuntime,    // Conditions attached to this graph node
-  freshness_runtime: FreshnessRuntime,    // Task-level source and output state
-  pub preconditions: Option<Vec<String>>, // Task run preconditions
-  pub timeout: Option<Timeout>,           // Maximum task execution time
+  condition_runtime: ConditionRuntime, // Conditions attached to this graph node
+  freshness_runtime: FreshnessRuntime, // Task-level source and output state
+  pub(crate) preconditions: Option<Vec<String>>, // Task run preconditions
+  pub(crate) timeout: Option<Timeout>, // Maximum task execution time
   execution_binding: Option<ExecutionBinding>,
   prefix_template: Option<String>,
 
   // State management
-  pub deps_res: Arc<Mutex<HashMap<String, String>>>, // Dependencies results
+  pub(crate) deps_res: Arc<Mutex<HashMap<String, Arc<str>>>>, // Shared dependency results
   action: NodeAction,
   plugin: Option<PluginInvocation>,
 }
@@ -304,29 +322,24 @@ impl Hash for TaskNode {
 
 mod execution;
 
-#[async_trait]
 impl Identifiable for TaskNode {
-  fn id(&self) -> String {
-    self.id.clone()
+  fn id(&self) -> &str {
+    &self.id
+  }
+}
+
+#[async_trait]
+impl TaskItem for TaskNode {
+  fn name(&self) -> &str {
+    &self.name
   }
 
-  fn name(&self) -> String {
-    self.name.clone()
-  }
-
-  async fn get_deps_result(&self) -> HashMap<String, String> {
-    let res = self.deps_res.lock().await;
-    res.clone()
+  async fn get_deps_result(&self) -> HashMap<String, Arc<str>> {
+    self.deps_res.lock().await.clone()
   }
 
   fn is_internal(&self) -> bool {
     !self.action.is_command()
-  }
-}
-
-impl TaskItem for TaskNode {
-  fn run_mode(&self) -> RunMode {
-    self.run_mode.clone()
   }
 
   fn failfast(&self) -> bool {

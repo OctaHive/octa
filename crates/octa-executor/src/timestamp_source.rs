@@ -1,3 +1,8 @@
+//! Modification-time source fingerprint strategy.
+//!
+//! Path identity is included alongside nanosecond timestamps so moving or
+//! replacing a source invalidates freshness even when times collide.
+
 use std::{path::PathBuf, time::UNIX_EPOCH};
 
 use async_trait::async_trait;

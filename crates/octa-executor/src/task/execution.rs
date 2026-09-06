@@ -1,15 +1,35 @@
 //! Runtime execution pipeline for a configured task node.
+//!
+//! The planner has already reduced task syntax to a [`TaskNode`] and its
+//! [`NodeAction`]. Execution then follows one ordered pipeline: inherited gate
+//! decisions, graph-only action, invocation context resolution, command
+//! conditions, preconditions, run-mode cache, and finally plugin invocation.
+//! Keeping that order here is important: work skipped by an ancestor condition
+//! must not prompt for variables or execute shell-backed environment values.
 
 use super::*;
 
+/// Per-call values needed only by hidden graph actions.
+///
+/// Keeping these outside [`TaskRuntime`] leaves unrelated terminal and cache
+/// services out of graph-action code; required evaluator/fingerprint services
+/// are passed explicitly to `execute_graph_action`.
 struct GraphActionRuntime<'a> {
+  /// Whether filesystem-changing work should be suppressed.
   dry: bool,
+  /// Whether freshness should be treated as stale.
   force: bool,
+  /// Execution-local cooperative cancellation.
   cancel_token: &'a CancellationToken,
+  /// Exit status exposed while executing a deferred plan.
   deferred_exit_code: Option<i32>,
 }
 
 impl TaskNode {
+  /// Builds highest-priority expansion overrides for a deferred invocation.
+  ///
+  /// `EXIT_CODE` must be visible while templates and shell-backed values are
+  /// resolved, not merely added to the final plugin variable map.
   fn deferred_variable_overrides(exit_code: Option<i32>) -> IndexMap<String, Value> {
     exit_code
       .map(|exit_code| ("EXIT_CODE".to_owned(), Value::from(exit_code)))
@@ -17,13 +37,23 @@ impl TaskNode {
       .collect()
   }
 
+  /// Adds `EXIT_CODE` to a cloned resolved context without polluting the shared cache.
+  ///
+  /// Invocation contexts are cached in a `OnceCell`. Applying this value after
+  /// cloning prevents one deferred execution's status from becoming permanent
+  /// state for another consumer of that context.
   fn expose_deferred_exit_code(vars: &mut Vars, exit_code: Option<i32>) {
     if let Some(exit_code) = exit_code {
       vars.insert("EXIT_CODE", &exit_code);
     }
   }
 
-  pub fn new(config: TaskConfig) -> Self {
+  /// Creates an immutable executable node from planner-owned configuration.
+  ///
+  /// Planner-built nodes share an [`InvocationRuntime`] across conditions and
+  /// commands. The fallback keeps directly constructed internal/test nodes
+  /// functional without duplicating resolution logic.
+  pub(crate) fn new(config: TaskConfig) -> Self {
     let invocation_runtime = config.invocation_runtime.unwrap_or_else(|| {
       Arc::new(InvocationRuntime::new(
         config.vars.clone(),
@@ -37,8 +67,9 @@ impl TaskNode {
       name: config.name,
       dep_name: config.dep_name,
       run_mode: config.run_mode,
-      standalone_freshness: config.standalone_freshness,
+      #[cfg(test)]
       vars: config.vars,
+      #[cfg(test)]
       envs: config.envs,
       invocation_runtime,
       dir: config.dir,
@@ -61,6 +92,7 @@ impl TaskNode {
   }
 
   #[cfg(test)]
+  /// Returns normalized condition commands for planner assertions.
   pub(crate) fn conditions(&self) -> Vec<String> {
     self
       .condition_runtime
@@ -71,16 +103,22 @@ impl TaskNode {
   }
 
   #[cfg(test)]
+  /// Returns the task scope bound to this node, if any.
   pub(crate) fn output_scope(&self) -> Option<&ConsoleScope> {
     self.execution_binding.as_ref().map(ExecutionBinding::scope)
   }
 
   #[cfg(test)]
+  /// Returns the shared interactive-session identity used by this node.
   pub(crate) fn interactive_session(&self) -> Option<&str> {
     self.interactive_session.as_deref()
   }
 
-  pub fn watch_target(&self) -> Option<WatchTarget> {
+  /// Returns watch metadata only from the node that owns freshness evaluation.
+  ///
+  /// Command and commit nodes deliberately return nothing so one invocation
+  /// cannot register the same source tree multiple times.
+  pub(crate) fn watch_target(&self) -> Option<WatchTarget> {
     match &self.action {
       NodeAction::FreshnessCheck { spec, .. } => spec.watch_target(),
       _ => None,
@@ -88,6 +126,7 @@ impl TaskNode {
   }
 
   #[cfg(test)]
+  /// Exposes the selected freshness method for planner tests.
   pub(crate) fn source_method(&self) -> Option<SourceMethod> {
     match &self.action {
       NodeAction::FreshnessCheck { spec, .. } => Some(spec.method()),
@@ -96,6 +135,7 @@ impl TaskNode {
   }
 
   #[cfg(test)]
+  /// Exposes the concrete source-strategy key for planner tests.
   pub(crate) fn source_strategy_key(&self) -> Option<&'static str> {
     match &self.action {
       NodeAction::FreshnessCheck { spec, .. } => Some(spec.strategy_key()),
@@ -103,6 +143,10 @@ impl TaskNode {
     }
   }
 
+  /// Renders a potentially templated task directory from resolved variables.
+  ///
+  /// Plugin-backed template helpers execute from the host's current directory
+  /// because the rendered task directory may not exist until rendering ends.
   async fn interpolate_dir(
     &self,
     dir: PathBuf,
@@ -144,11 +188,14 @@ impl TaskNode {
 
       debug!("Expanded path: {}", rendered);
 
-      Ok(PathBuf::from(rendered.trim_matches('"'))) // Remove extra quotes from result
+      // Tera may serialize a string-valued expression with surrounding quotes;
+      // directory configuration expects the underlying path.
+      Ok(PathBuf::from(rendered.trim_matches('"')))
     }
   }
 
   #[cfg(test)]
+  /// Test seam for directory interpolation without a plugin evaluator.
   pub(super) async fn prepare_dir_with_vars(&self, vars: &Vars, dry: bool) -> ExecutorResult<PathBuf> {
     let dir = self
       .interpolate_dir(self.dir.clone(), vars, None, dry, CancellationToken::new())
@@ -157,6 +204,7 @@ impl TaskNode {
     self.ensure_dir(dir, dry).await
   }
 
+  /// Resolves and prepares the working directory used during real execution.
   async fn prepare_runtime_dir(
     &self,
     vars: &Vars,
@@ -171,6 +219,11 @@ impl TaskNode {
     self.ensure_dir(dir, dry).await
   }
 
+  /// Returns a canonical execution directory, creating it outside dry-run mode.
+  ///
+  /// Dry runs preserve missing absolute paths and anchor missing relative paths
+  /// without mutating the filesystem. Existing paths are still canonicalized so
+  /// template/plugin behavior matches a normal execution.
   async fn ensure_dir(&self, dir: PathBuf, dry: bool) -> ExecutorResult<PathBuf> {
     if dry {
       return match canonicalize(&dir) {
@@ -191,6 +244,11 @@ impl TaskNode {
   }
 
   /// Resolves the values shared by conditions, cache checks, and the task command once.
+  ///
+  /// The `OnceCell` belongs to the complete task invocation rather than an
+  /// individual DAG node. Required prompts, variable shell commands, and
+  /// environment shell commands therefore execute at most once even when the
+  /// invocation contains several condition and command nodes.
   pub(super) async fn resolve_runtime_context(
     &self,
     evaluator: Arc<dyn PluginEvaluator>,
@@ -214,6 +272,8 @@ impl TaskNode {
           Some(self.ensure_dir(self.dir.clone(), dry).await?)
         };
 
+        // Required input is resolved before template expansion so supplied
+        // values are available to every later variable and directory template.
         let mut vars = self.invocation_runtime.vars.clone();
         vars
           .resolve_required(self.invocation_runtime.resolver.as_deref())
@@ -246,12 +306,18 @@ impl TaskNode {
       })
       .await?;
 
+    // Consumers receive an owned snapshot; task-specific additions cannot
+    // mutate the invocation-wide cached context.
     let mut context = context.clone();
     Self::expose_deferred_exit_code(&mut context.vars, deferred_exit_code);
     Ok(context)
   }
 
-  async fn log_info(&self, output: &ConsoleTarget, message: String) -> ExecutorResult<()> {
+  /// Emits informational task messages only for visible command nodes.
+  ///
+  /// Hidden condition/freshness/barrier nodes must not create user-facing
+  /// "Starting task" noise, and quiet mode suppresses the remaining messages.
+  async fn log_info(&self, output: &RuntimeOutput, message: String) -> ExecutorResult<()> {
     if self.action.is_command() && !self.quiet {
       output.message(ConsoleLevel::Info, message).await?;
     }
@@ -259,11 +325,14 @@ impl TaskNode {
   }
 
   /// Executes graph-only actions before entering the plugin command path.
+  ///
+  /// `Some` is a complete node outcome. `None` means the node still needs the
+  /// common condition/precondition/plugin pipeline below.
   async fn execute_graph_action(
     &self,
     fingerprint: &Db,
     evaluator: Arc<dyn PluginEvaluator>,
-    output: &ConsoleTarget,
+    output: &RuntimeOutput,
     runtime: GraphActionRuntime<'_>,
   ) -> ExecutorResult<Option<TaskOutcome>> {
     if !self.freshness_runtime.should_run()? {
@@ -277,6 +346,8 @@ impl TaskNode {
     }
 
     match &self.action {
+      // Condition nodes use the common plugin-condition path. Command nodes
+      // continue all the way to their configured plugin invocation.
       NodeAction::Command | NodeAction::Condition => Ok(None),
       // Barrier nodes only preserve graph ordering and carry no runtime payload.
       NodeAction::Barrier => Ok(Some(TaskOutcome::success(String::new()))),
@@ -298,6 +369,8 @@ impl TaskNode {
             runtime.cancel_token,
           )
           .await?;
+        // Publish before returning so every downstream node observes a fully
+        // initialized decision when the scheduler releases it.
         let should_run = outcome.should_run();
         state.publish(outcome)?;
         if !should_run {
@@ -312,6 +385,8 @@ impl TaskNode {
         }))
       },
       NodeAction::FreshnessCommit(state) => {
+        // Dry runs evaluate freshness for accurate planning output but never
+        // persist state describing work that was not actually performed.
         if !runtime.dry {
           state.commit(fingerprint)?;
         }
@@ -320,53 +395,11 @@ impl TaskNode {
     }
   }
 
-  pub(super) async fn standalone_freshness(
-    &self,
-    fingerprint: &Db,
-    force: bool,
-    vars: &Vars,
-    envs: &Envs,
-    cancel_token: &CancellationToken,
-    output: &ConsoleTarget,
-  ) -> ExecutorResult<Option<FreshnessOutcome>> {
-    if !self.action.is_command() || self.freshness_runtime.is_managed() {
-      return Ok(None);
-    }
-    let Some(freshness) = &self.standalone_freshness else {
-      return Ok(None);
-    };
-
-    let definition = serde_json::json!({
-      "dir": self.dir,
-      "run_mode": self.run_mode,
-      "preconditions": self.preconditions,
-      "timeout": self.timeout,
-      "plugin": self.plugin,
-    });
-    let identity = FreshnessIdentity::new(self.name.clone(), self.dep_name.clone(), definition);
-    let spec = freshness.spec(identity);
-    let outcome = spec.evaluate(fingerprint, force, vars, envs, cancel_token).await?;
-    if !outcome.should_run() {
-      self
-        .log_info(output, format!("Task {} is up to date", self.dep_name))
-        .await?;
-    }
-    Ok(Some(outcome))
-  }
-
-  fn commit_standalone_freshness(
-    outcome: Option<&FreshnessOutcome>,
-    fingerprint: &Db,
-    dry: bool,
-  ) -> ExecutorResult<()> {
-    if !dry {
-      if let Some(outcome) = outcome {
-        outcome.commit(fingerprint)?;
-      }
-    }
-    Ok(())
-  }
-
+  /// Evaluates every plugin-backed condition attached to this node.
+  ///
+  /// Conditions receive dependency results under `deps_result` but do not emit
+  /// normal task output. A non-zero plugin status means "false"; transport and
+  /// protocol errors remain execution failures.
   async fn check_condition(
     &self,
     plugin_manager: Arc<PluginManager>,
@@ -383,12 +416,20 @@ impl TaskNode {
       return Ok(true);
     }
 
+    // Copy references into the template/plugin value before releasing the lock;
+    // no plugin call is allowed to hold scheduler result state across an await.
     let deps_res = self.deps_res.lock().await;
     let mut vars = vars.clone();
-    vars.insert("deps_result", &*deps_res);
+    let dependency_values = deps_res
+      .iter()
+      .map(|(name, value)| (name.as_str(), value.as_ref()))
+      .collect::<HashMap<_, _>>();
+    vars.insert("deps_result", &dependency_values);
     drop(deps_res);
 
     let invoker = PluginInvoker::new(plugin_manager);
+    // Conditions are conjunctive and preserve their configured order. Stop on
+    // the first false result to avoid unnecessary plugin work.
     for condition in self.condition_runtime.conditions() {
       let request = PluginRequest {
         target: crate::plugin::PluginTarget::Key(condition.key.clone()),
@@ -418,6 +459,11 @@ impl TaskNode {
     Ok(true)
   }
 
+  /// Renders task preconditions and requires every value to be truthy.
+  ///
+  /// Preconditions use Tera/plugin helpers and dependency results from the same
+  /// resolved context as the command. They differ from conditions by treating a
+  /// false value as task cancellation/failure rather than a clean skip.
   async fn check_preconditions(
     &self,
     evaluator: Arc<dyn PluginEvaluator>,
@@ -432,9 +478,14 @@ impl TaskNode {
     };
 
     let mut context: Context = vars.clone().into();
-    // Add dependency results to template context
+    // Dependency results are input data, not top-level task variables, so keep
+    // them under the dedicated `deps_result` namespace.
     let deps_res = self.deps_res.lock().await;
-    context.insert("deps_result", &*deps_res);
+    let dependency_values = deps_res
+      .iter()
+      .map(|(name, value)| (name.as_str(), value.as_ref()))
+      .collect::<HashMap<_, _>>();
+    context.insert("deps_result", &dependency_values);
     drop(deps_res);
     let renderer = TemplateRenderer::new(
       context,
@@ -460,13 +511,18 @@ impl TaskNode {
         .await
         .map_err(|error| ExecutorError::ValueExpandError(precondition.to_owned(), error))?;
 
+      // Render every precondition to surface configuration errors consistently,
+      // even after an earlier expression evaluated to false.
       result = result && (rendered.trim() == "true" || rendered.trim() == "True" || rendered.trim() == "1");
     }
 
     Ok(result)
   }
 
-  /// Check if result is cached
+  /// Returns a reusable result according to the node's configured run mode.
+  ///
+  /// `once` ignores variable changes, while `changed` reuses output only for an
+  /// equal resolved variable set. `always` never consults the cache.
   async fn check_cache(
     &self,
     vars: &Vars,
@@ -488,7 +544,7 @@ impl TaskNode {
     Ok(None)
   }
 
-  /// Update cache with new result
+  /// Stores a successful result for `once` and `changed` run modes.
   async fn update_cache(
     &self,
     result: &str,
@@ -503,19 +559,23 @@ impl TaskNode {
     Ok(())
   }
 
+  /// Logs dependency names without cloning or exposing their potentially sensitive values.
   async fn debug_log_dependencies(&self) {
     if enabled!(Level::DEBUG) {
       let deps = self.deps_res.lock().await;
-      for (name, res) in &*deps {
-        debug!("Dependency {} results: {}", name, res);
-      }
+      debug!(dependencies = ?deps.keys().collect::<Vec<_>>(), "Resolved dependency results");
     }
   }
 
   /// Executes the task without applying its timeout wrapper.
+  ///
+  /// This is the canonical node pipeline. Early returns are deliberately
+  /// ordered from cheapest/shared decisions to operations that may prompt,
+  /// touch the filesystem, or invoke a plugin.
   async fn execute_inner(&self, runtime: TaskRuntime, cancel_token: CancellationToken) -> ExecutorResult<TaskOutcome> {
     let TaskRuntime {
       plugin_manager,
+      terminal,
       cache,
       fingerprint,
       console,
@@ -524,9 +584,11 @@ impl TaskNode {
       force,
       deferred_exit_code,
     } = runtime;
-    let console_target = ConsoleTarget::with_silence(console, run_id, self.execution_binding.clone(), self.silence);
+    let console_target = RuntimeOutput::with_silence(console, run_id, self.execution_binding.clone(), self.silence);
     let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::new(plugin_manager.clone()));
 
+    // Inherited gates are checked before runtime-context resolution. This is
+    // what prevents required-variable prompts for tasks already known to skip.
     if !self.condition_runtime.should_run(&self.name)? {
       if let NodeAction::FreshnessCheck { state, .. } = &self.action {
         state.publish_skipped()?;
@@ -534,6 +596,7 @@ impl TaskNode {
       return Ok(TaskOutcome::skipped(String::new()));
     }
 
+    // Barriers and freshness nodes can finish without entering command setup.
     if let Some(result) = self
       .execute_graph_action(
         &fingerprint,
@@ -551,9 +614,13 @@ impl TaskNode {
       return Ok(result);
     }
 
+    // From this point on every check and the command itself shares one resolved
+    // variables/environment/directory snapshot.
     let RuntimeContext { vars, envs, dir } = self
       .resolve_runtime_context(evaluator.clone(), dry, cancel_token.clone(), deferred_exit_code)
       .await?;
+    // Output prefix templates are runtime metadata on the scope. Resolve them
+    // once here so renderers never need access to executor variables.
     if let Some(scope) = self.execution_binding.as_ref().map(ExecutionBinding::scope) {
       let mut values = vars.to_merged_hashmap();
       values.insert("TASK".to_owned(), serde_json::Value::String(self.name.clone()));
@@ -569,6 +636,7 @@ impl TaskNode {
       .await?;
     self.condition_runtime.publish(condition_passed);
     if !condition_passed {
+      // A condition skip must also suppress the later freshness commit.
       self.freshness_runtime.mark_condition_skipped();
       self
         .log_info(
@@ -579,6 +647,8 @@ impl TaskNode {
       return Ok(TaskOutcome::skipped(String::new()));
     }
 
+    // `force` is an explicit request to run regardless of freshness and
+    // precondition shortcuts; cancellation still remains active.
     if !force
       && !self
         .check_preconditions(evaluator, &vars, &envs, &dir, dry, cancel_token.clone())
@@ -594,18 +664,7 @@ impl TaskNode {
       )));
     }
 
-    let standalone_freshness = self
-      .standalone_freshness(&fingerprint, force, &vars, &envs, &cancel_token, &console_target)
-      .await?;
-    if standalone_freshness
-      .as_ref()
-      .is_some_and(|outcome| !outcome.should_run())
-    {
-      return Ok(TaskOutcome::skipped(String::new()));
-    }
-
     if let Some(cached) = self.check_cache(&vars, &cache).await? {
-      Self::commit_standalone_freshness(standalone_freshness.as_ref(), &fingerprint, dry)?;
       return Ok(TaskOutcome::skipped(cached));
     }
 
@@ -614,13 +673,21 @@ impl TaskNode {
       .await?;
     self.debug_log_dependencies().await;
 
+    // Condition nodes have no command payload: after publishing their decision
+    // they terminate successfully here.
     let Some(plugin) = &self.plugin else {
-      Self::commit_standalone_freshness(standalone_freshness.as_ref(), &fingerprint, dry)?;
       return Ok(TaskOutcome::success(String::new()));
     };
+    // Dependency results are added only to the command snapshot, never to the
+    // shared invocation variables cached above.
     let mut vars_with_deps_results = vars.clone();
     let deps_res = self.deps_res.lock().await;
-    vars_with_deps_results.insert("deps_result", &*deps_res);
+    let dependency_values = deps_res
+      .iter()
+      .map(|(name, value)| (name.as_str(), value.as_ref()))
+      .collect::<HashMap<_, _>>();
+    vars_with_deps_results.insert("deps_result", &dependency_values);
+    drop(deps_res);
 
     let request = PluginRequest {
       target: crate::plugin::PluginTarget::Key(plugin.key.clone()),
@@ -637,13 +704,15 @@ impl TaskNode {
       output: Some(console_target.clone()),
       raw: self.raw,
     };
-    let result = match PluginInvoker::new(plugin_manager)
+    let result = match PluginInvoker::with_terminal(plugin_manager, terminal)
       .invoke(request, cancel_token.clone())
       .await
     {
       Ok(output) => {
         if output.code != 0 && !cancel_token.is_cancelled() {
           if self.ignore_errors {
+            // Ignored failures are terminal successes with empty dependency
+            // output, while the diagnostic remains visible to the user.
             console_target
               .message(
                 ConsoleLevel::Error,
@@ -663,6 +732,7 @@ impl TaskNode {
             })
           }
         } else {
+          // Only successful command output participates in task run-mode cache.
           self.update_cache(output.stdout.trim(), vars, &cache).await?;
           Ok(output.stdout.trim().to_string())
         }
@@ -672,14 +742,11 @@ impl TaskNode {
       },
       Err(error) => self.handle_execution_error(&console_target, error).await,
     };
-    if result.is_ok() {
-      Self::commit_standalone_freshness(standalone_freshness.as_ref(), &fingerprint, dry)?;
-    }
     result.map(TaskOutcome::success)
   }
 
-  /// Handle execution errors
-  async fn handle_execution_error(&self, output: &ConsoleTarget, error: ExecutorError) -> ExecutorResult<String> {
+  /// Converts an invocation error according to the task's `ignore_error` policy.
+  async fn handle_execution_error(&self, output: &RuntimeOutput, error: ExecutorError) -> ExecutorResult<String> {
     if self.ignore_errors {
       output
         .message(
@@ -695,20 +762,25 @@ impl TaskNode {
 }
 
 #[async_trait]
-impl Executable<TaskNode> for TaskNode {
-  /// Stores the result of a dependent task
-  async fn set_result(&self, task_name: String, res: String) {
+impl Executable for TaskNode {
+  /// Stores one direct dependency result for later templates and plugin input.
+  async fn set_result(&self, task_name: String, result: Arc<str>) {
     let mut deps_res = self.deps_res.lock().await;
 
-    deps_res.insert(task_name, res);
+    deps_res.insert(task_name, result);
   }
 
-  async fn bypass_result(&self, result: HashMap<String, String>) {
+  /// Replaces dependency results when an internal node propagates a bypassed branch.
+  async fn bypass_result(&self, result: HashMap<String, Arc<str>>) {
     let mut deps_res = self.deps_res.lock().await;
-    *deps_res = result
+    *deps_res = result;
   }
 
-  /// Executes the task and returns the result
+  /// Executes the node and enforces its optional wall-clock timeout.
+  ///
+  /// Timeout cancellation uses a child token so it stops only this command. The
+  /// executor waits briefly for protocol cleanup before returning, allowing the
+  /// same long-lived plugin connection to accept subsequent commands safely.
   async fn execute(&self, runtime: TaskRuntime, cancel_token: CancellationToken) -> ExecutorResult<TaskOutcome> {
     let Some(timeout) = self.timeout else {
       return self.execute_inner(runtime, cancel_token).await;
@@ -716,7 +788,7 @@ impl Executable<TaskNode> for TaskNode {
 
     // A child token limits cancellation to this command while preserving the caller's token.
     let command_token = cancel_token.child_token();
-    let output = ConsoleTarget::with_silence(
+    let output = RuntimeOutput::with_silence(
       runtime.console.clone(),
       runtime.run_id,
       self.execution_binding.clone(),

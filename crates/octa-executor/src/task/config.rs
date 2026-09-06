@@ -3,15 +3,21 @@
 use super::*;
 
 #[derive(Clone, Debug, Default)]
+/// Work performed by a graph node after dependency scheduling.
 pub(crate) enum NodeAction {
+  /// Invoke the configured plugin command.
   #[default]
   Command,
+  /// Preserve ordering without consuming a concurrency permit.
   Barrier,
+  /// Evaluate and publish a shared condition decision.
   Condition,
+  /// Evaluate source/output freshness and publish the decision.
   FreshnessCheck {
     spec: Box<FreshnessSpec>,
     state: Arc<FreshnessState>,
   },
+  /// Commit a successful freshness decision after command completion.
   FreshnessCommit(Arc<FreshnessState>),
 }
 
@@ -30,6 +36,7 @@ impl NodeAction {
 }
 
 #[derive(Clone, Debug, Default)]
+/// Access to the invocation-level freshness decision shared by command nodes.
 pub(crate) struct FreshnessRuntime {
   state: Option<Arc<FreshnessState>>,
 }
@@ -47,10 +54,6 @@ impl FreshnessRuntime {
     if let Some(state) = &self.state {
       state.mark_condition_skipped();
     }
-  }
-
-  pub(super) fn is_managed(&self) -> bool {
-    self.state.is_some()
   }
 }
 
@@ -156,20 +159,21 @@ impl ConditionRuntime {
   }
 }
 
-/// Cache implementation
+/// Output and variable context cached for a task configured to run once.
 #[derive(Debug)]
-pub struct CacheItem {
+pub(crate) struct CacheItem {
   pub(super) result: String,
   pub(super) vars: Vars,
 }
 
 impl CacheItem {
-  pub fn new(result: String, vars: Vars) -> Self {
+  pub(crate) fn new(result: String, vars: Vars) -> Self {
     Self { result, vars }
   }
 }
 
-pub struct TaskConfig {
+/// Immutable configuration consumed by one executable DAG node.
+pub(crate) struct TaskConfig {
   // Task identification
   pub id: String,
   pub name: String,
@@ -189,7 +193,6 @@ pub struct TaskConfig {
   pub vars: Vars,        // Task variables
   pub envs: Envs,        // Task environments
   pub(super) invocation_runtime: Option<Arc<InvocationRuntime>>,
-  pub(super) standalone_freshness: Option<FreshnessConfig>,
   pub(super) condition_runtime: ConditionRuntime, // Conditions attached to this graph node
   pub(super) freshness_runtime: FreshnessRuntime, // Task-level source and output state
   pub preconditions: Option<Vec<String>>,         // Task preconditions
@@ -203,13 +206,13 @@ pub struct TaskConfig {
 }
 
 impl TaskConfig {
-  pub fn builder() -> TaskConfigBuilder {
+  pub(crate) fn builder() -> TaskConfigBuilder {
     TaskConfigBuilder::default()
   }
 }
 
 #[derive(Default)]
-pub struct TaskConfigBuilder {
+pub(crate) struct TaskConfigBuilder {
   id: Option<String>,
   name: Option<String>,
   dep_name: Option<String>,
@@ -225,11 +228,6 @@ pub struct TaskConfigBuilder {
   pub vars: Option<Vars>,
   pub envs: Option<Envs>,
   invocation_runtime: Option<Arc<InvocationRuntime>>,
-  pub sources: Option<Vec<String>>,
-  pub output: Option<Vec<String>>,
-  pub octafile_root: Option<PathBuf>,
-  pub source_strategy: Option<SourceMethod>,
-  source_strategy_impl: Option<SourceStrategyHandle>,
   condition_runtime: ConditionRuntime,
   freshness_runtime: FreshnessRuntime,
   pub preconditions: Option<Vec<String>>,
@@ -243,37 +241,22 @@ pub struct TaskConfigBuilder {
 }
 
 impl TaskConfigBuilder {
-  pub fn name(mut self, name: impl Into<String>) -> Self {
+  pub(crate) fn name(mut self, name: impl Into<String>) -> Self {
     self.name = Some(name.into());
     self
   }
 
-  pub fn dep_name(mut self, dep_name: impl Into<String>) -> Self {
+  pub(crate) fn dep_name(mut self, dep_name: impl Into<String>) -> Self {
     self.dep_name = Some(dep_name.into());
     self
   }
 
-  pub fn id(mut self, id: impl Into<String>) -> Self {
+  pub(crate) fn id(mut self, id: impl Into<String>) -> Self {
     self.id = Some(id.into());
     self
   }
 
-  pub fn sources(mut self, sources: Option<Vec<String>>) -> Self {
-    self.sources = sources;
-    self
-  }
-
-  pub fn output(mut self, output: Option<Vec<String>>) -> Self {
-    self.output = output;
-    self
-  }
-
-  pub fn octafile_root(mut self, octafile_root: impl Into<PathBuf>) -> Self {
-    self.octafile_root = Some(octafile_root.into());
-    self
-  }
-
-  pub fn preconditions(mut self, preconditions: Option<Vec<String>>) -> Self {
+  pub(crate) fn preconditions(mut self, preconditions: Option<Vec<String>>) -> Self {
     self.preconditions = preconditions;
     self
   }
@@ -288,7 +271,7 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub fn timeout(mut self, timeout: Option<Timeout>) -> Self {
+  pub(crate) fn timeout(mut self, timeout: Option<Timeout>) -> Self {
     self.timeout = timeout;
     self
   }
@@ -308,7 +291,7 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub fn vars(mut self, vars: Vars) -> Self {
+  pub(crate) fn vars(mut self, vars: Vars) -> Self {
     self.vars = Some(vars);
     self
   }
@@ -318,12 +301,12 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub fn envs(mut self, envs: Envs) -> Self {
+  pub(crate) fn envs(mut self, envs: Envs) -> Self {
     self.envs = Some(envs);
     self
   }
 
-  pub fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
+  pub(crate) fn dir(mut self, dir: impl Into<PathBuf>) -> Self {
     self.dir = Some(dir.into());
     self
   }
@@ -333,48 +316,33 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub fn ignore_errors(mut self, ignore_errors: Option<bool>) -> Self {
+  pub(crate) fn ignore_errors(mut self, ignore_errors: Option<bool>) -> Self {
     self.ignore_errors = ignore_errors;
     self
   }
 
-  pub fn silent<T: Into<octa_octafile::Silence>>(mut self, silent: Option<T>) -> Self {
+  pub(crate) fn silent<T: Into<octa_octafile::Silence>>(mut self, silent: Option<T>) -> Self {
     self.silent = silent.map(Into::into);
     self
   }
 
-  pub fn quiet(mut self, quiet: Option<bool>) -> Self {
+  pub(crate) fn quiet(mut self, quiet: Option<bool>) -> Self {
     self.quiet = quiet;
     self
   }
 
-  pub fn raw(mut self, raw: Option<bool>) -> Self {
+  pub(crate) fn raw(mut self, raw: Option<bool>) -> Self {
     self.raw = raw;
     self
   }
 
-  pub fn failfast(mut self, failfast: Option<bool>) -> Self {
+  pub(crate) fn failfast(mut self, failfast: Option<bool>) -> Self {
     self.failfast = failfast;
     self
   }
 
-  pub fn run_mode(mut self, run_mode: Option<impl Into<RunMode>>) -> Self {
+  pub(crate) fn run_mode(mut self, run_mode: Option<impl Into<RunMode>>) -> Self {
     self.run_mode = run_mode.map(Into::into);
-    self
-  }
-
-  pub fn source_strategy(mut self, source_strategy: Option<impl Into<SourceMethod>>) -> Self {
-    self.source_strategy = source_strategy.map(Into::into);
-    self
-  }
-
-  /// Supplies a named fingerprint implementation used by a directly constructed task.
-  pub fn source_strategy_provider<S>(mut self, method: SourceMethod, strategy: S) -> Self
-  where
-    S: SourceStrategy + 'static,
-  {
-    self.source_strategy = Some(method);
-    self.source_strategy_impl = Some(SourceStrategyHandle::new(strategy));
     self
   }
 
@@ -383,29 +351,12 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub fn build(self) -> ExecutorResult<TaskConfig> {
+  pub(crate) fn build(self) -> ExecutorResult<TaskConfig> {
     let dir = match self.dir {
       Some(dir) => dir,
       None if self.action.needs_working_directory() => return Err(ExecutorError::TaskConfigFieldMissing("dir")),
       None => PathBuf::new(),
     };
-    let standalone_freshness = if self.sources.is_some() || self.output.is_some() {
-      let method = self.source_strategy.unwrap_or(SourceMethod::Hash);
-      let strategy = match self.source_strategy_impl {
-        Some(strategy) => strategy,
-        None => SourceStrategyRegistry::default().resolve(&method)?,
-      };
-      Some(FreshnessConfig::new(
-        self.sources,
-        self.output,
-        self.octafile_root.unwrap_or_else(|| dir.clone()),
-        method,
-        strategy,
-      ))
-    } else {
-      None
-    };
-
     Ok(TaskConfig {
       id: self.id.ok_or(ExecutorError::TaskConfigFieldMissing("id"))?,
       name: self.name.ok_or(ExecutorError::TaskConfigFieldMissing("name"))?,
@@ -421,7 +372,6 @@ impl TaskConfigBuilder {
       vars: self.vars.unwrap_or_default(),
       envs: self.envs.unwrap_or_default(),
       invocation_runtime: self.invocation_runtime,
-      standalone_freshness,
       condition_runtime: self.condition_runtime,
       freshness_runtime: self.freshness_runtime,
       preconditions: self.preconditions,

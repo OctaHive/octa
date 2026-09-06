@@ -1,3 +1,9 @@
+//! Layered variables, required-value prompting, and template expansion.
+//!
+//! Declaration order is preserved for same-layer references. Secret metadata
+//! remains separate from values so diagnostics can redact sensitive data
+//! without exposing it to templates that should not receive it.
+
 use std::{
   collections::{HashMap, HashSet},
   env,
@@ -79,15 +85,20 @@ struct ResolvedVars {
 /// Describes one missing variable that may be requested from an external input provider.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct VariablePrompt {
+  /// Variable name that will receive the returned value.
   pub name: String,
+  /// Human-readable question configured for the variable.
   pub question: String,
+  /// Allowed values, when the prompt is an enumeration.
   pub enum_values: Option<Vec<String>>,
+  /// Whether the host should conceal the entered value.
   pub secret: bool,
 }
 
 /// Resolves interactive input without coupling the executor to a terminal implementation.
 #[async_trait]
 pub trait VariableResolver: Send + Sync {
+  /// Obtains one value or returns a host-specific error message.
   async fn resolve(&self, prompt: &VariablePrompt) -> Result<String, String>;
 }
 

@@ -1,3 +1,9 @@
+//! Presentation-neutral routing of one command's runtime output.
+//!
+//! The router attaches run/task/step identity, applies per-stream silence, and
+//! forwards line, byte, diagnostic, progress, and raw-terminal events through a
+//! single console boundary.
+
 use std::{io, sync::Arc};
 
 use octa_octafile::Silence;
@@ -13,14 +19,14 @@ use crate::task::ExecutionBinding;
 
 /// Associates task output and diagnostics with one execution and optional scope.
 #[derive(Clone)]
-pub(crate) struct ConsoleTarget {
+pub(crate) struct RuntimeOutput {
   console: Arc<Console>,
   run_id: u64,
   binding: Option<ExecutionBinding>,
   silence: Silence,
 }
 
-impl ConsoleTarget {
+impl RuntimeOutput {
   #[cfg(test)]
   pub(crate) fn new(console: Arc<Console>, run_id: u64, scope: Option<ConsoleScope>) -> Self {
     Self {
@@ -46,9 +52,11 @@ impl ConsoleTarget {
   }
 
   pub(crate) async fn line(&self, command_id: &str, stream: ConsoleStream, line: String) -> io::Result<()> {
-    if matches!(stream, ConsoleStream::Stdout) && self.silence.hides_stdout()
-      || matches!(stream, ConsoleStream::Stderr) && self.silence.hides_stderr()
-    {
+    if self.hides(stream) {
+      self
+        .console
+        .observe_event(self.output_event(command_id, stream, ConsolePayload::Line(line.clone())))
+        .await?;
       if let Some(binding) = &self.binding {
         self.console.update_progress(binding.scope().clone(), line).await?;
       }
@@ -56,25 +64,16 @@ impl ConsoleTarget {
     }
     self
       .console
-      .event(ExecutionEvent::Output {
-        run_id: self.run_id,
-        scope: self.binding.as_ref().map(|binding| binding.scope().clone()),
-        step_id: self
-          .binding
-          .as_ref()
-          .and_then(ExecutionBinding::step)
-          .map(ConsoleStep::id),
-        command_id: command_id.to_owned(),
-        stream,
-        payload: ConsolePayload::Line(line),
-      })
+      .event(self.output_event(command_id, stream, ConsolePayload::Line(line)))
       .await
   }
 
   pub(crate) async fn bytes(&self, command_id: &str, stream: ConsoleStream, bytes: Vec<u8>) -> io::Result<()> {
-    if matches!(stream, ConsoleStream::Stdout) && self.silence.hides_stdout()
-      || matches!(stream, ConsoleStream::Stderr) && self.silence.hides_stderr()
-    {
+    if self.hides(stream) {
+      self
+        .console
+        .observe_event(self.output_event(command_id, stream, ConsolePayload::Bytes(bytes.clone())))
+        .await?;
       if let Some(binding) = &self.binding {
         self
           .console
@@ -85,19 +84,23 @@ impl ConsoleTarget {
     }
     self
       .console
-      .event(ExecutionEvent::Output {
-        run_id: self.run_id,
-        scope: self.binding.as_ref().map(|binding| binding.scope().clone()),
-        step_id: self
-          .binding
-          .as_ref()
-          .and_then(ExecutionBinding::step)
-          .map(ConsoleStep::id),
-        command_id: command_id.to_owned(),
-        stream,
-        payload: ConsolePayload::Bytes(bytes),
-      })
+      .event(self.output_event(command_id, stream, ConsolePayload::Bytes(bytes)))
       .await
+  }
+
+  fn output_event(&self, command_id: &str, stream: ConsoleStream, payload: ConsolePayload) -> ExecutionEvent {
+    ExecutionEvent::Output {
+      run_id: self.run_id,
+      scope: self.binding.as_ref().map(|binding| binding.scope().clone()),
+      step_id: self
+        .binding
+        .as_ref()
+        .and_then(ExecutionBinding::step)
+        .map(ConsoleStep::id),
+      command_id: command_id.to_owned(),
+      stream,
+      payload,
+    }
   }
 
   pub(crate) async fn progress(&self, command_id: &str, progress: ProgressUpdate) -> io::Result<()> {
@@ -228,13 +231,13 @@ mod tests {
     let records = Recording::default();
     let console = Arc::new(Console::new(records.clone()));
     let scope = ConsoleScopeAllocator::default().scope("task");
-    let stdout_hidden = ConsoleTarget::with_silence(
+    let stdout_hidden = RuntimeOutput::with_silence(
       console.clone(),
       7,
       Some(ExecutionBinding::for_task(scope.clone())),
       Silence::Stdout,
     );
-    let stderr_hidden = ConsoleTarget::with_silence(
+    let stderr_hidden = RuntimeOutput::with_silence(
       console.clone(),
       7,
       Some(ExecutionBinding::for_task(scope.clone())),
@@ -281,9 +284,17 @@ mod tests {
   #[tokio::test]
   async fn hidden_streams_update_progress_without_emitting_output_records() {
     let records = Recording::default();
-    let console = Arc::new(Console::new(records.clone()));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink_records = observed.clone();
+    let console = Arc::new(Console::with_event_sink(
+      records.clone(),
+      move |entry: &ConsoleEntry| {
+        sink_records.lock().unwrap().push(entry.record().clone());
+        Ok(())
+      },
+    ));
     let scope = ConsoleScopeAllocator::default().scope("task");
-    let target = ConsoleTarget::with_silence(
+    let target = RuntimeOutput::with_silence(
       console,
       7,
       Some(ExecutionBinding::for_task(scope.clone())),
@@ -304,6 +315,7 @@ mod tests {
       [(scope.clone(), "compiling".to_owned()), (scope, "linking".to_owned())]
     );
     assert!(records.records.lock().unwrap().is_empty());
+    assert_eq!(observed.lock().unwrap().len(), 2);
   }
 
   #[tokio::test]
@@ -313,7 +325,7 @@ mod tests {
     let allocator = ConsoleScopeAllocator::default();
     let scope = allocator.scope("task");
     let step = allocator.step(&scope, "compile");
-    let target = ConsoleTarget::with_silence(
+    let target = RuntimeOutput::with_silence(
       console.clone(),
       7,
       Some(ExecutionBinding::for_step(scope.clone(), step.clone())),
@@ -348,11 +360,11 @@ mod tests {
   #[tokio::test]
   async fn starts_raw_only_for_scoped_targets() {
     let console = Arc::new(Console::default());
-    let unscoped = ConsoleTarget::new(console.clone(), 1, None);
+    let unscoped = RuntimeOutput::new(console.clone(), 1, None);
     assert!(unscoped.begin_raw("command").await.unwrap().is_none());
 
     let scope = ConsoleScopeAllocator::default().scope("raw");
-    let scoped = ConsoleTarget::new(console, 1, Some(scope));
+    let scoped = RuntimeOutput::new(console, 1, Some(scope));
     assert!(scoped.begin_raw("command").await.unwrap().is_some());
   }
 }

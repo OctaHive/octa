@@ -26,6 +26,7 @@ octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
 clap_complete = "4"
 clap = { version = "4.6", features = ["derive", "env"] }
 dialoguer = "0.12"
+crossterm = { workspace = true }
 dotenvy = "0.15.7"
 lazy_static = { workspace = true }
 serde = { workspace = true }
@@ -44,3 +45,6 @@ assert_cmd = "2.2.2"
 predicates = "3.1.4"
 serde_json = { workspace = true }
 portable-pty = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["fs"] }

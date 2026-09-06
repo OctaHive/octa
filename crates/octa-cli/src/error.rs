@@ -1,7 +1,7 @@
 use dotenvy::Error as DotenvError;
 use thiserror::Error;
 
-use octa_executor::{error::ExecutorError, ExecutionFailure};
+use octa_executor::{ExecutionFailure, ExecutorError};
 use octa_monorepo::MonorepoError;
 use octa_octafile::OctafileError;
 

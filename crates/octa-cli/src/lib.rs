@@ -28,21 +28,20 @@ use tracing_subscriber::{prelude::*, EnvFilter};
 
 use error::{OctaError, OctaResult};
 use octa_executor::{
-  summary::Summary,
-  vars::{VariablePrompt, VariableResolver},
-  watcher::{SourceWatcher, WatchTarget},
-  ExecutionEngine, ExecutionRequest, PreparedExecution, RuntimeCoordinator,
+  ExecutionEngine, ExecutionRequest, PreparedExecution, RuntimeCoordinator, SourceWatcher, Summary, VariablePrompt,
+  VariableResolver, WatchTarget,
 };
 use octa_finder::OctaFinder;
 use octa_octafile::{
   Octafile, OctafileError, OutputConfig, OutputMode, PresentationConfig, Silence, SyntheticInclude, WatchInterval,
 };
-use octa_output::{CliDocument, Console, ConsoleLevel, ConsoleScopeAllocator, SummaryItem, TaskListItem};
+use octa_output::{CliDocument, Console, ConsoleLevel, SummaryItem, TaskListItem};
 use presentation::{terminal_console, CiMode};
 
 mod error;
 mod logger;
 mod presentation;
+mod raw_terminal;
 
 const SHELL_PLUGIN_NAME: &str = "shell";
 const TEMPLATE_PLUGIN_NAME: &str = "tpl";
@@ -277,7 +276,6 @@ struct ExecutionContext {
   concurrency: Option<ConcurrencyLimiter>,
   variable_resolver: Option<Arc<dyn VariableResolver>>,
   console: Arc<Console>,
-  scope_allocator: Arc<ConsoleScopeAllocator>,
   runtime_coordinator: Arc<RuntimeCoordinator>,
 }
 
@@ -565,8 +563,8 @@ async fn build_execute_items(
     context.console.clone(),
   )
   .with_summary(context.summary.clone())
-  .with_scope_allocator(context.scope_allocator.clone())
-  .with_runtime_coordinator(context.runtime_coordinator.clone());
+  .with_runtime_coordinator(context.runtime_coordinator.clone())
+  .with_raw_terminal(Arc::new(raw_terminal::LocalRawTerminal));
   if let Some(concurrency) = &context.concurrency {
     engine = engine.with_concurrency(concurrency.semaphore.clone());
   }
@@ -1005,7 +1003,6 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
     concurrency: concurrency_limiter(args.concurrency, octafile.concurrency),
     variable_resolver,
     console,
-    scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
     runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
   };
   let watch = args.watch || tasks_request_watch(&octafile, &commands);
@@ -1392,7 +1389,6 @@ tasks:
           concurrency: None,
           variable_resolver: None,
           console: Arc::new(Console::default()),
-          scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
           runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
         },
         &commands,
@@ -1453,7 +1449,6 @@ tasks:
         concurrency: None,
         variable_resolver: None,
         console: Arc::new(Console::default()),
-        scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
         runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
       },
       &["build".to_string()],
@@ -1512,7 +1507,6 @@ tasks:
           concurrency: None,
           variable_resolver: None,
           console,
-          scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
           runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
         },
         &commands,

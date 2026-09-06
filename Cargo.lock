@@ -2176,9 +2176,11 @@ dependencies = [
  "async-trait",
  "clap",
  "clap_complete",
+ "crossterm",
  "dialoguer",
  "dotenvy",
  "lazy_static",
+ "nix 0.31.3",
  "octa-executor",
  "octa-finder",
  "octa-monorepo",
@@ -2205,25 +2207,18 @@ dependencies = [
 name = "octa-dag"
 version = "0.3.0"
 dependencies = [
- "anyhow",
- "async-trait",
- "octa-octafile",
  "test-log",
  "thiserror 2.0.20",
  "tracing",
- "tracing-subscriber",
  "tracing-test",
- "uuid",
 ]
 
 [[package]]
 name = "octa-executor"
 version = "0.3.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "chrono",
- "crossterm",
  "dotenvy",
  "dunce",
  "futures",
@@ -2231,7 +2226,6 @@ dependencies = [
  "ignore",
  "indexmap",
  "lazy_static",
- "nix 0.31.3",
  "octa-dag",
  "octa-finder",
  "octa-octafile",
@@ -2251,7 +2245,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber",
  "tracing-test",
  "uuid",
  "whoami",

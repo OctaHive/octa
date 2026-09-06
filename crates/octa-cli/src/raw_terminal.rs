@@ -1,20 +1,33 @@
 use std::{io, io::IsTerminal, time::Duration};
 
-use octa_plugin_manager::plugin_client::PluginTerminalInput;
+use async_trait::async_trait;
+use octa_executor::{RawTerminalConnector, RawTerminalInput, RawTerminalSession};
 use tokio::task::JoinHandle;
 
 #[cfg(windows)]
 const DEFAULT_CURSOR_POSITION_RESPONSE: &[u8] = b"\x1b[1;1R";
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LocalRawTerminal;
+
+#[async_trait]
+impl RawTerminalConnector for LocalRawTerminal {
+  async fn connect(&self, input: RawTerminalInput) -> io::Result<Box<dyn RawTerminalSession>> {
+    RawTerminalBridge::start(input)
+      .await
+      .map(|bridge| Box::new(bridge) as Box<dyn RawTerminalSession>)
+  }
+}
+
 /// Bridges the host terminal to a command-scoped plugin protocol stream.
-pub(crate) struct RawTerminalBridge {
-  input: PluginTerminalInput,
+struct RawTerminalBridge {
+  input: RawTerminalInput,
   tasks: Vec<JoinHandle<()>>,
   terminal_mode: bool,
 }
 
 impl RawTerminalBridge {
-  pub(crate) async fn start(input: PluginTerminalInput) -> io::Result<Self> {
+  async fn start(input: RawTerminalInput) -> io::Result<Self> {
     let terminal_mode = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if terminal_mode {
       crossterm::terminal::enable_raw_mode()?;
@@ -24,10 +37,7 @@ impl RawTerminalBridge {
     if !terminal_mode {
       // portable-pty creates ConPTY with PSEUDOCONSOLE_INHERIT_CURSOR. When
       // stdout is not a terminal, answer its cursor query on the host's behalf.
-      input
-        .write(DEFAULT_CURSOR_POSITION_RESPONSE.to_vec())
-        .await
-        .map_err(io::Error::from)?;
+      input.write(DEFAULT_CURSOR_POSITION_RESPONSE.to_vec()).await?;
     }
 
     let mut tasks = Vec::new();
@@ -62,7 +72,7 @@ impl RawTerminalBridge {
     })
   }
 
-  pub(crate) async fn shutdown(&mut self) {
+  async fn stop(&mut self) {
     let tasks = std::mem::take(&mut self.tasks);
     for task in &tasks {
       task.abort();
@@ -83,7 +93,7 @@ impl RawTerminalBridge {
 }
 
 #[cfg(unix)]
-async fn forward_input(input: PluginTerminalInput, terminal_mode: bool) -> io::Result<()> {
+async fn forward_input(input: RawTerminalInput, terminal_mode: bool) -> io::Result<()> {
   use std::{fs::File, io::Read};
 
   use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -103,11 +113,11 @@ async fn forward_input(input: PluginTerminalInput, terminal_mode: bool) -> io::R
     loop {
       match stdin.read(&mut buffer).await {
         Ok(0) => break,
-        Ok(count) => input.write(buffer[..count].to_vec()).await.map_err(io::Error::from)?,
+        Ok(count) => input.write(buffer[..count].to_vec()).await?,
         Err(error) => return Err(error),
       }
     }
-    return input.close().await.map_err(io::Error::from);
+    return input.close().await;
   }
 
   let stdin = std::io::stdin();
@@ -123,16 +133,16 @@ async fn forward_input(input: PluginTerminalInput, terminal_mode: bool) -> io::R
       file.read(&mut buffer)
     }) {
       Ok(Ok(0)) => break,
-      Ok(Ok(count)) => input.write(buffer[..count].to_vec()).await.map_err(io::Error::from)?,
+      Ok(Ok(count)) => input.write(buffer[..count].to_vec()).await?,
       Ok(Err(error)) => return Err(error),
       Err(_) => continue,
     }
   }
-  input.close().await.map_err(io::Error::from)
+  input.close().await
 }
 
 #[cfg(not(unix))]
-async fn forward_input(input: PluginTerminalInput, terminal_mode: bool) -> io::Result<()> {
+async fn forward_input(input: RawTerminalInput, terminal_mode: bool) -> io::Result<()> {
   use tokio::io::AsyncReadExt;
 
   let mut stdin = tokio::io::stdin();
@@ -140,12 +150,12 @@ async fn forward_input(input: PluginTerminalInput, terminal_mode: bool) -> io::R
   loop {
     match stdin.read(&mut buffer).await {
       Ok(0) => break,
-      Ok(count) => input.write(buffer[..count].to_vec()).await.map_err(io::Error::from)?,
+      Ok(count) => input.write(buffer[..count].to_vec()).await?,
       Err(error) => return Err(error),
     }
   }
   if terminal_mode {
-    input.close().await.map_err(io::Error::from)
+    input.close().await
   } else {
     Ok(())
   }
@@ -157,5 +167,12 @@ impl Drop for RawTerminalBridge {
       task.abort();
     }
     self.restore_terminal();
+  }
+}
+
+#[async_trait]
+impl RawTerminalSession for RawTerminalBridge {
+  async fn shutdown(&mut self) {
+    self.stop().await;
   }
 }

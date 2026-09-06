@@ -23,6 +23,7 @@ const RAW_DIAGNOSTIC_CAPACITY: usize = 256;
 enum WriterRequest {
   Render {
     entry: ConsoleEntry,
+    present: bool,
     completed: Option<oneshot::Sender<io::Result<()>>>,
   },
   Barrier(oneshot::Sender<()>),
@@ -203,6 +204,11 @@ impl Console {
     self.emit(ConsoleRecord::Execution(event)).await
   }
 
+  /// Publishes an execution event to the structured sink without presenting it to the user.
+  pub async fn observe_event(&self, event: ExecutionEvent) -> io::Result<()> {
+    self.emit_observed(ConsoleRecord::Execution(event)).await
+  }
+
   /// Publishes a complete response produced by the CLI layer.
   pub async fn document(&self, document: CliDocument) -> io::Result<()> {
     self.emit(ConsoleRecord::Document(document)).await
@@ -293,7 +299,11 @@ impl Console {
       return Ok(());
     }
 
-    let result = self.try_send(WriterRequest::Render { entry, completed: None });
+    let result = self.try_send(WriterRequest::Render {
+      entry,
+      present: true,
+      completed: None,
+    });
     if result
       .as_ref()
       .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
@@ -405,12 +415,20 @@ impl Console {
   }
 
   async fn emit(&self, record: ConsoleRecord) -> io::Result<()> {
+    self.emit_with_presentation(record, true).await
+  }
+
+  async fn emit_observed(&self, record: ConsoleRecord) -> io::Result<()> {
+    self.emit_with_presentation(record, false).await
+  }
+
+  async fn emit_with_presentation(&self, record: ConsoleRecord, present: bool) -> io::Result<()> {
     let entry = ConsoleEntry::new(record);
     // Raw sessions hold this lock across writes; regular records hold it only until
     // the writer acknowledges the record, preserving a single global output order.
     let _guard = self.render_lock.lock().await;
     self.report_dropped_diagnostics().await?;
-    self.render(entry).await
+    self.render(entry, present).await
   }
 
   async fn report_dropped_diagnostics(&self) -> io::Result<()> {
@@ -420,14 +438,17 @@ impl Console {
     }
 
     let result = self
-      .render(ConsoleEntry::new(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
-        run_id: None,
-        scope: None,
-        step_id: None,
-        level: ConsoleLevel::Warn,
-        message: format!("Dropped {dropped} diagnostics because the output buffer was full"),
-        location: None,
-      })))
+      .render(
+        ConsoleEntry::new(ConsoleRecord::Diagnostic(ConsoleDiagnostic {
+          run_id: None,
+          scope: None,
+          step_id: None,
+          level: ConsoleLevel::Warn,
+          message: format!("Dropped {dropped} diagnostics because the output buffer was full"),
+          location: None,
+        })),
+        true,
+      )
       .await;
     if result.is_err() {
       self.dropped_diagnostics.fetch_add(dropped, Ordering::Relaxed);
@@ -435,12 +456,13 @@ impl Console {
     result
   }
 
-  async fn render(&self, entry: ConsoleEntry) -> io::Result<()> {
+  async fn render(&self, entry: ConsoleEntry, present: bool) -> io::Result<()> {
     let (completed, result) = oneshot::channel();
     self
       .writer
       .send(WriterRequest::Render {
         entry,
+        present,
         completed: Some(completed),
       })
       .await?;
@@ -593,14 +615,17 @@ impl RawConsoleSession {
   pub async fn write(&mut self, stream: ConsoleStream, bytes: impl Into<Vec<u8>>) -> io::Result<()> {
     self
       .console
-      .render(ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
-        run_id: self.run_id,
-        scope: Some(self.scope.clone()),
-        step_id: self.step_id,
-        command_id: self.command_id.clone(),
-        stream,
-        payload: ConsolePayload::RawBytes(bytes.into()),
-      })))
+      .render(
+        ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
+          run_id: self.run_id,
+          scope: Some(self.scope.clone()),
+          step_id: self.step_id,
+          command_id: self.command_id.clone(),
+          stream,
+          payload: ConsolePayload::RawBytes(bytes.into()),
+        })),
+        true,
+      )
       .await
   }
 }
@@ -642,10 +667,14 @@ fn render_loop(
       Err(mpsc::error::TryRecvError::Disconnected) => break,
     };
     match request {
-      WriterRequest::Render { mut entry, completed } => {
+      WriterRequest::Render {
+        mut entry,
+        present,
+        completed,
+      } => {
         entry.assign_sequence(next_sequence);
         next_sequence += 1;
-        let result = publish_entry(&mut renderer, &mut event_sink, &entry);
+        let result = publish_entry(&mut renderer, &mut event_sink, &entry, present);
         if let Some(completed) = completed {
           if let Err(Err(error)) = completed.send(result) {
             store_background_error(&background_error, error);
@@ -687,7 +716,7 @@ fn render_loop(
         for mut entry in entries {
           entry.assign_sequence(next_sequence);
           next_sequence += 1;
-          if let Err(error) = publish_entry(&mut renderer, &mut event_sink, &entry) {
+          if let Err(error) = publish_entry(&mut renderer, &mut event_sink, &entry, true) {
             store_background_error(&background_error, error);
           }
         }
@@ -703,9 +732,10 @@ fn publish_entry(
   renderer: &mut impl ConsoleRenderer,
   event_sink: &mut impl EventSink,
   entry: &ConsoleEntry,
+  present: bool,
 ) -> io::Result<()> {
   let event_result = event_sink.emit(entry);
-  let render_result = renderer.render(entry);
+  let render_result = if present { renderer.render(entry) } else { Ok(()) };
   event_result.and(render_result)
 }
 
@@ -842,6 +872,26 @@ mod tests {
 
     assert_eq!(sink.entries.lock().unwrap().len(), 2);
     assert!(renderer.records.lock().unwrap().is_empty());
+  }
+
+  #[tokio::test]
+  async fn observed_events_are_sequenced_without_being_presented() {
+    let renderer = Arc::new(RecordingRenderer::default());
+    let sink = Arc::new(RecordingEventSink::default());
+    let console = Console::with_event_sink(renderer.clone(), sink.clone());
+
+    console
+      .observe_event(ExecutionEvent::RunStarted {
+        run_id: 7,
+        command: "build".to_owned(),
+      })
+      .await
+      .unwrap();
+
+    assert!(renderer.records.lock().unwrap().is_empty());
+    let entries = sink.entries.lock().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].sequence(), 1);
   }
 
   struct FailingEventSink;

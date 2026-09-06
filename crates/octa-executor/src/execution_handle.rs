@@ -1,3 +1,9 @@
+//! Owned handle for a running execution.
+//!
+//! The handle exposes cooperative cancellation and resolves exactly once to a
+//! structured terminal result. Dropping either the handle or its wait future
+//! requests cancellation so detached runs are not silently leaked.
+
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 

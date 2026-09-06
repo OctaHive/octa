@@ -1,3 +1,9 @@
+//! Layered task environments and their runtime resolution.
+//!
+//! Each layer retains its working directory and dotenv configuration until an
+//! execution starts. Resolution proceeds parent-first so child templates and
+//! shell-backed values observe the same deterministic environment.
+
 use std::{
   borrow::Cow,
   collections::HashMap,
@@ -326,17 +332,16 @@ impl EnvironmentPlan {
         .map(|(key, value)| (key, EnvValue::String(value)))
         .chain(layer.context.clone())
         .collect();
-      let processed = self
-        .process_single_context(
-          context,
-          &accumulated,
-          vars,
-          &dir,
-          evaluator.clone(),
-          dry,
-          cancel_token.clone(),
-        )
-        .await?;
+      let processed = Self::process_single_context(
+        context,
+        &accumulated,
+        vars,
+        &dir,
+        evaluator.clone(),
+        dry,
+        cancel_token.clone(),
+      )
+      .await?;
       accumulated.extend(processed);
       template_environment.extend(resolved_environment(&accumulated));
     }
@@ -344,9 +349,7 @@ impl EnvironmentPlan {
     Ok(accumulated)
   }
 
-  #[allow(clippy::too_many_arguments)]
   async fn process_single_context(
-    &self,
     context: EnvContext,
     parent: &EnvContext,
     vars: &Vars,
@@ -402,13 +405,11 @@ impl EnvironmentPlan {
     for (key, value) in context {
       let processed_value = match value {
         EnvValue::String(value) if is_template(&value) => {
-          Some(self.process_template_value(&key, &value, &available, &renderer).await?)
+          Some(Self::process_template_value(&key, &value, &available, &renderer).await?)
         },
-        EnvValue::Shell(shell_value) => Some(
-          self
-            .process_shell_value(&key, &shell_value.sh, &available, &renderer)
-            .await?,
-        ),
+        EnvValue::Shell(shell_value) => {
+          Some(Self::process_shell_value(&key, &shell_value.sh, &available, &renderer).await?)
+        },
         EnvValue::String(_) => None,
       };
 
@@ -421,7 +422,6 @@ impl EnvironmentPlan {
   }
 
   async fn process_template_value(
-    &self,
     key: &str,
     value: &str,
     context: &ResolvedEnvContext,
@@ -437,7 +437,6 @@ impl EnvironmentPlan {
   }
 
   async fn process_shell_value(
-    &self,
     key: &str,
     command: &str,
     context: &ResolvedEnvContext,

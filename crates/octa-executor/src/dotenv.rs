@@ -1,3 +1,9 @@
+//! Ordered dotenv discovery and loading for an environment layer.
+//!
+//! Paths may contain Octafile variables, and bare file names are searched from
+//! the layer directory towards its ancestors. Loading never mutates the host
+//! process environment; it returns values for the caller to merge explicitly.
+
 use std::{
   collections::HashMap,
   env,

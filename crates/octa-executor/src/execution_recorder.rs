@@ -1,3 +1,16 @@
+//! Transactional task and step lifecycle recording.
+//!
+//! The recorder is the single authority for lifecycle ordering and result
+//! aggregation. State changes become visible only after the corresponding
+//! event is accepted; rejected finish events restore their prior state and may
+//! therefore be retried during shutdown.
+//!
+//! A task scope can contain several DAG nodes, but a step represents one plugin
+//! command. Scope completion is therefore reference-counted, while each step
+//! has a single terminal transition. Normal lifecycle follows `Planned ->
+//! Declared -> Started -> PublishingFinish -> Finished`; shutdown may finish a
+//! declared step directly when it was cancelled before scheduling.
+
 use std::{collections::HashMap, io, sync::Arc};
 
 use chrono::{DateTime, Utc};
@@ -10,13 +23,21 @@ use crate::{
   task::ExecutionBinding,
 };
 
+/// Aggregated state for all graph nodes belonging to one task invocation.
 struct ScopeState {
+  /// Bound DAG nodes that have not reported a terminal outcome.
   remaining: usize,
+  /// Most severe outcome observed across completed nodes.
   status: ConsoleStatus,
+  /// Current externally visible lifecycle transition.
   lifecycle: LifecycleState,
+  /// Time at which the first accepted start event was published.
   started_at: Option<DateTime<Utc>>,
+  /// Time at which the accepted finish event was published.
   finished_at: Option<DateTime<Utc>>,
+  /// First originating failure, with cancellation replaceable by a later cause.
   failure: Option<ExecutionFailure>,
+  /// Observation time used to select the run's originating failure.
   failure_at: Option<DateTime<Utc>>,
 }
 
@@ -35,63 +56,87 @@ impl Default for ScopeState {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
+/// Publication-aware lifecycle used to make terminal events retryable.
 enum LifecycleState {
+  /// Identity exists internally but has not been announced to observers.
   Planned,
+  /// Declaration was accepted; execution has not started.
   Declared,
+  /// Start was accepted and one or more bound nodes may be running.
   Started,
-  // Prevents concurrent terminal nodes from publishing duplicate finishes.
-  // A failed publication restores the preceding state and can be retried.
+  /// A finish event is in flight outside the state lock.
+  ///
+  /// This reservation prevents concurrent terminal nodes from publishing a
+  /// duplicate finish. Failed publication restores the preceding state.
   PublishingFinish,
+  /// Terminal event was accepted and timestamps/result data are complete.
   Finished,
 }
 
-impl LifecycleState {
-  fn needs_start_event(self, subject: &str, id: u64) -> io::Result<bool> {
-    match self {
-      Self::Declared => Ok(true),
-      Self::Started => Ok(false),
-      Self::Planned => Err(io::Error::other(format!(
-        "console {subject} {id} was started before it was declared"
-      ))),
-      Self::PublishingFinish | Self::Finished => Err(io::Error::other(format!(
-        "console {subject} {id} was started after it finished"
-      ))),
-    }
-  }
-}
-
+/// Scope event reserved under the state lock and published after releasing it.
 struct PendingScopeFinish {
+  /// Scope whose state was reserved for publication.
   scope: ConsoleScope,
+  /// Aggregated terminal status included in the event.
   status: ConsoleStatus,
+  /// State restored when the output sink rejects the event.
   previous: LifecycleState,
 }
 
+/// Step event reserved under the state lock and published after releasing it.
 struct PendingStepFinish {
+  /// Step whose state was reserved for publication.
   step: ConsoleStep,
+  /// Owning task scope required by the public event hierarchy.
   scope: ConsoleScope,
+  /// Terminal status included in the event.
   status: ConsoleStatus,
+  /// State restored when the output sink rejects the event.
   previous: LifecycleState,
 }
 
+/// Lifecycle and failure information for one executable command step.
 struct StepState {
+  /// Task invocation containing this command step.
   scope: ConsoleScope,
+  /// Current externally visible lifecycle transition.
   lifecycle: LifecycleState,
+  /// Terminal status, initialized as skipped until execution begins.
   status: ConsoleStatus,
+  /// Time at which the start event was accepted, if the step was scheduled.
   started_at: Option<DateTime<Utc>>,
+  /// Time at which the finish event was accepted.
   finished_at: Option<DateTime<Utc>>,
+  /// Failure attached to the step's terminal result.
   failure: Option<ExecutionFailure>,
 }
 
-/// Tracks output-group completion separately from DAG scheduling and task payloads.
-pub(crate) struct ConsoleScopeTracker {
+/// Tracks task/step lifecycle separately from DAG scheduling and task payloads.
+///
+/// The scheduler reports transitions through [`ExecutionBinding`]; the recorder
+/// emits ordered events and later materializes [`TaskResult`] values from the
+/// same state, preventing event and terminal-result models from diverging.
+pub(crate) struct ExecutionRecorder {
+  /// Single asynchronous output boundary for lifecycle publication.
   console: Arc<Console>,
+  /// Correlation ID attached to every emitted event and output reference.
   run_id: u64,
+  /// Serializes retryable declaration passes without holding the state lock over I/O.
   declaration: Mutex<()>,
+  /// Prevents duplicate starts when several nodes share one task scope.
+  starts: Mutex<()>,
+  /// Task states kept in declaration order for deterministic results.
   states: Mutex<IndexMap<ConsoleScope, ScopeState>>,
+  /// Step states kept in DAG/binding declaration order.
   steps: Mutex<IndexMap<ConsoleStep, StepState>>,
 }
 
-impl ConsoleScopeTracker {
+impl ExecutionRecorder {
+  /// Creates lifecycle state from declared scopes and executable-node bindings.
+  ///
+  /// `scopes` determines stable result order. Bindings provide the number of
+  /// nodes that must complete each scope and declare the command steps nested
+  /// below those scopes.
   pub(crate) fn new(
     console: Arc<Console>,
     run_id: u64,
@@ -105,6 +150,8 @@ impl ConsoleScopeTracker {
     let mut steps = IndexMap::new();
     for binding in node_bindings {
       let scope = binding.scope().clone();
+      // Several internal or executable nodes may contribute to one invocation.
+      // The scope finishes only after all of them report completion.
       states.entry(scope.clone()).or_default().remaining += 1;
       if let Some(step) = binding.step() {
         steps.insert(
@@ -124,13 +171,22 @@ impl ConsoleScopeTracker {
       console,
       run_id,
       declaration: Mutex::new(()),
+      starts: Mutex::new(()),
       states: Mutex::new(states),
       steps: Mutex::new(steps),
     }
   }
 
+  /// Publishes every still-planned scope and step in deterministic order.
+  ///
+  /// The method is retryable and idempotent for already accepted declarations.
+  /// Empty scopes are immediately closed as skipped so every declared identity
+  /// still receives a terminal event and result.
   pub(crate) async fn declare(&self) -> io::Result<()> {
     let _declaration = self.declaration.lock().await;
+
+    // Clone a snapshot before awaiting the sink. This avoids holding state
+    // locks during potentially backpressured output publication.
     let scopes = self
       .states
       .lock()
@@ -147,6 +203,7 @@ impl ConsoleScopeTracker {
           scope: scope.clone(),
         })
         .await?;
+      // Commit the state transition only after the event sink accepts it.
       let empty = {
         let mut states = self.states.lock().await;
         let state = states.get_mut(&scope).expect("scope was collected from the same map");
@@ -157,6 +214,8 @@ impl ConsoleScopeTracker {
         self.finish_scope(scope, ConsoleStatus::Skipped).await?;
       }
     }
+    // Scopes are declared before their children so observers can construct the
+    // hierarchy incrementally from the event stream.
     let steps = self
       .steps
       .lock()
@@ -185,53 +244,96 @@ impl ConsoleScopeTracker {
     Ok(())
   }
 
+  /// Starts a task scope once, even when multiple nodes enter it concurrently.
+  ///
+  /// Validation happens before publication, while the state and timestamp are
+  /// committed only after the sink accepts `ScopeStarted`.
   pub(crate) async fn start_scope(&self, binding: &ExecutionBinding) -> io::Result<()> {
     let scope = binding.scope();
-    let mut states = self.states.lock().await;
-    let Some(state) = states.get(scope) else {
-      return Err(unknown_scope(scope));
+    let _start = self.starts.lock().await;
+    {
+      let states = self.states.lock().await;
+      let state = states.get(scope).ok_or_else(|| unknown_scope(scope))?;
+      match state.lifecycle {
+        LifecycleState::Declared => {},
+        LifecycleState::Started => return Ok(()),
+        LifecycleState::Planned => {
+          return Err(io::Error::other(format!(
+            "execution scope {} was started before it was declared",
+            scope.id()
+          )));
+        },
+        LifecycleState::PublishingFinish | LifecycleState::Finished => {
+          return Err(io::Error::other(format!(
+            "execution scope {} was started after it finished",
+            scope.id()
+          )));
+        },
+      }
     };
-    let needs_event = state.lifecycle.needs_start_event("scope", scope.id())?;
-
-    // Keep the state lock until the event is accepted so concurrent nodes in
-    // one invocation cannot publish duplicate starts.
-    if needs_event {
-      self
-        .console
-        .event(ExecutionEvent::ScopeStarted {
-          run_id: self.run_id,
-          scope: scope.clone(),
-        })
-        .await?;
-      let state = states.get_mut(scope).expect("scope was validated above");
-      state.lifecycle = LifecycleState::Started;
-      state.started_at = Some(Utc::now());
-    }
-    Ok(())
-  }
-
-  pub(crate) async fn start_step(&self, binding: &ExecutionBinding) -> io::Result<()> {
-    let Some(step) = binding.step() else {
-      return Ok(());
-    };
-    let mut steps = self.steps.lock().await;
-    let state = steps.get_mut(step).ok_or_else(|| unknown_step(step))?;
-    if !state.lifecycle.needs_start_event("step", step.id())? {
-      return Ok(());
-    }
     self
       .console
-      .event(ExecutionEvent::StepStarted {
+      .event(ExecutionEvent::ScopeStarted {
         run_id: self.run_id,
-        scope: state.scope.clone(),
-        step: step.clone(),
+        scope: scope.clone(),
       })
       .await?;
+    let mut states = self.states.lock().await;
+    let state = states.get_mut(scope).expect("scope was validated above");
     state.lifecycle = LifecycleState::Started;
     state.started_at = Some(Utc::now());
     Ok(())
   }
 
+  /// Starts the command step attached to a binding, if it has one.
+  ///
+  /// Task-only bindings intentionally make this a no-op. The shared start lock
+  /// preserves scope/step ordering when sibling nodes begin concurrently.
+  pub(crate) async fn start_step(&self, binding: &ExecutionBinding) -> io::Result<()> {
+    let Some(step) = binding.step() else {
+      return Ok(());
+    };
+    let _start = self.starts.lock().await;
+    let scope = {
+      let steps = self.steps.lock().await;
+      let state = steps.get(step).ok_or_else(|| unknown_step(step))?;
+      match state.lifecycle {
+        LifecycleState::Declared => state.scope.clone(),
+        LifecycleState::Started => return Ok(()),
+        LifecycleState::Planned => {
+          return Err(io::Error::other(format!(
+            "execution step {} was started before it was declared",
+            step.id()
+          )));
+        },
+        LifecycleState::PublishingFinish | LifecycleState::Finished => {
+          return Err(io::Error::other(format!(
+            "execution step {} was started after it finished",
+            step.id()
+          )));
+        },
+      }
+    };
+    self
+      .console
+      .event(ExecutionEvent::StepStarted {
+        run_id: self.run_id,
+        scope,
+        step: step.clone(),
+      })
+      .await?;
+    let mut steps = self.steps.lock().await;
+    let state = steps.get_mut(step).expect("step was validated above");
+    state.lifecycle = LifecycleState::Started;
+    state.started_at = Some(Utc::now());
+    Ok(())
+  }
+
+  /// Records one bound node's outcome and closes its step/scope when eligible.
+  ///
+  /// Step completion is published before task completion to preserve hierarchy.
+  /// A scope aggregates status by severity and finishes only when `remaining`
+  /// reaches zero. No scope state is consumed if step publication fails.
   pub(crate) async fn complete(
     &self,
     binding: &ExecutionBinding,
@@ -241,6 +343,8 @@ impl ConsoleScopeTracker {
     let scope = binding.scope();
     let failure_at = failure.as_ref().map(|_| Utc::now());
     {
+      // Validate the parent first. Otherwise an invalid binding could publish a
+      // valid-looking step finish and fail only when updating its task scope.
       let states = self.states.lock().await;
       let Some(state) = states.get(scope) else {
         return Err(unknown_scope(scope));
@@ -276,6 +380,8 @@ impl ConsoleScopeTracker {
           scope.id()
         )));
       }
+      // ConsoleStatus ordering is severity ordering, so one failed node keeps
+      // the complete invocation failed regardless of later successes/skips.
       state.status = state.status.max(status);
       record_timed_failure(&mut state.failure, &mut state.failure_at, failure, failure_at);
       state.remaining -= 1;
@@ -296,6 +402,11 @@ impl ConsoleScopeTracker {
     Ok(())
   }
 
+  /// Closes every unfinished step and scope during cancellation or early failure.
+  ///
+  /// All entries are attempted even if one event is rejected; the first sink
+  /// error is returned after the remaining lifecycle has had a chance to close.
+  /// Children are always finished before their owning task scopes.
   pub(crate) async fn finish_remaining(&self, status: ConsoleStatus) -> io::Result<()> {
     let mut first_error = self.finish_remaining_steps(status).await.err();
     let unfinished = {
@@ -326,6 +437,7 @@ impl ConsoleScopeTracker {
     first_error.map_or(Ok(()), Err)
   }
 
+  /// Reserves and publishes the normal terminal transition of one step.
   async fn finish_step(
     &self,
     step: Option<&ConsoleStep>,
@@ -358,6 +470,7 @@ impl ConsoleScopeTracker {
     self.publish_step_finish(finish).await
   }
 
+  /// Attempts shutdown completion for every declared or started step.
   async fn finish_remaining_steps(&self, status: ConsoleStatus) -> io::Result<()> {
     let unfinished = {
       let mut steps = self.steps.lock().await;
@@ -387,6 +500,7 @@ impl ConsoleScopeTracker {
     first_error.map_or(Ok(()), Err)
   }
 
+  /// Finishes a scope that has no bound node, such as an empty invocation.
   async fn finish_scope(&self, scope: ConsoleScope, status: ConsoleStatus) -> io::Result<()> {
     let finish = {
       let mut states = self.states.lock().await;
@@ -403,6 +517,7 @@ impl ConsoleScopeTracker {
     self.publish_scope_finish(finish).await
   }
 
+  /// Publishes a reserved scope finish and commits or rolls back its state.
   async fn publish_scope_finish(&self, finish: PendingScopeFinish) -> io::Result<()> {
     let result = self
       .console
@@ -423,6 +538,7 @@ impl ConsoleScopeTracker {
     result
   }
 
+  /// Publishes a reserved step finish and commits or rolls back its state.
   async fn publish_step_finish(&self, finish: PendingStepFinish) -> io::Result<()> {
     let result = self
       .console
@@ -444,6 +560,12 @@ impl ConsoleScopeTracker {
     result
   }
 
+  /// Materializes the terminal result tree after every lifecycle has finished.
+  ///
+  /// Output bytes remain in the event stream; results contain stable selectors
+  /// that an embedding application can use to retrieve or persist that output.
+  /// Calling this before terminal publication is rejected rather than returning
+  /// a misleading partial snapshot.
   pub(crate) async fn results(&self) -> io::Result<Vec<TaskResult>> {
     let steps = self.steps.lock().await;
     let mut steps_by_scope = HashMap::new();
@@ -470,6 +592,8 @@ impl ConsoleScopeTracker {
     }
     drop(steps);
 
+    // Group steps first, then consume them while walking task scopes in their
+    // original declaration order.
     let states = self.states.lock().await;
     states
       .iter()
@@ -492,6 +616,10 @@ impl ConsoleScopeTracker {
       .collect()
   }
 
+  /// Aggregates a run status when scheduling itself produced no failure.
+  ///
+  /// An empty plan is successful; a non-empty plan consisting only of skipped
+  /// scopes remains skipped.
   pub(crate) async fn successful_run_status(&self) -> ConsoleStatus {
     let states = self.states.lock().await;
     if states.is_empty() {
@@ -502,6 +630,11 @@ impl ConsoleScopeTracker {
       .fold(ConsoleStatus::Skipped, |status, state| status.max(state.status))
   }
 
+  /// Returns the earliest originating task failure observed in the run.
+  ///
+  /// Parallel fail-fast commonly records sibling cancellations before the task
+  /// that caused them completes. Non-cancellation failures therefore take
+  /// priority; cancellation is returned only when no originating failure exists.
   pub(crate) async fn failure(&self) -> Option<ExecutionFailure> {
     let states = self.states.lock().await;
     let first_failure = states
@@ -522,6 +655,10 @@ impl ConsoleScopeTracker {
   }
 }
 
+/// Maps run shutdown status onto a scope or step that never started.
+///
+/// A sibling's failure makes queued work skipped, not failed. Cancellation is
+/// retained because it directly explains why queued work did not start.
 fn remaining_status(status: ConsoleStatus, lifecycle: LifecycleState) -> ConsoleStatus {
   if status == ConsoleStatus::Failed && lifecycle == LifecycleState::Declared {
     ConsoleStatus::Skipped
@@ -530,6 +667,7 @@ fn remaining_status(status: ConsoleStatus, lifecycle: LifecycleState) -> Console
   }
 }
 
+/// Records failure and observation time using originating-error precedence.
 fn record_timed_failure(
   recorded: &mut Option<ExecutionFailure>,
   recorded_at: &mut Option<DateTime<Utc>>,
@@ -545,6 +683,7 @@ fn record_timed_failure(
   }
 }
 
+/// Records a step failure using the same precedence as task aggregation.
 fn record_failure(recorded: &mut Option<ExecutionFailure>, failure: Option<ExecutionFailure>) {
   let Some(failure) = failure else {
     return;
@@ -554,16 +693,19 @@ fn record_failure(recorded: &mut Option<ExecutionFailure>, failure: Option<Execu
   }
 }
 
+/// Keeps the first useful failure, allowing a cause to replace prior cancellation.
 fn should_record_failure(recorded: Option<&ExecutionFailure>, failure: &ExecutionFailure) -> bool {
   recorded.is_none()
     || recorded.is_some_and(|failure| failure.kind == crate::ExecutionFailureKind::Cancelled)
       && failure.kind != crate::ExecutionFailureKind::Cancelled
 }
 
+/// Creates a consistent error for a binding owned by another recorder.
 fn unknown_scope(scope: &ConsoleScope) -> io::Error {
   io::Error::other(format!("unknown console scope {}", scope.id()))
 }
 
+/// Creates a consistent error for an undeclared step identity.
 fn unknown_step(step: &ConsoleStep) -> io::Error {
   io::Error::other(format!("unknown console step {}", step.id()))
 }
@@ -642,7 +784,7 @@ mod tests {
     let first = allocator.scope("first");
     let empty = allocator.scope("empty");
     let binding = ExecutionBinding::for_task(first.clone());
-    let tracker = ConsoleScopeTracker::new(console, 7, vec![first.clone(), empty.clone()], [binding.clone()]);
+    let tracker = ExecutionRecorder::new(console, 7, vec![first.clone(), empty.clone()], [binding.clone()]);
 
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
@@ -695,7 +837,7 @@ mod tests {
     let child = allocator.scope_with_parent_options("compile", Some(parent.id()), None, false, false);
     let step = allocator.step(&child, "shell");
     let binding = ExecutionBinding::for_step(child.clone(), step.clone());
-    let tracker = ConsoleScopeTracker::new(console, 19, vec![parent.clone(), child.clone()], [binding.clone()]);
+    let tracker = ExecutionRecorder::new(console, 19, vec![parent.clone(), child.clone()], [binding.clone()]);
 
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
@@ -737,7 +879,7 @@ mod tests {
     let failed_first = allocator.scope("second");
     let first_binding = ExecutionBinding::for_task(declared_first.clone());
     let second_binding = ExecutionBinding::for_task(failed_first.clone());
-    let tracker = ConsoleScopeTracker::new(
+    let tracker = ExecutionRecorder::new(
       console,
       23,
       vec![declared_first.clone(), failed_first.clone()],
@@ -777,7 +919,7 @@ mod tests {
     let allocator = octa_output::ConsoleScopeAllocator::default();
     let scope = allocator.scope("build");
     let binding = ExecutionBinding::for_task(scope.clone());
-    let tracker = ConsoleScopeTracker::new(console, 3, vec![scope], [binding]);
+    let tracker = ExecutionRecorder::new(console, 3, vec![scope], [binding]);
 
     tracker.declare().await.unwrap();
 
@@ -791,7 +933,7 @@ mod tests {
     let scope = allocator.scope("build");
     let step = allocator.step(&scope, "shell");
     let binding = ExecutionBinding::for_step(scope.clone(), step.clone());
-    let tracker = ConsoleScopeTracker::new(console, 7, vec![scope.clone()], [binding.clone()]);
+    let tracker = ExecutionRecorder::new(console, 7, vec![scope.clone()], [binding.clone()]);
 
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
@@ -843,7 +985,7 @@ mod tests {
     let unknown = allocator.step(&scope, "shell");
     let binding = ExecutionBinding::for_step(scope.clone(), step.clone());
     let unknown_binding = ExecutionBinding::for_step(scope.clone(), unknown.clone());
-    let tracker = ConsoleScopeTracker::new(console, 7, vec![scope.clone()], [binding.clone()]);
+    let tracker = ExecutionRecorder::new(console, 7, vec![scope.clone()], [binding.clone()]);
 
     assert!(tracker.start_scope(&binding).await.is_err());
     assert!(tracker.start_step(&binding).await.is_err());
@@ -876,7 +1018,7 @@ mod tests {
     let scope = allocator.scope("build");
     let step = allocator.step(&scope, "shell");
     let binding = ExecutionBinding::for_step(scope.clone(), step.clone());
-    let tracker = ConsoleScopeTracker::new(console, 7, vec![scope.clone()], [binding.clone()]);
+    let tracker = ExecutionRecorder::new(console, 7, vec![scope.clone()], [binding.clone()]);
 
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
@@ -902,7 +1044,7 @@ mod tests {
     let scope = allocator.scope("build");
     let unknown = allocator.scope("unknown");
     let binding = ExecutionBinding::for_task(scope.clone());
-    let tracker = ConsoleScopeTracker::new(console, 8, Vec::new(), [binding.clone(), binding.clone()]);
+    let tracker = ExecutionRecorder::new(console, 8, Vec::new(), [binding.clone(), binding.clone()]);
 
     let unknown_binding = ExecutionBinding::for_task(unknown);
     assert!(tracker.complete(&binding, ConsoleStatus::Success, None).await.is_err());
@@ -941,7 +1083,7 @@ mod tests {
     let second = allocator.scope("second");
     let first_binding = ExecutionBinding::for_task(first.clone());
     let second_binding = ExecutionBinding::for_task(second.clone());
-    let tracker = ConsoleScopeTracker::new(
+    let tracker = ExecutionRecorder::new(
       console,
       9,
       vec![first.clone(), second.clone()],

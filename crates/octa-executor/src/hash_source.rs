@@ -1,3 +1,8 @@
+//! Content-based source fingerprint strategy.
+//!
+//! Filesystem traversal and hashing run on Tokio's blocking pool; cancellation
+//! is checked by the shared path-hashing implementation between entries.
+
 use std::path::PathBuf;
 
 use async_trait::async_trait;

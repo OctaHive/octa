@@ -1,43 +1,63 @@
+//! Public embedding facade for preparing and starting an execution.
+//!
+//! The engine owns long-lived services such as plugins, fingerprints, and
+//! runtime coordination. Per-run options stay in [`ExecutionRequest`], while a
+//! prepared plan can be started immediately or attached to an external parent
+//! cancellation token.
+
 use std::{fmt, path::PathBuf, sync::Arc};
 
-use chrono::Utc;
+use indexmap::IndexMap;
 use octa_octafile::{Octafile, Silence};
-use octa_output::{Console, ConsoleScopeAllocator, ConsoleStatus, ExecutionEvent};
+use octa_output::{Console, ConsoleScopeAllocator, ConsoleStatus};
 use octa_plugin_manager::plugin_manager::PluginManager;
 use sled::Db;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
   error::{ExecutorError, ExecutorResult},
   execution_handle::ExecutionHandle,
   execution_result::{conclusion, ExecutionFailure, ExecutionResult},
+  execution_run::ExecutionRun,
   executor::{Executor, ExecutorConfig},
   runtime_coordinator::RuntimeCoordinator,
   summary::Summary,
-  task::TaskNode,
+  task::{TaskNode, TaskRuntime},
   vars::VariableResolver,
-  TaskGraphBuilder,
+  RawTerminalConnector, TaskGraphBuilder, UnsupportedRawTerminal,
 };
 
 /// Everything that varies between invocations of a prepared execution engine.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ExecutionRequest {
+  /// Task command to execute.
   pub command: String,
+  /// Directory used to resolve a bare command in monorepo mode.
   pub working_directory: Option<PathBuf>,
+  /// Ordered command-line variable overrides.
   pub variables: Vec<(String, String)>,
+  /// Arguments exposed to task templates and commands.
   pub command_args: Vec<String>,
+  /// Whether independent DAG nodes may execute concurrently.
   pub parallel: bool,
+  /// Whether plugins should describe work without mutating the workspace.
   pub dry: bool,
+  /// Whether freshness checks should be bypassed.
   pub force: bool,
+  /// Whether the first task failure should cancel the remaining plan.
   pub failfast: bool,
+  /// Whether informational task diagnostics should be suppressed.
   pub quiet: bool,
+  /// Optional task stream suppression override.
   pub silence: Option<Silence>,
+  /// Whether the selected command should own a raw terminal session.
   pub raw: bool,
 }
 
 impl ExecutionRequest {
+  /// Creates a request with headless, serial execution defaults.
   pub fn new(command: impl Into<String>) -> Self {
     Self {
       command: command.into(),
@@ -67,6 +87,7 @@ pub struct ExecutionEngine {
   summary: Option<Arc<Summary>>,
   scope_allocator: Arc<ConsoleScopeAllocator>,
   runtime_coordinator: Arc<RuntimeCoordinator>,
+  terminal: Arc<dyn RawTerminalConnector>,
 }
 
 #[derive(Clone, Copy)]
@@ -76,6 +97,7 @@ enum PreparationMode<'a> {
 }
 
 impl ExecutionEngine {
+  /// Creates an engine from application-owned runtime services.
   pub fn new(
     plugin_manager: Arc<PluginManager>,
     octafile: Arc<Octafile>,
@@ -92,6 +114,7 @@ impl ExecutionEngine {
       summary: None,
       scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
       runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
+      terminal: Arc::new(UnsupportedRawTerminal),
     }
   }
 
@@ -101,6 +124,7 @@ impl ExecutionEngine {
     self
   }
 
+  /// Supplies an application-owned provider for required variable prompts.
   pub fn with_variable_resolver(mut self, variable_resolver: Arc<dyn VariableResolver>) -> Self {
     self.variable_resolver = Some(variable_resolver);
     self
@@ -112,23 +136,24 @@ impl ExecutionEngine {
     self
   }
 
-  /// Shares task IDs with other prepared executions in the same declaration batch.
-  pub fn with_scope_allocator(mut self, scope_allocator: Arc<ConsoleScopeAllocator>) -> Self {
-    self.scope_allocator = scope_allocator;
-    self
-  }
-
   /// Shares interactive-execution coordination between concurrently running requests.
   pub fn with_runtime_coordinator(mut self, runtime_coordinator: Arc<RuntimeCoordinator>) -> Self {
     self.runtime_coordinator = runtime_coordinator;
     self
   }
 
+  /// Connects raw plugin sessions to a terminal owned by the embedding application.
+  pub fn with_raw_terminal(mut self, terminal: Arc<dyn RawTerminalConnector>) -> Self {
+    self.terminal = terminal;
+    self
+  }
+
   /// Builds an execution without starting it, for ordered batch declaration and watch discovery.
   pub async fn prepare(&self, request: ExecutionRequest) -> ExecutorResult<PreparedExecution> {
     let run_id = self.console.allocate_run_id();
+    let run = Arc::new(ExecutionRun::new(self.console.clone(), run_id));
     self
-      .prepare_with_run_id(request, run_id, PreparationMode::Inspectable)
+      .prepare_with_run_id(request, run_id, PreparationMode::Inspectable, run)
       .await
   }
 
@@ -162,17 +187,11 @@ impl ExecutionEngine {
     cancellation: CancellationToken,
   ) -> ExecutorResult<ExecutionResult> {
     let command = request.command.clone();
-    let started_at = Utc::now();
-    self
-      .console
-      .event(ExecutionEvent::RunStarted {
-        run_id,
-        command: command.clone(),
-      })
-      .await?;
+    let run = Arc::new(ExecutionRun::new(self.console.clone(), run_id));
+    let started_at = run.start(&command).await?;
 
     let prepared = self
-      .prepare_with_run_id(request, run_id, PreparationMode::Immediate(&cancellation))
+      .prepare_with_run_id(request, run_id, PreparationMode::Immediate(&cancellation), run.clone())
       .await;
     let prepared = match prepared {
       Ok(prepared) => prepared,
@@ -182,19 +201,12 @@ impl ExecutionEngine {
         } else {
           ConsoleStatus::Failed
         };
-        self
-          .console
-          .event(ExecutionEvent::RunFinished {
-            run_id,
-            command: command.clone(),
-            status,
-          })
-          .await?;
+        let finished_at = run.finish(&command, status).await?;
         return Ok(ExecutionResult {
           run_id,
           command,
           started_at,
-          finished_at: Utc::now(),
+          finished_at,
           conclusion: conclusion(status, Some(ExecutionFailure::from_error(&error, None)), None, None),
           tasks: Vec::new(),
           outputs: Vec::new(),
@@ -202,31 +214,11 @@ impl ExecutionEngine {
       },
     };
 
-    let mut result = match prepared.executor.execute(cancellation, &command).await {
-      Ok(result) => result,
-      Err(error) => {
-        let _ = self
-          .console
-          .event(ExecutionEvent::RunFinished {
-            run_id,
-            command,
-            status: ConsoleStatus::Failed,
-          })
-          .await;
-        return Err(error);
-      },
-    };
-    self
-      .console
-      .event(ExecutionEvent::RunFinished {
-        run_id,
-        command,
-        status: result.conclusion.status(),
-      })
-      .await?;
-    result.started_at = started_at;
-    result.finished_at = Utc::now();
-    Ok(result)
+    let result = prepared.executor.execute(cancellation, &command).await;
+    if result.is_err() {
+      let _ = run.finish(&command, ConsoleStatus::Failed).await;
+    }
+    result
   }
 
   async fn prepare_with_run_id(
@@ -234,6 +226,7 @@ impl ExecutionEngine {
     request: ExecutionRequest,
     run_id: u64,
     mode: PreparationMode<'_>,
+    run: Arc<ExecutionRun>,
   ) -> ExecutorResult<PreparedExecution> {
     let ExecutionRequest {
       command,
@@ -277,21 +270,25 @@ impl ExecutionEngine {
       Vec::new()
     };
     let executor = Executor::new(
-      self.plugin_manager.clone(),
       plan,
       ExecutorConfig {
-        emit_run_events: matches!(mode, PreparationMode::Inspectable),
         failfast,
         concurrency: self.concurrency.clone(),
-        console: self.console.clone(),
-        run_id: Some(run_id),
+        run: Some(run),
         runtime_coordinator: self.runtime_coordinator.clone(),
+        summary: self.summary.clone(),
       },
-      None,
-      self.fingerprint.clone(),
-      dry,
-      force,
-      self.summary.clone(),
+      TaskRuntime {
+        plugin_manager: self.plugin_manager.clone(),
+        terminal: self.terminal.clone(),
+        cache: Arc::new(Mutex::new(IndexMap::new())),
+        fingerprint: self.fingerprint.clone(),
+        console: self.console.clone(),
+        run_id,
+        dry,
+        force,
+        deferred_exit_code: None,
+      },
     )?;
     Ok(PreparedExecution {
       executor,
@@ -317,6 +314,7 @@ pub struct PreparedExecution {
 }
 
 impl PreparedExecution {
+  /// Returns the command captured by this plan.
   pub fn command(&self) -> &str {
     &self.command
   }
@@ -326,6 +324,7 @@ impl PreparedExecution {
     self.is_linear
   }
 
+  /// Returns source groups that should trigger a rebuild in watch mode.
   pub fn watch_targets(&self) -> &[crate::watcher::WatchTarget] {
     &self.watch_targets
   }
@@ -335,14 +334,17 @@ impl PreparedExecution {
     self.executor.prepare(&self.command).await
   }
 
+  /// Executes the prepared plan using the supplied cancellation token.
   pub async fn execute(self, cancellation: CancellationToken) -> ExecutorResult<ExecutionResult> {
     self.executor.execute(cancellation, &self.command).await
   }
 
+  /// Starts the prepared plan on the current Tokio runtime.
   pub fn start(self) -> ExecutionHandle {
     self.executor.start(self.command)
   }
 
+  /// Starts the plan with a child token linked to application-owned cancellation.
   pub fn start_with_token(self, parent_cancellation: &CancellationToken) -> ExecutionHandle {
     self.executor.start_with_token(parent_cancellation, self.command)
   }
@@ -352,7 +354,7 @@ impl PreparedExecution {
 mod tests {
   use std::{fs, io, sync::Mutex};
 
-  use octa_output::{ConsoleEntry, ConsoleRecord, ConsoleRenderer};
+  use octa_output::{ConsoleEntry, ConsoleRecord, ConsoleRenderer, ExecutionEvent};
   use tempfile::TempDir;
 
   use super::*;
@@ -496,5 +498,45 @@ mod tests {
 
     assert!(matches!(result.conclusion, ExecutionConclusion::Failed(_)));
     assert!(result.tasks.is_empty());
+  }
+
+  #[tokio::test]
+  async fn headless_engine_rejects_raw_execution_without_a_terminal_connector() {
+    let directory = TempDir::new().unwrap();
+    let octafile_path = directory.path().join("Octafile.yml");
+    fs::write(
+      &octafile_path,
+      r#"
+        version: 1
+        tasks:
+          interactive:
+            shell: printf raw
+      "#,
+    )
+    .unwrap();
+    let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_owned()], "shell").unwrap();
+    let project_root = env!("CARGO_MANIFEST_DIR");
+    let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../plugins")));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+    let engine = ExecutionEngine::new(
+      plugin_manager.clone(),
+      octafile,
+      Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      Arc::new(Console::default()),
+    );
+    let mut request = ExecutionRequest::new("interactive");
+    request.raw = true;
+
+    let result = engine.start(request).wait().await.unwrap();
+
+    assert!(matches!(result.conclusion, ExecutionConclusion::Failed(_)));
+    assert!(result
+      .failure()
+      .is_some_and(|failure| failure.message.contains("host terminal connector")));
+    plugin_manager.shutdown_all().await;
   }
 }

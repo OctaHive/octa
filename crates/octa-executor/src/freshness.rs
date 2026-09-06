@@ -1,3 +1,9 @@
+//! Freshness evaluation and persistent source fingerprints.
+//!
+//! Evaluation is split from commit: successful task completion publishes the
+//! new fingerprint, while failed or skipped work leaves the previous state
+//! intact. This prevents an interrupted run from marking work as current.
+
 use std::{
   collections::HashSet,
   path::PathBuf,
@@ -100,6 +106,7 @@ fn serialized_digest(identity: &impl Serialize) -> ExecutorResult<String> {
 }
 
 #[derive(Serialize)]
+/// Stable portion of the persisted value used to invalidate incompatible state.
 struct PersistedIdentity<'a> {
   invocation: &'a FreshnessIdentity,
   sources: &'a Option<Vec<String>>,
@@ -110,12 +117,14 @@ struct PersistedIdentity<'a> {
 }
 
 #[derive(Serialize)]
+/// Complete payload stored after a successful task invocation.
 struct PersistedState<'a> {
   identity: &'a PersistedIdentity<'a>,
   source_fingerprint: &'a [u8],
 }
 
 #[derive(Serialize)]
+/// Compact database-key identity independent of potentially secret inputs.
 struct FreshnessSlot<'a> {
   task: &'a str,
   invocation: &'a str,
@@ -138,7 +147,7 @@ fn canonical_value(value: serde_json::Value) -> serde_json::Value {
   }
 }
 
-/// Filesystem inputs and strategy shared by graph and standalone freshness checks.
+/// Filesystem inputs and strategy shared by freshness DAG nodes and watch discovery.
 #[derive(Clone)]
 pub(crate) struct FreshnessConfig {
   sources: Option<Vec<String>>,
