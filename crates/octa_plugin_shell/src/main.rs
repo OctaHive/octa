@@ -248,9 +248,10 @@ async fn execute_raw_pty(
   if let Some(master_close) = master_close {
     let _ = master_close.await;
   }
-  let response = PluginResponse::ExitStatus {
+  let response = PluginResponse::Completed {
     id,
     code: code.unwrap_or(-1),
+    outputs: Default::default(),
   };
   let json = serde_json::to_string(&response)? + "\n";
   let mut writer = writer.lock().await;
@@ -317,9 +318,10 @@ impl Plugin for ShellPlugin {
     if dry {
       logger.log(&format!("Run command in dry mode: {}", result))?;
 
-      let response = serde_json::to_string(&PluginResponse::ExitStatus {
+      let response = serde_json::to_string(&PluginResponse::Completed {
         id: id.clone(),
         code: 0,
+        outputs: Default::default(),
       })?
         + "\n";
       let mut writer = writer.lock().await;
@@ -408,7 +410,11 @@ impl Plugin for ShellPlugin {
 
     let _: (Result<(), _>, Result<(), _>) = tokio::join!(stdout_handle, stderr_handle);
 
-    let response = PluginResponse::ExitStatus { id, code };
+    let response = PluginResponse::Completed {
+      id,
+      code,
+      outputs: Default::default(),
+    };
     let response_json = serde_json::to_string(&response)? + "\n";
     let _ = tx.send(response_json.clone()).await;
     let _ = logger.log(&response_json);
@@ -537,18 +543,19 @@ mod tests {
 
     let output = writer.lock().await.get_output();
     let lines: Vec<&str> = output.lines().collect();
-    let exit_status = lines
+    let completed = lines
       .iter()
-      .find(|line| line.contains("\"type\":\"ExitStatus\""))
-      .expect("Should have exit status message");
+      .find(|line| line.contains("\"type\":\"Completed\""))
+      .expect("Should have completion message");
 
-    let response: PluginResponse = serde_json::from_str(exit_status).unwrap();
+    let response: PluginResponse = serde_json::from_str(completed).unwrap();
     match response {
-      PluginResponse::ExitStatus { id, code } => {
+      PluginResponse::Completed { id, code, outputs } => {
         assert_eq!(id, "test-id");
         assert_eq!(code, 0);
+        assert!(outputs.is_empty());
       },
-      _ => panic!("Expected ExitStatus response"),
+      _ => panic!("Expected Completed response"),
     }
   }
 }

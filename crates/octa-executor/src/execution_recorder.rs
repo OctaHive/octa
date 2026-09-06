@@ -16,6 +16,7 @@ use std::{collections::HashMap, io, sync::Arc};
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
 use octa_output::{Console, ConsoleScope, ConsoleStatus, ConsoleStep, ExecutionEvent};
+use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
 use crate::{
@@ -109,6 +110,8 @@ struct StepState {
   finished_at: Option<DateTime<Utc>>,
   /// Failure attached to the step's terminal result.
   failure: Option<ExecutionFailure>,
+  /// Structured values returned by the step's plugin operation.
+  outputs: Map<String, Value>,
 }
 
 /// Tracks task/step lifecycle separately from DAG scheduling and task payloads.
@@ -163,6 +166,7 @@ impl ExecutionRecorder {
             started_at: None,
             finished_at: None,
             failure: None,
+            outputs: Map::new(),
           },
         );
       }
@@ -339,6 +343,7 @@ impl ExecutionRecorder {
     binding: &ExecutionBinding,
     status: ConsoleStatus,
     failure: Option<ExecutionFailure>,
+    outputs: Map<String, Value>,
   ) -> io::Result<()> {
     let scope = binding.scope();
     let failure_at = failure.as_ref().map(|_| Utc::now());
@@ -362,7 +367,9 @@ impl ExecutionRecorder {
         )));
       }
     }
-    self.finish_step(binding.step(), status, failure.clone()).await?;
+    self
+      .finish_step(binding.step(), status, failure.clone(), outputs)
+      .await?;
     let finished = {
       let mut states = self.states.lock().await;
       let Some(state) = states.get_mut(scope) else {
@@ -443,6 +450,7 @@ impl ExecutionRecorder {
     step: Option<&ConsoleStep>,
     status: ConsoleStatus,
     failure: Option<ExecutionFailure>,
+    outputs: Map<String, Value>,
   ) -> io::Result<()> {
     let Some(step) = step else {
       return Ok(());
@@ -460,6 +468,7 @@ impl ExecutionRecorder {
       state.lifecycle = LifecycleState::PublishingFinish;
       state.status = state.status.max(status);
       record_failure(&mut state.failure, failure);
+      state.outputs = outputs;
       PendingStepFinish {
         step: step.clone(),
         scope: state.scope.clone(),
@@ -588,6 +597,7 @@ impl ExecutionRecorder {
             Some(step.id()),
           ),
           output: OutputReference::step(self.run_id, state.scope.id(), step.id()),
+          outputs: state.outputs.clone(),
         });
     }
     drop(steps);
@@ -789,7 +799,10 @@ mod tests {
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
     tracker.start_step(&binding).await.unwrap();
-    tracker.complete(&binding, ConsoleStatus::Success, None).await.unwrap();
+    tracker
+      .complete(&binding, ConsoleStatus::Success, None, Default::default())
+      .await
+      .unwrap();
     tracker.finish_remaining(ConsoleStatus::Failed).await.unwrap();
 
     let events = renderer.0.lock().unwrap();
@@ -846,8 +859,9 @@ mod tests {
       &crate::error::ExecutorError::TaskFailed("compile".to_owned()),
       Some(&binding),
     );
+    let outputs = serde_json::Map::from_iter([("digest".to_owned(), serde_json::json!("sha256:test"))]);
     tracker
-      .complete(&binding, ConsoleStatus::Failed, Some(failure.clone()))
+      .complete(&binding, ConsoleStatus::Failed, Some(failure.clone()), outputs.clone())
       .await
       .unwrap();
     tracker.finish_remaining(ConsoleStatus::Failed).await.unwrap();
@@ -865,6 +879,7 @@ mod tests {
     assert_eq!(results[1].steps.len(), 1);
     assert_eq!(results[1].steps[0].step_id, step.id());
     assert_eq!(results[1].steps[0].conclusion.failure(), Some(&failure));
+    assert_eq!(results[1].steps[0].outputs, outputs);
     assert_eq!(
       results[1].steps[0].output,
       OutputReference::step(19, child.id(), step.id())
@@ -895,7 +910,12 @@ mod tests {
       None,
     );
     tracker
-      .complete(&second_binding, ConsoleStatus::Failed, Some(second_failure.clone()))
+      .complete(
+        &second_binding,
+        ConsoleStatus::Failed,
+        Some(second_failure.clone()),
+        Default::default(),
+      )
       .await
       .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
@@ -906,7 +926,12 @@ mod tests {
       None,
     );
     tracker
-      .complete(&first_binding, ConsoleStatus::Failed, Some(first_failure))
+      .complete(
+        &first_binding,
+        ConsoleStatus::Failed,
+        Some(first_failure),
+        Default::default(),
+      )
       .await
       .unwrap();
 
@@ -938,7 +963,10 @@ mod tests {
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
     tracker.start_step(&binding).await.unwrap();
-    tracker.complete(&binding, ConsoleStatus::Success, None).await.unwrap();
+    tracker
+      .complete(&binding, ConsoleStatus::Success, None, Default::default())
+      .await
+      .unwrap();
 
     assert_eq!(
       *renderer.0.lock().unwrap(),
@@ -1023,7 +1051,10 @@ mod tests {
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
     tracker.start_step(&binding).await.unwrap();
-    assert!(tracker.complete(&binding, ConsoleStatus::Success, None).await.is_err());
+    assert!(tracker
+      .complete(&binding, ConsoleStatus::Success, None, Default::default())
+      .await
+      .is_err());
     tracker.finish_remaining(ConsoleStatus::Failed).await.unwrap();
 
     assert_eq!(
@@ -1047,19 +1078,31 @@ mod tests {
     let tracker = ExecutionRecorder::new(console, 8, Vec::new(), [binding.clone(), binding.clone()]);
 
     let unknown_binding = ExecutionBinding::for_task(unknown);
-    assert!(tracker.complete(&binding, ConsoleStatus::Success, None).await.is_err());
     assert!(tracker
-      .complete(&unknown_binding, ConsoleStatus::Success, None)
+      .complete(&binding, ConsoleStatus::Success, None, Default::default())
+      .await
+      .is_err());
+    assert!(tracker
+      .complete(&unknown_binding, ConsoleStatus::Success, None, Default::default(),)
       .await
       .is_err());
 
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
-    tracker.complete(&binding, ConsoleStatus::Success, None).await.unwrap();
-    tracker.complete(&binding, ConsoleStatus::Skipped, None).await.unwrap();
+    tracker
+      .complete(&binding, ConsoleStatus::Success, None, Default::default())
+      .await
+      .unwrap();
+    tracker
+      .complete(&binding, ConsoleStatus::Skipped, None, Default::default())
+      .await
+      .unwrap();
 
     assert_eq!(tracker.successful_run_status().await, ConsoleStatus::Success);
-    assert!(tracker.complete(&binding, ConsoleStatus::Success, None).await.is_err());
+    assert!(tracker
+      .complete(&binding, ConsoleStatus::Success, None, Default::default())
+      .await
+      .is_err());
     assert!(renderer
       .0
       .lock()

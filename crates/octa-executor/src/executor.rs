@@ -860,10 +860,11 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
     let result = match result {
       Ok(outcome) => {
         let status = outcome.status();
+        let (output, structured_outputs) = outcome.into_parts();
         self
-          .handle_success(outcome.into_output(), status, start_time)
+          .handle_success(output, status, start_time)
           .await
-          .map(|output| TaskOutcome::new(output, status))
+          .map(|output| TaskOutcome::new(output, status).with_structured_outputs(structured_outputs))
       },
       Err(e) => self.handle_error(e, binding.as_ref()).await,
     };
@@ -881,21 +882,32 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
     let Some(binding) = binding else {
       return result.map(TaskOutcome::into_output);
     };
-    let status = match &result {
-      Ok(outcome) => outcome.status(),
-      Err(ExecutorError::TaskCancelled(_)) => ConsoleStatus::Cancelled,
-      Err(_) => ConsoleStatus::Failed,
-    };
-    let failure = result
-      .as_ref()
-      .err()
-      .map(|error| ExecutionFailure::from_error(error, Some(binding)));
-    let completion = self.context.recorder.complete(binding, status, failure).await;
     match result {
-      Err(error) => Err(error),
       Ok(outcome) => {
-        completion?;
-        Ok(outcome.into_output())
+        let status = outcome.status();
+        let (output, structured_outputs) = outcome.into_parts();
+        self
+          .context
+          .recorder
+          .complete(binding, status, None, structured_outputs)
+          .await?;
+        Ok(output)
+      },
+      Err(error) => {
+        let status = if matches!(&error, ExecutorError::TaskCancelled(_)) {
+          ConsoleStatus::Cancelled
+        } else {
+          ConsoleStatus::Failed
+        };
+        let failure = ExecutionFailure::from_error(&error, Some(binding));
+        // Preserve the originating task error if publishing its terminal
+        // lifecycle also fails; shutdown will retry any unfinished transition.
+        let _ = self
+          .context
+          .recorder
+          .complete(binding, status, Some(failure), Default::default())
+          .await;
+        Err(error)
       },
     }
   }
@@ -1087,6 +1099,7 @@ mod tests {
     running: Option<Arc<AtomicUsize>>,
     maximum_running: Option<Arc<AtomicUsize>>,
     execution_binding: Option<ExecutionBinding>,
+    structured_outputs: serde_json::Map<String, serde_json::Value>,
   }
 
   struct RunningTaskGuard(Arc<AtomicUsize>);
@@ -1173,7 +1186,7 @@ mod tests {
       select! {
         _ = sleep(Duration::from_millis(150)) => {
           self.completed.store(true, Ordering::SeqCst);
-          Ok(TaskOutcome::success(self.id.clone()))
+          Ok(TaskOutcome::success(self.id.clone()).with_structured_outputs(self.structured_outputs.clone()))
         },
         _ = cancel_token.cancelled() => Err(ExecutorError::TaskCancelled(self.id.clone())),
       }
@@ -1197,6 +1210,7 @@ mod tests {
       running: None,
       maximum_running: None,
       execution_binding: None,
+      structured_outputs: Default::default(),
     }
   }
 
@@ -1501,6 +1515,32 @@ mod tests {
 
     assert!(matches!(result.conclusion, ExecutionConclusion::Failed(_)));
     assert!(!completed.load(Ordering::SeqCst));
+  }
+
+  #[tokio::test]
+  async fn returns_structured_outputs_on_the_completed_step() {
+    let allocator = octa_output::ConsoleScopeAllocator::default();
+    let scope = allocator.scope("image");
+    let step = allocator.step(&scope, "docker");
+    let mut task = test_task("image");
+    task.execution_binding = Some(ExecutionBinding::for_step(scope.clone(), step));
+    task.structured_outputs = serde_json::Map::from_iter([
+      ("digest".to_owned(), serde_json::json!("sha256:test")),
+      ("pushed".to_owned(), serde_json::json!(true)),
+    ]);
+    let expected = task.structured_outputs.clone();
+    let mut dag = DAG::new();
+    dag.add_node(Arc::new(task));
+    let executor = test_executor_with_console(
+      ExecutionPlan::new(dag, HashMap::new(), vec![scope]),
+      ExecutorConfig::default(),
+      Arc::new(Console::default()),
+      1,
+    );
+
+    let result = executor.execute(CancellationToken::new(), "image").await.unwrap();
+
+    assert_eq!(result.tasks[0].steps[0].outputs, expected);
   }
 
   #[test]

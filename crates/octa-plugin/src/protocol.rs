@@ -137,9 +137,14 @@ pub enum PluginResponse {
     id: String,
     progress: ProgressUpdate,
   },
-  ExitStatus {
+  /// Normal terminal result of a plugin operation.
+  Completed {
     id: String,
+    /// Process-compatible status where zero represents success.
     code: i32,
+    /// Structured values produced by the completed operation.
+    #[serde(default, skip_serializing_if = "Map::is_empty")]
+    outputs: Map<String, Value>,
   },
   Error {
     id: String,
@@ -226,6 +231,28 @@ mod tests {
       } if id == "command"
     ));
     assert!(!json.contains("stdout"));
+  }
+
+  #[test]
+  fn completed_response_carries_structured_outputs() {
+    let response = PluginResponse::Completed {
+      id: "command".to_owned(),
+      code: 0,
+      outputs: serde_json::Map::from_iter([
+        ("digest".to_owned(), serde_json::json!("sha256:test")),
+        ("pushed".to_owned(), serde_json::json!(true)),
+      ]),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    let decoded = serde_json::from_str::<PluginResponse>(&json).unwrap();
+
+    assert!(matches!(
+      decoded,
+      PluginResponse::Completed { id, code: 0, outputs }
+        if id == "command"
+          && outputs["digest"] == "sha256:test"
+          && outputs["pushed"] == true
+    ));
   }
 
   #[test]

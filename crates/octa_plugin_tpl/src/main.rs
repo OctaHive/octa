@@ -117,18 +117,19 @@ impl Plugin for TemplatePlugin {
     };
     let stdout_response_json = serde_json::to_string(&stdout_response).unwrap() + "\n";
 
-    let exit_response = PluginResponse::ExitStatus {
+    let completed_response = PluginResponse::Completed {
       id: id.clone(),
       code: 0,
+      outputs: Default::default(),
     };
-    let exit_response_json = serde_json::to_string(&exit_response).unwrap() + "\n";
+    let completed_response_json = serde_json::to_string(&completed_response).unwrap() + "\n";
 
     let mut lock = writer.lock().await;
     let _ = lock.write_all(stdout_response_json.as_bytes()).await;
     let _ = logger.log(&stdout_response_json.to_string());
 
-    let _ = lock.write_all(exit_response_json.as_bytes()).await;
-    let _ = logger.log(&exit_response_json.to_string());
+    let _ = lock.write_all(completed_response_json.as_bytes()).await;
+    let _ = logger.log(&completed_response_json.to_string());
 
     let _ = lock.flush().await;
 

@@ -10,7 +10,7 @@ use octa_plugin::{
 };
 use octa_plugin_manager::plugin_client::PluginExecutionRequest;
 use octa_plugin_manager::plugin_manager::PluginManager;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -64,6 +64,7 @@ pub(crate) struct PluginOutput {
   pub code: i32,
   pub stdout: String,
   pub stderr: String,
+  pub outputs: Map<String, Value>,
   pub failure_location: Option<SourceLocation>,
 }
 
@@ -185,13 +186,14 @@ impl PluginInvoker {
             PluginResponseAction::Continue(location) => {
               failure_location = location.or(failure_location);
             },
-            PluginResponseAction::Exit(code) => {
+            PluginResponseAction::Complete { code, outputs } => {
               terminal_response = true;
               let (stdout, stderr) = output.into_strings().await?;
               break Ok(PluginOutput {
                 code,
                 stdout,
                 stderr,
+                outputs,
                 failure_location,
               });
             },
@@ -234,7 +236,7 @@ impl PluginInvoker {
 #[derive(Debug, Eq, PartialEq)]
 enum PluginResponseAction {
   Continue(Option<SourceLocation>),
-  Exit(i32),
+  Complete { code: i32, outputs: Map<String, Value> },
   Error(String),
 }
 
@@ -320,7 +322,9 @@ async fn route_plugin_response(
       }
       return Ok(PluginResponseAction::Continue(is_error.then_some(location).flatten()));
     },
-    PluginResponse::ExitStatus { id, code } if id == command_id => return Ok(PluginResponseAction::Exit(code)),
+    PluginResponse::Completed { id, code, outputs } if id == command_id => {
+      return Ok(PluginResponseAction::Complete { code, outputs });
+    },
     PluginResponse::Error { id, message } if id == command_id => return Ok(PluginResponseAction::Error(message)),
     _ => {},
   }
@@ -635,9 +639,10 @@ mod tests {
 
     assert_eq!(
       route_plugin_response(
-        PluginResponse::ExitStatus {
+        PluginResponse::Completed {
           id: "command".to_owned(),
           code: 4,
+          outputs: serde_json::Map::from_iter([("digest".to_owned(), serde_json::json!("sha256:test"))]),
         },
         "command",
         Some(&target),
@@ -647,7 +652,10 @@ mod tests {
       )
       .await
       .unwrap(),
-      PluginResponseAction::Exit(4)
+      PluginResponseAction::Complete {
+        code: 4,
+        outputs: serde_json::Map::from_iter([("digest".to_owned(), serde_json::json!("sha256:test"))]),
+      }
     );
     assert_eq!(
       route_plugin_response(

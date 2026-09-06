@@ -443,7 +443,7 @@ impl PluginClient {
       | PluginResponse::StdoutBytes { id, .. }
       | PluginResponse::StderrBytes { id, .. }
       | PluginResponse::Diagnostic { id, .. } => (Some(id.clone()), false),
-      PluginResponse::ExitStatus { id, .. } | PluginResponse::Error { id, .. } => (Some(id.clone()), true),
+      PluginResponse::Completed { id, .. } | PluginResponse::Error { id, .. } => (Some(id.clone()), true),
       _ => (None, false),
     };
     if let Some(id) = id {
@@ -970,7 +970,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
           }
           if handle_type == "terminal-before-start" {
-            Some(PluginResponse::ExitStatus { id, code: 0 })
+            Some(PluginResponse::Completed {
+              id,
+              code: 0,
+              outputs: Default::default(),
+            })
           } else if handle_type == "progress-before-start" {
             Some(PluginResponse::Progress {
               id,
@@ -993,7 +997,11 @@ mod tests {
           let OctaCommand::Cancel { id } = serde_json::from_str::<OctaCommand>(&buffer).unwrap() else {
             unreachable!()
           };
-          Some(PluginResponse::ExitStatus { id, code: -1 })
+          Some(PluginResponse::Completed {
+            id,
+            code: -1,
+            outputs: Default::default(),
+          })
         } else if buffer.contains("Shutdown") {
           Some(PluginResponse::Shutdown {
             message: "Shutting down".to_string(),
@@ -1606,7 +1614,15 @@ mod tests {
                 },
               )
               .await;
-              write_response(&writer, PluginResponse::ExitStatus { id, code: 0 }).await;
+              write_response(
+                &writer,
+                PluginResponse::Completed {
+                  id,
+                  code: 0,
+                  outputs: Default::default(),
+                },
+              )
+              .await;
             });
           },
           OctaCommand::Shutdown => {
@@ -1691,7 +1707,15 @@ mod tests {
               )
               .await;
             }
-            write_response(&writer, PluginResponse::ExitStatus { id, code: 0 }).await;
+            write_response(
+              &writer,
+              PluginResponse::Completed {
+                id,
+                code: 0,
+                outputs: Default::default(),
+              },
+            )
+            .await;
           },
           OctaCommand::Execute { id, .. } => {
             write_response(&writer, PluginResponse::Started { id: id.clone() }).await;
@@ -1703,10 +1727,26 @@ mod tests {
               },
             )
             .await;
-            write_response(&writer, PluginResponse::ExitStatus { id, code: 0 }).await;
+            write_response(
+              &writer,
+              PluginResponse::Completed {
+                id,
+                code: 0,
+                outputs: Default::default(),
+              },
+            )
+            .await;
           },
           OctaCommand::Cancel { id } => {
-            write_response(&writer, PluginResponse::ExitStatus { id, code: -1 }).await;
+            write_response(
+              &writer,
+              PluginResponse::Completed {
+                id,
+                code: -1,
+                outputs: Default::default(),
+              },
+            )
+            .await;
           },
           OctaCommand::Shutdown => {
             write_response(
@@ -1748,7 +1788,7 @@ mod tests {
     ));
     assert!(matches!(
       quiet.receive_output(&CancellationToken::new()).await.unwrap(),
-      Some(PluginResponse::ExitStatus { code: 0, .. })
+      Some(PluginResponse::Completed { code: 0, .. })
     ));
 
     client.shutdown().await.unwrap();

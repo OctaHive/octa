@@ -9,6 +9,7 @@ use std::{error::Error, fmt};
 use chrono::{DateTime, Utc};
 use octa_output::{ConsoleStatus, SourceLocation};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::{error::ExecutorError, task::ExecutionBinding};
 
@@ -255,6 +256,9 @@ pub struct StepResult {
   pub conclusion: ExecutionConclusion,
   /// Selector for this step's streamed output events.
   pub output: OutputReference,
+  /// Structured values returned by the plugin when the step completed.
+  #[serde(default, skip_serializing_if = "Map::is_empty")]
+  pub outputs: Map<String, Value>,
 }
 
 /// Terminal result of one task invocation.
@@ -475,6 +479,7 @@ mod tests {
           finished_at: now,
           conclusion: ExecutionConclusion::Succeeded,
           output: OutputReference::step(11, 2, 7),
+          outputs: serde_json::Map::new(),
         }],
       }],
       outputs: vec!["artifact".to_owned()],

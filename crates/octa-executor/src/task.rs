@@ -19,7 +19,7 @@ use dunce::canonicalize;
 use indexmap::IndexMap;
 use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sled::Db;
 use tera::Context;
 use tokio::{
@@ -37,7 +37,9 @@ use crate::{
   envs::{EnvironmentPlan, Envs},
   error::{ExecutorError, ExecutorResult},
   freshness::{FreshnessSpec, FreshnessState},
-  plugin::{ManagerPluginEvaluator, PluginEvaluator, PluginExecutionContext, PluginInvoker, PluginRequest},
+  plugin::{
+    ManagerPluginEvaluator, PluginEvaluator, PluginExecutionContext, PluginInvoker, PluginOutput, PluginRequest,
+  },
   runtime_output::RuntimeOutput,
   template::{PluginTemplateContext, TemplateRenderer},
   terminal::RawTerminalConnector,
@@ -72,17 +74,23 @@ pub(crate) struct TaskRuntime {
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct TaskOutcome {
   output: Arc<str>,
+  structured_outputs: Map<String, Value>,
   status: ConsoleStatus,
 }
 
 impl TaskOutcome {
   pub(crate) fn new(output: Arc<str>, status: ConsoleStatus) -> Self {
-    Self { output, status }
+    Self {
+      output,
+      structured_outputs: Map::new(),
+      status,
+    }
   }
 
   pub(crate) fn success(output: impl Into<Arc<str>>) -> Self {
     Self {
       output: output.into(),
+      structured_outputs: Map::new(),
       status: ConsoleStatus::Success,
     }
   }
@@ -90,8 +98,14 @@ impl TaskOutcome {
   pub(crate) fn skipped(output: impl Into<Arc<str>>) -> Self {
     Self {
       output: output.into(),
+      structured_outputs: Map::new(),
       status: ConsoleStatus::Skipped,
     }
+  }
+
+  pub(crate) fn with_structured_outputs(mut self, outputs: Map<String, Value>) -> Self {
+    self.structured_outputs = outputs;
+    self
   }
 
   pub(crate) fn status(&self) -> ConsoleStatus {
@@ -105,6 +119,10 @@ impl TaskOutcome {
 
   pub(crate) fn into_output(self) -> Arc<str> {
     self.output
+  }
+
+  pub(crate) fn into_parts(self) -> (Arc<str>, Map<String, Value>) {
+    (self.output, self.structured_outputs)
   }
 }
 

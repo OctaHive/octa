@@ -863,7 +863,7 @@ mod tests {
 
     // Receive output
     let mut received_stdout = false;
-    let mut received_exit = false;
+    let mut received_completion = false;
 
     while let Ok(Some(response)) = execution.receive_output(&cancel_token).await {
       match response {
@@ -872,10 +872,11 @@ mod tests {
           assert_eq!(line, "test output");
           received_stdout = true;
         },
-        PluginResponse::ExitStatus { id, code } => {
+        PluginResponse::Completed { id, code, outputs } => {
           assert_eq!(id, execution_id);
           assert_eq!(code, 0);
-          received_exit = true;
+          assert!(outputs.is_empty());
+          received_completion = true;
           break;
         },
         _ => {},
@@ -883,7 +884,7 @@ mod tests {
     }
 
     assert!(received_stdout, "Did not receive expected stdout");
-    assert!(received_exit, "Did not receive exit status");
+    assert!(received_completion, "Did not receive completion");
   }
 
   #[tokio::test]

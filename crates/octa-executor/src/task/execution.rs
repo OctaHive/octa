@@ -704,45 +704,55 @@ impl TaskNode {
       output: Some(console_target.clone()),
       raw: self.raw,
     };
-    let result = match PluginInvoker::with_terminal(plugin_manager, terminal)
+    let (result, structured_outputs) = match PluginInvoker::with_terminal(plugin_manager, terminal)
       .invoke(request, cancel_token.clone())
       .await
     {
       Ok(output) => {
-        if output.code != 0 && !cancel_token.is_cancelled() {
+        let PluginOutput {
+          code,
+          stdout,
+          stderr,
+          outputs,
+          failure_location,
+        } = output;
+        if code != 0 && !cancel_token.is_cancelled() {
           if self.ignore_errors {
             // Ignored failures are terminal successes with empty dependency
             // output, while the diagnostic remains visible to the user.
             console_target
               .message(
                 ConsoleLevel::Error,
-                format!(
-                  "Task {} failed but errors ignored. Error code: {}",
-                  self.name, output.code
-                ),
+                format!("Task {} failed but errors ignored. Error code: {}", self.name, code),
               )
               .await?;
-            Ok("".to_string())
+            (Ok("".to_string()), outputs)
           } else {
-            Err(ExecutorError::CommandFailed {
-              task: self.name.clone(),
-              code: output.code,
-              stderr: output.stderr,
-              location: output.failure_location,
-            })
+            (
+              Err(ExecutorError::CommandFailed {
+                task: self.name.clone(),
+                code,
+                stderr,
+                location: failure_location,
+              }),
+              Default::default(),
+            )
           }
         } else {
           // Only successful command output participates in task run-mode cache.
-          self.update_cache(output.stdout.trim(), vars, &cache).await?;
-          Ok(output.stdout.trim().to_string())
+          self.update_cache(stdout.trim(), vars, &cache).await?;
+          (Ok(stdout.trim().to_string()), outputs)
         }
       },
       Err(ExecutorError::IoError(error)) if error.kind() == io::ErrorKind::Interrupted => {
-        Err(ExecutorError::TaskCancelled(self.name.clone()))
+        (Err(ExecutorError::TaskCancelled(self.name.clone())), Default::default())
       },
-      Err(error) => self.handle_execution_error(&console_target, error).await,
+      Err(error) => (
+        self.handle_execution_error(&console_target, error).await,
+        Default::default(),
+      ),
     };
-    result.map(TaskOutcome::success)
+    result.map(|output| TaskOutcome::success(output).with_structured_outputs(structured_outputs))
   }
 
   /// Converts an invocation error according to the task's `ignore_error` policy.

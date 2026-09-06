@@ -48,15 +48,16 @@ class CommandHandler:
         }
         response.append(stdout)
 
-        # Send exit status
-        exit_status = {
-            "type": "ExitStatus",
+        # Send terminal completion
+        completed = {
+            "type": "Completed",
             "payload": {
               "id": command_id,
-              "code": 0
+              "code": 0,
+              "outputs": {}
             }
         }
-        response.append(exit_status)
+        response.append(completed)
 
         return False, response
 

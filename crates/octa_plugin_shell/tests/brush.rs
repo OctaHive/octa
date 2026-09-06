@@ -40,10 +40,10 @@ async fn collect(mut execution: PluginExecution) -> (String, String, i32) {
       Some(PluginResponse::Stderr { line, .. }) => stderr.push_str(&line),
       Some(PluginResponse::StdoutBytes { bytes, .. }) => stdout.push_str(&String::from_utf8_lossy(&bytes)),
       Some(PluginResponse::StderrBytes { bytes, .. }) => stderr.push_str(&String::from_utf8_lossy(&bytes)),
-      Some(PluginResponse::ExitStatus { code, .. }) => return (stdout, stderr, code),
+      Some(PluginResponse::Completed { code, .. }) => return (stdout, stderr, code),
       Some(PluginResponse::Error { message, .. }) => panic!("Plugin command failed: {message}"),
       Some(_) => {},
-      None => panic!("Plugin response stream closed before ExitStatus"),
+      None => panic!("Plugin response stream closed before Completed"),
     }
   }
 }
@@ -68,7 +68,7 @@ async fn normal_execution_streams_both_outputs_before_a_newline_or_exit() {
       match execution.receive_output(&CancellationToken::new()).await.unwrap() {
         Some(PluginResponse::StdoutBytes { bytes, .. }) => stdout.extend(bytes),
         Some(PluginResponse::StderrBytes { bytes, .. }) => stderr.extend(bytes),
-        Some(PluginResponse::ExitStatus { .. } | PluginResponse::Error { .. }) | None => {
+        Some(PluginResponse::Completed { .. } | PluginResponse::Error { .. }) | None => {
           panic!("command completed before streaming its partial output")
         },
         Some(_) => {},

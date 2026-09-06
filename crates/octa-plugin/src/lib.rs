@@ -691,9 +691,10 @@ mod tests {
         return Err(anyhow::anyhow!("Command failed"));
       }
 
-      let response = PluginResponse::ExitStatus {
+      let response = PluginResponse::Completed {
         id: id.clone(),
         code: 0,
+        outputs: Default::default(),
       };
       writer
         .lock()
@@ -855,7 +856,7 @@ mod tests {
     assert!(matches!(responses[1], PluginResponse::Stdout { .. }));
     assert!(matches!(responses[2], PluginResponse::Stdout { .. }));
     assert!(matches!(responses[3], PluginResponse::Stdout { .. }));
-    assert!(matches!(responses[4], PluginResponse::ExitStatus { .. }));
+    assert!(matches!(responses[4], PluginResponse::Completed { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
@@ -1160,7 +1161,7 @@ mod tests {
     assert!(matches!(responses[0], PluginResponse::Started { .. }));
     assert!(matches!(responses[1], PluginResponse::Stdout { .. }));
     assert!(matches!(responses[2], PluginResponse::Stdout { .. }));
-    assert!(matches!(responses[3], PluginResponse::ExitStatus { .. }));
+    assert!(matches!(responses[3], PluginResponse::Completed { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
@@ -1315,9 +1316,9 @@ mod tests {
     assert!(result.is_ok());
 
     let responses = response_handle.await.unwrap();
-    assert_eq!(responses.len(), 2); // Only Started and ExitStatus
+    assert_eq!(responses.len(), 2); // Only Started and Completed
     assert!(matches!(responses[0], PluginResponse::Started { .. }));
-    assert!(matches!(responses[1], PluginResponse::ExitStatus { .. }));
+    assert!(matches!(responses[1], PluginResponse::Completed { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
@@ -1374,7 +1375,7 @@ mod tests {
     let responses = response_handle.await.unwrap();
     assert!(matches!(responses[0], PluginResponse::Started { .. }));
     assert!(matches!(responses[1], PluginResponse::Stdout { .. }));
-    assert!(matches!(responses[2], PluginResponse::ExitStatus { .. }));
+    assert!(matches!(responses[2], PluginResponse::Completed { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
@@ -1514,13 +1515,13 @@ mod tests {
       .iter()
       .filter(|r| matches!(r, PluginResponse::Started { .. }))
       .count();
-    let exit_count = responses
+    let completed_count = responses
       .iter()
-      .filter(|r| matches!(r, PluginResponse::ExitStatus { .. }))
+      .filter(|r| matches!(r, PluginResponse::Completed { .. }))
       .count();
 
     assert_eq!(started_count, 3);
-    assert_eq!(exit_count, 3);
+    assert_eq!(completed_count, 3);
   }
 
   #[tokio::test]

@@ -234,7 +234,7 @@ A plugin can report transient progress without writing presentation text to stdo
 ```
 
 `message` is required; `current`, `total`, and `unit` are optional. Progress is command-scoped and
-non-terminal: a plugin may send any number of updates before `ExitStatus` or `Error`. Octa forwards
+non-terminal: a plugin may send any number of updates before `Completed` or `Error`. Octa forwards
 updates as structured runtime events, but may coalesce pending updates per command when their
 producer outpaces the consumer. A progress burst therefore cannot overflow the command output queue
 or fail the command. The `replacing` renderer displays progress even when task stdout and stderr are
@@ -244,7 +244,7 @@ output and does not alter the task result.
 Every started command must finish with exactly one terminal response:
 
 ```json
-{"type":"ExitStatus","payload":{"id":"command-id","code":0}}
+{"type":"Completed","payload":{"id":"command-id","code":0,"outputs":{"digest":"sha256:..."}}}
 ```
 
 or:
@@ -253,8 +253,11 @@ or:
 {"type":"Error","payload":{"id":"command-id","message":"failed to start compiler"}}
 ```
 
-`ExitStatus` represents a process-like result. `Error` represents a plugin/protocol failure. After
-either response, Octa removes the command ID; sending later output for it is a protocol violation.
+`Completed` represents the normal terminal result of an operation, including an operation with a
+non-zero `code`. Its optional `outputs` object carries typed values such as an image digest; Octa
+stores those values on the corresponding `StepResult` without parsing stdout. `Error` represents a
+plugin/protocol failure for which no normal completion result is available. After either response,
+Octa removes the command ID; sending later output for it is a protocol violation.
 
 ## Raw and PTY execution
 
@@ -295,7 +298,7 @@ Octa cancels one command without shutting down the plugin:
 {"type":"Cancel","payload":{"id":"command-id"}}
 ```
 
-The plugin should stop the command and still send `ExitStatus` or `Error`. The SDK exposes a
+The plugin should stop the command and still send `Completed` or `Error`. The SDK exposes a
 command-scoped `CancellationToken` and waits for the terminal response with a bounded timeout.
 On Windows, the built-in shell plugin places each command tree in a Job Object configured with
 kill-on-close. This provides forced cleanup of command descendants when cooperative cancellation
@@ -354,9 +357,10 @@ impl Plugin for EchoPlugin {
       id: command.id.clone(),
       line: command.command,
     };
-    let done = PluginResponse::ExitStatus {
+    let done = PluginResponse::Completed {
       id: command.id,
       code: 0,
+      outputs: Default::default(),
     };
 
     let mut writer = writer.lock().await;

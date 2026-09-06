@@ -102,9 +102,11 @@ call is still attempted.
 The live event stream and the Rust `ExecutionResult` use the same `run_id`, task IDs, and step IDs.
 Events are the streaming observation interface; the result returned by `Executor::execute` is the
 authoritative terminal snapshot with timestamps and structured conclusions for the run, its tasks,
-and their steps. `OutputReference` points back to matching output events instead of retaining a
-second copy of their payloads. Expected execution failures are represented in the snapshot, while
-an `ExecutorError` return means a complete snapshot could not be formed or published.
+and their steps. Each `StepResult.outputs` map contains the typed values supplied by the plugin's
+terminal `Completed` response. `OutputReference` points back to matching output events instead of
+retaining a second copy of their payloads. Expected execution failures are represented in the
+snapshot, while an `ExecutorError` return means a complete snapshot could not be formed or
+published.
 
 Each returned task has a `main` or `deferred` role. A failed deferred task remains visible without
 changing an otherwise successful run conclusion; failure to form or publish its terminal result is
