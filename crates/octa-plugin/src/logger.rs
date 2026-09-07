@@ -191,16 +191,13 @@ impl LoggerSystem {
   }
 
   pub fn shutdown(self) -> anyhow::Result<()> {
-    // Send shutdown message before setting the flag
+    // Reject new messages before the sentinel is queued so none can be
+    // accepted behind it and silently left unwritten.
+    self.logger.is_shutdown.store(true, Ordering::SeqCst);
     let _ = self.logger.send_shutdown();
 
-    // Now set the shutdown flag
-    self.logger.is_shutdown.store(true, Ordering::SeqCst);
-
-    // Drop the sender
     drop(self.logger);
 
-    // Wait for the writer thread to complete
     self
       .writer_handle
       .join()
@@ -255,7 +252,7 @@ impl Logger for MockLogger {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::{fs, time::Duration};
+  use std::fs;
   use tempfile::tempdir;
 
   #[test]
@@ -304,10 +301,7 @@ mod tests {
     logger.log("Test message 1").expect("Can't write log message");
     logger.log("Test message 2").expect("Can't write log message");
 
-    // Allow time for messages to be written
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Shutdown logger
+    // Shutdown waits for every queued message to be written and flushed.
     logger_system.shutdown().expect("Can't shutdown logger system");
 
     // Read log file
@@ -395,10 +389,7 @@ mod tests {
     handle1.join().unwrap();
     handle2.join().unwrap();
 
-    // Allow time for messages to be written
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Shutdown logger
+    // Shutdown waits for every queued message to be written and flushed.
     logger_system.shutdown().expect("Can't shutdown logger system");
 
     // Read log file
@@ -426,10 +417,7 @@ mod tests {
     // Log a message
     logger.log("Test message").expect("Can't write log message");
 
-    // Allow time for message to be written
-    std::thread::sleep(Duration::from_millis(100));
-
-    // Shutdown logger
+    // Shutdown waits for the queued message to be written and flushed.
     logger_system.shutdown().expect("Can't shutdown logger system");
 
     // Read log file

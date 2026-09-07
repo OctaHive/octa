@@ -12,6 +12,7 @@ use serde_json::Value;
 use tokio::{
   io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
   sync::{mpsc, oneshot, watch, Mutex},
+  time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -22,6 +23,9 @@ const CONTROL_RESPONSE_CAPACITY: usize = 16;
 const COMMAND_RESPONSE_CAPACITY: usize = 32;
 const MAX_PLUGIN_FRAME_BYTES: usize = 1024 * 1024;
 const CANCELLED_ROUTE_TTL: Duration = Duration::from_secs(5);
+const PLUGIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const INITIAL_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(1);
+const MAX_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 pub enum PluginClientError {
@@ -244,18 +248,19 @@ pub struct PluginExecutionRequest {
 }
 
 pub async fn connect_to_plugin(socket_path: &Name<'_>) -> io::Result<TokioStream> {
-  let mut attempts = 0;
-  const MAX_ATTEMPTS: u32 = 50;
+  let deadline = Instant::now() + PLUGIN_CONNECT_TIMEOUT;
+  let mut retry_delay = INITIAL_CONNECT_RETRY_DELAY;
 
   loop {
     match <TokioStream as StreamTrait>::connect(socket_path.to_owned()).await {
       Ok(stream) => return Ok(stream),
       Err(e) => {
-        if attempts >= MAX_ATTEMPTS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
           return Err(e);
         }
-        attempts += 1;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(retry_delay.min(remaining)).await;
+        retry_delay = retry_delay.saturating_mul(2).min(MAX_CONNECT_RETRY_DELAY);
       },
     }
   }

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::OsStr, io, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, ffi::OsStr, io, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use clap::Parser;
@@ -621,10 +621,6 @@ pub async fn serve_plugin(plugin: impl Plugin + 'static, schema: PluginSchema) -
   }
 
   logger.log("Plugin shutdown complete")?;
-
-  // Wait log message writed to disk
-  tokio::time::sleep(Duration::from_millis(100)).await;
-
   logger_system.shutdown()?;
 
   Ok(())

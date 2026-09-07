@@ -2345,6 +2345,7 @@ name = "octa-plugin-manager"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "interprocess",
  "jsonschema",
  "octa-plugin",

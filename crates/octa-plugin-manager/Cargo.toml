@@ -12,6 +12,7 @@ include = ["src/"]
 
 [dependencies]
 async-trait = { workspace = true }
+futures-util = "0.3.34"
 interprocess = { git = "https://github.com/federico-terzi/interprocess", features = [
   "tokio",
 ] }

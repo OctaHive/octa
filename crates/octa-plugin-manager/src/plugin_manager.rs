@@ -1,3 +1,4 @@
+use futures_util::future::join_all;
 use octa_plugin::protocol::Schema;
 use octa_plugin::socket::{interpret_local_socket_name, make_local_socket_name};
 use serde_json::{Map, Value};
@@ -498,7 +499,7 @@ impl PluginManager {
   /// Shutdown a specific plugin
   pub async fn shutdown_plugin(&self, plugin_name: &str) -> Result<()> {
     let mut active_plugins = self.active_plugins.lock().await;
-    let mut instance = active_plugins
+    let instance = active_plugins
       .remove(plugin_name)
       .ok_or_else(|| PluginManagerError::PluginNotFound(plugin_name.to_string()))?;
 
@@ -507,7 +508,10 @@ impl PluginManager {
     drop(registry);
     drop(active_plugins);
 
-    // Handle the client shutdown
+    Self::shutdown_instance(instance).await
+  }
+
+  async fn shutdown_instance(mut instance: PluginInstance) -> Result<()> {
     let shutdown_result = instance
       .client
       .shutdown()
@@ -538,21 +542,24 @@ impl PluginManager {
       },
     }
 
-    // Return the shutdown result
     shutdown_result
   }
 
   /// Shutdown all plugins
   pub async fn shutdown_all(&self) -> Vec<Result<()>> {
-    let active_plugins = self.active_plugins.lock().await;
-    let plugin_names: Vec<String> = active_plugins.keys().cloned().collect();
+    let mut active_plugins = self.active_plugins.lock().await;
+    let mut registry = self.plugin_registry.lock().await;
+    let instances = active_plugins
+      .drain()
+      .map(|(plugin_name, instance)| {
+        registry.remove_plugin(&plugin_name);
+        instance
+      })
+      .collect::<Vec<_>>();
+    drop(registry);
     drop(active_plugins);
 
-    let mut results = Vec::new();
-    for plugin_name in plugin_names {
-      results.push(self.shutdown_plugin(&plugin_name).await);
-    }
-    results
+    join_all(instances.into_iter().map(Self::shutdown_instance)).await
   }
 
   /// List all active plugins
