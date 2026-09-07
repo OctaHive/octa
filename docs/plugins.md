@@ -75,7 +75,13 @@ The plugin responds with its task key and optional capabilities:
     "key": "shell",
     "supports_raw": true,
     "capabilities": ["shell"],
-    "validation_schema": {"type": "string"}
+    "input_schema": {"type": "string"},
+    "output_schema": {
+      "type": "object",
+      "properties": {"digest": {"type": "string"}},
+      "required": ["digest"],
+      "additionalProperties": false
+    }
   }
 }
 ```
@@ -85,11 +91,18 @@ The plugin responds with its task key and optional capabilities:
 | `key` | string | required | Octafile task attribute and YAML annotation name |
 | `supports_raw` | boolean | `false` | Plugin accepts raw execution and the terminal-input messages |
 | `capabilities` | string array | `[]` | Generic behavior exposed independently of the plugin name |
-| `validation_schema` | JSON object | omitted | JSON Schema used to validate the plugin task value |
+| `input_schema` | JSON object | omitted | JSON Schema used to validate the plugin task value |
+| `output_schema` | JSON object | omitted | JSON Schema used to validate successful `Completed.outputs` |
 
-Octa compiles `validation_schema` once while loading plugins, then validates matching tasks,
-annotations, commands, and conditions before execution. Omitting it preserves compatibility with
-older plugins but leaves the plugin-specific value unvalidated.
+Octa compiles both schemas once while loading plugins. It validates matching tasks, annotations,
+commands, and conditions against `input_schema` before execution, and validates every successful
+`Completed.outputs` against `output_schema`. Because task output references are checked statically,
+an output schema must describe a top-level object with explicit `properties` and
+`additionalProperties: false`. Omitting a schema leaves that side of the contract unvalidated; a
+task cannot export a field that the plugin has not declared.
+Only fields listed in the schema's `required` array may be exported. This makes a successful
+`Completed` response sufficient to resolve every declared task output without introducing a second
+"possibly missing" type into task variables.
 
 The built-in shell plugin advertises the `shell` capability. Octa uses that capability for plain
 string commands, `sh:` variable values, and shell template helpers. Keys and capabilities must be
@@ -167,6 +180,7 @@ Octa bounds every stage between a plugin and the task result:
 - every running command has its own 32-response mailbox;
 - captured stdout and stderr share a 64 MiB task-result limit;
 - each captured stream stays in memory through 1 MiB and then spills to a temporary file.
+- retained structured step and task outputs share a 64 MiB execution limit.
 
 If one command fills its mailbox, Octa reports that command as failed, sends `Cancel`, and discards
 its remaining messages through the terminal response. Other commands on the same plugin connection
@@ -254,10 +268,19 @@ or:
 ```
 
 `Completed` represents the normal terminal result of an operation, including an operation with a
-non-zero `code`. Its optional `outputs` object carries typed values such as an image digest; Octa
-stores those values on the corresponding `StepResult` without parsing stdout. `Error` represents a
-plugin/protocol failure for which no normal completion result is available. After either response,
-Octa removes the command ID; sending later output for it is a protocol violation.
+non-zero `code`. Its optional `outputs` object carries typed values such as an image digest. For a
+successful operation Octa validates that object against `output_schema`, stores the raw object on
+the corresponding `StepResult`, and exposes only fields explicitly exported by the task. A non-zero
+completion does not export values. `Error` represents a plugin/protocol failure for which no normal
+completion result is available. After either response, Octa removes the command ID; sending later
+output for it is a protocol violation.
+
+A task may export a required schema field under a stable task-level name. Marking that export
+`secret: true` keeps the typed value available to dependent task variables and propagates secret
+redaction to the consumer. The value itself is omitted from both `StepResult.outputs` and
+`TaskResult.outputs`; `TaskResult.redacted_outputs` contains its exported name. The same plugin
+field cannot be exported as both public and secret because that would leak it through the public
+alias.
 
 ## Raw and PTY execution
 
@@ -360,7 +383,10 @@ impl Plugin for EchoPlugin {
     let done = PluginResponse::Completed {
       id: command.id,
       code: 0,
-      outputs: Default::default(),
+      outputs: serde_json::Map::from_iter([(
+        "value".to_owned(),
+        serde_json::Value::String("finished".to_owned()),
+      )]),
     };
 
     let mut writer = writer.lock().await;
@@ -381,9 +407,17 @@ async fn main() -> Result<()> {
       key: "echo".to_owned(),
       supports_raw: false,
       capabilities: vec![],
-      validation_schema: serde_json::json!({"type": "string"})
+      input_schema: serde_json::json!({"type": "string"})
         .as_object()
         .cloned(),
+      output_schema: serde_json::json!({
+        "type": "object",
+        "properties": {"value": {"type": "string"}},
+        "required": ["value"],
+        "additionalProperties": false
+      })
+      .as_object()
+      .cloned(),
     },
   )
   .await

@@ -588,7 +588,7 @@ mod tests {
       Some(root_path),
       false,
       None,
-      std::collections::HashMap::from([("shell".to_owned(), None)]),
+      std::collections::HashMap::from([("shell".to_owned(), octa_octafile::PluginTypeSchema::default())]),
       "shell",
       &[],
       &[

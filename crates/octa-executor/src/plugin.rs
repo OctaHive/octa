@@ -92,7 +92,7 @@ impl PluginInvoker {
     }
     .ok_or_else(|| ExecutorError::PluginUnavailable(request.target.name().to_owned()))?;
     registration
-      .validate(&request.value)
+      .validate_input(&request.value)
       .map_err(|error| ExecutorError::PluginValidationFailed(request.target.name().to_owned(), error))?;
     if request.raw && !registration.supports_raw() {
       return Err(ExecutorError::RawUnsupported(request.target.name().to_owned()));
@@ -188,6 +188,18 @@ impl PluginInvoker {
             },
             PluginResponseAction::Complete { code, outputs } => {
               terminal_response = true;
+              let outputs = if code == 0 {
+                let outputs = Value::Object(outputs);
+                registration.validate_outputs(&outputs).map_err(|error| {
+                  ExecutorError::PluginOutputValidationFailed(request.target.name().to_owned(), error)
+                })?;
+                let Value::Object(outputs) = outputs else {
+                  unreachable!("plugin outputs are constructed as an object")
+                };
+                outputs
+              } else {
+                outputs
+              };
               let (stdout, stderr) = output.into_strings().await?;
               break Ok(PluginOutput {
                 code,

@@ -581,6 +581,15 @@ impl Octafile {
       }
     }
 
+    reject_dependency_output_vars(octafile.vars.as_ref(), "Octafile-level")?;
+    if let Some(includes) = &octafile.includes {
+      for (name, include) in includes {
+        if let IncludeInfo::Complex(include) = include {
+          reject_dependency_output_vars(include.vars.as_ref(), &format!("include '{name}'"))?;
+        }
+      }
+    }
+
     Ok(octafile)
   }
 
@@ -904,6 +913,15 @@ impl Octafile {
       }
     }
   }
+}
+
+fn reject_dependency_output_vars(vars: Option<&Vars>, scope: &str) -> Result<(), String> {
+  let Some((name, _)) = vars.and_then(|vars| vars.iter().find(|(_, variable)| variable.is_task_output())) else {
+    return Ok(());
+  };
+  Err(format!(
+    "{scope} variable '{name}' cannot reference a task output; use task-level vars"
+  ))
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -1356,7 +1374,7 @@ tasks:
     )
     .unwrap();
 
-    let schemas = PluginSchemas::from([("shell".to_owned(), None)]);
+    let schemas = PluginSchemas::from([("shell".to_owned(), PluginTypeSchema::default())]);
     let variables = vec![("PROFILE".to_owned(), "production".to_owned())];
     let octafile =
       Octafile::load_with_schemas_and_vars_from(Some(root_path), false, None, schemas, "shell", &variables).unwrap();
@@ -1429,6 +1447,39 @@ tasks:
   }
 
   #[test]
+  fn task_output_references_are_restricted_to_task_variable_scopes() {
+    for (name, content, expected) in [
+      (
+        "root_output_reference",
+        r#"
+version: 1
+vars:
+  DIGEST: { from: { task: image, output: digest } }
+tasks: {}
+"#,
+        "Octafile-level variable 'DIGEST'",
+      ),
+      (
+        "include_output_reference",
+        r#"
+version: 1
+includes:
+  service:
+    octafile: Child.yml
+    vars:
+      DIGEST: { from: { task: image, output: digest } }
+tasks: {}
+"#,
+        "include 'service' variable 'DIGEST'",
+      ),
+    ] {
+      let (_temp_dir, file_path) = create_temp_octafile(content, name);
+      let error = Octafile::load(Some(file_path), false, vec!["shell".to_owned()], "shell").unwrap_err();
+      assert!(error.to_string().contains(expected), "{error}");
+    }
+  }
+
+  #[test]
   fn does_not_expose_secret_runtime_variables_to_nested_include_templates() {
     let temp_dir = TempDir::new().unwrap();
     let root_path = temp_dir.path().join("Octafile.yml");
@@ -1457,7 +1508,7 @@ tasks: {}
     )
     .unwrap();
 
-    let schemas = PluginSchemas::from([("shell".to_owned(), None)]);
+    let schemas = PluginSchemas::from([("shell".to_owned(), PluginTypeSchema::default())]);
     let variables = vec![("TOKEN".to_owned(), "literal-secret".to_owned())];
     let error = Octafile::load_with_schemas_and_vars_from(Some(root_path), false, None, schemas, "shell", &variables)
       .unwrap_err();
@@ -1982,17 +2033,20 @@ tasks: {}
   fn docker_schemas() -> PluginSchemas {
     PluginSchemas::from([(
       "docker".to_string(),
-      serde_json::json!({
-        "type": "object",
-        "properties": {
-          "image": { "type": "string" },
-          "replicas": { "type": "integer", "minimum": 1 }
-        },
-        "required": ["image"],
-        "additionalProperties": false
-      })
-      .as_object()
-      .cloned(),
+      PluginTypeSchema {
+        input: serde_json::json!({
+          "type": "object",
+          "properties": {
+            "image": { "type": "string" },
+            "replicas": { "type": "integer", "minimum": 1 }
+          },
+          "required": ["image"],
+          "additionalProperties": false
+        })
+        .as_object()
+        .cloned(),
+        output: None,
+      },
     )])
   }
 
@@ -2363,14 +2417,17 @@ tasks: {}
   }
 
   #[test]
-  fn rejects_invalid_plugin_validation_schema() {
+  fn rejects_invalid_plugin_input_schema() {
     let content = "version: 1\n";
     let (_temp_dir, file_path) = create_temp_octafile(content, "invalid_plugin_schema");
     let schemas = PluginSchemas::from([(
       "docker".to_string(),
-      serde_json::json!({ "type": "not-a-json-schema-type" })
-        .as_object()
-        .cloned(),
+      PluginTypeSchema {
+        input: serde_json::json!({ "type": "not-a-json-schema-type" })
+          .as_object()
+          .cloned(),
+        output: None,
+      },
     )]);
 
     let error = Octafile::load_with_schemas(Some(file_path), false, schemas, "docker").unwrap_err();
@@ -2804,7 +2861,7 @@ tasks: {}
     fs::create_dir_all(&project_dir).unwrap();
     fs::write(&root_path, "version: 1\ntasks: {}\n").unwrap();
     fs::write(&project_path, "version: 1\ntasks:\n  build: echo build\n").unwrap();
-    let schemas = HashMap::from([("shell".to_owned(), None)]);
+    let schemas = HashMap::from([("shell".to_owned(), PluginTypeSchema::default())]);
     let discovered = SyntheticInclude {
       namespace: vec!["packages".to_owned(), "api".to_owned()],
       path: project_path,
@@ -2845,7 +2902,7 @@ tasks: {}
       Some(root_path),
       false,
       None,
-      HashMap::from([("shell".to_owned(), None)]),
+      HashMap::from([("shell".to_owned(), PluginTypeSchema::default())]),
       "shell",
       &[],
       &[discovered],

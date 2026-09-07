@@ -27,12 +27,13 @@ use crate::freshness::{FreshnessConfig, FreshnessIdentity, FreshnessState};
 #[cfg(test)]
 use crate::source_strategy::SourceStrategy;
 use crate::source_strategy::{SourceMethod, SourceStrategyRegistry};
+use crate::structured_output::StepExport;
 use crate::task::{self, TaskNode};
 use crate::task::{
   ConditionRuntime, ConditionState, ExecutionBinding, FreshnessRuntime, NodeAction, PluginInvocation, TaskConfig,
 };
 use crate::task_identity;
-use crate::vars::{VariableResolver, Vars};
+use crate::vars::{TaskOutputVariable, VariableResolver, Vars};
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
 use octa_octafile::{

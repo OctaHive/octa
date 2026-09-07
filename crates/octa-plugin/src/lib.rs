@@ -27,10 +27,16 @@ pub const SHELL_CAPABILITY: &str = "shell";
 
 #[derive(Clone)]
 pub struct PluginSchema {
+  /// Octafile key handled by this plugin.
   pub key: String,
+  /// Whether the plugin accepts raw terminal input and resize messages.
   pub supports_raw: bool,
+  /// Generic host capabilities implemented by this plugin.
   pub capabilities: Vec<String>,
-  pub validation_schema: Option<Map<String, Value>>,
+  /// JSON Schema for plugin command parameters.
+  pub input_schema: Option<Map<String, Value>>,
+  /// JSON Schema for successful structured completion values.
+  pub output_schema: Option<Map<String, Value>>,
 }
 
 /// Host-side terminal input delivered to an interactive plugin command.
@@ -477,7 +483,8 @@ where
         key: schema.key,
         supports_raw: schema.supports_raw,
         capabilities: schema.capabilities,
-        validation_schema: schema.validation_schema,
+        input_schema: schema.input_schema,
+        output_schema: schema.output_schema,
       });
       let response_json = serde_json::to_string(&schema_response)? + "\n";
       writer.lock().await.write_all(response_json.as_bytes()).await?;
@@ -1545,7 +1552,8 @@ mod tests {
       key: "key".to_owned(),
       supports_raw: false,
       capabilities: Vec::new(),
-      validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+      input_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+      output_schema: None,
     };
 
     // Create a listener for the socket
@@ -1635,7 +1643,7 @@ mod tests {
       PluginResponse::Schema(schema) => {
         assert_eq!(schema.key, "key");
         assert_eq!(
-          schema.validation_schema,
+          schema.input_schema,
           serde_json::json!({ "type": "string" }).as_object().cloned()
         );
       },

@@ -35,6 +35,17 @@ pub enum VariableSource {
   Value(Value),
   Shell(String),
   Required(RequiredMode),
+  TaskOutput(TaskOutputReference),
+}
+
+/// Structured output exported by a direct task dependency.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskOutputReference {
+  /// Direct dependency name as written in `deps`.
+  pub task: String,
+  /// Public output name declared by that dependency.
+  pub output: String,
 }
 
 /// Controls how an absent required variable is handled before task execution.
@@ -60,6 +71,11 @@ impl Variable {
   /// Returns whether a higher-priority variable layer must provide the value.
   pub fn is_required(&self) -> bool {
     matches!(self.source, VariableSource::Required(_))
+  }
+
+  /// Returns whether the value must be resolved from a task dependency.
+  pub(crate) fn is_task_output(&self) -> bool {
+    matches!(self.source, VariableSource::TaskOutput(_))
   }
 
   /// Returns the missing-value behavior for a required variable.
@@ -94,6 +110,7 @@ impl Variable {
       VariableSource::Value(value) => Some(value),
       VariableSource::Shell(command) => Some(serde_json::json!({ "sh": command })),
       VariableSource::Required(_) => None,
+      VariableSource::TaskOutput(_) => None,
     }
   }
 
@@ -108,6 +125,7 @@ impl Variable {
       VariableSource::Value(value) => Some(value.clone()),
       VariableSource::Shell(command) => Some(serde_json::json!({ "sh": command })),
       VariableSource::Required(_) => None,
+      VariableSource::TaskOutput(_) => None,
     }
   }
 
@@ -124,7 +142,7 @@ impl Variable {
 
     if !definition
       .keys()
-      .any(|name| matches!(name.as_str(), "secret" | "required" | "enum" | "question"))
+      .any(|name| matches!(name.as_str(), "secret" | "required" | "enum" | "question" | "from"))
     {
       // An exact `{ sh: ... }` mapping is executable; every other mapping remains user data.
       if definition.len() == 1 {
@@ -149,7 +167,7 @@ impl Variable {
     if let Some(name) = definition.keys().find(|name| {
       !matches!(
         name.as_str(),
-        "value" | "sh" | "secret" | "required" | "enum" | "question"
+        "value" | "sh" | "secret" | "required" | "enum" | "question" | "from"
       )
     }) {
       return Err(format!("unknown variable option '{name}'"));
@@ -175,6 +193,23 @@ impl Variable {
         _ => Err("'question' must be a string".to_owned()),
       })
       .transpose()?;
+
+    if let Some(from) = definition.remove("from") {
+      if required.is_some() || enum_source.is_some() || question.is_some() || !definition.is_empty() {
+        return Err("'from' can only be combined with 'secret'".to_owned());
+      }
+      let reference = serde_json::from_value::<TaskOutputReference>(from)
+        .map_err(|error| format!("invalid task output reference: {error}"))?;
+      if reference.task.trim().is_empty() || reference.output.trim().is_empty() {
+        return Err("task output reference names must not be empty".to_owned());
+      }
+      return Ok(Self {
+        source: VariableSource::TaskOutput(reference),
+        secret,
+        enum_source: None,
+        question: None,
+      });
+    }
 
     if let Some(mode) = required {
       if definition.contains_key("value") || definition.contains_key("sh") {
@@ -238,6 +273,8 @@ impl Variable {
         }
         Value::Object(definition)
       },
+      (VariableSource::TaskOutput(reference), false) => serde_json::json!({ "from": reference }),
+      (VariableSource::TaskOutput(reference), true) => serde_json::json!({ "from": reference, "secret": true }),
     }
   }
 }
@@ -320,6 +357,28 @@ mod tests {
     let variable = Variable::from_json(json!({ "required": true })).unwrap();
 
     assert_eq!(variable.template_value(), None);
+  }
+
+  #[test]
+  fn parses_and_serializes_task_output_references() {
+    let value = json!({ "from": { "task": "image", "output": "digest" } });
+    let variable = Variable::from_json(value.clone()).unwrap();
+
+    assert!(matches!(
+      variable.clone().into_source(),
+      VariableSource::TaskOutput(TaskOutputReference { task, output })
+        if task == "image" && output == "digest"
+    ));
+    assert_eq!(variable.template_value(), None);
+    assert_eq!(variable.configuration_value(), value);
+    assert!(Variable::from_json(json!({ "from": { "task": "", "output": "digest" } })).is_err());
+    let secret = json!({
+      "from": { "task": "image", "output": "digest" },
+      "secret": true
+    });
+    let secret_variable = Variable::from_json(secret.clone()).unwrap();
+    assert!(secret_variable.is_secret());
+    assert_eq!(secret_variable.configuration_value(), secret);
   }
 
   #[test]

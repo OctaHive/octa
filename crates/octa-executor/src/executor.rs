@@ -84,7 +84,7 @@ fn validate_execution_identities(scopes: &[ConsoleScope], bindings: &[ExecutionB
 
 /// Intermediate scheduler result before run-level lifecycle is finalized.
 struct PlanExecution {
-  outputs: Vec<String>,
+  stdout: Vec<String>,
   nested_tasks: Vec<TaskResult>,
   failure: Option<ExecutorError>,
   cancelled: bool,
@@ -309,7 +309,7 @@ impl<T: Eq + Hash + Executable + Send + Sync + Clone + 'static> Executor<T> {
     let plan = match self.execute_plan(cancel_token).await {
       Ok(plan) => plan,
       Err(error) => PlanExecution {
-        outputs: Vec::new(),
+        stdout: Vec::new(),
         nested_tasks: Vec::new(),
         failure: Some(error),
         cancelled: false,
@@ -357,7 +357,7 @@ impl<T: Eq + Hash + Executable + Send + Sync + Clone + 'static> Executor<T> {
       finished_at,
       conclusion: conclusion(status, failure, None, None),
       tasks,
-      outputs: plan.outputs,
+      stdout: plan.stdout,
     })
   }
 
@@ -630,7 +630,7 @@ impl<T: Eq + Hash + Executable + Send + Sync + Clone + 'static> Executor<T> {
     indexed_outputs.sort_by_key(|(index, _)| *index);
 
     Ok(PlanExecution {
-      outputs: indexed_outputs
+      stdout: indexed_outputs
         .into_iter()
         .map(|(_, output)| output.to_string())
         .collect(),
@@ -660,7 +660,7 @@ impl<T: Eq + Hash + Executable + Send + Sync + Clone + 'static> Executor<T> {
         abort_and_join(handles).await;
         let _ = self.log_error("Shutdown timeout exceeded, forcing shutdown").await;
         Ok(PlanExecution {
-          outputs: Vec::new(),
+          stdout: Vec::new(),
           nested_tasks: Vec::new(),
           failure: Some(ExecutorError::ShutdownTimeout),
           cancelled: true,
@@ -673,13 +673,13 @@ impl<T: Eq + Hash + Executable + Send + Sync + Clone + 'static> Executor<T> {
     &self,
     results: Vec<Result<ExecutorResult<NodeExecution>, tokio::task::JoinError>>,
   ) -> ExecutorResult<PlanExecution> {
-    let mut outputs = Vec::new();
+    let mut stdout = Vec::new();
     let mut nested_tasks = Vec::new();
     let mut first_error = None;
     for result in results {
       match result {
         Ok(Ok(result)) => {
-          outputs.push(result.output.to_string());
+          stdout.push(result.output.to_string());
           nested_tasks.extend(result.nested_tasks);
         },
         Ok(Err(error)) => {
@@ -694,7 +694,7 @@ impl<T: Eq + Hash + Executable + Send + Sync + Clone + 'static> Executor<T> {
     }
     self.log_info("Graceful shutdown completed").await?;
     Ok(PlanExecution {
-      outputs,
+      stdout,
       nested_tasks,
       failure: first_error,
       cancelled: true,
@@ -826,7 +826,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
       {
         Ok(mut result) => {
           let failure = result.failure().map(ToString::to_string);
-          let output = result.outputs.join("\n");
+          let output = result.stdout.join("\n");
           mark_deferred(&mut result.tasks);
           nested_tasks = result.tasks;
           if let Some(failure) = failure {
@@ -860,11 +860,12 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
     let result = match result {
       Ok(outcome) => {
         let status = outcome.status();
-        let (output, structured_outputs) = outcome.into_parts();
+        let (output, outputs) = outcome.into_parts();
+        let recorded_outputs = outputs.clone();
         self
-          .handle_success(output, status, start_time)
+          .handle_success(output, outputs.into_task(), status, start_time)
           .await
-          .map(|output| TaskOutcome::new(output, status).with_structured_outputs(structured_outputs))
+          .map(|output| TaskOutcome::new(output, status).with_outputs(recorded_outputs))
       },
       Err(e) => self.handle_error(e, binding.as_ref()).await,
     };
@@ -885,12 +886,8 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
     match result {
       Ok(outcome) => {
         let status = outcome.status();
-        let (output, structured_outputs) = outcome.into_parts();
-        self
-          .context
-          .recorder
-          .complete(binding, status, None, structured_outputs)
-          .await?;
+        let (output, outputs) = outcome.into_parts();
+        self.context.recorder.complete(binding, status, None, outputs).await?;
         Ok(output)
       },
       Err(error) => {
@@ -932,6 +929,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
   async fn handle_success(
     &self,
     output: Arc<str>,
+    exported_outputs: crate::structured_output::TaskOutputs,
     status: ConsoleStatus,
     start_time: SystemTime,
   ) -> ExecutorResult<Arc<str>> {
@@ -962,7 +960,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
       .await
       .insert(self.task.id().to_owned());
 
-    self.process_task_success(output).await
+    self.process_task_success(output, exported_outputs).await
   }
 
   async fn handle_error(
@@ -1004,14 +1002,26 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
     Err(error)
   }
 
-  async fn process_task_success(&self, output: Arc<str>) -> ExecutorResult<Arc<str>> {
+  async fn process_task_success(
+    &self,
+    output: Arc<str>,
+    exported_outputs: crate::structured_output::TaskOutputs,
+  ) -> ExecutorResult<Arc<str>> {
     if let Some(deps) = self.context.dag.edges().get(self.task.id()) {
-      for dep in deps {
-        if self.task.is_internal() {
-          let res = self.task.get_deps_result().await;
-          dep.bypass_result(res).await;
-        } else {
-          dep.set_result(self.task.name().to_owned(), output.clone()).await;
+      if self.task.is_internal() {
+        let inherited = self.task.get_deps_result().await;
+        for dep in deps {
+          dep.bypass_result(inherited.clone()).await;
+        }
+      } else {
+        let mut published = crate::task::DependencyResult::with_outputs(output.clone(), exported_outputs);
+        if let Some(previous) = self.task.get_deps_result().await.remove(self.task.dependency_name()) {
+          published.merge_missing(&previous);
+        }
+        for dep in deps {
+          dep
+            .set_result(self.task.dependency_name().to_owned(), published.clone())
+            .await;
         }
       }
 
@@ -1083,7 +1093,10 @@ mod tests {
   use tokio::time::sleep;
 
   use super::*;
-  use crate::ExecutionConclusion;
+  use crate::{
+    structured_output::{CompletionOutputs, TaskOutputs},
+    ExecutionConclusion,
+  };
   use octa_output::{ConsoleDiagnostic, ConsoleRecord};
 
   #[derive(Clone)]
@@ -1140,7 +1153,7 @@ mod tests {
       self.internal
     }
 
-    async fn get_deps_result(&self) -> HashMap<String, Arc<str>> {
+    async fn get_deps_result(&self) -> HashMap<String, crate::task::DependencyResult> {
       HashMap::new()
     }
 
@@ -1186,15 +1199,18 @@ mod tests {
       select! {
         _ = sleep(Duration::from_millis(150)) => {
           self.completed.store(true, Ordering::SeqCst);
-          Ok(TaskOutcome::success(self.id.clone()).with_structured_outputs(self.structured_outputs.clone()))
+          Ok(TaskOutcome::success(self.id.clone()).with_outputs(CompletionOutputs::new(
+            self.structured_outputs.clone(),
+            TaskOutputs::default(),
+          )))
         },
         _ = cancel_token.cancelled() => Err(ExecutorError::TaskCancelled(self.id.clone())),
       }
     }
 
-    async fn set_result(&self, _task_name: String, _result: Arc<str>) {}
+    async fn set_result(&self, _task_name: String, _result: crate::task::DependencyResult) {}
 
-    async fn bypass_result(&self, _result: HashMap<String, Arc<str>>) {}
+    async fn bypass_result(&self, _result: HashMap<String, crate::task::DependencyResult>) {}
   }
 
   fn test_task(id: impl Into<String>) -> TestTask {
@@ -1238,6 +1254,7 @@ mod tests {
       dry: false,
       force: false,
       deferred_exit_code: None,
+      structured_output_budget: Arc::new(crate::structured_output::StructuredOutputBudget::default()),
     }
   }
 
@@ -1441,7 +1458,7 @@ mod tests {
       .await
       .unwrap();
 
-    assert_eq!(result.outputs, ["completed"]);
+    assert_eq!(result.stdout, ["completed"]);
     assert!(matches!(result.failure, Some(ExecutorError::JoinError(_))));
   }
 
@@ -1886,7 +1903,7 @@ mod tests {
         ..
       })
     ));
-    assert_eq!(result.outputs, ["slow"]);
+    assert_eq!(result.stdout, ["slow"]);
     assert!(completed);
   }
 

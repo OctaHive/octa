@@ -15,7 +15,7 @@ use std::{
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
-use octa_octafile::{RequiredMode, VariableEnum, VariableSource, Vars as OctafileVars};
+use octa_octafile::{RequiredMode, TaskOutputReference, VariableEnum, VariableSource, Vars as OctafileVars};
 use octa_plugin_manager::plugin_manager::PluginManager;
 use regex::Regex;
 use serde::Serialize;
@@ -40,6 +40,7 @@ pub struct Vars {
   // Sensitivity is runtime metadata and must stay separate from values passed to Tera/plugins.
   secrets: HashSet<String>,
   required_vars: IndexMap<String, RequiredVar>,
+  output_refs: IndexMap<String, TaskOutputReference>,
   parent: Option<Arc<Vars>>, // Link to parent variables
   dir: Option<PathBuf>,      // Directory used by shell-backed values in this context
   expanded: bool,            // Indicates that all inherited values have been expanded
@@ -50,6 +51,7 @@ struct VariableLayer {
   values: IndexMap<String, Value>,
   secrets: HashSet<String>,
   required_vars: IndexMap<String, RequiredVar>,
+  output_refs: IndexMap<String, TaskOutputReference>,
   dir: Option<PathBuf>,
 }
 
@@ -82,6 +84,31 @@ struct ResolvedVars {
   required_vars: IndexMap<String, RequiredVar>,
 }
 
+/// Highest-priority runtime values together with redaction metadata.
+#[derive(Default)]
+pub(crate) struct VariableOverrides {
+  values: IndexMap<String, Value>,
+  secrets: HashSet<String>,
+}
+
+impl VariableOverrides {
+  pub(crate) fn insert(&mut self, name: String, value: Value, secret: bool) {
+    self.values.insert(name.clone(), value);
+    if secret {
+      self.secrets.insert(name);
+    } else {
+      self.secrets.remove(&name);
+    }
+  }
+}
+
+/// One unresolved dependency-output variable collected without cloning other layers.
+pub(crate) struct TaskOutputVariable {
+  pub(crate) name: String,
+  pub(crate) reference: TaskOutputReference,
+  pub(crate) secret: bool,
+}
+
 /// Describes one missing variable that may be requested from an external input provider.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct VariablePrompt {
@@ -104,7 +131,10 @@ pub trait VariableResolver: Send + Sync {
 
 impl PartialEq for Vars {
   fn eq(&self, other: &Self) -> bool {
-    self.values == other.values && self.secrets == other.secrets && self.required_vars == other.required_vars
+    self.values == other.values
+      && self.secrets == other.secrets
+      && self.required_vars == other.required_vars
+      && self.output_refs == other.output_refs
   }
 }
 
@@ -116,6 +146,7 @@ impl Vars {
       values: IndexMap::new(),
       secrets: HashSet::new(),
       required_vars: IndexMap::new(),
+      output_refs: IndexMap::new(),
       parent: None,
       dir: None,
       expanded: false,
@@ -127,6 +158,7 @@ impl Vars {
       values: IndexMap::new(),
       secrets: HashSet::new(),
       required_vars: IndexMap::new(),
+      output_refs: IndexMap::new(),
       parent: Some(Arc::new(parent)),
       dir: None,
       expanded: false,
@@ -162,6 +194,7 @@ impl Vars {
     self.values = serialized_values(&value);
     self.secrets.clear();
     self.required_vars.clear();
+    self.output_refs.clear();
     self.expanded = false;
   }
 
@@ -169,6 +202,7 @@ impl Vars {
     self.values.clear();
     self.secrets.clear();
     self.required_vars.clear();
+    self.output_refs.clear();
     self.extend_variables(variables);
   }
 
@@ -187,6 +221,7 @@ impl Vars {
     if let Ok(value) = serde_json::to_value(value) {
       self.values.insert(key.to_owned(), value);
       self.secrets.remove(key);
+      self.output_refs.shift_remove(key);
     }
     self.expanded = false;
   }
@@ -201,6 +236,7 @@ impl Vars {
       for (key, value) in values {
         self.values.insert(key.clone(), value.clone());
         self.secrets.remove(key);
+        self.output_refs.shift_remove(key);
       }
     }
     self.expanded = false;
@@ -211,6 +247,7 @@ impl Vars {
     for (key, value) in serialized_values(value) {
       self.values.insert(key.clone(), value);
       self.secrets.remove(&key);
+      self.output_refs.shift_remove(&key);
     }
     self.expanded = false;
   }
@@ -225,8 +262,10 @@ impl Vars {
         VariableSource::Value(value) => value,
         VariableSource::Shell(command) => serde_json::json!({ "sh": command }),
         VariableSource::Required(mode) => {
+          self.values.shift_remove(&key);
+          self.output_refs.shift_remove(&key);
           self.required_vars.insert(
-            key,
+            key.clone(),
             RequiredVar {
               mode,
               secret,
@@ -234,10 +273,28 @@ impl Vars {
               question,
             },
           );
+          if secret {
+            self.secrets.insert(key);
+          } else {
+            self.secrets.remove(&key);
+          }
+          continue;
+        },
+        VariableSource::TaskOutput(reference) => {
+          self.values.shift_remove(&key);
+          self.required_vars.shift_remove(&key);
+          self.output_refs.insert(key.clone(), reference);
+          if secret {
+            self.secrets.insert(key);
+          } else {
+            self.secrets.remove(&key);
+          }
           continue;
         },
       };
 
+      self.required_vars.shift_remove(&key);
+      self.output_refs.shift_remove(&key);
       self.values.insert(key.clone(), value);
       if secret {
         self.secrets.insert(key);
@@ -253,10 +310,22 @@ impl Vars {
   }
 
   /// Resolves and validates requirements when an executable node reaches runtime.
+  #[cfg(test)]
   pub(crate) async fn resolve_required(&mut self, resolver: Option<&dyn VariableResolver>) -> ExecutorResult<()> {
+    self
+      .resolve_required_with_overrides(resolver, &VariableOverrides::default())
+      .await
+  }
+
+  /// Resolves requirements while treating dependency outputs as concrete supplied values.
+  pub(crate) async fn resolve_required_with_overrides(
+    &mut self,
+    resolver: Option<&dyn VariableResolver>,
+    overrides: &VariableOverrides,
+  ) -> ExecutorResult<()> {
     let contexts = self.collect_context_chain();
-    let required_vars = resolve_required_vars(&contexts, collect_required_vars(&contexts))?;
-    let supplied = collect_supplied_required_vars(&contexts, &required_vars);
+    let required_vars = resolve_required_vars(&contexts, collect_required_vars(&contexts), overrides)?;
+    let supplied = collect_supplied_required_vars(&contexts, &required_vars, overrides);
     let mut prompts = Vec::new();
 
     // Validate the complete non-interactive configuration before asking the user for anything.
@@ -307,7 +376,7 @@ impl Vars {
 
   pub async fn expand(&mut self, dry: bool) -> ExecutorResult<()> {
     self
-      .expand_with_evaluator_option(None, dry, CancellationToken::new(), IndexMap::new())
+      .expand_with_evaluator_option(None, dry, CancellationToken::new(), VariableOverrides::default())
       .await
   }
 
@@ -329,7 +398,7 @@ impl Vars {
     cancel_token: CancellationToken,
   ) -> ExecutorResult<()> {
     self
-      .expand_with_evaluator_option(Some(evaluator), dry, cancel_token, IndexMap::new())
+      .expand_with_evaluator_option(Some(evaluator), dry, cancel_token, VariableOverrides::default())
       .await
   }
 
@@ -340,7 +409,7 @@ impl Vars {
     evaluator: Arc<dyn PluginEvaluator>,
     dry: bool,
     cancel_token: CancellationToken,
-    overrides: IndexMap<String, Value>,
+    overrides: VariableOverrides,
   ) -> ExecutorResult<()> {
     self
       .expand_with_evaluator_option(Some(evaluator), dry, cancel_token, overrides)
@@ -352,12 +421,16 @@ impl Vars {
     evaluator: Option<Arc<dyn PluginEvaluator>>,
     dry: bool,
     cancel_token: CancellationToken,
-    overrides: IndexMap<String, Value>,
+    overrides: VariableOverrides,
   ) -> ExecutorResult<()> {
     if self.expanded {
-      for (key, value) in overrides {
+      for (key, value) in overrides.values {
         self.values.insert(key.clone(), value);
-        self.secrets.remove(&key);
+        if overrides.secrets.contains(&key) {
+          self.secrets.insert(key);
+        } else {
+          self.secrets.remove(&key);
+        }
       }
       return Ok(());
     }
@@ -385,6 +458,7 @@ impl Vars {
         values: vars.values.clone(),
         secrets: vars.secrets.clone(),
         required_vars: vars.required_vars.clone(),
+        output_refs: vars.output_refs.clone(),
         dir: vars.dir.clone(),
       });
       current = vars.parent.as_ref().map(|p| p.as_ref());
@@ -399,11 +473,11 @@ impl Vars {
     evaluator: Option<Arc<dyn PluginEvaluator>>,
     dry: bool,
     cancel_token: CancellationToken,
-    overrides: IndexMap<String, Value>,
+    overrides: VariableOverrides,
   ) -> ExecutorResult<ResolvedVars> {
     let required_definitions = collect_required_vars(&contexts);
-    let required_vars = resolve_required_vars(&contexts, required_definitions.clone())?;
-    let supplied_required_vars = collect_supplied_required_vars(&contexts, &required_vars);
+    let required_vars = resolve_required_vars(&contexts, required_definitions.clone(), &overrides)?;
+    let supplied_required_vars = collect_supplied_required_vars(&contexts, &required_vars, &overrides);
     validate_required_vars(
       &required_vars,
       supplied_required_vars
@@ -419,9 +493,13 @@ impl Vars {
       .filter(|(key, supplied)| supplied.secret || required_vars.get(*key).is_some_and(|required| required.secret))
       .map(|(key, _)| key.clone())
       .collect::<HashSet<_>>();
-    for (key, value) in &overrides {
+    for (key, value) in &overrides.values {
       accumulated.insert(key.clone(), value.clone());
-      secrets.remove(key);
+      if overrides.secrets.contains(key) {
+        secrets.insert(key.clone());
+      } else {
+        secrets.remove(key);
+      }
     }
 
     // Each value is added immediately after expansion. This preserves YAML declaration order
@@ -431,6 +509,7 @@ impl Vars {
         values,
         secrets: layer_secrets,
         required_vars: _,
+        output_refs: _,
         dir,
       } = layer;
       let current_dir = match dir {
@@ -439,7 +518,7 @@ impl Vars {
       };
 
       for (key, value) in values {
-        if overrides.contains_key(&key) {
+        if overrides.values.contains_key(&key) {
           continue;
         }
         // Required values are concrete inputs and were inserted before dependent declarations.
@@ -580,13 +659,47 @@ impl Vars {
     self
       .collect_context_chain()
       .into_iter()
-      .flat_map(|layer| layer.values.into_keys().chain(layer.required_vars.into_keys()))
+      .flat_map(|layer| {
+        layer
+          .values
+          .into_keys()
+          .chain(layer.required_vars.into_keys())
+          .chain(layer.output_refs.into_keys())
+      })
       .collect()
   }
 
   /// Names of values that plugins must redact from their diagnostic logs.
   pub(crate) fn secret_names(&self) -> Vec<String> {
     self.secrets.iter().cloned().collect()
+  }
+
+  pub(crate) fn task_output_references(&self) -> Vec<TaskOutputVariable> {
+    let mut references = IndexMap::new();
+    let mut layers = Vec::new();
+    let mut current = Some(self);
+    while let Some(vars) = current {
+      layers.push(vars);
+      current = vars.parent.as_deref();
+    }
+    for layer in layers.into_iter().rev() {
+      // A concrete or required declaration in a child layer replaces an inherited reference
+      // just as it replaces an inherited value during normal expansion.
+      for name in layer.values.keys().chain(layer.required_vars.keys()) {
+        references.shift_remove(name);
+      }
+      for (name, reference) in &layer.output_refs {
+        references.insert(
+          name.clone(),
+          TaskOutputVariable {
+            name: name.clone(),
+            reference: reference.clone(),
+            secret: layer.secrets.contains(name),
+          },
+        );
+      }
+    }
+    references.into_values().collect()
   }
 }
 
@@ -607,8 +720,17 @@ fn collect_required_vars(contexts: &[VariableLayer]) -> IndexMap<String, Require
 fn resolve_required_vars(
   contexts: &[VariableLayer],
   required_vars: IndexMap<String, RequiredVar>,
+  overrides: &VariableOverrides,
 ) -> ExecutorResult<IndexMap<String, ResolvedRequiredVar>> {
-  let (values, mut secrets) = collect_enum_context(contexts);
+  let (mut values, mut secrets) = collect_enum_context(contexts);
+  for (name, value) in &overrides.values {
+    values.insert(name.clone(), value.clone());
+    if overrides.secrets.contains(name) {
+      secrets.insert(name.clone());
+    } else {
+      secrets.remove(name);
+    }
+  }
   secrets.extend(
     required_vars
       .iter()
@@ -657,6 +779,7 @@ fn collect_enum_context(contexts: &[VariableLayer]) -> (IndexMap<String, Value>,
 fn collect_supplied_required_vars(
   contexts: &[VariableLayer],
   required_vars: &IndexMap<String, ResolvedRequiredVar>,
+  overrides: &VariableOverrides,
 ) -> IndexMap<String, SuppliedRequiredVar> {
   let mut supplied = IndexMap::new();
   for layer in contexts {
@@ -670,6 +793,18 @@ fn collect_supplied_required_vars(
           },
         );
       }
+    }
+  }
+
+  for (key, value) in &overrides.values {
+    if required_vars.contains_key(key) {
+      supplied.insert(
+        key.clone(),
+        SuppliedRequiredVar {
+          value: value.clone(),
+          secret: overrides.secrets.contains(key),
+        },
+      );
     }
   }
 
@@ -825,6 +960,7 @@ impl From<Context> for Vars {
       // Tera Context contains values only and cannot carry secret metadata.
       secrets: HashSet::new(),
       required_vars: IndexMap::new(),
+      output_refs: IndexMap::new(),
       parent: None,
       dir: None,
       expanded: false,
@@ -884,11 +1020,38 @@ mod tests {
     assert!(vars.values.is_empty());
   }
 
+  #[test]
+  fn resolves_task_output_references_without_string_conversion() {
+    let configured: OctafileVars =
+      serde_yml::from_str("IMAGE_DIGEST:\n  from:\n    task: image\n    output: digest\n  secret: true\n").unwrap();
+    let vars = Vars::with_variables(configured);
+    let references = vars.task_output_references();
+
+    assert_eq!(references.len(), 1);
+    assert_eq!(references[0].name, "IMAGE_DIGEST");
+    assert_eq!(references[0].reference.task, "image");
+    assert_eq!(references[0].reference.output, "digest");
+    assert!(references[0].secret);
+  }
+
+  #[test]
+  fn child_declarations_replace_inherited_task_output_references() {
+    let configured: OctafileVars = serde_yml::from_str(
+      "IMAGE:\n  from: { task: image, output: digest }\nTOKEN:\n  from: { task: image, output: token }\n",
+    )
+    .unwrap();
+    let parent = Vars::with_variables(configured);
+    let mut child = Vars::with_parent(parent);
+    child.extend_variables(serde_yml::from_str("IMAGE: local\nTOKEN: { required: true }\n").unwrap());
+
+    assert!(child.task_output_references().is_empty());
+  }
+
   #[tokio::test]
   async fn re_expansion_applies_runtime_overrides_and_removes_secret_metadata() {
     let mut vars = Vars::with_value(json!({"value": "initial"}));
     vars
-      .expand_with_evaluator_option(None, false, CancellationToken::new(), IndexMap::new())
+      .expand_with_evaluator_option(None, false, CancellationToken::new(), VariableOverrides::default())
       .await
       .unwrap();
     vars.secrets.insert("value".to_owned());
@@ -898,7 +1061,10 @@ mod tests {
         None,
         false,
         CancellationToken::new(),
-        IndexMap::from([("value".to_owned(), json!("override"))]),
+        VariableOverrides {
+          values: IndexMap::from([("value".to_owned(), json!("override"))]),
+          secrets: HashSet::new(),
+        },
       )
       .await
       .unwrap();

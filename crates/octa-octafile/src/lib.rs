@@ -14,6 +14,7 @@ pub use octafile::{EnvValue, Envs, Octafile, PresentationConfig, ShellValue, Syn
 pub use output::{GroupOutput, OutputConfig, OutputMode, TaskOutputMode, TaskPresentation};
 pub use task::{
   AllowedRun, CommandOptions, CommandPayload, ComplexDep, ConditionEvaluation, Deps, ExecuteMode, PluginCommand,
-  PluginSchemas, Silence, SourceStrategies, Task, TaskCommand, TaskCondition, TaskConditions, Timeout,
+  PluginSchemas, PluginTypeSchema, Silence, SourceStrategies, Task, TaskCommand, TaskCondition, TaskConditions,
+  TaskOutput, Timeout,
 };
-pub use variable::{RequiredMode, Variable, VariableEnum, VariableSource};
+pub use variable::{RequiredMode, TaskOutputReference, Variable, VariableEnum, VariableSource};

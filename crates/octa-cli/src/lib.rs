@@ -870,10 +870,16 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
   let (plugin_manager, plugin_schemas) = initialize_plugins(plugin_manager.clone(), config.plugins).await?;
   let default_plugin = resolve_default_plugin(config.default_plugin, &plugin_schemas)?;
 
-  let mut validation_schemas = HashMap::new();
+  let mut plugin_schemas_by_key = HashMap::new();
   for schema in plugin_schemas.values() {
-    if validation_schemas
-      .insert(schema.key.clone(), schema.validation_schema.clone())
+    if plugin_schemas_by_key
+      .insert(
+        schema.key.clone(),
+        octa_octafile::PluginTypeSchema {
+          input: schema.input_schema.clone(),
+          output: schema.output_schema.clone(),
+        },
+      )
       .is_some()
     {
       return Err(OctaError::PluginStartError(format!(
@@ -928,7 +934,7 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
     Some(monorepo.root_octafile),
     false,
     None,
-    validation_schemas,
+    plugin_schemas_by_key,
     default_plugin,
     &args.vars,
     &synthetic_includes,
@@ -1659,7 +1665,8 @@ tasks:
           key: "shell-command".to_string(),
           supports_raw: true,
           capabilities: vec![SHELL_CAPABILITY.to_owned()],
-          validation_schema: None,
+          input_schema: None,
+          output_schema: None,
         },
       ),
       (
@@ -1668,7 +1675,8 @@ tasks:
           key: "docker".to_string(),
           supports_raw: false,
           capabilities: Vec::new(),
-          validation_schema: None,
+          input_schema: None,
+          output_schema: None,
         },
       ),
     ]);
@@ -1686,7 +1694,8 @@ tasks:
         key: "legacy-shell".to_owned(),
         supports_raw: false,
         capabilities: Vec::new(),
-        validation_schema: None,
+        input_schema: None,
+        output_schema: None,
       },
     )]);
     assert_eq!(resolve_default_plugin(None, &legacy).unwrap(), "legacy-shell");

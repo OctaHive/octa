@@ -18,7 +18,11 @@ pub struct Schema {
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub capabilities: Vec<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
-  pub validation_schema: Option<Map<String, Value>>,
+  /// JSON Schema for values accepted in `Execute.params`.
+  pub input_schema: Option<Map<String, Value>>,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  /// JSON Schema for the object returned in a successful `Completed.outputs`.
+  pub output_schema: Option<Map<String, Value>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
@@ -180,13 +184,14 @@ mod tests {
   use super::{OctaCommand, PluginResponse, ProgressUpdate, Schema};
 
   #[test]
-  fn schema_without_validation_schema_is_backward_compatible() {
+  fn schema_without_optional_schemas_uses_no_validation() {
     let schema: Schema = serde_json::from_str(r#"{"key":"shell"}"#).unwrap();
 
     assert_eq!(schema.key, "shell");
     assert!(schema.capabilities.is_empty());
     assert!(!schema.supports_raw);
-    assert!(schema.validation_schema.is_none());
+    assert!(schema.input_schema.is_none());
+    assert!(schema.output_schema.is_none());
     assert_eq!(serde_json::to_string(&schema).unwrap(), r#"{"key":"shell"}"#);
   }
 
@@ -256,8 +261,8 @@ mod tests {
   }
 
   #[test]
-  fn boolean_validation_schema_is_rejected() {
-    let result = serde_json::from_str::<Schema>(r#"{"key":"shell","validation_schema":true}"#);
+  fn boolean_input_schema_is_rejected() {
+    let result = serde_json::from_str::<Schema>(r#"{"key":"shell","input_schema":true}"#);
 
     assert!(result.is_err());
   }

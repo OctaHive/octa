@@ -27,6 +27,7 @@ mod runtime_coordinator;
 mod runtime_output;
 mod source;
 mod source_strategy;
+mod structured_output;
 mod summary;
 mod task;
 mod task_identity;

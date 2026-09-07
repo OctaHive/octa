@@ -77,7 +77,7 @@ impl TaskItem for UnscopedTaskItem {
     "unscoped"
   }
 
-  async fn get_deps_result(&self) -> HashMap<String, Arc<str>> {
+  async fn get_deps_result(&self) -> HashMap<String, DependencyResult> {
     HashMap::new()
   }
 
@@ -96,7 +96,7 @@ impl TaskItem for LegacyScopedTaskItem {
     "legacy"
   }
 
-  async fn get_deps_result(&self) -> HashMap<String, Arc<str>> {
+  async fn get_deps_result(&self) -> HashMap<String, DependencyResult> {
     HashMap::new()
   }
 
@@ -182,6 +182,153 @@ async fn invocation_nodes_resolve_required_variables_once() {
   assert!(format!("{invocation:?}").contains("initialized: true"));
 }
 
+#[tokio::test]
+async fn task_output_variables_preserve_structured_values() {
+  let temp_dir = TempDir::new().unwrap();
+  let required = serde_yml::from_str("IMAGE: { required: true }\n").unwrap();
+  let configured =
+    serde_yml::from_str("IMAGE:\n  from:\n    task: build\n    output: image\nLABEL: '{{ IMAGE.name }}'\n").unwrap();
+  let mut vars = Vars::with_parent(Vars::with_variables(required));
+  vars.extend_variables(configured);
+  let task = TaskNode::new(
+    TaskConfig::builder()
+      .id("deploy")
+      .name("deploy")
+      .dep_name("deploy")
+      .dir(temp_dir.path())
+      .vars(vars)
+      .build()
+      .unwrap(),
+  );
+  let mut outputs = TaskOutputs::default();
+  outputs.insert("image".to_owned(), serde_json::json!({ "name": "api" }), true);
+  task
+    .set_result(
+      "build".to_owned(),
+      DependencyResult::with_outputs(Arc::from("ignored"), outputs),
+    )
+    .await;
+  let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::new(Arc::new(PluginManager::new(
+    temp_dir.path(),
+  ))));
+
+  let context = task
+    .resolve_runtime_context(evaluator, false, CancellationToken::new(), None)
+    .await
+    .unwrap();
+  assert_eq!(context.vars.get("IMAGE"), Some(&serde_json::json!({ "name": "api" })));
+  assert_eq!(context.vars.get("LABEL"), Some(&Value::String("api".to_owned())));
+  assert!(context.vars.secret_names().contains(&"IMAGE".to_owned()));
+}
+
+#[test]
+fn step_exports_are_selected_without_flattening_plugin_outputs() {
+  let allocator = octa_output::ConsoleScopeAllocator::default();
+  let scope = allocator.scope("build");
+  let step = allocator.step(&scope, "package");
+  let task = TaskNode::new(
+    TaskConfig::builder()
+      .id("build")
+      .name("build")
+      .dep_name("build")
+      .dir(".")
+      .execution_binding(Some(ExecutionBinding::for_step(scope, step)))
+      .step_exports(HashMap::from([(
+        "image_digest".to_owned(),
+        crate::structured_output::StepExport {
+          field: "digest".to_owned(),
+          secret: false,
+        },
+      )]))
+      .build()
+      .unwrap(),
+  );
+  let plugin_outputs = serde_json::Map::from_iter([
+    ("digest".to_owned(), serde_json::json!("sha256:test")),
+    ("internal".to_owned(), serde_json::json!(true)),
+  ]);
+
+  assert_eq!(
+    task.completion_outputs(plugin_outputs).unwrap().task().public_values(),
+    serde_json::Map::from_iter([("image_digest".to_owned(), serde_json::json!("sha256:test"))])
+  );
+  assert!(matches!(
+    task.completion_outputs(serde_json::Map::new()),
+    Err(ExecutorError::TaskOutputMissing { step, field })
+      if step == "package" && field == "digest"
+  ));
+}
+
+#[test]
+fn secret_exports_are_available_to_dependencies_but_removed_from_step_results() {
+  let allocator = octa_output::ConsoleScopeAllocator::default();
+  let scope = allocator.scope("build");
+  let step = allocator.step(&scope, "package");
+  let task = TaskNode::new(
+    TaskConfig::builder()
+      .id("build")
+      .name("build")
+      .dep_name("build")
+      .dir(".")
+      .execution_binding(Some(ExecutionBinding::for_step(scope, step)))
+      .step_exports(HashMap::from([(
+        "token".to_owned(),
+        crate::structured_output::StepExport {
+          field: "digest".to_owned(),
+          secret: true,
+        },
+      )]))
+      .build()
+      .unwrap(),
+  );
+
+  let completion = task
+    .completion_outputs(serde_json::Map::from_iter([
+      ("digest".to_owned(), serde_json::json!("private")),
+      ("image".to_owned(), serde_json::json!("public")),
+    ]))
+    .unwrap();
+
+  assert_eq!(completion.task().get("token"), Some(&serde_json::json!("private")));
+  assert!(completion.task().is_secret("token"));
+  assert!(!completion.step().contains_key("digest"));
+  assert_eq!(completion.step()["image"], "public");
+}
+
+#[tokio::test]
+async fn dependency_results_merge_exports_from_parallel_steps() {
+  let task = create_test_task("consumer", None, None, None);
+  task
+    .set_result(
+      "build".to_owned(),
+      DependencyResult::new(
+        Arc::from("first"),
+        serde_json::Map::from_iter([("digest".to_owned(), serde_json::json!("sha256:test"))]),
+      ),
+    )
+    .await;
+  task
+    .set_result(
+      "build".to_owned(),
+      DependencyResult::new(
+        Arc::from("second"),
+        serde_json::Map::from_iter([("pushed".to_owned(), serde_json::json!(true))]),
+      ),
+    )
+    .await;
+
+  let dependencies = task.get_deps_result().await;
+  assert_eq!(dependencies["build"].stdout(), "second");
+  assert_eq!(
+    dependencies["build"].outputs().get("digest"),
+    Some(&serde_json::json!("sha256:test"))
+  );
+  assert_eq!(
+    dependencies["build"].outputs().get("pushed"),
+    Some(&serde_json::json!(true))
+  );
+}
+
 // Helper function to create a test TaskNode
 fn create_test_task(name: &str, cmd: Option<&str>, tpl: Option<String>, run_mode: Option<RunMode>) -> TaskNode {
   let plugin = tpl
@@ -218,6 +365,7 @@ fn runtime(
     dry: false,
     force: false,
     deferred_exit_code: None,
+    structured_output_budget: Arc::new(StructuredOutputBudget::default()),
   }
 }
 
@@ -408,6 +556,7 @@ async fn plugin_stdout_and_stderr_are_routed_as_structured_events() {
     dry: false,
     force: false,
     deferred_exit_code: None,
+    structured_output_budget: Arc::new(StructuredOutputBudget::default()),
   };
 
   task.execute(runtime, CancellationToken::new()).await.unwrap();
@@ -515,6 +664,43 @@ async fn test_cache_behavior() {
   assert_eq!(result1.output(), result2.output());
   assert_eq!(result1.status(), octa_output::ConsoleStatus::Success);
   assert_eq!(result2.status(), octa_output::ConsoleStatus::Skipped);
+
+  // Equal node display names at different command positions must not share
+  // cached stdout or structured outputs. The planner supplies these stable
+  // position keys while repeated invocations of the same position reuse them.
+  let mut first_position = create_test_task("same payload", Some("echo first"), None, Some(RunMode::Once));
+  first_position.cache_key = "build::command[0]".to_owned();
+  let mut second_position = create_test_task("same payload", Some("echo second"), None, Some(RunMode::Once));
+  second_position.cache_key = "build::command[1]".to_owned();
+  let position_cache = Arc::new(Mutex::new(IndexMap::new()));
+
+  let first = first_position
+    .execute(
+      runtime(plugin_manager.clone(), position_cache.clone(), fingerprint.clone()),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+  let second = second_position
+    .execute(
+      runtime(plugin_manager.clone(), position_cache.clone(), fingerprint.clone()),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+  let second_cached = second_position
+    .execute(
+      runtime(plugin_manager.clone(), position_cache, fingerprint),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+  assert_eq!(first.output().trim(), "first");
+  assert_eq!(second.output().trim(), "second");
+  assert_eq!(second.status(), octa_output::ConsoleStatus::Success);
+  assert_eq!(second_cached.output(), second.output());
+  assert_eq!(second_cached.status(), octa_output::ConsoleStatus::Skipped);
   plugin_manager.shutdown_all().await;
 }
 
@@ -611,6 +797,7 @@ async fn missing_plugin_errors_can_be_propagated_or_ignored() {
           dry: false,
           force: false,
           deferred_exit_code: None,
+          structured_output_budget: Arc::new(StructuredOutputBudget::default()),
         },
         CancellationToken::new(),
       )
@@ -802,7 +989,12 @@ async fn test_dependency_results() {
     None,
   );
 
-  task.set_result("dep1".to_string(), Arc::from("dep_output")).await;
+  task
+    .set_result(
+      "dep1".to_string(),
+      DependencyResult::new(Arc::from("dep_output"), Default::default()),
+    )
+    .await;
 
   let cache = Arc::new(Mutex::new(IndexMap::new()));
   let fingerprint = Arc::new(db);

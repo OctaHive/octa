@@ -352,19 +352,26 @@ impl PluginClient {
         match read {
           Ok(0) => break,
           Ok(_) => {
-            let response =
-              serde_json::from_str::<PluginResponse>(buffer.trim()).unwrap_or_else(|error| PluginResponse::Error {
-                id: "parse_error".to_string(),
-                message: format!("Invalid JSON response: {error}"),
-              });
             let Some(inner) = inner.upgrade() else {
               break;
+            };
+            let response = match serde_json::from_str::<PluginResponse>(buffer.trim()) {
+              Ok(response) => response,
+              Err(error) => {
+                Self::fail_protocol(&inner, format!("Invalid JSON response: {error}")).await;
+                break;
+              },
             };
             if !Self::dispatch_response(&inner, &control_tx, response).await {
               break;
             }
           },
-          Err(_) => break,
+          Err(error) => {
+            if let Some(inner) = inner.upgrade() {
+              Self::fail_protocol(&inner, format!("Failed to read plugin response: {error}")).await;
+            }
+            break;
+          },
         }
       }
 
@@ -509,10 +516,21 @@ impl PluginClient {
 
   async fn fail_protocol(inner: &Arc<PluginClientInner>, message: String) -> bool {
     inner.connection_closed.cancel();
-    for (_, route) in inner.commands.lock().await.drain() {
+    for (id, mut route) in inner.commands.lock().await.drain() {
       route.completed.cancel();
-      if let CommandRouteState::AwaitingStart(pending) = route.state {
-        let _ = pending.send(Err(PluginClientError::Protocol(message.clone())));
+      match route.state {
+        CommandRouteState::AwaitingStart(pending) => {
+          let _ = pending.send(Err(PluginClientError::Protocol(message.clone())));
+        },
+        CommandRouteState::Running => {
+          if let Some(sender) = route.sender.take() {
+            let _ = sender.try_send(PluginResponse::Error {
+              id,
+              message: message.clone(),
+            });
+          }
+        },
+        CommandRouteState::Cancelled => {},
       }
     }
     false
@@ -957,7 +975,8 @@ mod tests {
             key: "key".to_owned(),
             supports_raw: false,
             capabilities: Vec::new(),
-            validation_schema: None,
+            input_schema: None,
+            output_schema: None,
           }))
         } else if buffer.contains("Execute") {
           let mut id = match serde_json::from_str::<OctaCommand>(&buffer).unwrap() {
@@ -1516,6 +1535,83 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn incompatible_terminal_response_fails_running_command_and_unblocks_cancellation() {
+    let mut server = TestServer::new().await;
+    let listener = Arc::clone(&server.listener);
+    server.server_handle = Some(tokio::spawn(async move {
+      let stream = listener.accept().await.unwrap();
+      let (reader, mut writer) = tokio::io::split(stream);
+      let mut reader = BufReader::new(reader);
+      let mut line = String::new();
+
+      reader.read_line(&mut line).await.unwrap();
+      assert!(matches!(
+        serde_json::from_str::<OctaCommand>(line.trim()).unwrap(),
+        OctaCommand::Hello(_)
+      ));
+      let hello = PluginResponse::Hello(Version {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        features: Vec::new(),
+      });
+      writer
+        .write_all((serde_json::to_string(&hello).unwrap() + "\n").as_bytes())
+        .await
+        .unwrap();
+
+      line.clear();
+      reader.read_line(&mut line).await.unwrap();
+      let OctaCommand::Execute { id, .. } = serde_json::from_str::<OctaCommand>(line.trim()).unwrap() else {
+        panic!("expected execute request");
+      };
+      let started = PluginResponse::Started { id: id.clone() };
+      writer
+        .write_all((serde_json::to_string(&started).unwrap() + "\n").as_bytes())
+        .await
+        .unwrap();
+      // This is the terminal variant used before the current protocol. It must
+      // fail the running route instead of being misrouted as a control error.
+      writer
+        .write_all((format!(r#"{{"type":"ExitStatus","payload":{{"id":"{id}","code":0}}}}"#) + "\n").as_bytes())
+        .await
+        .unwrap();
+      writer.flush().await.unwrap();
+
+      line.clear();
+      reader.read_line(&mut line).await.unwrap();
+      vec![line]
+    }));
+
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+
+    let mut execution = client
+      .start_execution(execution_request("test"), CancellationToken::new())
+      .await
+      .unwrap();
+    let response = tokio::time::timeout(
+      Duration::from_millis(250),
+      execution.receive_output(&CancellationToken::new()),
+    )
+    .await
+    .expect("running command remained blocked after a protocol error")
+    .unwrap();
+    assert!(matches!(
+      response,
+      Some(PluginResponse::Error { message, .. }) if message.contains("ExitStatus")
+    ));
+    tokio::time::timeout(Duration::from_millis(250), execution.cancel_and_wait())
+      .await
+      .expect("cancellation remained blocked after a protocol error")
+      .unwrap();
+
+    let messages = server.stop().await;
+    assert!(matches!(
+      serde_json::from_str::<OctaCommand>(messages[0].trim()).unwrap(),
+      OctaCommand::Cancel { .. }
+    ));
+  }
+
+  #[tokio::test]
   async fn test_connection_timeout() {
     let temp_dir = tempfile::tempdir().unwrap();
     let socket_path = temp_dir.path().join("nonexistent.sock");
@@ -1828,7 +1924,8 @@ mod tests {
               key: "key".to_owned(),
               supports_raw: false,
               capabilities: Vec::new(),
-              validation_schema: None,
+              input_schema: None,
+              output_schema: None,
             });
             let response_json = serde_json::to_string(&response).unwrap() + "\n";
             writer.write_all(response_json.as_bytes()).await.unwrap();

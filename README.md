@@ -1347,6 +1347,42 @@ tasks:
       - task2
 ```
 
+Plugins can also return typed values independently of their console output. Give the producing
+command an `id`, explicitly export the fields that form the task's public result, and bind a
+dependent variable with `from`. For example, a Docker plugin that declares a `digest` output could
+be used as follows:
+
+```yaml
+tasks:
+  image:
+    cmds:
+      - id: build
+        docker:
+          build: .
+          tags: [registry.example.com/api:latest]
+    outputs:
+      digest:
+        step: build
+        field: digest
+  deploy:
+    deps: [image]
+    vars:
+      IMAGE_DIGEST:
+        from:
+          task: image
+          output: digest
+    shell: deploy --image registry.example.com/api@{{ IMAGE_DIGEST }}
+```
+
+Octa validates the step ID and plugin output field while loading the Octafile, and validates the
+dependency and exported task field while building the execution plan. Values retain their JSON
+type—strings, numbers, booleans, arrays, and objects are not converted through stdout. A task only
+exports values after a successful command. Output-producing commands cannot be deferred, and tasks
+with structured outputs currently cannot use source/file freshness because there is no previous-run
+value to restore when such a task is skipped. Set `secret: true` for sensitive values: they remain
+available to dependent task variables, but are omitted from step/task result values and their names
+are listed as redacted outputs.
+
 # Task run mode
 Some of your tasks may depend on the same tasks. By default, Octa will rerun the dependent task each time, which will result in 
 the dependent task being executed multiple times. You can change this behavior by setting the `run` attribute of task. The following

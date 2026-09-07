@@ -24,6 +24,7 @@ impl TaskGraphBuilder {
     request: InvocationRequest,
     run_parallel: Option<bool>,
   ) -> ExecutorResult<Option<ArcNode>> {
+    self.validate_selected_task_outputs(command)?;
     Box::pin(self._build_invocation(dag, command, request, run_parallel)).await
   }
 
@@ -74,6 +75,7 @@ impl TaskGraphBuilder {
     // Variables and environments are collected once per invocation and shared
     // by all of its condition, freshness, command, and barrier nodes.
     let collected_vars = self.collect_vars_with_identity(command, request.context.vars.clone())?;
+    self.validate_task_output_references(command, &collected_vars.runtime)?;
     let environment = self.collect_environment_plan(command, request.context.envs.clone())?;
     request.context.runtime = Some(Arc::new(task::InvocationRuntime::new(
       collected_vars.runtime,
@@ -94,6 +96,99 @@ impl TaskGraphBuilder {
       .await
   }
 
+  /// Validates structured references while the complete task namespace is available.
+  fn validate_task_output_references(&self, command: &FindResult, vars: &Vars) -> ExecutorResult<()> {
+    let references = vars.task_output_references();
+    if references.is_empty() {
+      return Ok(());
+    }
+    if command
+      .task
+      .condition
+      .as_ref()
+      .is_some_and(|condition| condition.before_deps.is_some())
+    {
+      return Err(ExecutorError::InvalidTaskOutputReference {
+        variable: references[0].name.clone(),
+        message: "task output variables cannot be used with a before_deps condition".to_owned(),
+      });
+    }
+    let dependency_names = command
+      .task
+      .deps
+      .as_deref()
+      .unwrap_or_default()
+      .iter()
+      .map(|dependency| match dependency {
+        Deps::Simple(name) => name.as_str(),
+        Deps::Complex(dependency) => dependency.task.as_str(),
+      })
+      .collect::<Vec<_>>();
+
+    for TaskOutputVariable {
+      name: variable,
+      reference,
+      ..
+    } in references
+    {
+      if dependency_names.iter().filter(|name| **name == reference.task).count() != 1 {
+        return Err(ExecutorError::InvalidTaskOutputReference {
+          variable,
+          message: format!("'{}' must name exactly one direct dependency", reference.task),
+        });
+      }
+      let resolved =
+        self.filter_command_by_platform(self.find_and_filter_commands(&command.octafile, &reference.task)?);
+      if resolved.len() != 1 {
+        return Err(ExecutorError::InvalidTaskOutputReference {
+          variable,
+          message: format!(
+            "dependency '{}' must resolve to exactly one task on this platform",
+            reference.task
+          ),
+        });
+      }
+      if !resolved[0]
+        .task
+        .outputs
+        .as_ref()
+        .is_some_and(|outputs| outputs.contains_key(&reference.output))
+      {
+        return Err(ExecutorError::InvalidTaskOutputReference {
+          variable,
+          message: format!("dependency '{}' does not export '{}'", reference.task, reference.output),
+        });
+      }
+    }
+    Ok(())
+  }
+
+  /// Ensures platform filtering leaves one producer for every declared task output.
+  fn validate_selected_task_outputs(&self, command: &FindResult) -> ExecutorResult<()> {
+    let Some(outputs) = &command.task.outputs else {
+      return Ok(());
+    };
+    let commands = command.task.cmds.as_deref().unwrap_or_default();
+    for (name, output) in outputs {
+      let producers = commands
+        .iter()
+        .filter(|candidate| candidate.options.id.as_deref() == Some(output.step.as_str()))
+        .filter(|candidate| self.matches_platforms(candidate.options.platforms.as_deref()))
+        .count();
+      if producers != 1 {
+        return Err(ExecutorError::InvalidTaskOutput {
+          task: command.name.clone(),
+          output: name.clone(),
+          message: format!(
+            "step '{}' has {producers} executable producers on this platform; expected exactly one",
+            output.step
+          ),
+        });
+      }
+    }
+    Ok(())
+  }
+
   async fn build_task_body(
     &mut self,
     dag: &mut DagNode,
@@ -108,7 +203,14 @@ impl TaskGraphBuilder {
 
     // Shorthand tasks contain one plugin payload directly instead of `cmds`.
     let Some(commands) = &command.task.cmds else {
-      let task = self.create_task_node(dag, command, &context, None)?;
+      let task = self.create_task_node(
+        dag,
+        command,
+        &context,
+        None,
+        None,
+        Self::command_cache_key(&command.name, 0),
+      )?;
       Self::connect_parents(dag, &parents, &task)?;
       return self.add_freshness_commit(dag, command, &context, freshness, vec![task]);
     };
@@ -138,7 +240,7 @@ impl TaskGraphBuilder {
     let mut parallel_terminals = Vec::new();
     let mut deferred_nodes = Vec::new();
 
-    for command_item in commands {
+    for (command_index, command_item) in commands.iter().enumerate() {
       // Platform-excluded commands contribute no node and therefore cannot
       // accidentally block the remaining body.
       if !self.matches_platforms(command_item.options.platforms.as_deref()) {
@@ -193,7 +295,14 @@ impl TaskGraphBuilder {
         },
         CommandPayload::Plugin(plugin) => {
           let simple = self.create_simple_command(plugin, command, &command_item.options);
-          let task = self.create_task_node(dag, &simple, &context, command_item.options.condition.clone())?;
+          let task = self.create_task_node(
+            dag,
+            &simple,
+            &context,
+            command_item.options.condition.clone(),
+            command_item.options.id.as_deref(),
+            Self::command_cache_key(&command.name, command_index),
+          )?;
           Self::connect_parents(dag, &entries, &task)?;
           vec![task]
         },
@@ -536,6 +645,8 @@ impl TaskGraphBuilder {
     cmd: &FindResult,
     context: &InvocationContext,
     command_condition: Option<PluginCommand>,
+    configured_step_id: Option<&str>,
+    cache_key: String,
   ) -> ExecutorResult<ArcNode> {
     let plugin = cmd.task.plugin.clone().map(plugin_invocation).transpose()?;
 
@@ -553,7 +664,9 @@ impl TaskGraphBuilder {
     let id = Uuid::new_v4().to_string();
     let execution_binding = context.output_scope.clone().map(|scope| {
       if let Some(plugin) = &plugin {
-        let step = self.scope_allocator.step(&scope, plugin.key());
+        let step = self
+          .scope_allocator
+          .step(&scope, configured_step_id.unwrap_or_else(|| plugin.key()));
         ExecutionBinding::for_step(scope, step)
       } else {
         ExecutionBinding::for_task(scope)
@@ -563,6 +676,7 @@ impl TaskGraphBuilder {
       .id(id)
       .name(cmd.name.clone())
       .dep_name(context.dep_name.clone())
+      .cache_key(cache_key)
       .dir(self.task_working_dir(cmd))
       .vars(runtime.vars().clone())
       .envs(runtime.configured_envs())
@@ -573,6 +687,7 @@ impl TaskGraphBuilder {
       .timeout(cmd.task.timeout)
       .execution_binding(execution_binding)
       .prefix_template(cmd.task.prefix.clone())
+      .step_exports(step_exports(&cmd.task, configured_step_id))
       .interactive_session(context.interactive_session.clone())
       .silent(self.force_silence.or(cmd.task.silent).or(cmd.octafile.silent))
       .quiet(if self.force_quiet {
@@ -596,6 +711,12 @@ impl TaskGraphBuilder {
     dag.add_node(arc_task.clone());
 
     Ok(arc_task)
+  }
+
+  /// Returns a cache identity shared by repeated invocations of the same
+  /// task definition, but not by separate commands with equal payloads.
+  fn command_cache_key(task_name: &str, command_index: usize) -> String {
+    format!("{task_name}::command[{command_index}]")
   }
 
   /// Creates a single-evaluation condition node and adds its result to the task scope.
@@ -1060,4 +1181,26 @@ fn task_output_mode(mode: TaskOutputMode) -> RenderMode {
     TaskOutputMode::Replacing => RenderMode::Replacing,
     TaskOutputMode::Timed => RenderMode::Timed,
   }
+}
+
+fn step_exports(task: &Task, step_id: Option<&str>) -> HashMap<String, StepExport> {
+  let Some(step_id) = step_id else {
+    return HashMap::new();
+  };
+  task
+    .outputs
+    .as_ref()
+    .into_iter()
+    .flat_map(|outputs| outputs.iter())
+    .filter(|(_, output)| output.step == step_id)
+    .map(|(name, output)| {
+      (
+        name.clone(),
+        StepExport {
+          field: output.field.clone(),
+          secret: output.secret,
+        },
+      )
+    })
+    .collect()
 }

@@ -61,6 +61,263 @@ fn repeated_dependencies_receive_distinct_invocation_names() {
   );
 }
 
+fn structured_plugin_schemas() -> octa_octafile::PluginSchemas {
+  octa_octafile::PluginSchemas::from([(
+    "key".to_owned(),
+    octa_octafile::PluginTypeSchema {
+      input: None,
+      output: serde_json::json!({
+        "type": "object",
+        "properties": { "digest": { "type": "string" } },
+        "required": ["digest"],
+        "additionalProperties": false
+      })
+      .as_object()
+      .cloned(),
+    },
+  )])
+}
+
+#[tokio::test]
+async fn validates_task_output_references_before_execution() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let path = temp_dir.path().join("Octafile.yml");
+  fs::write(
+    &path,
+    r#"
+version: 1
+tasks:
+  image:
+    cmds:
+      - id: package
+        key: build
+    outputs:
+      digest: { step: package, field: digest }
+  deploy:
+    deps:
+      - task: image
+    vars:
+      IMAGE_DIGEST:
+        from: { task: image, output: digest }
+    key: "{{ IMAGE_DIGEST }}"
+"#,
+  )?;
+  let octafile = Octafile::load_with_schemas(Some(path.clone()), false, structured_plugin_schemas(), "key")?;
+  let plugin_manager = Arc::new(PluginManager::new(temp_dir.path()));
+  TaskGraphBuilder::new(plugin_manager.clone())?
+    .build(octafile, "deploy", false, vec![])
+    .await?;
+
+  let invalid = fs::read_to_string(&path)?.replace("output: digest", "output: missing");
+  fs::write(&path, invalid)?;
+  let octafile = Octafile::load_with_schemas(Some(path.clone()), false, structured_plugin_schemas(), "key")?;
+  assert!(matches!(
+    TaskGraphBuilder::new(plugin_manager)?
+      .build(octafile, "deploy", false, vec![])
+      .await,
+    Err(ExecutorError::InvalidTaskOutputReference { variable, .. }) if variable == "IMAGE_DIGEST"
+  ));
+  Ok(())
+}
+
+#[tokio::test]
+async fn rejects_unresolvable_task_output_references_before_execution() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let path = temp_dir.path().join("Octafile.yml");
+  let plugin_manager = Arc::new(PluginManager::new(temp_dir.path()));
+  let cases = [
+    (
+      r#"
+  deploy:
+    deps: [image]
+    if:
+      before_deps: { key: check }
+    vars:
+      VALUE: { from: { task: image, output: digest } }
+    key: "{{ VALUE }}"
+"#,
+      "cannot be used with a before_deps condition",
+    ),
+    (
+      r#"
+  other:
+    key: run
+  deploy:
+    deps: [other]
+    vars:
+      VALUE: { from: { task: image, output: digest } }
+    key: "{{ VALUE }}"
+"#,
+      "must name exactly one direct dependency",
+    ),
+    (
+      r#"
+  deploy:
+    deps: [image]
+    vars:
+      VALUE: { from: { task: image, output: digest } }
+    key: "{{ VALUE }}"
+"#,
+      "must resolve to exactly one task on this platform",
+    ),
+  ];
+
+  for (deploy, expected) in cases {
+    let platform = if expected.contains("platform") {
+      "    platforms: [not-a-real-platform]\n"
+    } else {
+      ""
+    };
+    fs::write(
+      &path,
+      format!(
+        r#"version: 1
+tasks:
+  image:
+{platform}    cmds:
+      - {{ id: package, key: build }}
+    outputs:
+      digest: {{ step: package, field: digest }}
+{deploy}"#
+      ),
+    )?;
+    let octafile = Octafile::load_with_schemas(Some(path.clone()), false, structured_plugin_schemas(), "key")?;
+    let result = TaskGraphBuilder::new(plugin_manager.clone())?
+      .build(octafile, "deploy", false, vec![])
+      .await;
+    let Err(error) = result else {
+      panic!("reference should have been rejected: {expected}");
+    };
+    assert!(error.to_string().contains(expected), "{error}");
+  }
+  Ok(())
+}
+
+#[tokio::test]
+async fn rejects_an_output_whose_producing_step_is_filtered_on_this_platform() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let path = temp_dir.path().join("Octafile.yml");
+  fs::write(
+    &path,
+    r#"
+version: 1
+tasks:
+  image:
+    cmds:
+      - id: package
+        platforms: [not-a-real-platform]
+        key: build
+    outputs:
+      digest: { step: package, field: digest }
+"#,
+  )?;
+  let octafile = Octafile::load_with_schemas(Some(path.clone()), false, structured_plugin_schemas(), "key")?;
+
+  let result = TaskGraphBuilder::new(Arc::new(PluginManager::new(temp_dir.path())))?
+    .build(octafile, "image", false, vec![])
+    .await;
+
+  assert!(matches!(
+    result,
+    Err(ExecutorError::InvalidTaskOutput { task, output, .. })
+      if task == "image" && output == "digest"
+  ));
+
+  fs::write(
+    &path,
+    format!(
+      r#"
+version: 1
+tasks:
+  image:
+    cmds:
+      - id: package
+        platforms: [{}]
+        key: native
+      - id: package
+        platforms: [not-a-real-platform]
+        key: other
+    outputs:
+      digest: {{ step: package, field: digest }}
+"#,
+      std::env::consts::OS
+    ),
+  )?;
+  let octafile = Octafile::load_with_schemas(Some(path), false, structured_plugin_schemas(), "key")?;
+  TaskGraphBuilder::new(Arc::new(PluginManager::new(temp_dir.path())))?
+    .build(octafile, "image", false, vec![])
+    .await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn exported_plugin_values_flow_to_dependent_variables_and_results() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let path = temp_dir.path().join("Octafile.yml");
+  fs::write(
+    &path,
+    r#"
+version: 1
+tasks:
+  image:
+    cmds:
+      - id: package
+        key: build
+    outputs:
+      digest: { step: package, field: digest }
+  deploy:
+    deps: [image]
+    vars:
+      IMAGE_DIGEST:
+        from: { task: image, output: digest }
+    key: "{{ IMAGE_DIGEST }}"
+"#,
+  )?;
+  let plugins_dir = PathBuf::from("../../plugins").canonicalize()?;
+  let plugin_manager = Arc::new(PluginManager::new(&plugins_dir));
+  let schema = plugin_manager.start_plugin("test.py").await.unwrap();
+  let schemas = octa_octafile::PluginSchemas::from([(
+    schema.key,
+    octa_octafile::PluginTypeSchema {
+      input: schema.input_schema,
+      output: schema.output_schema,
+    },
+  )]);
+  let octafile = Octafile::load_with_schemas(Some(path), false, schemas, "key")?;
+  let allocator = Arc::new(ConsoleScopeAllocator::default());
+  let console = Arc::new(Console::default());
+  let plan = TaskGraphBuilder::new(plugin_manager.clone())?
+    .with_scope_allocator(allocator)
+    .build(octafile, "deploy", false, Vec::new())
+    .await?;
+  let executor = Executor::new(
+    plan,
+    crate::executor::ExecutorConfig::default(),
+    TaskRuntime {
+      plugin_manager: plugin_manager.clone(),
+      terminal: Arc::new(UnsupportedRawTerminal),
+      cache: Arc::new(tokio::sync::Mutex::new(indexmap::IndexMap::new())),
+      fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      console,
+      run_id: 1,
+      dry: false,
+      force: false,
+      deferred_exit_code: None,
+      structured_output_budget: Arc::new(crate::structured_output::StructuredOutputBudget::default()),
+    },
+  )?;
+
+  let result = executor.execute(CancellationToken::new(), "deploy").await?;
+  plugin_manager.shutdown_all().await;
+
+  assert!(result.is_success());
+  let image = result.tasks.iter().find(|task| task.label == "image").unwrap();
+  assert_eq!(image.outputs["digest"], "sha256:test");
+  assert_eq!(image.steps[0].label, "package");
+  assert_eq!(image.steps[0].outputs["digest"], "sha256:test");
+  Ok(())
+}
+
 #[test]
 fn test_matches_platform_and_architecture() {
   for selector in ["linux", "x86_64", "amd64", "x64", "linux/x86_64", "linux/amd64"] {
@@ -311,6 +568,7 @@ tasks:
       dry: false,
       force: false,
       deferred_exit_code: None,
+      structured_output_budget: Arc::new(crate::structured_output::StructuredOutputBudget::default()),
     },
   )?;
 

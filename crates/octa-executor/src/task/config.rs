@@ -160,15 +160,16 @@ impl ConditionRuntime {
 }
 
 /// Output and variable context cached for a task configured to run once.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CacheItem {
   pub(super) result: String,
   pub(super) vars: Vars,
+  pub(super) outputs: CompletionOutputs,
 }
 
 impl CacheItem {
-  pub(crate) fn new(result: String, vars: Vars) -> Self {
-    Self { result, vars }
+  pub(crate) fn new(result: String, vars: Vars, outputs: CompletionOutputs) -> Self {
+    Self { result, vars, outputs }
   }
 }
 
@@ -178,6 +179,7 @@ pub(crate) struct TaskConfig {
   pub id: String,
   pub name: String,
   pub dep_name: String,
+  pub cache_key: String,
 
   // Execution configuration
   pub dir: PathBuf,        // Working directory
@@ -199,6 +201,7 @@ pub(crate) struct TaskConfig {
   pub timeout: Option<Timeout>,                   // Maximum task execution time
   pub(super) execution_binding: Option<ExecutionBinding>,
   pub(super) prefix_template: Option<String>,
+  pub(super) step_exports: HashMap<String, crate::structured_output::StepExport>,
 
   // State management
   pub(super) action: NodeAction,
@@ -216,6 +219,7 @@ pub(crate) struct TaskConfigBuilder {
   id: Option<String>,
   name: Option<String>,
   dep_name: Option<String>,
+  cache_key: Option<String>,
 
   pub dir: Option<PathBuf>,
   pub ignore_errors: Option<bool>,
@@ -234,6 +238,7 @@ pub(crate) struct TaskConfigBuilder {
   pub timeout: Option<Timeout>,
   execution_binding: Option<ExecutionBinding>,
   prefix_template: Option<String>,
+  step_exports: HashMap<String, crate::structured_output::StepExport>,
   interactive_session: Option<String>,
 
   action: NodeAction,
@@ -253,6 +258,12 @@ impl TaskConfigBuilder {
 
   pub(crate) fn id(mut self, id: impl Into<String>) -> Self {
     self.id = Some(id.into());
+    self
+  }
+
+  /// Sets the stable command-position identity used by `once` and `changed`.
+  pub(crate) fn cache_key(mut self, cache_key: impl Into<String>) -> Self {
+    self.cache_key = Some(cache_key.into());
     self
   }
 
@@ -283,6 +294,11 @@ impl TaskConfigBuilder {
 
   pub(crate) fn prefix_template(mut self, prefix_template: Option<String>) -> Self {
     self.prefix_template = prefix_template;
+    self
+  }
+
+  pub(crate) fn step_exports(mut self, step_exports: HashMap<String, crate::structured_output::StepExport>) -> Self {
+    self.step_exports = step_exports;
     self
   }
 
@@ -352,6 +368,7 @@ impl TaskConfigBuilder {
   }
 
   pub(crate) fn build(self) -> ExecutorResult<TaskConfig> {
+    let name = self.name.ok_or(ExecutorError::TaskConfigFieldMissing("name"))?;
     let dir = match self.dir {
       Some(dir) => dir,
       None if self.action.needs_working_directory() => return Err(ExecutorError::TaskConfigFieldMissing("dir")),
@@ -359,7 +376,8 @@ impl TaskConfigBuilder {
     };
     Ok(TaskConfig {
       id: self.id.ok_or(ExecutorError::TaskConfigFieldMissing("id"))?,
-      name: self.name.ok_or(ExecutorError::TaskConfigFieldMissing("name"))?,
+      cache_key: self.cache_key.unwrap_or_else(|| name.clone()),
+      name,
       dep_name: self.dep_name.ok_or(ExecutorError::TaskConfigFieldMissing("dep_name"))?,
       dir,
       ignore_errors: self.ignore_errors.unwrap_or(false),
@@ -378,6 +396,7 @@ impl TaskConfigBuilder {
       timeout: self.timeout,
       execution_binding: self.execution_binding,
       prefix_template: self.prefix_template,
+      step_exports: self.step_exports,
       action: self.action,
       plugin: self.plugin,
     })

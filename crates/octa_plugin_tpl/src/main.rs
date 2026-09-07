@@ -31,7 +31,7 @@ fn plugin_schema() -> PluginSchema {
     key: "tpl".to_owned(),
     supports_raw: false,
     capabilities: Vec::new(),
-    validation_schema: serde_json::json!({
+    input_schema: serde_json::json!({
       "oneOf": [
         { "type": "string" },
         {
@@ -46,6 +46,7 @@ fn plugin_schema() -> PluginSchema {
     })
     .as_object()
     .cloned(),
+    output_schema: None,
   }
 }
 
@@ -210,7 +211,7 @@ mod tests {
 
     assert_eq!(schema.key, "tpl");
     assert!(schema.capabilities.is_empty());
-    assert_eq!(schema.validation_schema.unwrap()["oneOf"].as_array().unwrap().len(), 2);
+    assert_eq!(schema.input_schema.unwrap()["oneOf"].as_array().unwrap().len(), 2);
   }
 
   #[tokio::test]

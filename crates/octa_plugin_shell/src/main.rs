@@ -273,7 +273,8 @@ fn plugin_schema() -> PluginSchema {
     key: "shell".to_owned(),
     supports_raw: true,
     capabilities: vec![SHELL_CAPABILITY.to_owned()],
-    validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+    input_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+    output_schema: None,
   }
 }
 
@@ -508,7 +509,7 @@ mod tests {
     assert_eq!(schema.key, "shell");
     assert_eq!(schema.capabilities, [SHELL_CAPABILITY]);
     assert_eq!(
-      schema.validation_schema.unwrap().get("type"),
+      schema.input_schema.unwrap().get("type"),
       Some(&Value::String("string".to_owned()))
     );
   }

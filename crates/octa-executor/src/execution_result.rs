@@ -67,8 +67,11 @@ impl ExecutionFailure {
       ExecutorError::TaskFailed(_) => ExecutionFailureKind::Task,
       ExecutorError::PluginUnavailable(_)
       | ExecutorError::PluginValidationFailed(..)
+      | ExecutorError::PluginOutputValidationFailed(..)
       | ExecutorError::RawUnsupported(_)
       | ExecutorError::PluginOutputTooLarge { .. }
+      | ExecutorError::StructuredOutputLimitExceeded { .. }
+      | ExecutorError::StructuredOutputSerializationFailed(_)
       | ExecutorError::PluginEvaluationUnavailable(_) => ExecutionFailureKind::Plugin,
       ExecutorError::TaskParsedError
       | ExecutorError::CycleDetected
@@ -94,6 +97,10 @@ impl ExecutionFailure {
       | ExecutorError::RequiredVariableEnumError(..)
       | ExecutorError::VariablePromptUnavailable(_)
       | ExecutorError::VariablePromptFailed(..)
+      | ExecutorError::TaskOutputMissing { .. }
+      | ExecutorError::DependencyOutputMissing { .. }
+      | ExecutorError::InvalidTaskOutputReference { .. }
+      | ExecutorError::InvalidTaskOutput { .. }
       | ExecutorError::ExecutionIdentityError(_)
       | ExecutorError::GetCotafile(_) => ExecutionFailureKind::Configuration,
       ExecutorError::ShutdownTimeout
@@ -282,6 +289,12 @@ pub struct TaskResult {
   pub conclusion: ExecutionConclusion,
   /// Selector for every streamed output event belonging to this task.
   pub output: OutputReference,
+  /// Typed values explicitly exported by this task.
+  #[serde(default, skip_serializing_if = "Map::is_empty")]
+  pub outputs: Map<String, Value>,
+  /// Names of secret outputs withheld from this serializable result.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub redacted_outputs: Vec<String>,
   /// Executable steps in declaration order.
   pub steps: Vec<StepResult>,
 }
@@ -305,8 +318,8 @@ pub struct ExecutionResult {
   pub conclusion: ExecutionConclusion,
   /// Task invocations ordered by their execution-local declaration IDs.
   pub tasks: Vec<TaskResult>,
-  /// Values exported by successful DAG nodes for dependency interpolation.
-  pub outputs: Vec<String>,
+  /// Captured stdout returned by successful root DAG nodes in declaration order.
+  pub stdout: Vec<String>,
 }
 
 impl ExecutionResult {
@@ -472,6 +485,8 @@ mod tests {
         finished_at: now,
         conclusion: ExecutionConclusion::Failed(failure),
         output: OutputReference::task(11, 2),
+        outputs: serde_json::Map::new(),
+        redacted_outputs: Vec::new(),
         steps: vec![StepResult {
           step_id: 7,
           label: "shell".to_owned(),
@@ -482,7 +497,7 @@ mod tests {
           outputs: serde_json::Map::new(),
         }],
       }],
-      outputs: vec!["artifact".to_owned()],
+      stdout: vec!["artifact".to_owned()],
     };
 
     let encoded = serde_json::to_string(&result).unwrap();

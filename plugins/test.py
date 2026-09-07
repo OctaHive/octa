@@ -54,7 +54,7 @@ class CommandHandler:
             "payload": {
               "id": command_id,
               "code": 0,
-              "outputs": {}
+              "outputs": {"digest": "sha256:test"}
             }
         }
         response.append(completed)
@@ -66,6 +66,14 @@ class CommandHandler:
           "type": "Schema",
           "payload": {
             "key": "key",
+            "output_schema": {
+              "type": "object",
+              "properties": {
+                "digest": {"type": "string"}
+              },
+              "required": ["digest"],
+              "additionalProperties": False
+            }
           }
       }
       return False, [response]

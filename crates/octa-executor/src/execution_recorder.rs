@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 
 use crate::{
   execution_result::{conclusion, ExecutionFailure, OutputReference, StepResult, TaskResult, TaskRole},
+  structured_output::{CompletionOutputs, TaskOutputs},
   task::ExecutionBinding,
 };
 
@@ -40,6 +41,8 @@ struct ScopeState {
   failure: Option<ExecutionFailure>,
   /// Observation time used to select the run's originating failure.
   failure_at: Option<DateTime<Utc>>,
+  /// Values exported by successful steps, including secrets kept internal until result materialization.
+  outputs: TaskOutputs,
 }
 
 impl Default for ScopeState {
@@ -52,6 +55,7 @@ impl Default for ScopeState {
       finished_at: None,
       failure: None,
       failure_at: None,
+      outputs: TaskOutputs::default(),
     }
   }
 }
@@ -111,7 +115,7 @@ struct StepState {
   /// Failure attached to the step's terminal result.
   failure: Option<ExecutionFailure>,
   /// Structured values returned by the step's plugin operation.
-  outputs: Map<String, Value>,
+  outputs: Arc<Map<String, Value>>,
 }
 
 /// Tracks task/step lifecycle separately from DAG scheduling and task payloads.
@@ -166,7 +170,7 @@ impl ExecutionRecorder {
             started_at: None,
             finished_at: None,
             failure: None,
-            outputs: Map::new(),
+            outputs: Arc::new(Map::new()),
           },
         );
       }
@@ -343,7 +347,7 @@ impl ExecutionRecorder {
     binding: &ExecutionBinding,
     status: ConsoleStatus,
     failure: Option<ExecutionFailure>,
-    outputs: Map<String, Value>,
+    outputs: CompletionOutputs,
   ) -> io::Result<()> {
     let scope = binding.scope();
     let failure_at = failure.as_ref().map(|_| Utc::now());
@@ -368,7 +372,7 @@ impl ExecutionRecorder {
       }
     }
     self
-      .finish_step(binding.step(), status, failure.clone(), outputs)
+      .finish_step(binding.step(), status, failure.clone(), outputs.shared_step())
       .await?;
     let finished = {
       let mut states = self.states.lock().await;
@@ -391,6 +395,7 @@ impl ExecutionRecorder {
       // the complete invocation failed regardless of later successes/skips.
       state.status = state.status.max(status);
       record_timed_failure(&mut state.failure, &mut state.failure_at, failure, failure_at);
+      state.outputs.extend(outputs.task());
       state.remaining -= 1;
       if state.remaining == 0 {
         state.lifecycle = LifecycleState::PublishingFinish;
@@ -450,7 +455,7 @@ impl ExecutionRecorder {
     step: Option<&ConsoleStep>,
     status: ConsoleStatus,
     failure: Option<ExecutionFailure>,
-    outputs: Map<String, Value>,
+    outputs: Arc<Map<String, Value>>,
   ) -> io::Result<()> {
     let Some(step) = step else {
       return Ok(());
@@ -597,7 +602,7 @@ impl ExecutionRecorder {
             Some(step.id()),
           ),
           output: OutputReference::step(self.run_id, state.scope.id(), step.id()),
-          outputs: state.outputs.clone(),
+          outputs: state.outputs.as_ref().clone(),
         });
     }
     drop(steps);
@@ -620,6 +625,8 @@ impl ExecutionRecorder {
           finished_at,
           conclusion: conclusion(state.status, state.failure.clone(), Some(scope.id()), None),
           output: OutputReference::task(self.run_id, scope.id()),
+          outputs: state.outputs.public_values(),
+          redacted_outputs: state.outputs.secret_names(),
           steps: steps_by_scope.remove(&scope.id()).unwrap_or_default(),
         })
       })
@@ -747,6 +754,14 @@ mod tests {
     (console, renderer)
   }
 
+  fn completion_outputs(step: Map<String, Value>, task: Map<String, Value>) -> CompletionOutputs {
+    let mut task_outputs = TaskOutputs::default();
+    for (name, value) in task {
+      task_outputs.insert(name, value, false);
+    }
+    CompletionOutputs::new(step, task_outputs)
+  }
+
   #[derive(Clone)]
   struct RejectFirstFinish {
     records: Arc<StdMutex<Vec<ConsoleRecord>>>,
@@ -799,11 +814,24 @@ mod tests {
     tracker.declare().await.unwrap();
     tracker.start_scope(&binding).await.unwrap();
     tracker.start_step(&binding).await.unwrap();
+    let exported = serde_json::Map::from_iter([("digest".to_owned(), serde_json::json!("sha256:test"))]);
+    let mut task_outputs = TaskOutputs::default();
+    task_outputs.insert("digest".to_owned(), serde_json::json!("sha256:test"), false);
+    task_outputs.insert("token".to_owned(), serde_json::json!("private"), true);
     tracker
-      .complete(&binding, ConsoleStatus::Success, None, Default::default())
+      .complete(
+        &binding,
+        ConsoleStatus::Success,
+        None,
+        CompletionOutputs::new(Default::default(), task_outputs),
+      )
       .await
       .unwrap();
     tracker.finish_remaining(ConsoleStatus::Failed).await.unwrap();
+
+    let results = tracker.results().await.unwrap();
+    assert_eq!(results[0].outputs, exported);
+    assert_eq!(results[0].redacted_outputs, ["token"]);
 
     let events = renderer.0.lock().unwrap();
     assert_eq!(
@@ -861,7 +889,12 @@ mod tests {
     );
     let outputs = serde_json::Map::from_iter([("digest".to_owned(), serde_json::json!("sha256:test"))]);
     tracker
-      .complete(&binding, ConsoleStatus::Failed, Some(failure.clone()), outputs.clone())
+      .complete(
+        &binding,
+        ConsoleStatus::Failed,
+        Some(failure.clone()),
+        completion_outputs(outputs.clone(), Default::default()),
+      )
       .await
       .unwrap();
     tracker.finish_remaining(ConsoleStatus::Failed).await.unwrap();

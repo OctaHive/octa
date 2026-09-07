@@ -41,9 +41,10 @@ use crate::{
     ManagerPluginEvaluator, PluginEvaluator, PluginExecutionContext, PluginInvoker, PluginOutput, PluginRequest,
   },
   runtime_output::RuntimeOutput,
+  structured_output::{CompletionOutputs, StructuredOutputBudget, TaskOutputs},
   template::{PluginTemplateContext, TemplateRenderer},
   terminal::RawTerminalConnector,
-  vars::{VariableResolver, Vars},
+  vars::{VariableOverrides, VariableResolver, Vars},
   watcher::WatchTarget,
 };
 
@@ -68,13 +69,15 @@ pub(crate) struct TaskRuntime {
   pub(crate) force: bool,
   /// Exit code exposed to commands executing as part of a deferred action.
   pub(crate) deferred_exit_code: Option<i32>,
+  /// Shared bound for structured values retained by this execution.
+  pub(crate) structured_output_budget: Arc<StructuredOutputBudget>,
 }
 
 /// Result of one DAG node, including whether it performed work or was skipped.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct TaskOutcome {
   output: Arc<str>,
-  structured_outputs: Map<String, Value>,
+  outputs: CompletionOutputs,
   status: ConsoleStatus,
 }
 
@@ -82,7 +85,7 @@ impl TaskOutcome {
   pub(crate) fn new(output: Arc<str>, status: ConsoleStatus) -> Self {
     Self {
       output,
-      structured_outputs: Map::new(),
+      outputs: CompletionOutputs::default(),
       status,
     }
   }
@@ -90,7 +93,7 @@ impl TaskOutcome {
   pub(crate) fn success(output: impl Into<Arc<str>>) -> Self {
     Self {
       output: output.into(),
-      structured_outputs: Map::new(),
+      outputs: CompletionOutputs::default(),
       status: ConsoleStatus::Success,
     }
   }
@@ -98,13 +101,13 @@ impl TaskOutcome {
   pub(crate) fn skipped(output: impl Into<Arc<str>>) -> Self {
     Self {
       output: output.into(),
-      structured_outputs: Map::new(),
+      outputs: CompletionOutputs::default(),
       status: ConsoleStatus::Skipped,
     }
   }
 
-  pub(crate) fn with_structured_outputs(mut self, outputs: Map<String, Value>) -> Self {
-    self.structured_outputs = outputs;
+  pub(crate) fn with_outputs(mut self, outputs: CompletionOutputs) -> Self {
+    self.outputs = outputs;
     self
   }
 
@@ -121,16 +124,58 @@ impl TaskOutcome {
     self.output
   }
 
-  pub(crate) fn into_parts(self) -> (Arc<str>, Map<String, Value>) {
-    (self.output, self.structured_outputs)
+  pub(crate) fn into_parts(self) -> (Arc<str>, CompletionOutputs) {
+    (self.output, self.outputs)
+  }
+}
+
+/// Text and typed values published by one completed dependency invocation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DependencyResult {
+  stdout: Arc<str>,
+  outputs: TaskOutputs,
+}
+
+impl DependencyResult {
+  #[cfg(test)]
+  pub(crate) fn new(stdout: Arc<str>, outputs: Map<String, Value>) -> Self {
+    let mut task_outputs = TaskOutputs::default();
+    for (name, value) in outputs {
+      task_outputs.insert(name, value, false);
+    }
+    Self {
+      stdout,
+      outputs: task_outputs,
+    }
+  }
+
+  pub(crate) fn with_outputs(stdout: Arc<str>, outputs: TaskOutputs) -> Self {
+    Self { stdout, outputs }
+  }
+
+  pub(crate) fn stdout(&self) -> &str {
+    &self.stdout
+  }
+
+  pub(crate) fn outputs(&self) -> &TaskOutputs {
+    &self.outputs
+  }
+
+  pub(crate) fn merge_missing(&mut self, older: &Self) {
+    self.outputs.extend_missing(&older.outputs);
+  }
+
+  fn merge(&mut self, newer: Self) {
+    self.stdout = newer.stdout;
+    self.outputs.extend(&newer.outputs);
   }
 }
 
 #[async_trait]
 pub(crate) trait Executable: TaskItem {
   async fn execute(&self, runtime: TaskRuntime, cancel_token: CancellationToken) -> ExecutorResult<TaskOutcome>;
-  async fn set_result(&self, task_name: String, result: Arc<str>);
-  async fn bypass_result(&self, result: HashMap<String, Arc<str>>);
+  async fn set_result(&self, task_name: String, result: DependencyResult);
+  async fn bypass_result(&self, result: HashMap<String, DependencyResult>);
 }
 
 #[cfg(test)]
@@ -178,11 +223,15 @@ impl ExecutionBinding {
 pub(crate) trait TaskItem: Identifiable {
   fn name(&self) -> &str;
 
+  fn dependency_name(&self) -> &str {
+    self.name()
+  }
+
   fn is_internal(&self) -> bool {
     false
   }
 
-  async fn get_deps_result(&self) -> HashMap<String, Arc<str>>;
+  async fn get_deps_result(&self) -> HashMap<String, DependencyResult>;
   fn failfast(&self) -> bool;
   fn requires_concurrency_permit(&self) -> bool;
 
@@ -292,6 +341,7 @@ pub(crate) struct TaskNode {
   pub(crate) id: String,       // Task uniq id
   pub(crate) name: String,     // Task name
   pub(crate) dep_name: String, // Name of task in deps
+  cache_key: String,           // Stable task-definition command position
 
   // Execution configuration
   pub(crate) dir: PathBuf,        // Working directory
@@ -315,9 +365,10 @@ pub(crate) struct TaskNode {
   pub(crate) timeout: Option<Timeout>, // Maximum task execution time
   execution_binding: Option<ExecutionBinding>,
   prefix_template: Option<String>,
+  step_exports: HashMap<String, crate::structured_output::StepExport>,
 
   // State management
-  pub(crate) deps_res: Arc<Mutex<HashMap<String, Arc<str>>>>, // Shared dependency results
+  pub(crate) deps_res: Arc<Mutex<HashMap<String, DependencyResult>>>, // Shared dependency results
   action: NodeAction,
   plugin: Option<PluginInvocation>,
 }
@@ -352,7 +403,11 @@ impl TaskItem for TaskNode {
     &self.name
   }
 
-  async fn get_deps_result(&self) -> HashMap<String, Arc<str>> {
+  fn dependency_name(&self) -> &str {
+    &self.dep_name
+  }
+
+  async fn get_deps_result(&self) -> HashMap<String, DependencyResult> {
     self.deps_res.lock().await.clone()
   }
 

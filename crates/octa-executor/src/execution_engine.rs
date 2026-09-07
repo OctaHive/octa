@@ -209,7 +209,7 @@ impl ExecutionEngine {
           finished_at,
           conclusion: conclusion(status, Some(ExecutionFailure::from_error(&error, None)), None, None),
           tasks: Vec::new(),
-          outputs: Vec::new(),
+          stdout: Vec::new(),
         });
       },
     };
@@ -288,6 +288,7 @@ impl ExecutionEngine {
         dry,
         force,
         deferred_exit_code: None,
+        structured_output_budget: Arc::new(crate::structured_output::StructuredOutputBudget::default()),
       },
     )?;
     Ok(PreparedExecution {

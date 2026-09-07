@@ -49,7 +49,7 @@ run (`run_id`)
 
 A `progress` event carries a human-readable `message` plus optional `current`, `total`, and `unit`.
 It is transient command state, not stdout/stderr, and is therefore not included in output capture or
-`ExecutionResult.outputs`. Consumers may display or store progress events, but must not require one
+the terminal result's textual outputs. Consumers may display or store progress events, but must not require one
 before accepting a terminal step event. If a producer outpaces its consumer, Octa coalesces pending
 updates per command and preserves the newest value; progress delivery is best-effort and never
 delays terminal output. Plugins that do not support structured progress continue to work; the
@@ -102,8 +102,10 @@ call is still attempted.
 The live event stream and the Rust `ExecutionResult` use the same `run_id`, task IDs, and step IDs.
 Events are the streaming observation interface; the result returned by `Executor::execute` is the
 authoritative terminal snapshot with timestamps and structured conclusions for the run, its tasks,
-and their steps. Each `StepResult.outputs` map contains the typed values supplied by the plugin's
-terminal `Completed` response. `OutputReference` points back to matching output events instead of
+and their steps. Each `StepResult.outputs` map contains the typed object supplied by the plugin's
+successful terminal `Completed` response except fields exported as secret. `TaskResult.outputs`
+contains only public fields explicitly exported from named steps; `redacted_outputs` names secret
+exports whose values remain internal to dependency resolution. `OutputReference` points back to matching output events instead of
 retaining a second copy of their payloads. Expected execution failures are represented in the
 snapshot, while an `ExecutorError` return means a complete snapshot could not be formed or
 published.

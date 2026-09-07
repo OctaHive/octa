@@ -26,22 +26,11 @@ struct GraphActionRuntime<'a> {
 }
 
 impl TaskNode {
-  /// Builds highest-priority expansion overrides for a deferred invocation.
+  /// Ensures a deferred status is present on the node-owned context snapshot.
   ///
-  /// `EXIT_CODE` must be visible while templates and shell-backed values are
-  /// resolved, not merely added to the final plugin variable map.
-  fn deferred_variable_overrides(exit_code: Option<i32>) -> IndexMap<String, Value> {
-    exit_code
-      .map(|exit_code| ("EXIT_CODE".to_owned(), Value::from(exit_code)))
-      .into_iter()
-      .collect()
-  }
-
-  /// Adds `EXIT_CODE` to a cloned resolved context without polluting the shared cache.
-  ///
-  /// Invocation contexts are cached in a `OnceCell`. Applying this value after
-  /// cloning prevents one deferred execution's status from becoming permanent
-  /// state for another consumer of that context.
+  /// Deferred plans own their invocation runtime and use one exit code for all
+  /// of its nodes. The additional insertion also covers an already initialized
+  /// context without mutating the stored snapshot.
   fn expose_deferred_exit_code(vars: &mut Vars, exit_code: Option<i32>) {
     if let Some(exit_code) = exit_code {
       vars.insert("EXIT_CODE", &exit_code);
@@ -66,6 +55,7 @@ impl TaskNode {
       id: config.id,
       name: config.name,
       dep_name: config.dep_name,
+      cache_key: config.cache_key,
       run_mode: config.run_mode,
       #[cfg(test)]
       vars: config.vars,
@@ -87,6 +77,7 @@ impl TaskNode {
       timeout: config.timeout,
       execution_binding: config.execution_binding,
       prefix_template: config.prefix_template,
+      step_exports: config.step_exports,
       plugin: config.plugin,
     }
   }
@@ -260,6 +251,17 @@ impl TaskNode {
       .invocation_runtime
       .context
       .get_or_try_init(|| async {
+        // Dependency values can be large JSON objects. Resolve and clone them
+        // only for the node that initializes the invocation-wide context.
+        let mut overrides = {
+          let dependencies = self.deps_res.lock().await;
+          self.task_output_overrides(&dependencies)?
+        };
+        if let Some(exit_code) = deferred_exit_code {
+          // This must precede expansion so deferred task vars and environments
+          // can reference EXIT_CODE in their templates.
+          overrides.insert("EXIT_CODE".to_owned(), Value::from(exit_code), false);
+        }
         let dir_is_template = {
           let value = self.dir.to_string_lossy();
           value.contains("{{") && value.contains("}}")
@@ -276,15 +278,10 @@ impl TaskNode {
         // values are available to every later variable and directory template.
         let mut vars = self.invocation_runtime.vars.clone();
         vars
-          .resolve_required(self.invocation_runtime.resolver.as_deref())
+          .resolve_required_with_overrides(self.invocation_runtime.resolver.as_deref(), &overrides)
           .await?;
         vars
-          .expand_with_evaluator_and_overrides(
-            evaluator.clone(),
-            dry,
-            cancel_token.clone(),
-            Self::deferred_variable_overrides(deferred_exit_code),
-          )
+          .expand_with_evaluator_and_overrides(evaluator.clone(), dry, cancel_token.clone(), overrides)
           .await?;
 
         // A templated directory can only be created after its variables have been expanded.
@@ -311,6 +308,30 @@ impl TaskNode {
     let mut context = context.clone();
     Self::expose_deferred_exit_code(&mut context.vars, deferred_exit_code);
     Ok(context)
+  }
+
+  /// Resolves dependency references at the task boundary, keeping [`Vars`] independent of DAG transport types.
+  fn task_output_overrides(
+    &self,
+    dependencies: &HashMap<String, DependencyResult>,
+  ) -> ExecutorResult<VariableOverrides> {
+    let mut overrides = VariableOverrides::default();
+    for variable in self.invocation_runtime.vars.task_output_references() {
+      let output = dependencies
+        .get(&variable.reference.task)
+        .and_then(|result| result.outputs().get(&variable.reference.output))
+        .cloned()
+        .ok_or_else(|| ExecutorError::DependencyOutputMissing {
+          variable: variable.name.clone(),
+          task: variable.reference.task.clone(),
+          output: variable.reference.output.clone(),
+        })?;
+      let inherited_secret = dependencies
+        .get(&variable.reference.task)
+        .is_some_and(|result| result.outputs().is_secret(&variable.reference.output));
+      overrides.insert(variable.name, output, variable.secret || inherited_secret);
+    }
+    Ok(overrides)
   }
 
   /// Emits informational task messages only for visible command nodes.
@@ -422,7 +443,7 @@ impl TaskNode {
     let mut vars = vars.clone();
     let dependency_values = deps_res
       .iter()
-      .map(|(name, value)| (name.as_str(), value.as_ref()))
+      .map(|(name, value)| (name.as_str(), value.stdout()))
       .collect::<HashMap<_, _>>();
     vars.insert("deps_result", &dependency_values);
     drop(deps_res);
@@ -483,7 +504,7 @@ impl TaskNode {
     let deps_res = self.deps_res.lock().await;
     let dependency_values = deps_res
       .iter()
-      .map(|(name, value)| (name.as_str(), value.as_ref()))
+      .map(|(name, value)| (name.as_str(), value.stdout()))
       .collect::<HashMap<_, _>>();
     context.insert("deps_result", &dependency_values);
     drop(deps_res);
@@ -527,18 +548,18 @@ impl TaskNode {
     &self,
     vars: &Vars,
     cache: &Arc<Mutex<IndexMap<String, CacheItem>>>,
-  ) -> ExecutorResult<Option<String>> {
+  ) -> ExecutorResult<Option<CacheItem>> {
     if self.run_mode == RunMode::Always {
       return Ok(None);
     }
 
     let cache_lock = cache.lock().await;
-    if let Some(cached_result) = cache_lock.get(&self.name) {
+    if let Some(cached_result) = cache_lock.get(&self.cache_key) {
       if self.run_mode == RunMode::Once {
-        return Ok(Some(cached_result.result.clone()));
+        return Ok(Some(cached_result.clone()));
       } else if &cached_result.vars == vars {
         debug!("Cache hit for task: {}", self.name);
-        return Ok(Some(cached_result.result.clone()));
+        return Ok(Some(cached_result.clone()));
       }
     }
     Ok(None)
@@ -548,12 +569,16 @@ impl TaskNode {
   async fn update_cache(
     &self,
     result: &str,
-    vars: Vars,
+    vars: &Vars,
+    outputs: &CompletionOutputs,
     cache: &Arc<Mutex<IndexMap<String, CacheItem>>>,
   ) -> ExecutorResult<()> {
     if self.run_mode != RunMode::Always {
       let mut cache_lock = cache.lock().await;
-      cache_lock.insert(self.name.clone(), CacheItem::new(result.to_string(), vars.clone()));
+      cache_lock.insert(
+        self.cache_key.clone(),
+        CacheItem::new(result.to_string(), vars.clone(), outputs.clone()),
+      );
       debug!("Cached result for task: {}", self.name);
     }
     Ok(())
@@ -565,6 +590,29 @@ impl TaskNode {
       let deps = self.deps_res.lock().await;
       debug!(dependencies = ?deps.keys().collect::<Vec<_>>(), "Resolved dependency results");
     }
+  }
+
+  /// Selects task-level outputs and removes secret exports from the public step result.
+  pub(super) fn completion_outputs(&self, mut step_outputs: Map<String, Value>) -> ExecutorResult<CompletionOutputs> {
+    let mut task_outputs = TaskOutputs::default();
+    for (name, export) in &self.step_exports {
+      let value = step_outputs
+        .get(&export.field)
+        .cloned()
+        .ok_or_else(|| ExecutorError::TaskOutputMissing {
+          step: self
+            .execution_binding
+            .as_ref()
+            .and_then(|binding| binding.step())
+            .map_or_else(|| self.name.clone(), |step| step.label().to_owned()),
+          field: export.field.clone(),
+        })?;
+      task_outputs.insert(name.clone(), value, export.secret);
+      if export.secret {
+        step_outputs.remove(&export.field);
+      }
+    }
+    Ok(CompletionOutputs::new(step_outputs, task_outputs))
   }
 
   /// Executes the task without applying its timeout wrapper.
@@ -583,6 +631,7 @@ impl TaskNode {
       dry,
       force,
       deferred_exit_code,
+      structured_output_budget,
     } = runtime;
     let console_target = RuntimeOutput::with_silence(console, run_id, self.execution_binding.clone(), self.silence);
     let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::new(plugin_manager.clone()));
@@ -665,7 +714,8 @@ impl TaskNode {
     }
 
     if let Some(cached) = self.check_cache(&vars, &cache).await? {
-      return Ok(TaskOutcome::skipped(cached));
+      structured_output_budget.reserve(&cached.outputs)?;
+      return Ok(TaskOutcome::skipped(cached.result).with_outputs(cached.outputs));
     }
 
     self
@@ -684,7 +734,7 @@ impl TaskNode {
     let deps_res = self.deps_res.lock().await;
     let dependency_values = deps_res
       .iter()
-      .map(|(name, value)| (name.as_str(), value.as_ref()))
+      .map(|(name, value)| (name.as_str(), value.stdout()))
       .collect::<HashMap<_, _>>();
     vars_with_deps_results.insert("deps_result", &dependency_values);
     drop(deps_res);
@@ -704,7 +754,7 @@ impl TaskNode {
       output: Some(console_target.clone()),
       raw: self.raw,
     };
-    let (result, structured_outputs) = match PluginInvoker::with_terminal(plugin_manager, terminal)
+    let (result, outputs) = match PluginInvoker::with_terminal(plugin_manager, terminal)
       .invoke(request, cancel_token.clone())
       .await
     {
@@ -718,15 +768,16 @@ impl TaskNode {
         } = output;
         if code != 0 && !cancel_token.is_cancelled() {
           if self.ignore_errors {
-            // Ignored failures are terminal successes with empty dependency
-            // output, while the diagnostic remains visible to the user.
+            // Ignored failures are terminal successes with no structured
+            // result. Failed completions are not output-schema validated, so
+            // neither step results nor dependency exports may retain them.
             console_target
               .message(
                 ConsoleLevel::Error,
                 format!("Task {} failed but errors ignored. Error code: {}", self.name, code),
               )
               .await?;
-            (Ok("".to_string()), outputs)
+            (Ok("".to_string()), CompletionOutputs::default())
           } else {
             (
               Err(ExecutorError::CommandFailed {
@@ -740,7 +791,9 @@ impl TaskNode {
           }
         } else {
           // Only successful command output participates in task run-mode cache.
-          self.update_cache(stdout.trim(), vars, &cache).await?;
+          let outputs = self.completion_outputs(outputs)?;
+          structured_output_budget.reserve(&outputs)?;
+          self.update_cache(stdout.trim(), &vars, &outputs, &cache).await?;
           (Ok(stdout.trim().to_string()), outputs)
         }
       },
@@ -752,7 +805,7 @@ impl TaskNode {
         Default::default(),
       ),
     };
-    result.map(|output| TaskOutcome::success(output).with_structured_outputs(structured_outputs))
+    result.map(|output| TaskOutcome::success(output).with_outputs(outputs))
   }
 
   /// Converts an invocation error according to the task's `ignore_error` policy.
@@ -774,16 +827,27 @@ impl TaskNode {
 #[async_trait]
 impl Executable for TaskNode {
   /// Stores one direct dependency result for later templates and plugin input.
-  async fn set_result(&self, task_name: String, result: Arc<str>) {
+  async fn set_result(&self, task_name: String, result: DependencyResult) {
     let mut deps_res = self.deps_res.lock().await;
-
-    deps_res.insert(task_name, result);
+    match deps_res.get_mut(&task_name) {
+      Some(existing) => existing.merge(result),
+      None => {
+        deps_res.insert(task_name, result);
+      },
+    }
   }
 
   /// Replaces dependency results when an internal node propagates a bypassed branch.
-  async fn bypass_result(&self, result: HashMap<String, Arc<str>>) {
+  async fn bypass_result(&self, result: HashMap<String, DependencyResult>) {
     let mut deps_res = self.deps_res.lock().await;
-    *deps_res = result;
+    for (name, result) in result {
+      match deps_res.get_mut(&name) {
+        Some(existing) => existing.merge(result),
+        None => {
+          deps_res.insert(name, result);
+        },
+      }
+    }
   }
 
   /// Executes the node and enforces its optional wall-clock timeout.

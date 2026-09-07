@@ -47,6 +47,10 @@ pub enum ExecutorError {
   #[error("Invalid parameters for plugin '{0}': {1}")]
   PluginValidationFailed(String, String),
 
+  /// Successful plugin outputs did not satisfy the declared output schema.
+  #[error("Invalid outputs from plugin '{0}': {1}")]
+  PluginOutputValidationFailed(String, String),
+
   /// The selected plugin cannot execute through a raw terminal session.
   #[error("Plugin '{0}' does not support raw/PTY execution")]
   RawUnsupported(String),
@@ -59,6 +63,17 @@ pub enum ExecutorError {
     /// Configured result limit in mebibytes.
     limit_mib: usize,
   },
+
+  /// Retaining structured step results would exceed the run-level memory budget.
+  #[error("Structured outputs exceed the {limit} byte execution limit")]
+  StructuredOutputLimitExceeded {
+    /// Maximum serialized structured output retained by one execution.
+    limit: usize,
+  },
+
+  /// A structured JSON value could not be measured before retention.
+  #[error("Failed to serialize structured plugin outputs: {0}")]
+  StructuredOutputSerializationFailed(String),
 
   /// A plugin-backed template or condition evaluation returned a failure status.
   #[error("Plugin '{key}' evaluation failed with status {code}: {stderr}")]
@@ -227,6 +242,46 @@ pub enum ExecutorError {
   /// The configured input resolver failed to obtain a required value.
   #[error("Failed to read required variable '{0}': {1}")]
   VariablePromptFailed(String, String),
+
+  /// A successful plugin omitted a field exported by its task declaration.
+  #[error("Plugin step '{step}' did not produce exported field '{field}'")]
+  TaskOutputMissing {
+    /// Stable configured step identifier.
+    step: String,
+    /// Declared plugin output field that was absent.
+    field: String,
+  },
+
+  /// A task variable references an output that was not produced by its dependency.
+  #[error("Variable '{variable}' requires missing output '{output}' from dependency '{task}'")]
+  DependencyOutputMissing {
+    /// Variable that requested the value.
+    variable: String,
+    /// Direct dependency expected to provide it.
+    task: String,
+    /// Public dependency output name.
+    output: String,
+  },
+
+  /// A structured output variable does not name a unique direct dependency export.
+  #[error("Invalid structured output reference for variable '{variable}': {message}")]
+  InvalidTaskOutputReference {
+    /// Variable containing the invalid reference.
+    variable: String,
+    /// Configuration problem detected while planning.
+    message: String,
+  },
+
+  /// A task output does not have exactly one executable producer in the selected plan.
+  #[error("Invalid structured output '{output}' for task '{task}': {message}")]
+  InvalidTaskOutput {
+    /// Task declaring the output.
+    task: String,
+    /// Public output name.
+    output: String,
+    /// Configuration problem detected after platform filtering.
+    message: String,
+  },
 
   /// Loading a referenced or included Octafile failed.
   #[error("Failed to get included octafile: {0}")]

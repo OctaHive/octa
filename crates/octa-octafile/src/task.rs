@@ -1,5 +1,12 @@
-use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+  collections::{HashMap, HashSet},
+  fmt,
+  path::PathBuf,
+  sync::Arc,
+  time::Duration,
+};
 
+use indexmap::IndexMap;
 use serde::{
   de::{DeserializeSeed, MapAccess, Visitor},
   Deserialize, Deserializer, Serialize,
@@ -9,7 +16,16 @@ use serde_yml::Value;
 
 use crate::{octafile::Envs, TaskPresentation, Vars};
 
-pub type PluginSchemas = HashMap<String, Option<serde_json::Map<String, serde_json::Value>>>;
+/// Static schemas exposed by one plugin task type.
+#[derive(Clone, Debug, Default)]
+pub struct PluginTypeSchema {
+  /// Schema used while parsing plugin command values.
+  pub input: Option<serde_json::Map<String, serde_json::Value>>,
+  /// Schema used to validate and statically address plugin completion fields.
+  pub output: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+pub type PluginSchemas = HashMap<String, PluginTypeSchema>;
 
 // Plugin task types share YAML namespaces with task fields, command metadata, and condition
 // controls. Reject collisions during plugin registration instead of parsing the same key
@@ -25,6 +41,7 @@ const RESERVED_PLUGIN_KEYS: &[&str] = &[
   "cmds",
   "internal",
   "platforms",
+  "id",
   "ignore_error",
   "deps",
   "run",
@@ -37,6 +54,7 @@ const RESERVED_PLUGIN_KEYS: &[&str] = &[
   "timeout",
   "sources",
   "output",
+  "outputs",
   "source_strategy",
   "watch",
   "if",
@@ -306,6 +324,9 @@ pub enum CommandPayload {
 /// Execution options shared by every command payload.
 #[derive(Debug, Clone, Default)]
 pub struct CommandOptions {
+  /// Stable name used by task output declarations to select this step.
+  pub id: Option<String>,
+
   /// Platforms on which this command is included in the execution plan.
   pub platforms: Option<Vec<String>>,
 
@@ -371,64 +392,95 @@ pub struct TaskCommand {
   pub options: CommandOptions,
 }
 
+/// Selects one field returned by a named plugin command.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskOutput {
+  /// Stable `id` of the plugin command that produces the value.
+  pub step: String,
+  /// Top-level field selected from that command's structured outputs.
+  pub field: String,
+  /// Prevents this value from being serialized and propagates redaction to consumers.
+  #[serde(default)]
+  pub secret: bool,
+}
+
 pub(crate) struct Context {
-  validators: Arc<HashMap<String, Option<jsonschema::Validator>>>,
+  plugins: Arc<HashMap<String, PluginType>>,
   default_plugin: String,
+}
+
+struct PluginType {
+  input_validator: Option<jsonschema::Validator>,
+  required_output_fields: HashSet<String>,
 }
 
 impl Context {
   pub(crate) fn from_keys(keys: Vec<String>, default_plugin: impl Into<String>) -> Result<Self, String> {
-    let mut validators = HashMap::with_capacity(keys.len());
+    let mut plugins = HashMap::with_capacity(keys.len());
     for key in keys {
       validate_plugin_key(&key)?;
-      if validators.insert(key.clone(), None).is_some() {
+      if plugins
+        .insert(
+          key.clone(),
+          PluginType {
+            input_validator: None,
+            required_output_fields: HashSet::new(),
+          },
+        )
+        .is_some()
+      {
         return Err(format!("duplicated plugin task key '{key}'"));
       }
     }
 
-    Self::new(validators, default_plugin)
+    Self::new(plugins, default_plugin)
   }
 
   pub(crate) fn from_schemas(schemas: PluginSchemas, default_plugin: impl Into<String>) -> Result<Self, String> {
-    let mut validators = HashMap::with_capacity(schemas.len());
+    let mut plugins = HashMap::with_capacity(schemas.len());
 
     for (key, schema) in schemas {
       validate_plugin_key(&key)?;
-
-      let validator = schema
+      let input_validator = schema
+        .input
         .map(|schema| {
           let schema = serde_json::Value::Object(schema);
           jsonschema::validator_for(&schema)
-            .map_err(|error| format!("invalid validation schema for plugin '{key}': {error}"))
+            .map_err(|error| format!("invalid input schema for plugin '{key}': {error}"))
         })
         .transpose()?;
-      validators.insert(key, validator);
+      let required_output_fields = required_output_fields(&key, schema.output)?;
+      plugins.insert(
+        key,
+        PluginType {
+          input_validator,
+          required_output_fields,
+        },
+      );
     }
 
-    Self::new(validators, default_plugin)
+    Self::new(plugins, default_plugin)
   }
 
-  fn new(
-    validators: HashMap<String, Option<jsonschema::Validator>>,
-    default_plugin: impl Into<String>,
-  ) -> Result<Self, String> {
+  fn new(plugins: HashMap<String, PluginType>, default_plugin: impl Into<String>) -> Result<Self, String> {
     let default_plugin = default_plugin.into();
-    if !validators.contains_key(&default_plugin) {
+    if !plugins.contains_key(&default_plugin) {
       return Err(format!("unknown default plugin '{default_plugin}'"));
     }
 
     Ok(Self {
-      validators: Arc::new(validators),
+      plugins: Arc::new(plugins),
       default_plugin,
     })
   }
 
   pub(crate) fn contains(&self, key: &str) -> bool {
-    self.validators.contains_key(key)
+    self.plugins.contains_key(key)
   }
 
   pub(crate) fn validate(&self, key: &str, value: &Value) -> Result<(), String> {
-    let Some(Some(validator)) = self.validators.get(key) else {
+    let Some(validator) = self.plugins.get(key).and_then(|plugin| plugin.input_validator.as_ref()) else {
       return Ok(());
     };
 
@@ -452,7 +504,7 @@ impl Context {
     }
 
     Ok(Self {
-      validators: Arc::clone(&self.validators),
+      plugins: Arc::clone(&self.plugins),
       default_plugin,
     })
   }
@@ -550,6 +602,14 @@ impl Context {
       Value::String(value) => (Value::String(value), CommandOptions::default()),
       Value::Mapping(mut mapping) => {
         // Command metadata belongs to the wrapper and must not be passed to a plugin schema.
+        let id = mapping
+          .remove("id")
+          .map(serde_yml::from_value::<String>)
+          .transpose()
+          .map_err(|error| format!("invalid command id: {error}"))?;
+        if id.as_ref().is_some_and(|id| id.trim().is_empty()) {
+          return Err("command id must not be empty".to_owned());
+        }
         let platforms = mapping
           .remove("platforms")
           .map(serde_yml::from_value::<Vec<String>>)
@@ -585,6 +645,7 @@ impl Context {
           .transpose()
           .map_err(|error| format!("invalid command ignore_error option: {error}"))?;
         let options = CommandOptions {
+          id,
           platforms,
           timeout,
           condition,
@@ -645,6 +706,105 @@ impl Context {
 
     Ok(TaskCommand { payload, options })
   }
+
+  fn validate_task_outputs(&self, task: &Task) -> Result<(), String> {
+    if task.outputs.as_ref().is_some_and(|outputs| !outputs.is_empty())
+      && (task.sources.is_some() || task.output.is_some())
+    {
+      return Err("structured task outputs cannot be combined with freshness sources or file outputs".to_owned());
+    }
+    let mut steps = HashMap::<&str, Vec<(&str, bool)>>::new();
+    for command in task.cmds.as_deref().unwrap_or_default() {
+      let Some(id) = command.options.id.as_deref() else {
+        continue;
+      };
+      let CommandPayload::Plugin(plugin) = &command.payload else {
+        return Err(format!(
+          "command id '{id}' belongs to a task reference, not a plugin step"
+        ));
+      };
+      steps
+        .entry(id)
+        .or_default()
+        .push((plugin.key.as_str(), command.options.deferred));
+    }
+
+    let Some(outputs) = &task.outputs else {
+      return Ok(());
+    };
+    let mut field_secrecy = HashMap::new();
+    for (name, output) in outputs {
+      if name.trim().is_empty() || output.step.trim().is_empty() || output.field.trim().is_empty() {
+        return Err("output names, steps, and fields must not be empty".to_owned());
+      }
+      let producers = steps
+        .get(output.step.as_str())
+        .ok_or_else(|| format!("output '{name}' references unknown plugin step '{}'", output.step))?;
+      if producers.iter().any(|(_, deferred)| *deferred) {
+        return Err(format!("output '{name}' references deferred step '{}'", output.step));
+      }
+      if producers
+        .iter()
+        .any(|(plugin_key, _)| !self.plugins[*plugin_key].required_output_fields.contains(&output.field))
+      {
+        return Err(format!(
+          "output '{name}' references field '{}' that is undeclared or optional on a producer of plugin step '{}'",
+          output.field, output.step
+        ));
+      }
+      if field_secrecy
+        .insert((output.step.as_str(), output.field.as_str()), output.secret)
+        .is_some_and(|secret| secret != output.secret)
+      {
+        return Err(format!(
+          "plugin field '{}.{}' cannot be exported as both secret and public",
+          output.step, output.field
+        ));
+      }
+    }
+    Ok(())
+  }
+}
+
+fn required_output_fields(
+  key: &str,
+  schema: Option<serde_json::Map<String, serde_json::Value>>,
+) -> Result<HashSet<String>, String> {
+  let Some(schema) = schema else {
+    return Ok(HashSet::new());
+  };
+  jsonschema::validator_for(&serde_json::Value::Object(schema.clone()))
+    .map_err(|error| format!("invalid output schema for plugin '{key}': {error}"))?;
+  if schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+    return Err(format!("output schema for plugin '{key}' must have type 'object'"));
+  }
+  if schema.get("additionalProperties").and_then(serde_json::Value::as_bool) != Some(false) {
+    return Err(format!(
+      "output schema for plugin '{key}' must set additionalProperties to false"
+    ));
+  }
+  let properties = schema
+    .get("properties")
+    .and_then(serde_json::Value::as_object)
+    .ok_or_else(|| format!("output schema for plugin '{key}' must declare object properties"))?;
+  let required = schema
+    .get("required")
+    .and_then(serde_json::Value::as_array)
+    .map(|fields| {
+      fields
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<HashSet<_>>()
+    })
+    .unwrap_or_default();
+  Ok(
+    properties
+      .keys()
+      .filter(|field| required.contains(*field))
+      .cloned()
+      .collect(),
+  )
 }
 
 fn validate_plugin_key(key: &str) -> Result<(), String> {
@@ -660,33 +820,34 @@ fn validate_plugin_key(key: &str) -> Result<(), String> {
 
 #[derive(Debug, Clone, Default)]
 pub struct Task {
-  pub env: Option<Envs>,                         // Task environment variables
-  pub dotenv: Option<Vec<String>>,               // Environment files applied to this task
-  pub dir: Option<PathBuf>,                      // Working directory for the task
-  pub desc: Option<String>,                      // Task description
-  pub prefix: Option<String>,                    // Label used by prefixed output
-  pub presentation: Option<TaskPresentation>,    // Task-specific output presentation
-  pub vars: Option<Vars>,                        // Task-specific variables
-  pub cmds: Option<Vec<TaskCommand>>,            // List of commands
-  pub internal: Option<bool>,                    // Show command in list of available commands
-  pub platforms: Option<Vec<String>>,            // Supported platforms
-  pub ignore_error: Option<bool>,                // Whether to continue on error
-  pub deps: Option<Vec<Deps>>,                   // Task dependencies
-  pub run: Option<AllowedRun>,                   // When task should run
-  pub quiet: Option<bool>,                       // Suppress Octa's task diagnostics
-  pub silent: Option<Silence>,                   // Suppress one or both task streams
-  pub raw: Option<bool>,                         // Use exclusive byte-oriented terminal IO
-  pub interactive: Option<bool>,                 // Reserve terminal IO for the whole task body
-  pub execute_mode: Option<ExecuteMode>,         // How execute task commands
-  pub failfast: Option<bool>,                    // Cancel parallel work after the first failure
-  pub timeout: Option<Timeout>,                  // Default timeout for task commands
-  pub sources: Option<Vec<String>>,              // Sources for fingerprinting
-  pub output: Option<Vec<String>>,               // Files produced by this task
-  pub source_strategy: Option<SourceStrategies>, // Strategy used to fingerprint sources
-  pub watch: Option<bool>,                       // Watch sources and rerun the task
-  pub condition: Option<TaskConditions>,         // Plugin conditions around dependency execution
-  pub preconditions: Option<Vec<String>>,        // Commands to check should run command
-  pub plugin: Option<PluginCommand>,             // Plugin command executed by this task
+  pub env: Option<Envs>,                             // Task environment variables
+  pub dotenv: Option<Vec<String>>,                   // Environment files applied to this task
+  pub dir: Option<PathBuf>,                          // Working directory for the task
+  pub desc: Option<String>,                          // Task description
+  pub prefix: Option<String>,                        // Label used by prefixed output
+  pub presentation: Option<TaskPresentation>,        // Task-specific output presentation
+  pub vars: Option<Vars>,                            // Task-specific variables
+  pub cmds: Option<Vec<TaskCommand>>,                // List of commands
+  pub internal: Option<bool>,                        // Show command in list of available commands
+  pub platforms: Option<Vec<String>>,                // Supported platforms
+  pub ignore_error: Option<bool>,                    // Whether to continue on error
+  pub deps: Option<Vec<Deps>>,                       // Task dependencies
+  pub run: Option<AllowedRun>,                       // When task should run
+  pub quiet: Option<bool>,                           // Suppress Octa's task diagnostics
+  pub silent: Option<Silence>,                       // Suppress one or both task streams
+  pub raw: Option<bool>,                             // Use exclusive byte-oriented terminal IO
+  pub interactive: Option<bool>,                     // Reserve terminal IO for the whole task body
+  pub execute_mode: Option<ExecuteMode>,             // How execute task commands
+  pub failfast: Option<bool>,                        // Cancel parallel work after the first failure
+  pub timeout: Option<Timeout>,                      // Default timeout for task commands
+  pub sources: Option<Vec<String>>,                  // Sources for fingerprinting
+  pub output: Option<Vec<String>>,                   // Files produced by this task
+  pub outputs: Option<IndexMap<String, TaskOutput>>, // Structured values exported from named steps
+  pub source_strategy: Option<SourceStrategies>,     // Strategy used to fingerprint sources
+  pub watch: Option<bool>,                           // Watch sources and rerun the task
+  pub condition: Option<TaskConditions>,             // Plugin conditions around dependency execution
+  pub preconditions: Option<Vec<String>>,            // Commands to check should run command
+  pub plugin: Option<PluginCommand>,                 // Plugin command executed by this task
 }
 
 pub(crate) struct TaskSeed<'a> {
@@ -768,6 +929,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "timeout" => task.timeout = map.next_value()?,
         "sources" => task.sources = map.next_value()?,
         "output" => task.output = map.next_value()?,
+        "outputs" => task.outputs = map.next_value()?,
         "source_strategy" => task.source_strategy = map.next_value()?,
         "watch" => task.watch = map.next_value()?,
         "if" => {
@@ -805,6 +967,11 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
       ));
     }
 
+    self
+      .context
+      .validate_task_outputs(&task)
+      .map_err(serde::de::Error::custom)?;
+
     Ok(task)
   }
 }
@@ -815,6 +982,30 @@ mod tests {
 
   fn context() -> Context {
     Context::from_keys(vec!["shell".to_owned(), "tpl".to_owned()], "shell").unwrap()
+  }
+
+  fn structured_context() -> Context {
+    Context::from_schemas(
+      PluginSchemas::from([(
+        "docker".to_owned(),
+        PluginTypeSchema {
+          input: None,
+          output: serde_json::json!({
+            "type": "object",
+            "properties": {
+              "digest": { "type": "string" },
+              "pushed": { "type": "boolean" }
+            },
+            "required": ["digest"],
+            "additionalProperties": false
+          })
+          .as_object()
+          .cloned(),
+        },
+      )]),
+      "docker",
+    )
+    .unwrap()
   }
 
   fn yaml_value(content: &str) -> Value {
@@ -838,7 +1029,7 @@ mod tests {
       assert_eq!(error, format!("plugin task key '{key}' is reserved by Octafile syntax"));
     }
 
-    let schemas = PluginSchemas::from([("timeout".to_string(), None)]);
+    let schemas = PluginSchemas::from([("timeout".to_string(), PluginTypeSchema::default())]);
     let schema_error = Context::from_schemas(schemas, "timeout").err().unwrap();
     assert_eq!(schema_error, "plugin task key 'timeout' is reserved by Octafile syntax");
   }
@@ -850,6 +1041,150 @@ mod tests {
       .unwrap();
 
     assert_eq!(error, "duplicated plugin task key 'shell'");
+  }
+
+  #[test]
+  fn validates_named_step_exports_against_plugin_output_schema() {
+    let task = parse_task(
+      &structured_context(),
+      r#"
+cmds:
+  - id: build
+    docker: { image: app }
+outputs:
+  image_digest:
+    step: build
+    field: digest
+"#,
+    )
+    .unwrap();
+
+    assert_eq!(task.cmds.unwrap()[0].options.id.as_deref(), Some("build"));
+    assert_eq!(task.outputs.unwrap()["image_digest"].field, "digest");
+
+    let error = parse_task(
+      &structured_context(),
+      r#"
+cmds:
+  - id: build
+    docker: { image: app }
+outputs:
+  image_id: { step: build, field: unknown }
+"#,
+    )
+    .unwrap_err();
+    assert!(
+      error.contains("field 'unknown' that is undeclared or optional"),
+      "{error}"
+    );
+
+    let error = parse_task(
+      &Context::from_schemas(
+        PluginSchemas::from([(
+          "docker".to_owned(),
+          PluginTypeSchema {
+            input: None,
+            output: serde_json::json!({
+              "type": "object",
+              "properties": { "digest": { "type": "string" } },
+              "additionalProperties": false
+            })
+            .as_object()
+            .cloned(),
+          },
+        )]),
+        "docker",
+      )
+      .unwrap(),
+      "cmds:\n  - { id: build, docker: run }\noutputs:\n  value: { step: build, field: digest }",
+    )
+    .unwrap_err();
+    assert!(error.contains("undeclared or optional"), "{error}");
+  }
+
+  #[test]
+  fn accepts_secret_exports_and_rejects_mixed_visibility_for_one_plugin_field() {
+    let task = parse_task(
+      &structured_context(),
+      "cmds:\n  - { id: build, docker: run }\noutputs:\n  token: { step: build, field: digest, secret: true }",
+    )
+    .unwrap();
+    assert!(task.outputs.unwrap()["token"].secret);
+
+    let error = parse_task(
+      &structured_context(),
+      "cmds:\n  - { id: build, docker: run }\noutputs:\n  public: { step: build, field: digest }\n  token: { step: build, field: digest, secret: true }",
+    )
+    .unwrap_err();
+    assert!(error.contains("both secret and public"), "{error}");
+  }
+
+  #[test]
+  fn allows_one_output_step_to_have_platform_specific_producers() {
+    let task = parse_task(
+      &structured_context(),
+      "cmds:\n  - { id: build, platforms: [linux], docker: linux }\n  - { id: build, platforms: [windows], docker: windows }\noutputs:\n  digest: { step: build, field: digest }",
+    )
+    .unwrap();
+
+    assert_eq!(task.cmds.unwrap().len(), 2);
+  }
+
+  #[test]
+  fn rejects_ambiguous_or_unavailable_output_steps() {
+    for (yaml, expected) in [
+      (
+        "cmds:\n  - { id: cleanup, defer: { docker: clean } }\noutputs:\n  value: { step: cleanup, field: digest }",
+        "references deferred step 'cleanup'",
+      ),
+      (
+        "cmds:\n  - { id: build, docker: run }\noutputs:\n  value: { step: missing, field: digest }",
+        "unknown plugin step 'missing'",
+      ),
+      (
+        "sources: [src]\ncmds:\n  - { id: build, docker: run }\noutputs:\n  value: { step: build, field: digest }",
+        "cannot be combined with freshness",
+      ),
+      ("cmds:\n  - { id: '', docker: run }", "command id must not be empty"),
+      ("cmds:\n  - { id: nested, task: child }", "belongs to a task reference"),
+      (
+        "cmds:\n  - { id: build, docker: run }\noutputs:\n  '': { step: build, field: digest }",
+        "output names, steps, and fields must not be empty",
+      ),
+    ] {
+      let error = parse_task(&structured_context(), yaml).unwrap_err();
+      assert!(error.contains(expected), "{error}");
+    }
+  }
+
+  #[test]
+  fn an_explicit_empty_structured_output_map_does_not_disable_file_freshness() {
+    parse_task(
+      &structured_context(),
+      "sources: [src]\noutput: [target]\noutputs: {}\ndocker: build",
+    )
+    .unwrap();
+  }
+
+  #[test]
+  fn output_schemas_must_expose_a_closed_object_shape() {
+    for schema in [
+      serde_json::json!({ "type": "string" }),
+      serde_json::json!({ "type": "object", "additionalProperties": false }),
+      serde_json::json!({ "type": "object", "properties": {} }),
+    ] {
+      let result = Context::from_schemas(
+        PluginSchemas::from([(
+          "docker".to_owned(),
+          PluginTypeSchema {
+            input: None,
+            output: schema.as_object().cloned(),
+          },
+        )]),
+        "docker",
+      );
+      assert!(result.is_err());
+    }
   }
 
   #[test]

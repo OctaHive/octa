@@ -37,6 +37,7 @@ pub(crate) fn task_definition(task: &Task) -> ExecutorResult<Value> {
     timeout,
     sources,
     output,
+    outputs,
     source_strategy,
     watch,
     condition,
@@ -63,6 +64,7 @@ pub(crate) fn task_definition(task: &Task) -> ExecutorResult<Value> {
     "timeout": timeout,
     "sources": sources,
     "output": output,
+    "outputs": outputs,
     "source_strategy": source_strategy,
     "watch": watch,
     "condition": condition.as_ref().map(condition_definitions).transpose()?,
@@ -82,6 +84,7 @@ fn command_definition(command: &TaskCommand) -> ExecutorResult<Value> {
     CommandPayload::Plugin(plugin) => json!({ "type": "plugin", "value": plugin_definition(plugin)? }),
   };
   let CommandOptions {
+    id,
     platforms,
     deferred,
     timeout,
@@ -96,6 +99,7 @@ fn command_definition(command: &TaskCommand) -> ExecutorResult<Value> {
     "payload": payload,
     "options": {
       "platforms": platforms,
+      "id": id,
       "deferred": deferred,
       "timeout": timeout,
       "condition": condition.as_ref().map(plugin_definition).transpose()?,

@@ -1,5 +1,6 @@
 use octa_plugin::protocol::Schema;
 use octa_plugin::socket::{interpret_local_socket_name, make_local_socket_name};
+use serde_json::{Map, Value};
 use std::ffi::OsString;
 use std::{
   collections::{HashMap, HashSet, VecDeque},
@@ -82,21 +83,25 @@ impl Drop for StartupReservation {
 pub struct PluginRegistration {
   plugin_name: String,
   schema: Schema,
-  validator: Option<Arc<jsonschema::Validator>>,
+  input_validator: Option<Arc<jsonschema::Validator>>,
+  output_validator: Option<Arc<jsonschema::Validator>>,
 }
 
 impl PluginRegistration {
   fn new(plugin_name: String, schema: Schema) -> std::result::Result<Self, String> {
-    let validator = schema
-      .validation_schema
-      .clone()
-      .map(|schema| jsonschema::validator_for(&serde_json::Value::Object(schema)).map(Arc::new))
-      .transpose()
-      .map_err(|error| error.to_string())?;
+    let compile = |schema: Option<Map<String, Value>>| {
+      schema
+        .map(|schema| jsonschema::validator_for(&Value::Object(schema)).map(Arc::new))
+        .transpose()
+        .map_err(|error| error.to_string())
+    };
+    let input_validator = compile(schema.input_schema.clone())?;
+    let output_validator = compile(schema.output_schema.clone())?;
     Ok(Self {
       plugin_name,
       schema,
-      validator,
+      input_validator,
+      output_validator,
     })
   }
 
@@ -108,19 +113,36 @@ impl PluginRegistration {
     self.schema.supports_raw
   }
 
-  pub fn validate(&self, value: &serde_json::Value) -> std::result::Result<(), String> {
-    let Some(validator) = &self.validator else {
-      return Ok(());
-    };
-    let errors = validator
-      .iter_errors(value)
-      .map(|error| error.to_string())
-      .collect::<Vec<_>>();
-    if errors.is_empty() {
-      Ok(())
-    } else {
-      Err(errors.join("; "))
-    }
+  /// Validates one invocation value against the cached plugin input schema.
+  pub fn validate_input(&self, value: &serde_json::Value) -> std::result::Result<(), String> {
+    validate_with(self.input_validator.as_deref(), value)
+  }
+
+  /// Validates one successful completion object against the cached plugin schema.
+  pub fn validate_outputs(&self, outputs: &Value) -> std::result::Result<(), String> {
+    validate_with(self.output_validator.as_deref(), outputs)
+  }
+}
+
+fn validate_with(validator: Option<&jsonschema::Validator>, value: &Value) -> std::result::Result<(), String> {
+  let Some(validator) = validator else {
+    return Ok(());
+  };
+  let errors = validator
+    .iter_errors(value)
+    .map(|error| {
+      format!(
+        "value at '{}' failed schema rule '{}' ({})",
+        error.instance_path(),
+        error.schema_path(),
+        error.kind().keyword()
+      )
+    })
+    .collect::<Vec<_>>();
+  if errors.is_empty() {
+    Ok(())
+  } else {
+    Err(errors.join("; "))
   }
 }
 
@@ -739,7 +761,8 @@ mod tests {
           key: key.to_owned(),
           supports_raw: false,
           capabilities: capabilities.iter().map(|value| (*value).to_owned()).collect(),
-          validation_schema: None,
+          input_schema: None,
+          output_schema: None,
         },
       )
       .unwrap()
@@ -759,25 +782,61 @@ mod tests {
   }
 
   #[test]
-  fn plugin_validation_schema_is_compiled_once() {
+  fn plugin_input_schema_is_compiled_once() {
     let registration = PluginRegistration::new(
       "plugin".to_owned(),
       Schema {
         key: "key".to_owned(),
         supports_raw: false,
         capabilities: Vec::new(),
-        validation_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+        input_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+        output_schema: None,
       },
     )
     .unwrap();
 
-    registration.validate(&serde_json::json!("valid")).unwrap();
+    registration.validate_input(&serde_json::json!("valid")).unwrap();
     let cloned = registration.clone();
-    assert!(registration.validate(&serde_json::json!(1)).is_err());
+    let error = registration.validate_input(&serde_json::json!(1)).unwrap_err();
+    assert!(error.contains("type"));
+    assert!(!error.contains('1'));
     assert!(Arc::ptr_eq(
-      registration.validator.as_ref().unwrap(),
-      cloned.validator.as_ref().unwrap()
+      registration.input_validator.as_ref().unwrap(),
+      cloned.input_validator.as_ref().unwrap()
     ));
+  }
+
+  #[test]
+  fn plugin_output_schema_validates_completed_values() {
+    let registration = PluginRegistration::new(
+      "plugin".to_owned(),
+      Schema {
+        key: "key".to_owned(),
+        supports_raw: false,
+        capabilities: Vec::new(),
+        input_schema: None,
+        output_schema: serde_json::json!({
+          "type": "object",
+          "properties": { "digest": { "type": "string" } },
+          "required": ["digest"],
+          "additionalProperties": false
+        })
+        .as_object()
+        .cloned(),
+      },
+    )
+    .unwrap();
+
+    registration
+      .validate_outputs(&serde_json::json!({ "digest": "sha256:test" }))
+      .unwrap();
+    assert!(registration.validate_outputs(&serde_json::json!({})).is_err());
+    let error = registration
+      .validate_outputs(&serde_json::json!({ "digest": 42 }))
+      .unwrap_err();
+    assert!(error.contains("/digest"));
+    assert!(error.contains("type"));
+    assert!(!error.contains("42"));
   }
 
   #[tokio::test]
@@ -875,7 +934,7 @@ mod tests {
         PluginResponse::Completed { id, code, outputs } => {
           assert_eq!(id, execution_id);
           assert_eq!(code, 0);
-          assert!(outputs.is_empty());
+          assert_eq!(outputs["digest"], "sha256:test");
           received_completion = true;
           break;
         },
