@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, ffi::OsStr, path::Path, process::Stdio};
+use std::{collections::HashMap, env, ffi::OsStr, path::Path, process::Stdio, time::Duration};
 
 use anyhow::{bail, Context};
 use brush_builtins::{BuiltinSet, ShellBuilderExt};
@@ -135,6 +135,82 @@ pub(crate) fn process_group(_child: &tokio::process::Child) -> Option<i32> {
   None
 }
 
+/// Waits for the command leader without allowing its process-group id to be reused before cleanup.
+pub(crate) async fn wait_for_command(
+  child: &mut tokio::process::Child,
+  process_group: Option<i32>,
+  cancel_token: &tokio_util::sync::CancellationToken,
+) -> anyhow::Result<i32> {
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  {
+    let pid = child
+      .id()
+      .ok_or_else(|| std::io::Error::other("command process has no id"))?;
+    let mut child_events = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+
+    loop {
+      if process_exited_without_reaping(pid as i32)? {
+        // WNOWAIT keeps the leader as a zombie, reserving its PID while the
+        // numeric process-group id is used to terminate surviving descendants.
+        terminate_descendants(process_group);
+        return Ok(child.wait().await?.code().unwrap_or(-1));
+      }
+
+      tokio::select! {
+        _ = cancel_token.cancelled() => {
+          terminate(child, process_group);
+          tokio::time::sleep(Duration::from_millis(100)).await;
+          terminate_descendants(process_group);
+          let _ = child.wait().await;
+          return Ok(-1);
+        },
+        _ = child_events.recv() => {},
+      }
+    }
+  }
+
+  #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+  {
+    let code = tokio::select! {
+      status = child.wait() => status?.code().unwrap_or(-1),
+      _ = cancel_token.cancelled() => {
+        terminate(child, process_group);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = child.kill().await;
+        -1
+      }
+    };
+    terminate_descendants(process_group);
+    Ok(code)
+  }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn process_exited_without_reaping(pid: i32) -> std::io::Result<bool> {
+  use std::mem::MaybeUninit;
+
+  use nix::libc;
+
+  let mut info = MaybeUninit::<libc::siginfo_t>::zeroed();
+  // SAFETY: `info` points to writable storage for siginfo_t. WNOHANG makes
+  // waitid non-blocking and WNOWAIT explicitly leaves the child waitable.
+  let result = unsafe {
+    libc::waitid(
+      libc::P_PID,
+      pid as libc::id_t,
+      info.as_mut_ptr(),
+      libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+    )
+  };
+  if result == -1 {
+    return Err(std::io::Error::last_os_error());
+  }
+
+  // SAFETY: a successful waitid call initializes siginfo_t; with WNOHANG the
+  // zeroed si_pid is retained when the selected child has not exited yet.
+  Ok(unsafe { info.assume_init().si_pid() } != 0)
+}
+
 #[cfg(unix)]
 pub(crate) fn terminate(_child: &mut tokio::process::Child, process_group: Option<i32>) {
   use nix::sys::signal::{kill, Signal};
@@ -150,7 +226,7 @@ pub(crate) fn terminate(child: &mut tokio::process::Child, _process_group: Optio
   let _ = child.start_kill();
 }
 
-/// Removes descendants that outlive the isolated shell leader and could retain its output pipes.
+/// Terminates the command process group, including descendants that outlive its leader.
 pub(crate) fn terminate_descendants(process_group: Option<i32>) {
   #[cfg(unix)]
   if let Some(process_group) = process_group {
@@ -163,4 +239,12 @@ pub(crate) fn terminate_descendants(process_group: Option<i32>) {
 
   #[cfg(windows)]
   let _ = process_group;
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+  #[test]
+  fn wait_without_reaping_rejects_an_unknown_child() {
+    assert!(super::process_exited_without_reaping(i32::MAX).is_err());
+  }
 }

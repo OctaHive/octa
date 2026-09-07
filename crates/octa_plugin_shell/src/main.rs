@@ -228,10 +228,42 @@ async fn execute_raw_pty(
         }
       },
       _ = tokio::time::sleep(Duration::from_millis(20)), if code.is_none() => {
-        let status = child.child.lock().unwrap().try_wait()?;
-        if let Some(status) = status {
-          code = Some(status.exit_code() as i32);
-          child.finished();
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+          let status = match process_group {
+            Some(pid) if brush::process_exited_without_reaping(pid)? => {
+              // Keep the exited leader waitable until its process group has
+              // been terminated, so another process cannot reuse the PGID.
+              child.finished();
+              Some(
+                child
+                  .child
+                  .lock()
+                  .unwrap()
+                  .try_wait()?
+                  .expect("waitid observed the PTY child exit"),
+              )
+            },
+            Some(_) => None,
+            None => child.child.lock().unwrap().try_wait()?,
+          };
+          if let Some(status) = status {
+            if process_group.is_none() {
+              child.finished();
+            }
+            code = Some(status.exit_code() as i32);
+          }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+          let status = child.child.lock().unwrap().try_wait()?;
+          if let Some(status) = status {
+            code = Some(status.exit_code() as i32);
+            child.finished();
+          }
+        }
+
+        if code.is_some() {
           pty_writer = None;
           #[cfg(windows)]
           {
@@ -394,16 +426,7 @@ impl Plugin for ShellPlugin {
       })
     };
 
-    let code = tokio::select! {
-      status = child.wait() => status?.code().unwrap_or(-1),
-      _ = cancel_token.cancelled() => {
-        brush::terminate(&mut child, process_group);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let _ = child.kill().await;
-        -1
-      }
-    };
-    brush::terminate_descendants(process_group);
+    let code = brush::wait_for_command(&mut child, process_group, &cancel_token).await?;
     // Closing the job after the command leader exits terminates background descendants and lets
     // inherited stdout/stderr pipes reach EOF before the terminal response is sent.
     #[cfg(windows)]
