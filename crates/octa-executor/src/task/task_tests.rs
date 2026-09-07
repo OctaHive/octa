@@ -2,7 +2,6 @@
 
 use super::*;
 use std::{
-  fs,
   sync::{
     atomic::{AtomicUsize, Ordering},
     Mutex as StdMutex,
@@ -472,6 +471,7 @@ async fn test_prepare_dir_propagates_interpolation_error() {
 #[cfg(unix)]
 #[tokio::test]
 async fn test_prepare_dir_dry_run_propagates_canonicalize_error() {
+  use std::fs;
   use std::os::unix::fs::PermissionsExt;
 
   let temp_dir = TempDir::new().unwrap();

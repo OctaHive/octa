@@ -202,18 +202,29 @@ impl PluginExecution {
     }
   }
 
-  /// Sends cancellation and consumes this command's terminal response only.
+  /// Cancels an active command and waits for its terminal response.
   pub async fn cancel_and_wait(&mut self) -> Result<(), PluginClientError> {
-    self.client.send(&OctaCommand::Cancel { id: self.id.clone() }).await?;
+    // A terminal response or a local protocol failure has already removed the
+    // route. Writing Cancel afterwards is both unnecessary and unsafe on
+    // transports such as Windows named pipes while the peer is closing.
+    if self.completed.is_cancelled() {
+      return Ok(());
+    }
+    if self.client.inner.connection_closed.is_cancelled() {
+      return Err(PluginClientError::ConnectionClosed);
+    }
 
-    let wait = async {
+    let cancel = async {
+      self.client.send(&OctaCommand::Cancel { id: self.id.clone() }).await?;
       tokio::select! {
         _ = self.completed.cancelled() => Ok(()),
         _ = self.client.inner.connection_closed.cancelled() => Err(PluginClientError::ConnectionClosed),
       }
     };
 
-    tokio::time::timeout(Duration::from_secs(5), wait)
+    // The write itself can block when a local-socket peer is alive but no
+    // longer reading, so it belongs to the same deadline as the response.
+    tokio::time::timeout(Duration::from_secs(5), cancel)
       .await
       .map_err(|_| PluginClientError::Protocol(format!("Timed out while cancelling command {}", self.id)))?
   }
@@ -1576,9 +1587,7 @@ mod tests {
         .unwrap();
       writer.flush().await.unwrap();
 
-      line.clear();
-      reader.read_line(&mut line).await.unwrap();
-      vec![line]
+      Vec::new()
     }));
 
     let client = PluginClient::connect(server.socket_name()).await.unwrap();
@@ -1588,27 +1597,20 @@ mod tests {
       .start_execution(execution_request("test"), CancellationToken::new())
       .await
       .unwrap();
-    let response = tokio::time::timeout(
-      Duration::from_millis(250),
-      execution.receive_output(&CancellationToken::new()),
-    )
-    .await
-    .expect("running command remained blocked after a protocol error")
-    .unwrap();
+    let response = tokio::time::timeout(TIMEOUT, execution.receive_output(&CancellationToken::new()))
+      .await
+      .expect("running command remained blocked after a protocol error")
+      .unwrap();
     assert!(matches!(
       response,
       Some(PluginResponse::Error { message, .. }) if message.contains("ExitStatus")
     ));
-    tokio::time::timeout(Duration::from_millis(250), execution.cancel_and_wait())
+    tokio::time::timeout(TIMEOUT, execution.cancel_and_wait())
       .await
       .expect("cancellation remained blocked after a protocol error")
       .unwrap();
 
-    let messages = server.stop().await;
-    assert!(matches!(
-      serde_json::from_str::<OctaCommand>(messages[0].trim()).unwrap(),
-      OctaCommand::Cancel { .. }
-    ));
+    server.stop().await;
   }
 
   #[tokio::test]

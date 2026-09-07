@@ -109,30 +109,39 @@ class WindowsServer:
         self.pipe = None
 
     async def handle_client(self, pipe):
-        import win32pipe
         import win32file
 
         loop = asyncio.get_running_loop()
         command_handler = CommandHandler(self.log_file)
+        pending = b""
 
         while True:
             data = await loop.run_in_executor(None, win32file.ReadFile, pipe, 4096)
-            message = data[1].decode()
-            log_message(self.log_file, f"Received: {message}")
+            chunk = data[1]
+            if not chunk:
+                break
+            pending += chunk
 
-            try:
-                cmd = json.loads(message)
-                should_close, response = command_handler.handle_command(cmd)
+            while b"\n" in pending:
+                encoded, pending = pending.split(b"\n", 1)
+                if not encoded:
+                    continue
+                message = encoded.decode()
+                log_message(self.log_file, f"Received: {message}")
 
-                for message in response:
-                    response_json = json.dumps(message) + "\n"
-                    log_message(self.log_file, f"Sending: {json.dumps(message)}")
-                    await loop.run_in_executor(None, win32file.WriteFile, pipe, response_json.encode())
+                try:
+                    cmd = json.loads(message)
+                    should_close, response = command_handler.handle_command(cmd)
 
-                if should_close:
-                    break
-            except json.JSONDecodeError as e:
-                log_message(self.log_file, f"Invalid JSON received: {e}")
+                    for response_message in response:
+                        response_json = json.dumps(response_message) + "\n"
+                        log_message(self.log_file, f"Sending: {json.dumps(response_message)}")
+                        await loop.run_in_executor(None, win32file.WriteFile, pipe, response_json.encode())
+
+                    if should_close:
+                        return
+                except json.JSONDecodeError as e:
+                    log_message(self.log_file, f"Invalid JSON received: {e}")
 
         print("Closing pipe...")
         win32file.CloseHandle(pipe)
@@ -146,7 +155,7 @@ class WindowsServer:
         self.pipe = win32pipe.CreateNamedPipe(
             self.path,
             win32pipe.PIPE_ACCESS_DUPLEX,
-            win32pipe.PIPE_TYPE_MESSAGE | win32pipe.PIPE_READMODE_MESSAGE | win32pipe.PIPE_WAIT,
+            win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_READMODE_BYTE | win32pipe.PIPE_WAIT,
             1,
             65536,
             65536,
