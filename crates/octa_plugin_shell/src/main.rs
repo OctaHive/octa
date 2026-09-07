@@ -61,6 +61,38 @@ impl PtyChildGuard {
     brush::terminate_descendants(self.process_group);
     let _ = self.child.lock().unwrap().kill();
   }
+
+  fn try_finish(&mut self) -> anyhow::Result<Option<i32>> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let status = match self.process_group {
+      Some(pid) if brush::process_exited_without_reaping(pid)? => {
+        // Keep the exited leader waitable until its process group has
+        // been terminated, so another process cannot reuse the PGID.
+        self.finished();
+        Some(
+          self
+            .child
+            .lock()
+            .unwrap()
+            .try_wait()?
+            .expect("waitid observed the PTY child exit"),
+        )
+      },
+      Some(_) => None,
+      None => self.child.lock().unwrap().try_wait()?,
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let status = self.child.lock().unwrap().try_wait()?;
+
+    if let Some(status) = status {
+      if self.running {
+        self.finished();
+      }
+      Ok(Some(status.exit_code() as i32))
+    } else {
+      Ok(None)
+    }
+  }
 }
 
 impl Drop for PtyChildGuard {
@@ -228,42 +260,8 @@ async fn execute_raw_pty(
         }
       },
       _ = tokio::time::sleep(Duration::from_millis(20)), if code.is_none() => {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-          let status = match process_group {
-            Some(pid) if brush::process_exited_without_reaping(pid)? => {
-              // Keep the exited leader waitable until its process group has
-              // been terminated, so another process cannot reuse the PGID.
-              child.finished();
-              Some(
-                child
-                  .child
-                  .lock()
-                  .unwrap()
-                  .try_wait()?
-                  .expect("waitid observed the PTY child exit"),
-              )
-            },
-            Some(_) => None,
-            None => child.child.lock().unwrap().try_wait()?,
-          };
-          if let Some(status) = status {
-            if process_group.is_none() {
-              child.finished();
-            }
-            code = Some(status.exit_code() as i32);
-          }
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-          let status = child.child.lock().unwrap().try_wait()?;
-          if let Some(status) = status {
-            code = Some(status.exit_code() as i32);
-            child.finished();
-          }
-        }
-
-        if code.is_some() {
+        if let Some(exit_code) = child.try_finish()? {
+          code = Some(exit_code);
           pty_writer = None;
           #[cfg(windows)]
           {
@@ -581,5 +579,34 @@ mod tests {
       },
       _ => panic!("Expected Completed response"),
     }
+  }
+
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  #[test]
+  fn pty_child_guard_observes_exit_before_reaping_a_process_group_leader() {
+    use std::os::unix::process::CommandExt;
+
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg("sleep 30").process_group(0);
+    let child = command.spawn().unwrap();
+    let process_group = child.id() as i32;
+    let mut guard = PtyChildGuard::new(Box::new(child), Some(process_group));
+
+    assert_eq!(guard.try_finish().unwrap(), None);
+    nix::sys::signal::kill(
+      nix::unistd::Pid::from_raw(-process_group),
+      nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+
+    for _ in 0..100 {
+      if let Some(code) = guard.try_finish().unwrap() {
+        assert_ne!(code, 0);
+        assert!(!guard.running);
+        return;
+      }
+      std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("terminated PTY child was not observed");
   }
 }
