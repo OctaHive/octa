@@ -15,6 +15,7 @@ impl TaskGraphBuilder {
     if let Some(exec_vars) = execute_vars {
       vars.extend_variables(exec_vars);
     }
+    vars.set_secret_session(self.secret_session.clone());
 
     // Ambient values are available at runtime, but only explicitly declared
     // names are build inputs. This avoids invalidating every task when an

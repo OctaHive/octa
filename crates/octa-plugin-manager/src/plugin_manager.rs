@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::{
   plugin_client::PluginClient,
+  plugin_lock::{PluginLock, PluginLockError},
   plugin_process::{LocalPluginLauncher, PluginLaunchError, PluginLaunchRequest, PluginLauncher, PluginProcess},
 };
 
@@ -57,6 +58,15 @@ pub enum PluginManagerError {
 
   #[error("Pipe error: {0}")]
   PipeError(String),
+
+  #[error(transparent)]
+  Lock(Box<PluginLockError>),
+}
+
+impl From<PluginLockError> for PluginManagerError {
+  fn from(error: PluginLockError) -> Self {
+    Self::Lock(Box::new(error))
+  }
 }
 
 type Result<T> = std::result::Result<T, PluginManagerError>;
@@ -191,6 +201,7 @@ pub struct PluginManager {
   plugin_registry: Arc<Mutex<PluginRegistry>>,
   starting_plugins: Arc<StdMutex<HashSet<String>>>,
   execution_lock: Arc<RwLock<()>>,
+  plugin_lock: Option<Arc<PluginLock>>,
 }
 
 /// Prevents an interactive command from overlapping another plugin invocation.
@@ -235,7 +246,15 @@ impl PluginManager {
       plugin_registry: Arc::new(Mutex::new(PluginRegistry::default())),
       starting_plugins: Arc::new(StdMutex::new(HashSet::new())),
       execution_lock: Arc::new(RwLock::new(())),
+      plugin_lock: None,
     }
+  }
+
+  /// Creates a manager that only launches binaries present in a verified lock file.
+  pub fn with_locked_plugins(plugins_dir: impl Into<PathBuf>, workspace: impl Into<PathBuf>, lock: PluginLock) -> Self {
+    let mut manager = Self::with_workspace(plugins_dir, workspace);
+    manager.plugin_lock = Some(Arc::new(lock));
+    manager
   }
 
   pub async fn execution_guard(&self, raw: bool) -> PluginExecutionGuard {
@@ -461,6 +480,27 @@ impl PluginManager {
       },
     );
 
+    Ok(schema)
+  }
+
+  /// Verifies a logical lock entry before launching its exact entrypoint.
+  pub async fn start_locked_plugin(&self, plugin_name: &str) -> Result<Schema> {
+    let lock = self
+      .plugin_lock
+      .as_ref()
+      .ok_or_else(|| PluginManagerError::StartError("plugin lock is not configured".to_owned()))?;
+    let mut expected_capabilities = lock.plugin(plugin_name)?.capabilities.clone();
+    let executable = lock.verify(plugin_name, &self.plugins_dir).await?;
+    let schema = self.start_plugin(&executable.to_string_lossy()).await?;
+    expected_capabilities.sort();
+    let mut actual_capabilities = schema.capabilities.clone();
+    actual_capabilities.sort();
+    if actual_capabilities != expected_capabilities {
+      let _ = self.shutdown_plugin(plugin_name).await;
+      return Err(PluginManagerError::StartError(format!(
+        "plugin '{plugin_name}' capabilities differ from its lock entry"
+      )));
+    }
     Ok(schema)
   }
 

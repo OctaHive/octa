@@ -11,6 +11,12 @@ Messages use Serde's adjacent representation:
 The Rust definitions in [`crates/octa-plugin/src/protocol.rs`](../crates/octa-plugin/src/protocol.rs)
 are the source of truth. Plugin authors should normally use the `octa-plugin` SDK and
 `serve_plugin`; the wire format is documented here for compatibility and non-Rust implementations.
+Release manifests and lock-file verification are documented in
+[Reproducible plugins](plugin-distribution.md).
+
+`Hello` carries `protocol_version: 1` independently from the Octa and plugin
+package versions. Compatibility is decided from this protocol version; product
+semver is informational and may differ between Octa and a plugin.
 
 This private engine-to-plugin transport is distinct from Octa's public
 [runtime event stream](events.md). Plugin command IDs are translated into stable plan-level step IDs
@@ -30,7 +36,7 @@ Launchers add their transport-specific socket argument but do not reinterpret sc
 
 A plugin connection has three phases:
 
-1. `Hello` negotiates the Octa version.
+1. `Hello` negotiates the plugin protocol version.
 2. `Schema` registers the task key and capabilities.
 3. Zero or more `Execute` requests run concurrently until `Shutdown`.
 
@@ -39,24 +45,26 @@ execution phase.
 
 ## Handshake
 
-Octa sends its exact version and currently enabled protocol features:
+Octa sends the protocol version, its product version, and enabled features:
 
 ```json
-{"type":"Hello","payload":{"version":"0.3.0","features":[]}}
+{"type":"Hello","payload":{"protocol_version":1,"version":"0.3.0","features":[]}}
 ```
 
-The plugin responds with a semver requirement that must accept the engine version:
+The plugin responds with the same protocol version and its own product version:
 
 ```json
-{"type":"Hello","payload":{"version":">=0.3.0, <0.4.0","features":[]}}
+{"type":"Hello","payload":{"protocol_version":1,"version":"0.3.0","features":[]}}
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `version` | string | Exact engine version in the request; semver requirement in the response |
+| `protocol_version` | integer | Wire protocol version; must equal `1` on both sides |
+| `version` | string | Informational Octa or plugin package version |
 | `features` | string array | Negotiated feature names; currently empty |
 
-A version mismatch terminates plugin startup.
+A protocol version mismatch terminates plugin startup. Product versions do not
+participate in compatibility checks.
 
 ## Schema discovery
 
@@ -255,6 +263,37 @@ or fail the command. The `replacing` renderer displays progress even when task s
 silent, preferring it over the latest output line. Progress is not appended to captured command
 output and does not alter the task result.
 
+A plugin may register artifacts and reports before its terminal response. Paths are relative to the
+effective `Execute.dir` working directory:
+
+```json
+{"type":"RegisterArtifact","payload":{"id":"command-id","artifact":{"name":"binary","path":"dist/app","content_type":"application/octet-stream"}}}
+{"type":"RegisterReport","payload":{"id":"command-id","report":{"name":"tests","path":"reports/junit.xml","format":"junit"}}}
+```
+
+`format` is an opaque, stable identifier owned by the producer. It must contain 1-128 ASCII letters,
+digits, `.`, `_`, `/`, `+`, `:`, or `-`, and must begin with a letter or digit. Common identifiers
+include `junit`, `cobertura`, and `sarif`; a plugin may emit a namespaced identifier such as
+`acme/benchmark-v2` without a protocol or Octa release. Consumers decide which identifiers they can
+parse and preserve unknown reports as files. Octa resolves the path after successful command
+completion, requires it to exist, converts it to a workspace-relative path, and rejects absolute
+paths, the workspace root, missing reports, and symlinks whose resolved target leaves the workspace.
+Octa only publishes the declaration and includes it in the terminal result; it never uploads files.
+
+The official `junit` plugin demonstrates this boundary. It owns the `junit` identifier and turns a
+typed plugin command into `RegisterReport`; it does not make the executor or event protocol aware of
+JUnit XML. Enable it explicitly with `plugins: [junit]`, then use it after the test command:
+
+```yaml
+tasks:
+  test:
+    cmds:
+      - shell: ./run-tests.sh
+      - junit:
+          name: unit-tests
+          path: reports/junit.xml
+```
+
 Every started command must finish with exactly one terminal response:
 
 ```json
@@ -271,7 +310,7 @@ or:
 non-zero `code`. Its optional `outputs` object carries typed values such as an image digest. For a
 successful operation Octa validates that object against `output_schema`, stores the raw object on
 the corresponding `StepResult`, and exposes only fields explicitly exported by the task. A non-zero
-completion does not export values. `Error` represents a plugin/protocol failure for which no normal
+completion does not export values or register resources. `Error` represents a plugin/protocol failure for which no normal
 completion result is available. After either response, Octa removes the command ID; sending later
 output for it is a protocol violation.
 

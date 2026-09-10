@@ -1,0 +1,24 @@
+[package]
+name = "octa_plugin_junit"
+description = "JUnit report registration plugin for Octa"
+version = "0.3.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+include = ["src/"]
+
+[[bin]]
+name = "octa_plugin_junit"
+bench = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }

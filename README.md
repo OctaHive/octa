@@ -13,6 +13,10 @@ functionality missing, so I decided to create my own builder.
 * Support returning dependency task results. This is useful, for example, when you need to process the result of a task in its parent task.
 * Support rendering templates and return result of rendering as task result
 
+Architecture and integration references: [runner protocol](docs/runner-protocol.md),
+[plugin distribution](docs/plugin-distribution.md), [secret providers](docs/secrets.md),
+and the [Agent Ready plan](docs/agent-readiness-plan.md).
+
 # Installation
 
 ## Homebrew
@@ -1036,6 +1040,17 @@ policy.
 All JSONL records, including stderr events, are written to process stdout. JSON output cannot be
 combined with raw/PTY mode.
 
+## Headless runner
+
+Release archives also contain `octa-runner`, the non-interactive process entry point intended for
+an Octa agent. It executes the same runtime as `octa`, while reserving stdin and stdout for a
+versioned JSON Lines control and event protocol. See the
+[runner protocol documentation](docs/runner-protocol.md).
+
+For reproducible local or agent execution, release plugins include manifests and an `Octa.lock`.
+Use `octa plugin verify --lock Octa.lock` and run with `--plugin-lock Octa.lock`; see
+[Reproducible plugins](docs/plugin-distribution.md).
+
 ## Embedding the executor
 
 The Rust API can build and start a request without duplicating CLI orchestration:
@@ -1525,6 +1540,50 @@ Prefix a pattern with `!` to exclude its matches from `sources` or `output`. Pat
 in declaration order, so a later positive pattern can re-include a path. Quote exclusions in YAML
 to prevent `!` from being parsed as a tag. Use `\!` at the beginning for a literal path whose name
 starts with `!`.
+
+Use `artifacts` and `reports` for files that an external runner should collect. Unlike freshness
+`output` patterns, these are exact paths relative to the task working directory:
+
+```yaml
+tasks:
+  test:
+    shell: ./run-tests.sh
+    artifacts:
+      - name: debug-binaries
+        path: target/debug
+        content_type: application/octet-stream
+    reports:
+      - name: test-results
+        path: reports/junit.xml
+        format: junit
+```
+
+`format` is a stable identifier supplied by the report producer, not an enum owned by Octa. Known
+examples are `junit`, `cobertura`, and `sarif`; plugins can introduce identifiers such as
+`acme/benchmark-v2` without changing Octa core. Event consumers may render formats they understand
+and retain unknown formats as downloadable reports. Octa requires registered paths to exist after
+successful execution, rejects paths and symlinks that escape the workspace, emits structured
+registration events, and stores the workspace-relative declarations in runner results. Uploading is
+intentionally left to the caller of `octa-runner`.
+
+The optional JUnit plugin is a minimal example of plugin-owned report registration. Add it to the
+plugin configuration (it is not started unless requested):
+
+```yaml
+plugins: [junit]
+```
+
+Then register the report after the command that creates it:
+
+```yaml
+tasks:
+  test:
+    cmds:
+      - shell: ./run-tests.sh --junit reports/junit.xml
+      - junit:
+          name: unit-tests
+          path: reports/junit.xml
+```
 
 You can use glob patterns when specify source targets.
 

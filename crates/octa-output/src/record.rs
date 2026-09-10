@@ -1,15 +1,17 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::{CliDocument, ConsoleScope, ConsoleStep};
+use super::{CliDocument, ConsoleScope, ConsoleStep, RegisteredArtifact, RegisteredReport};
 
 /// Version of the externally supported JSON Lines event contract.
-pub const EVENT_SCHEMA_VERSION: u16 = 2;
+pub const EVENT_SCHEMA_VERSION: u16 = 3;
 
 /// JSON Schema for [`ConsoleEntry`] version 1.
 pub const EVENT_SCHEMA_V1: &str = include_str!("../schema/events-v1.schema.json");
 /// JSON Schema for [`ConsoleEntry`] version 2.
 pub const EVENT_SCHEMA_V2: &str = include_str!("../schema/events-v2.schema.json");
+/// JSON Schema for [`ConsoleEntry`] version 3.
+pub const EVENT_SCHEMA_V3: &str = include_str!("../schema/events-v3.schema.json");
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +149,22 @@ pub enum ExecutionEvent {
     step_id: Option<u64>,
     command_id: String,
     progress: ProgressUpdate,
+  },
+  /// Registers a validated artifact path for collection by an external agent.
+  ArtifactRegistered {
+    run_id: u64,
+    scope: ConsoleScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step_id: Option<u64>,
+    artifact: RegisteredArtifact,
+  },
+  /// Registers a validated report path for collection by an external agent.
+  ReportRegistered {
+    run_id: u64,
+    scope: ConsoleScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    step_id: Option<u64>,
+    report: RegisteredReport,
   },
 }
 
@@ -328,7 +346,7 @@ mod tests {
 
   #[test]
   fn current_schema_validates_every_public_record_shape() {
-    let schema = serde_json::from_str(EVENT_SCHEMA_V2).unwrap();
+    let schema = serde_json::from_str(EVENT_SCHEMA_V3).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     let allocator = ConsoleScopeAllocator::default();
     let parent = allocator.scope("build");
@@ -407,6 +425,26 @@ mod tests {
           current: Some(3),
           total: Some(10),
           unit: Some("files".to_owned()),
+        },
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::ArtifactRegistered {
+        run_id: 1,
+        scope: scope.clone(),
+        step_id: Some(step.id()),
+        artifact: RegisteredArtifact {
+          name: "binary".to_owned(),
+          path: "dist/app".into(),
+          content_type: Some("application/octet-stream".to_owned()),
+        },
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::ReportRegistered {
+        run_id: 1,
+        scope: scope.clone(),
+        step_id: Some(step.id()),
+        report: RegisteredReport {
+          name: "tests".to_owned(),
+          path: "reports/junit.xml".into(),
+          format: "acme/tests-v2".to_owned(),
         },
       }),
       ConsoleRecord::Diagnostic(ConsoleDiagnostic {
@@ -505,7 +543,7 @@ mod tests {
 
   #[test]
   fn current_schema_rejects_mismatched_categories_and_unknown_fields() {
-    let schema = serde_json::from_str(EVENT_SCHEMA_V2).unwrap();
+    let schema = serde_json::from_str(EVENT_SCHEMA_V3).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     let mut value = serde_json::to_value(ConsoleEntry::new(ConsoleRecord::Execution(
       ExecutionEvent::RunStarted {

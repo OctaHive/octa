@@ -1,0 +1,29 @@
+[package]
+name = "octa-runtime"
+description = "Shared Octa execution bootstrap"
+version = "0.3.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+include = ["src/"]
+
+[dependencies]
+octa-executor = { version = "0.3.0", path = "../octa-executor" }
+octa-finder = { version = "0.3.0", path = "../octa-finder" }
+octa-monorepo = { version = "0.3.0", path = "../octa-monorepo" }
+octa-octafile = { version = "0.3.0", path = "../octa-octafile" }
+octa-output = { version = "0.3.0", path = "../octa-output" }
+octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
+octa-plugin-manager = { version = "0.3.0", path = "../octa-plugin-manager" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sled = "0.34"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -248,11 +248,15 @@ fn step_exports_are_selected_without_flattening_plugin_outputs() {
   ]);
 
   assert_eq!(
-    task.completion_outputs(plugin_outputs).unwrap().task().public_values(),
+    task
+      .completion_outputs(plugin_outputs, &[], &[], &task.dir)
+      .unwrap()
+      .task()
+      .public_values(),
     serde_json::Map::from_iter([("image_digest".to_owned(), serde_json::json!("sha256:test"))])
   );
   assert!(matches!(
-    task.completion_outputs(serde_json::Map::new()),
+    task.completion_outputs(serde_json::Map::new(), &[], &[], &task.dir),
     Err(ExecutorError::TaskOutputMissing { step, field })
       if step == "package" && field == "digest"
   ));
@@ -282,10 +286,15 @@ fn secret_exports_are_available_to_dependencies_but_removed_from_step_results() 
   );
 
   let completion = task
-    .completion_outputs(serde_json::Map::from_iter([
-      ("digest".to_owned(), serde_json::json!("private")),
-      ("image".to_owned(), serde_json::json!("public")),
-    ]))
+    .completion_outputs(
+      serde_json::Map::from_iter([
+        ("digest".to_owned(), serde_json::json!("private")),
+        ("image".to_owned(), serde_json::json!("public")),
+      ]),
+      &[],
+      &[],
+      &task.dir,
+    )
     .unwrap();
 
   assert_eq!(completion.task().get("token"), Some(&serde_json::json!("private")));
@@ -499,7 +508,7 @@ async fn test_basic_command_execution() {
   let cache = Arc::new(Mutex::new(IndexMap::new()));
   let fingerprint = Arc::new(db);
   let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -538,7 +547,7 @@ async fn plugin_stdout_and_stderr_are_routed_as_structured_events() {
       .unwrap(),
   );
   let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../plugins")));
+  let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../target/debug")));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -601,7 +610,7 @@ async fn test_template_rendering() {
   let cache = Arc::new(Mutex::new(IndexMap::new()));
   let fingerprint = Arc::new(db);
   let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_tpl";
   #[cfg(windows)]
@@ -630,7 +639,7 @@ async fn test_cache_behavior() {
   let cache = Arc::new(Mutex::new(IndexMap::new()));
   let fingerprint = Arc::new(db);
   let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -716,7 +725,7 @@ async fn test_error_handling() {
   let cache = Arc::new(Mutex::new(IndexMap::new()));
   let fingerprint = Arc::new(db);
   let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -844,7 +853,7 @@ async fn test_task_cancellation() {
   let cache = Arc::new(Mutex::new(IndexMap::new()));
   let fingerprint = Arc::new(db);
   let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -951,7 +960,7 @@ async fn test_ignore_errors() {
   let cache = Arc::new(Mutex::new(IndexMap::new()));
   let fingerprint = Arc::new(db);
   let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -999,7 +1008,7 @@ async fn test_dependency_results() {
   let cache = Arc::new(Mutex::new(IndexMap::new()));
   let fingerprint = Arc::new(db);
   let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../plugins", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]

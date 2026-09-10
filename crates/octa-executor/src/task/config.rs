@@ -19,6 +19,11 @@ pub(crate) enum NodeAction {
   },
   /// Commit a successful freshness decision after command completion.
   FreshnessCommit(Arc<FreshnessState>),
+  /// Validate and publish task-level artifact and report declarations.
+  RegisterResources {
+    artifacts: Vec<octa_octafile::ArtifactDeclaration>,
+    reports: Vec<octa_octafile::ReportDeclaration>,
+  },
 }
 
 impl NodeAction {
@@ -27,7 +32,7 @@ impl NodeAction {
   }
 
   fn needs_working_directory(&self) -> bool {
-    matches!(self, Self::Command)
+    matches!(self, Self::Command | Self::RegisterResources { .. })
   }
 
   pub(super) fn needs_runtime_lock(&self) -> bool {
@@ -183,6 +188,7 @@ pub(crate) struct TaskConfig {
 
   // Execution configuration
   pub dir: PathBuf,        // Working directory
+  pub workspace: PathBuf,  // Root used to constrain collected resource paths
   pub ignore_errors: bool, // Whether to continue on error
   pub silence: octa_octafile::Silence,
   pub quiet: bool,
@@ -222,6 +228,7 @@ pub(crate) struct TaskConfigBuilder {
   cache_key: Option<String>,
 
   pub dir: Option<PathBuf>,
+  pub workspace: Option<PathBuf>,
   pub ignore_errors: Option<bool>,
   pub silent: Option<octa_octafile::Silence>,
   pub quiet: Option<bool>,
@@ -327,6 +334,11 @@ impl TaskConfigBuilder {
     self
   }
 
+  pub(crate) fn workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+    self.workspace = Some(workspace.into());
+    self
+  }
+
   pub(crate) fn plugin(mut self, plugin: Option<PluginInvocation>) -> Self {
     self.plugin = plugin;
     self
@@ -380,6 +392,7 @@ impl TaskConfigBuilder {
       name,
       dep_name: self.dep_name.ok_or(ExecutorError::TaskConfigFieldMissing("dep_name"))?,
       dir,
+      workspace: self.workspace.unwrap_or_default(),
       ignore_errors: self.ignore_errors.unwrap_or(false),
       silence: self.silent.unwrap_or_default(),
       quiet: self.quiet.unwrap_or(false),

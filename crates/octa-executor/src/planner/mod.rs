@@ -181,6 +181,8 @@ pub(crate) struct TaskGraphBuilder {
   variable_overrides: Vec<(String, String)>,
   // Optional input provider shared by the main graph and nested deferred plans.
   variable_resolver: Option<Arc<dyn VariableResolver>>,
+  secret_session: Option<Arc<crate::SecretSession>>,
+  runtime_identity: serde_json::Value,
   source_strategies: SourceStrategyRegistry,
   scope_allocator: Arc<ConsoleScopeAllocator>,
   force_quiet: bool,
@@ -209,6 +211,8 @@ impl TaskGraphBuilder {
       command_args: vec![],
       variable_overrides: Vec::new(),
       variable_resolver: None,
+      secret_session: None,
+      runtime_identity: serde_json::json!({"octa": env!("CARGO_PKG_VERSION")}),
       source_strategies: SourceStrategyRegistry::default(),
       scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
       force_quiet: false,
@@ -241,6 +245,16 @@ impl TaskGraphBuilder {
   /// Provides interactive values for variables declared with `required: prompt`.
   pub(crate) fn with_variable_resolver(mut self, resolver: Arc<dyn VariableResolver>) -> Self {
     self.variable_resolver = Some(resolver);
+    self
+  }
+
+  pub(crate) fn with_secret_session(mut self, session: Arc<crate::SecretSession>) -> Self {
+    self.secret_session = Some(session);
+    self
+  }
+
+  pub(crate) fn with_runtime_identity(mut self, identity: serde_json::Value) -> Self {
+    self.runtime_identity = identity;
     self
   }
 

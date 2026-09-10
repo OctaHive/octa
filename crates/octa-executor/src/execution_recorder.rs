@@ -15,7 +15,9 @@ use std::{collections::HashMap, io, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
-use octa_output::{Console, ConsoleScope, ConsoleStatus, ConsoleStep, ExecutionEvent};
+use octa_output::{
+  Console, ConsoleScope, ConsoleStatus, ConsoleStep, ExecutionEvent, RegisteredArtifact, RegisteredReport,
+};
 use serde_json::{Map, Value};
 use tokio::sync::Mutex;
 
@@ -43,6 +45,8 @@ struct ScopeState {
   failure_at: Option<DateTime<Utc>>,
   /// Values exported by successful steps, including secrets kept internal until result materialization.
   outputs: TaskOutputs,
+  artifacts: Vec<RegisteredArtifact>,
+  reports: Vec<RegisteredReport>,
 }
 
 impl Default for ScopeState {
@@ -56,6 +60,8 @@ impl Default for ScopeState {
       failure: None,
       failure_at: None,
       outputs: TaskOutputs::default(),
+      artifacts: Vec::new(),
+      reports: Vec::new(),
     }
   }
 }
@@ -116,6 +122,8 @@ struct StepState {
   failure: Option<ExecutionFailure>,
   /// Structured values returned by the step's plugin operation.
   outputs: Arc<Map<String, Value>>,
+  artifacts: Vec<RegisteredArtifact>,
+  reports: Vec<RegisteredReport>,
 }
 
 /// Tracks task/step lifecycle separately from DAG scheduling and task payloads.
@@ -171,6 +179,8 @@ impl ExecutionRecorder {
             finished_at: None,
             failure: None,
             outputs: Arc::new(Map::new()),
+            artifacts: Vec::new(),
+            reports: Vec::new(),
           },
         );
       }
@@ -371,8 +381,37 @@ impl ExecutionRecorder {
         )));
       }
     }
+    for artifact in outputs.artifacts() {
+      self
+        .console
+        .event(ExecutionEvent::ArtifactRegistered {
+          run_id: self.run_id,
+          scope: scope.clone(),
+          step_id: binding.step().map(ConsoleStep::id),
+          artifact: artifact.clone(),
+        })
+        .await?;
+    }
+    for report in outputs.reports() {
+      self
+        .console
+        .event(ExecutionEvent::ReportRegistered {
+          run_id: self.run_id,
+          scope: scope.clone(),
+          step_id: binding.step().map(ConsoleStep::id),
+          report: report.clone(),
+        })
+        .await?;
+    }
     self
-      .finish_step(binding.step(), status, failure.clone(), outputs.shared_step())
+      .finish_step(
+        binding.step(),
+        status,
+        failure.clone(),
+        outputs.shared_step(),
+        outputs.artifacts(),
+        outputs.reports(),
+      )
       .await?;
     let finished = {
       let mut states = self.states.lock().await;
@@ -396,6 +435,8 @@ impl ExecutionRecorder {
       state.status = state.status.max(status);
       record_timed_failure(&mut state.failure, &mut state.failure_at, failure, failure_at);
       state.outputs.extend(outputs.task());
+      state.artifacts.extend_from_slice(outputs.artifacts());
+      state.reports.extend_from_slice(outputs.reports());
       state.remaining -= 1;
       if state.remaining == 0 {
         state.lifecycle = LifecycleState::PublishingFinish;
@@ -456,6 +497,8 @@ impl ExecutionRecorder {
     status: ConsoleStatus,
     failure: Option<ExecutionFailure>,
     outputs: Arc<Map<String, Value>>,
+    artifacts: &[RegisteredArtifact],
+    reports: &[RegisteredReport],
   ) -> io::Result<()> {
     let Some(step) = step else {
       return Ok(());
@@ -474,6 +517,8 @@ impl ExecutionRecorder {
       state.status = state.status.max(status);
       record_failure(&mut state.failure, failure);
       state.outputs = outputs;
+      state.artifacts.extend_from_slice(artifacts);
+      state.reports.extend_from_slice(reports);
       PendingStepFinish {
         step: step.clone(),
         scope: state.scope.clone(),
@@ -603,6 +648,8 @@ impl ExecutionRecorder {
           ),
           output: OutputReference::step(self.run_id, state.scope.id(), step.id()),
           outputs: state.outputs.as_ref().clone(),
+          artifacts: state.artifacts.clone(),
+          reports: state.reports.clone(),
         });
     }
     drop(steps);
@@ -627,6 +674,8 @@ impl ExecutionRecorder {
           output: OutputReference::task(self.run_id, scope.id()),
           outputs: state.outputs.public_values(),
           redacted_outputs: state.outputs.secret_names(),
+          artifacts: state.artifacts.clone(),
+          reports: state.reports.clone(),
           steps: steps_by_scope.remove(&scope.id()).unwrap_or_default(),
         })
       })

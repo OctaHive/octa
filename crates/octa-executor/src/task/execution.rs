@@ -63,6 +63,7 @@ impl TaskNode {
       envs: config.envs,
       invocation_runtime,
       dir: config.dir,
+      workspace: config.workspace,
       ignore_errors: config.ignore_errors,
       silence: config.silence,
       quiet: config.quiet,
@@ -413,6 +414,13 @@ impl TaskNode {
         }
         Ok(Some(TaskOutcome::success(String::new())))
       },
+      NodeAction::RegisterResources { artifacts, reports } => {
+        let artifacts = crate::resource::octafile_artifacts(artifacts, &self.dir, &self.workspace)?;
+        let reports = crate::resource::octafile_reports(reports, &self.dir, &self.workspace)?;
+        Ok(Some(TaskOutcome::success(String::new()).with_outputs(
+          CompletionOutputs::default().with_resources(artifacts, reports),
+        )))
+      },
     }
   }
 
@@ -593,7 +601,13 @@ impl TaskNode {
   }
 
   /// Selects task-level outputs and removes secret exports from the public step result.
-  pub(super) fn completion_outputs(&self, mut step_outputs: Map<String, Value>) -> ExecutorResult<CompletionOutputs> {
+  pub(super) fn completion_outputs(
+    &self,
+    mut step_outputs: Map<String, Value>,
+    artifacts: &[octa_plugin::protocol::ArtifactDeclaration],
+    reports: &[octa_plugin::protocol::ReportDeclaration],
+    working_dir: &Path,
+  ) -> ExecutorResult<CompletionOutputs> {
     let mut task_outputs = TaskOutputs::default();
     for (name, export) in &self.step_exports {
       let value = step_outputs
@@ -612,7 +626,9 @@ impl TaskNode {
         step_outputs.remove(&export.field);
       }
     }
-    Ok(CompletionOutputs::new(step_outputs, task_outputs))
+    let artifacts = crate::resource::plugin_artifacts(artifacts, working_dir, &self.workspace)?;
+    let reports = crate::resource::plugin_reports(reports, working_dir, &self.workspace)?;
+    Ok(CompletionOutputs::new(step_outputs, task_outputs).with_resources(artifacts, reports))
   }
 
   /// Executes the task without applying its timeout wrapper.
@@ -739,6 +755,7 @@ impl TaskNode {
     vars_with_deps_results.insert("deps_result", &dependency_values);
     drop(deps_res);
 
+    let working_dir = dir.clone();
     let request = PluginRequest {
       target: crate::plugin::PluginTarget::Key(plugin.key.clone()),
       value: plugin.value(),
@@ -764,6 +781,8 @@ impl TaskNode {
           stdout,
           stderr,
           outputs,
+          artifacts,
+          reports,
           failure_location,
         } = output;
         if code != 0 && !cancel_token.is_cancelled() {
@@ -791,7 +810,7 @@ impl TaskNode {
           }
         } else {
           // Only successful command output participates in task run-mode cache.
-          let outputs = self.completion_outputs(outputs)?;
+          let outputs = self.completion_outputs(outputs, &artifacts, &reports, &working_dir)?;
           structured_output_budget.reserve(&outputs)?;
           self.update_cache(stdout.trim(), &vars, &outputs, &cache).await?;
           (Ok(stdout.trim().to_string()), outputs)

@@ -9,33 +9,25 @@ use std::{
 };
 
 use async_trait::async_trait;
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::aot::{generate, Generator, Shell};
 use dialoguer::{Input, Password, Select};
 use lazy_static::lazy_static;
 pub use logger::ConsoleLayer;
-use octa_plugin::{protocol::Schema, SHELL_CAPABILITY};
-use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Deserialize;
-use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout, Duration};
-use tokio::{
-  signal,
-  sync::{Mutex, Semaphore},
-};
+#[cfg(test)]
+use tokio::time::timeout;
+use tokio::time::{sleep, Duration};
+use tokio::{signal, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 use error::{OctaError, OctaResult};
-use octa_executor::{
-  ExecutionEngine, ExecutionRequest, PreparedExecution, RuntimeCoordinator, SourceWatcher, Summary, VariablePrompt,
-  VariableResolver, WatchTarget,
-};
+use octa_executor::{SourceWatcher, VariablePrompt, VariableResolver};
 use octa_finder::OctaFinder;
-use octa_octafile::{
-  Octafile, OctafileError, OutputConfig, OutputMode, PresentationConfig, Silence, SyntheticInclude, WatchInterval,
-};
+use octa_octafile::{Octafile, OctafileError, OutputConfig, OutputMode, PresentationConfig, Silence, WatchInterval};
 use octa_output::{CliDocument, Console, ConsoleLevel, SummaryItem, TaskListItem};
+use octa_runtime::{RunOptions, Runtime, RuntimeConfig};
 use presentation::{terminal_console, CiMode};
 
 mod error;
@@ -43,11 +35,7 @@ mod logger;
 mod presentation;
 mod raw_terminal;
 
-const SHELL_PLUGIN_NAME: &str = "shell";
-const TEMPLATE_PLUGIN_NAME: &str = "tpl";
-const BUILTIN_PLUGIN_NAMES: [&str; 2] = [SHELL_PLUGIN_NAME, TEMPLATE_PLUGIN_NAME];
 const DEFAULT_TASK: &str = "default";
-const PLUGIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_millis(100);
 
 enum DiagnosticsSetup {
@@ -79,8 +67,19 @@ lazy_static! {
 }
 
 #[derive(Parser)]
-#[clap(author, version, about, bin_name("octa"), name("octa"), propagate_version(true))]
+#[clap(
+  author,
+  version,
+  about,
+  bin_name("octa"),
+  name("octa"),
+  propagate_version(true),
+  subcommand_precedence_over_arg = true
+)]
 pub(crate) struct Cli {
+  #[command(subcommand)]
+  management: Option<ManagementCommand>,
+
   /// Tasks to run and optional variable overrides
   #[arg(value_name = "TASK|NAME=VALUE")]
   pub commands: Option<Vec<String>>,
@@ -94,6 +93,14 @@ pub(crate) struct Cli {
 
   #[arg(short, long)]
   pub config: Option<PathBuf>,
+
+  /// Verify and load plugins from this lock file.
+  #[arg(long, value_name = "PATH")]
+  pub plugin_lock: Option<PathBuf>,
+
+  /// Resolve logical secret references using this provider profile.
+  #[arg(long, value_name = "PATH", env = "OCTA_SECRETS_PROFILE")]
+  pub secrets_profile: Option<PathBuf>,
 
   #[arg(short = 'e', long = "env-file", value_name = "PATH")]
   pub env_files: Vec<PathBuf>,
@@ -197,6 +204,29 @@ pub(crate) struct Cli {
   task_args: Vec<String>,
 }
 
+#[derive(Clone, Debug, Subcommand)]
+enum ManagementCommand {
+  /// Manage reproducible plugin metadata.
+  Plugin {
+    #[command(subcommand)]
+    command: PluginCommand,
+  },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum PluginCommand {
+  /// Build Octa.lock from '*.plugin.yml' manifests in the plugin directory.
+  Lock {
+    #[arg(long, value_name = "PATH", default_value = "Octa.lock")]
+    output: PathBuf,
+  },
+  /// Verify every locked plugin digest, platform, and protocol.
+  Verify {
+    #[arg(long, value_name = "PATH", default_value = "Octa.lock")]
+    lock: PathBuf,
+  },
+}
+
 fn generate_completions<G: Generator>(gen: G, cmd: &mut clap::Command) -> String {
   let bin_name = cmd.get_name().to_string();
   let mut output = Vec::new();
@@ -253,43 +283,6 @@ fn load_env_files(paths: &[PathBuf]) -> OctaResult<()> {
   }
 
   Ok(())
-}
-
-struct ExecutionOptions {
-  parallel: bool,
-  dry: bool,
-  force: bool,
-  failfast: bool,
-  vars: Vec<(String, String)>,
-  task_args: Vec<String>,
-  quiet: bool,
-  silence: Option<Silence>,
-  raw: bool,
-}
-
-#[derive(Clone)]
-struct ExecutionContext {
-  plugin_manager: Arc<PluginManager>,
-  octafile: Arc<Octafile>,
-  fingerprint: Arc<sled::Db>,
-  summary: Arc<Summary>,
-  concurrency: Option<ConcurrencyLimiter>,
-  variable_resolver: Option<Arc<dyn VariableResolver>>,
-  console: Arc<Console>,
-  runtime_coordinator: Arc<RuntimeCoordinator>,
-}
-
-#[derive(Clone)]
-struct ConcurrencyLimiter {
-  semaphore: Arc<Semaphore>,
-  limit: NonZeroUsize,
-}
-
-fn concurrency_limiter(cli: Option<NonZeroUsize>, configured: Option<NonZeroUsize>) -> Option<ConcurrencyLimiter> {
-  cli.or(configured).map(|limit| ConcurrencyLimiter {
-    semaphore: Arc::new(Semaphore::new(limit.get())),
-    limit,
-  })
 }
 
 struct TerminalVariableResolver {
@@ -411,248 +404,14 @@ fn setup_logging(console: &Arc<Console>, verbose: bool) -> OctaResult<()> {
     .map_err(|error| OctaError::Runtime(format!("failed to initialize diagnostics: {error}")))
 }
 
-/// Initializes plugin manager and loads plugins
-async fn initialize_plugins(
-  plugin_manager: Arc<PluginManager>,
-  config_plugins: Vec<String>,
-) -> OctaResult<(Arc<PluginManager>, HashMap<String, Schema>)> {
-  let mut plugin_futures = Vec::new();
-  let plugins = [
-    config_plugins,
-    BUILTIN_PLUGIN_NAMES.iter().map(|name| name.to_string()).collect(),
-  ]
-  .concat();
-
-  // Start all plugins in parallel
-  for plugin in plugins {
-    #[cfg(not(windows))]
-    let plugin_name = format!("octa_plugin_{}", plugin);
-    #[cfg(windows)]
-    let plugin_name = format!("octa_plugin_{}.exe", plugin);
-
-    let plugin_manager = plugin_manager.clone();
-    let plugin_key = plugin.clone();
-
-    let future = tokio::spawn(async move {
-      match timeout(PLUGIN_TIMEOUT, plugin_manager.start_plugin(&plugin_name)).await {
-        Ok(Ok(schema)) => Ok((plugin_key, schema)),
-        Ok(Err(e)) => Err(OctaError::PluginStartError(format!("Plugin error: {}", e))),
-        Err(_) => Err(OctaError::PluginStartError(format!("Plugin timeout: {}", plugin_name))),
-      }
-    });
-
-    plugin_futures.push(future);
-  }
-
-  // Collect results
-  let mut plugin_keys = HashMap::new();
-  for future in plugin_futures {
-    match future.await {
-      Ok(Ok((plugin, schema))) => {
-        plugin_keys.insert(plugin, schema);
-      },
-      Ok(Err(e)) => return Err(e),
-      Err(e) => return Err(OctaError::Runtime(e.to_string())),
-    }
-  }
-
-  Ok((plugin_manager, plugin_keys))
-}
-
-async fn shutdown_plugins(plugin_manager: &PluginManager, console: &Console) {
-  for error in plugin_manager.shutdown_all().await.into_iter().filter_map(Result::err) {
-    let _ = console
-      .message(ConsoleLevel::Error, format!("Failed to shut down plugin: {error}"))
-      .await;
-  }
-}
-
-/// Resolves the task-type key used for short commands from configuration or the shell capability.
-fn resolve_default_plugin(configured: Option<String>, schemas: &HashMap<String, Schema>) -> OctaResult<String> {
-  if let Some(key) = configured {
-    if schemas.values().any(|schema| schema.key == key) {
-      return Ok(key);
-    }
-
-    return Err(OctaError::ConfigLoadError(format!(
-      "unknown default plugin task type '{key}'"
-    )));
-  }
-
-  schemas
-    .values()
-    .find(|schema| {
-      schema
-        .capabilities
-        .iter()
-        .any(|capability| capability == SHELL_CAPABILITY)
-    })
-    // Plugins built against the previous protocol did not advertise capabilities.
-    .or_else(|| schemas.get(SHELL_PLUGIN_NAME))
-    .map(|schema| schema.key.clone())
-    .ok_or_else(|| OctaError::PluginStartError("no plugin provides the shell capability".to_string()))
-}
-
-/// Executes tasks either in parallel or sequentially
-async fn execute_tasks(
-  tasks: Vec<PreparedExecution>,
-  parallel: bool,
-  failfast: bool,
-  cancel_token: CancellationToken,
-) -> OctaResult<()> {
-  // A batch token lets CLI fail-fast cancel sibling commands without cancelling a watch loop
-  // or another caller that owns the outer token.
-  let batch_token = cancel_token.child_token();
-
-  if parallel {
-    // Declare every run and scope before scheduling work so renderers such as keep-order observe
-    // the same order as the command line even when Tokio polls spawned executions differently.
-    for task in &tasks {
-      task.declare().await?;
-    }
-    let mut handles = JoinSet::new();
-    let mut first_error = None;
-
-    for task in tasks {
-      let task_token = batch_token.clone();
-      handles.spawn(task.execute(task_token));
-    }
-
-    // Join in completion order so the first failure can interrupt siblings immediately.
-    while let Some(result) = handles.join_next().await {
-      let error = match result {
-        Ok(Ok(result)) => match result.into_failure() {
-          Some(failure) => OctaError::ExecutionFailed(Box::new(failure)),
-          None => continue,
-        },
-        Ok(Err(error)) => OctaError::ExecutionError(error),
-        Err(error) => OctaError::Runtime(error.to_string()),
-      };
-
-      if first_error.is_none() {
-        if failfast {
-          batch_token.cancel();
-        }
-        first_error = Some(error);
-      }
-    }
-
-    if let Some(error) = first_error {
-      return Err(error);
-    }
-  } else {
-    for task in tasks {
-      let result = task.execute(batch_token.clone()).await?;
-      if let Some(failure) = result.into_failure() {
-        return Err(Box::new(failure).into());
-      }
-    }
-  }
-  Ok(())
-}
-
-async fn build_execute_items(
-  context: &ExecutionContext,
-  commands: &[String],
-  options: &ExecutionOptions,
-) -> OctaResult<(Vec<PreparedExecution>, Vec<WatchTarget>)> {
-  let mut engine = ExecutionEngine::new(
-    context.plugin_manager.clone(),
-    context.octafile.clone(),
-    context.fingerprint.clone(),
-    context.console.clone(),
-  )
-  .with_summary(context.summary.clone())
-  .with_runtime_coordinator(context.runtime_coordinator.clone())
-  .with_raw_terminal(Arc::new(raw_terminal::LocalRawTerminal));
-  if let Some(concurrency) = &context.concurrency {
-    engine = engine.with_concurrency(concurrency.semaphore.clone());
-  }
-  if let Some(variable_resolver) = &context.variable_resolver {
-    engine = engine.with_variable_resolver(variable_resolver.clone());
-  }
-  let mut tasks = Vec::with_capacity(commands.len());
-  let mut watch_targets = Vec::new();
-  let mut plan_is_parallel = false;
-
-  for command in commands {
-    if !(options.quiet || context.octafile.quiet.unwrap_or(false)) {
-      context
-        .console
-        .message(
-          ConsoleLevel::Info,
-          format!(
-            "Building DAG for command {} with provided args {:?}",
-            command, options.task_args
-          ),
-        )
-        .await?;
-    }
-    let mut request = ExecutionRequest::new(command);
-    request.parallel = options.parallel;
-    request.dry = options.dry;
-    request.force = options.force;
-    request.failfast = options.failfast;
-    request.variables = options.vars.clone();
-    request.command_args = options.task_args.clone();
-    request.quiet = options.quiet;
-    request.silence = options.silence;
-    request.raw = options.raw;
-    let execution = engine.prepare(request).await?;
-
-    plan_is_parallel |= options.parallel || !execution.is_linear();
-    watch_targets.extend_from_slice(execution.watch_targets());
-    tasks.push(execution);
-  }
-
-  let concurrency_is_one = context
-    .concurrency
-    .as_ref()
-    .is_some_and(|limiter| limiter.limit.get() == 1);
-  context
-    .console
-    .set_parallel(plan_is_parallel && !options.raw && !concurrency_is_one)
-    .await?;
-
-  Ok((tasks, watch_targets))
-}
-
-fn tasks_request_watch(octafile: &Arc<Octafile>, commands: &[String]) -> bool {
-  let finder = OctaFinder::new();
-  commands.iter().any(|command| {
-    finder
-      .find_by_path(Arc::clone(octafile), command)
-      .iter()
-      .any(|result| result.task.watch.unwrap_or(false))
-  })
-}
-
-fn qualify_monorepo_commands(commands: Vec<String>, namespace: Option<&[String]>) -> Vec<String> {
-  let Some(namespace) = namespace.filter(|namespace| !namespace.is_empty()) else {
-    return commands;
-  };
-  let prefix = namespace.join(":");
-
-  commands
-    .into_iter()
-    .map(|command| {
-      if command.contains(':') {
-        command
-      } else {
-        format!("{prefix}:{command}")
-      }
-    })
-    .collect()
-}
-
 async fn execute_watch(
-  context: ExecutionContext,
+  runtime: Arc<Runtime>,
   commands: &[String],
-  options: &ExecutionOptions,
+  options: &RunOptions,
   interval: Duration,
   cancel_token: CancellationToken,
 ) -> OctaResult<()> {
-  let (tasks, targets) = build_execute_items(&context, commands, options).await?;
+  let (tasks, targets) = runtime.prepare(commands, options).await?;
 
   if targets.is_empty() {
     return Err(OctaError::WatchSourcesMissing);
@@ -663,9 +422,9 @@ async fn execute_watch(
     _ = cancel_token.cancelled() => return Ok(()),
     watcher = SourceWatcher::new(targets, cancel_token.clone()) => watcher?,
   };
-  if let Err(error) = execute_tasks(tasks, options.parallel, options.failfast, cancel_token.clone()).await {
-    context
-      .console
+  if let Err(error) = run_prepared(&runtime, tasks, options).await {
+    runtime
+      .console()
       .message(
         ConsoleLevel::Warn,
         format!("Task execution failed; waiting for source changes: {error}"),
@@ -673,8 +432,8 @@ async fn execute_watch(
       .await?;
   }
 
-  context
-    .console
+  runtime
+    .console()
     .message(ConsoleLevel::Info, "Watching sources for changes")
     .await?;
   loop {
@@ -689,15 +448,15 @@ async fn execute_watch(
       changed = watcher.poll() => changed?,
     };
     if changed {
-      context
-        .console
+      runtime
+        .console()
         .message(ConsoleLevel::Info, "Sources changed; restarting tasks")
         .await?;
-      let (tasks, _) = build_execute_items(&context, commands, options).await?;
+      let (tasks, _) = runtime.prepare(commands, options).await?;
 
-      if let Err(error) = execute_tasks(tasks, options.parallel, options.failfast, cancel_token.clone()).await {
-        context
-          .console
+      if let Err(error) = run_prepared(&runtime, tasks, options).await {
+        runtime
+          .console()
           .message(
             ConsoleLevel::Warn,
             format!("Task execution failed; waiting for source changes: {error}"),
@@ -707,6 +466,18 @@ async fn execute_watch(
     }
   }
 
+  Ok(())
+}
+
+async fn run_prepared(
+  runtime: &Runtime,
+  tasks: Vec<octa_executor::PreparedExecution>,
+  options: &RunOptions,
+) -> OctaResult<()> {
+  let results = runtime.execute(tasks, options.parallel, options.failfast).await?;
+  if let Some(failure) = results.into_iter().find_map(|result| result.into_failure()) {
+    return Err(Box::new(failure).into());
+  }
   Ok(())
 }
 
@@ -859,99 +630,144 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
     setup_logging(&console, args.verbose)?;
   }
 
-  let plugins_dir = std::env::var("OCTA_PLUGINS_DIR").unwrap_or_else(|_| "plugins".to_string());
-  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
-
-  let config = match args.config {
+  let config = match args.config.as_ref() {
     Some(config) => load_config(config)?,
     None => PluginConfig::default(),
   };
-
-  let (plugin_manager, plugin_schemas) = initialize_plugins(plugin_manager.clone(), config.plugins).await?;
-  let default_plugin = resolve_default_plugin(config.default_plugin, &plugin_schemas)?;
-
-  let mut plugin_schemas_by_key = HashMap::new();
-  for schema in plugin_schemas.values() {
-    if plugin_schemas_by_key
-      .insert(
-        schema.key.clone(),
-        octa_octafile::PluginTypeSchema {
-          input: schema.input_schema.clone(),
-          output: schema.output_schema.clone(),
-        },
-      )
-      .is_some()
-    {
-      return Err(OctaError::PluginStartError(format!(
-        "more than one plugin provides the '{}' task type",
-        schema.key
-      )));
-    }
-  }
-
-  let fingerprint = Arc::new(sled::open(format!("{}/fingerprint", *OCTA_DATA_DIR))?);
-  if args.clean_cache {
-    fingerprint.clear()?;
-    octa_monorepo::clear_cache(&fingerprint)?;
-    shutdown_plugins(&plugin_manager, &console).await;
-    return Ok(());
-  }
-
-  let entry_path = Octafile::resolve_path(args.octafile.clone(), args.global, args.dir.clone())?;
-  let working_dir = match &args.dir {
+  let workspace = match &args.dir {
     Some(path) if path.is_absolute() => path.clone(),
     Some(path) => env::current_dir()?.join(path),
     None => env::current_dir()?,
   };
-  let monorepo = octa_monorepo::resolve(
-    &entry_path,
-    &working_dir,
-    args.octafile.is_some() || args.global,
-    &fingerprint,
-  )?;
-  let synthetic_includes = monorepo
-    .projects
-    .iter()
-    .map(|project| SyntheticInclude {
-      namespace: project.namespace.clone(),
-      path: project.octafile.clone(),
+  let data_dir = PathBuf::from(OCTA_DATA_DIR.as_str());
+  if args.clean_cache {
+    let data_dir = if data_dir.is_absolute() {
+      data_dir
+    } else {
+      workspace.join(data_dir)
+    };
+    let fingerprint = sled::open(data_dir.join("fingerprint"))?;
+    fingerprint.clear()?;
+    octa_monorepo::clear_cache(&fingerprint)?;
+    return Ok(());
+  }
+
+  let variable_resolver: Option<Arc<dyn VariableResolver>> =
+    (!args.non_interactive && io::stdin().is_terminal() && io::stderr().is_terminal())
+      .then(|| Arc::new(TerminalVariableResolver::new()) as Arc<dyn VariableResolver>);
+  let plugins_dir = PathBuf::from(std::env::var_os("OCTA_PLUGINS_DIR").unwrap_or_else(|| "plugins".into()));
+  if let Some(command) = &args.management {
+    return run_plugin_management(command, &workspace, &plugins_dir, &console).await;
+  }
+  let cancellation = CancellationToken::new();
+  setup_signal_handling(cancellation.clone(), console.clone()).await;
+  let runtime = Arc::new(
+    Runtime::load(RuntimeConfig {
+      workspace,
+      octafile: args.octafile.clone(),
+      global: args.global,
+      data_dir,
+      plugins_dir,
+      plugin_lock: args.plugin_lock.clone(),
+      secrets_profile: args.secrets_profile.clone(),
+      plugins: config.plugins,
+      default_plugin: config.default_plugin,
+      variables: args.vars.clone(),
+      concurrency: args.concurrency,
+      variable_resolver,
+      raw_terminal: Arc::new(raw_terminal::LocalRawTerminal),
+      console: console.clone(),
+      cancellation,
     })
-    .collect::<Vec<_>>();
-  if !synthetic_includes.is_empty() {
+    .await?,
+  );
+
+  if runtime.monorepo_project_count() > 0 {
     console
       .message(
         ConsoleLevel::Info,
         format!(
           "Loaded {} monorepo projects{}",
-          synthetic_includes.len(),
-          if monorepo.cache_hit { " from cache" } else { "" }
+          runtime.monorepo_project_count(),
+          if runtime.monorepo_cache_hit() {
+            " from cache"
+          } else {
+            ""
+          }
         ),
       )
       .await?;
   }
 
-  let octafile = Octafile::load_with_schemas_vars_and_includes_from(
-    Some(monorepo.root_octafile),
-    false,
-    None,
-    plugin_schemas_by_key,
-    default_plugin,
-    &args.vars,
-    &synthetic_includes,
-  )?;
+  let result = run_loaded_runtime(runtime.clone(), console, args).await;
+  runtime.shutdown().await;
+  result
+}
 
+async fn run_plugin_management(
+  command: &ManagementCommand,
+  workspace: &Path,
+  plugins_dir: &Path,
+  console: &Console,
+) -> OctaResult<()> {
+  use octa_plugin_manager::plugin_lock::PluginLock;
+
+  let plugins_dir = if plugins_dir.is_absolute() {
+    plugins_dir.to_path_buf()
+  } else {
+    workspace.join(plugins_dir)
+  };
+  match command {
+    ManagementCommand::Plugin {
+      command: PluginCommand::Lock { output },
+    } => {
+      let output = if output.is_absolute() {
+        output.clone()
+      } else {
+        workspace.join(output)
+      };
+      let lock = PluginLock::from_manifest_directory(&plugins_dir).await?;
+      lock.write(&output)?;
+      console
+        .message(
+          ConsoleLevel::Info,
+          format!("Locked {} plugins in {}", lock.plugins.len(), output.display()),
+        )
+        .await?;
+    },
+    ManagementCommand::Plugin {
+      command: PluginCommand::Verify { lock },
+    } => {
+      let lock_path = if lock.is_absolute() {
+        lock.clone()
+      } else {
+        workspace.join(lock)
+      };
+      let lock = PluginLock::load(&lock_path)?;
+      lock.verify_all(&plugins_dir).await?;
+      console
+        .message(
+          ConsoleLevel::Info,
+          format!("Verified {} locked plugins", lock.plugins.len()),
+        )
+        .await?;
+    },
+  }
+  Ok(())
+}
+
+async fn run_loaded_runtime(runtime: Arc<Runtime>, console: Arc<Console>, args: Cli) -> OctaResult<()> {
   if args.dry {
     console.message(ConsoleLevel::Warn, "Octa run in dry mode").await?;
   }
 
-  let cancel_token = CancellationToken::new();
-  setup_signal_handling(cancel_token.clone(), console.clone()).await;
+  let cancel_token = runtime.cancellation();
 
   if args.list_tasks || args.search.is_some() {
     let finder = OctaFinder::new();
     let commands = match args.search.as_deref() {
-      Some(query) => finder.search(Arc::clone(&octafile), query),
-      None => finder.find_by_path(Arc::clone(&octafile), "**"),
+      Some(query) => finder.search(runtime.octafile().clone(), query),
+      None => finder.find_by_path(runtime.octafile().clone(), "**"),
     };
     let filtered = commands.into_iter().filter(|cmd| !cmd.task.internal.unwrap_or(false));
     let found_commands: Vec<(String, Option<String>)> = filtered.map(|c| (c.name.clone(), c.task.desc)).collect();
@@ -967,13 +783,10 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
   }
 
   let use_default_task = args.commands.is_none();
-  let commands = qualify_monorepo_commands(
-    args.commands.unwrap_or_else(|| vec![DEFAULT_TASK.to_string()]),
-    monorepo.current_namespace.as_deref(),
-  );
+  let commands = runtime.qualify_commands(args.commands.unwrap_or_else(|| vec![DEFAULT_TASK.to_string()]));
   if use_default_task
     && OctaFinder::new()
-      .find_by_path(Arc::clone(&octafile), &commands[0])
+      .find_by_path(runtime.octafile().clone(), &commands[0])
       .is_empty()
   {
     let help = Cli::command().render_help().to_string();
@@ -986,59 +799,37 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
     return Ok(());
   }
 
-  let options = ExecutionOptions {
+  let options = RunOptions {
     parallel: args.parallel && !args.raw,
     dry: args.dry,
     force: args.force,
     failfast: args.failfast,
-    vars: args.vars,
+    variables: args.vars,
     task_args: args.task_args,
     quiet: args.quiet,
     silence: args.silent,
     raw: args.raw,
   };
-  let summary = Arc::new(Summary::new());
-  let variable_resolver: Option<Arc<dyn VariableResolver>> =
-    (!args.non_interactive && io::stdin().is_terminal() && io::stderr().is_terminal())
-      .then(|| Arc::new(TerminalVariableResolver::new()) as Arc<dyn VariableResolver>);
-  let execution_context = ExecutionContext {
-    plugin_manager: plugin_manager.clone(),
-    octafile: Arc::clone(&octafile),
-    fingerprint: Arc::clone(&fingerprint),
-    summary: summary.clone(),
-    concurrency: concurrency_limiter(args.concurrency, octafile.concurrency),
-    variable_resolver,
-    console,
-    runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
-  };
-  let watch = args.watch || tasks_request_watch(&octafile, &commands);
+  let watch = args.watch || runtime.commands_request_watch(&commands);
 
   if watch {
     let interval = if let Some(interval) = args.interval {
       interval
-    } else if let Some(interval) = octafile.interval {
+    } else if let Some(interval) = runtime.octafile().interval {
       interval.duration()
     } else {
       DEFAULT_WATCH_INTERVAL
     };
 
-    execute_watch(
-      execution_context.clone(),
-      &commands,
-      &options,
-      interval,
-      cancel_token.clone(),
-    )
-    .await?;
+    execute_watch(runtime.clone(), &commands, &options, interval, cancel_token.clone()).await?;
   } else {
-    let (tasks, _) = build_execute_items(&execution_context, &commands, &options).await?;
-    execute_tasks(tasks, options.parallel, options.failfast, cancel_token).await?;
+    let (tasks, _) = runtime.prepare(&commands, &options).await?;
+    run_prepared(&runtime, tasks, &options).await?;
   }
 
   if args.summary {
-    let report = summary.report().await;
-    execution_context
-      .console
+    let report = runtime.summary().report().await;
+    console
       .document(CliDocument::Summary {
         tasks: report
           .tasks
@@ -1052,8 +843,6 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
       })
       .await?;
   }
-
-  shutdown_plugins(&plugin_manager, &execution_context.console).await;
 
   Ok(())
 }
@@ -1100,6 +889,19 @@ mod tests {
     } else {
       PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins")
     }
+  }
+
+  async fn test_runtime(temp_dir: &TempDir, console: Arc<Console>) -> Arc<Runtime> {
+    Arc::new(
+      Runtime::load(RuntimeConfig::headless(
+        temp_dir.path().to_path_buf(),
+        test_plugins_dir(),
+        PathBuf::from(".octa-test"),
+        console,
+      ))
+      .await
+      .unwrap(),
+    )
   }
 
   fn glob_path(path: &Path) -> String {
@@ -1164,39 +966,6 @@ mod tests {
     assert_eq!(cli.commands, Some(vec!["build".to_string()]));
 
     assert!(Cli::try_parse_from(["octa", "--concurrency", "0", "build"]).is_err());
-  }
-
-  #[test]
-  fn cli_concurrency_overrides_octafile_default() {
-    let configured = NonZeroUsize::new(2);
-    let cli = NonZeroUsize::new(4);
-
-    assert_eq!(concurrency_limiter(None, None).map(|limiter| limiter.limit.get()), None);
-    assert_eq!(
-      concurrency_limiter(None, configured).map(|limiter| limiter.limit.get()),
-      Some(2)
-    );
-    assert_eq!(
-      concurrency_limiter(cli, configured).map(|limiter| limiter.limit.get()),
-      Some(4)
-    );
-  }
-
-  #[test]
-  fn qualifies_only_bare_commands_inside_a_monorepo_project() {
-    let namespace = ["packages".to_owned(), "api".to_owned()];
-    let commands = vec![
-      "build".to_owned(),
-      "*".to_owned(),
-      "packages:web:build".to_owned(),
-      "::root".to_owned(),
-    ];
-
-    assert_eq!(
-      qualify_monorepo_commands(commands, Some(&namespace)),
-      ["packages:api:build", "packages:api:*", "packages:web:build", "::root"]
-    );
-    assert_eq!(qualify_monorepo_commands(vec!["build".to_owned()], None), ["build"]);
   }
 
   #[tokio::test]
@@ -1293,8 +1062,8 @@ mod tests {
     assert!(parse_watch_interval("100").is_err());
   }
 
-  #[test]
-  fn task_watch_only_applies_to_direct_cli_selection() {
+  #[tokio::test]
+  async fn task_watch_only_applies_to_direct_cli_selection() {
     let temp_dir = TempDir::new().unwrap();
     fs::write(
       temp_dir.path().join("Octafile.yml"),
@@ -1320,17 +1089,11 @@ tasks:
     )
     .unwrap();
 
-    let octafile = Octafile::load(
-      Some(temp_dir.path().join("Octafile.yml")),
-      false,
-      vec!["shell".to_string()],
-      "shell",
-    )
-    .unwrap();
-
-    assert!(tasks_request_watch(&octafile, &["watched".to_string()]));
-    assert!(!tasks_request_watch(&octafile, &["dependency".to_string()]));
-    assert!(!tasks_request_watch(&octafile, &["command".to_string()]));
+    let runtime = test_runtime(&temp_dir, Arc::new(Console::default())).await;
+    assert!(runtime.commands_request_watch(&["watched".to_string()]));
+    assert!(!runtime.commands_request_watch(&["dependency".to_string()]));
+    assert!(!runtime.commands_request_watch(&["command".to_string()]));
+    runtime.shutdown().await;
   }
 
   #[tokio::test]
@@ -1358,45 +1121,17 @@ tasks:
     )
     .unwrap();
 
-    let plugin_manager = Arc::new(PluginManager::new(test_plugins_dir()));
-    let (plugin_manager, schemas) = initialize_plugins(plugin_manager, Vec::new()).await.unwrap();
-    let octafile = Octafile::load(
-      Some(temp_dir.path().join("Octafile.yml")),
-      false,
-      schemas.values().map(|schema| schema.key.clone()).collect(),
-      "shell",
-    )
-    .unwrap();
+    let runtime = test_runtime(&temp_dir, Arc::new(Console::default())).await;
     let commands = vec!["build".to_string()];
-    assert!(tasks_request_watch(&octafile, &commands));
+    assert!(runtime.commands_request_watch(&commands));
 
     let cancel_token = CancellationToken::new();
     let watch_cancel_token = cancel_token.clone();
-    let watch_plugin_manager = plugin_manager.clone();
-    let fingerprint = Arc::new(sled::Config::new().temporary(true).open().unwrap());
+    let watch_runtime = runtime.clone();
     let handle = tokio::spawn(async move {
-      let options = ExecutionOptions {
-        parallel: false,
-        dry: false,
-        force: false,
-        failfast: false,
-        vars: Vec::new(),
-        task_args: Vec::new(),
-        quiet: false,
-        silence: None,
-        raw: false,
-      };
+      let options = RunOptions::default();
       execute_watch(
-        ExecutionContext {
-          plugin_manager: watch_plugin_manager,
-          octafile,
-          fingerprint,
-          summary: Arc::new(Summary::new()),
-          concurrency: None,
-          variable_resolver: None,
-          console: Arc::new(Console::default()),
-          runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
-        },
+        watch_runtime,
         &commands,
         &options,
         Duration::from_millis(25),
@@ -1411,7 +1146,7 @@ tasks:
     cancel_token.cancel();
 
     handle.await.unwrap().unwrap();
-    plugin_manager.shutdown_all().await;
+    runtime.shutdown().await;
   }
 
   #[tokio::test]
@@ -1428,35 +1163,10 @@ tasks:
     )
     .unwrap();
 
-    let octafile = Octafile::load(
-      Some(temp_dir.path().join("Octafile.yml")),
-      false,
-      vec!["shell".to_string()],
-      "shell",
-    )
-    .unwrap();
-    let options = ExecutionOptions {
-      parallel: false,
-      dry: false,
-      force: false,
-      failfast: false,
-      vars: Vec::new(),
-      task_args: Vec::new(),
-      quiet: false,
-      silence: None,
-      raw: false,
-    };
+    let runtime = test_runtime(&temp_dir, Arc::new(Console::default())).await;
+    let options = RunOptions::default();
     let result = execute_watch(
-      ExecutionContext {
-        plugin_manager: Arc::new(PluginManager::new(temp_dir.path())),
-        octafile,
-        fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
-        summary: Arc::new(Summary::new()),
-        concurrency: None,
-        variable_resolver: None,
-        console: Arc::new(Console::default()),
-        runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
-      },
+      runtime.clone(),
       &["build".to_string()],
       &options,
       Duration::from_millis(25),
@@ -1465,6 +1175,7 @@ tasks:
     .await;
 
     assert!(matches!(result, Err(OctaError::WatchSourcesMissing)));
+    runtime.shutdown().await;
   }
 
   #[tokio::test]
@@ -1488,45 +1199,18 @@ tasks:
     )
     .unwrap();
 
-    let plugin_manager = Arc::new(PluginManager::new(test_plugins_dir()));
-    let (plugin_manager, schemas) = initialize_plugins(plugin_manager, Vec::new()).await.unwrap();
-    let octafile = Octafile::load(
-      Some(temp_dir.path().join("Octafile.yml")),
-      false,
-      schemas.values().map(|schema| schema.key.clone()).collect(),
-      "shell",
-    )
-    .unwrap();
     let events = Arc::new(StdMutex::new(Vec::new()));
     let console = Arc::new(Console::new(RecordingRenderer(events.clone())));
+    let runtime = test_runtime(&temp_dir, console).await;
     let cancel_token = CancellationToken::new();
     let watch_cancel_token = cancel_token.clone();
-    let watch_plugin_manager = plugin_manager.clone();
+    let watch_runtime = runtime.clone();
     let commands = vec!["build".to_owned()];
     let handle = tokio::spawn(async move {
       execute_watch(
-        ExecutionContext {
-          plugin_manager: watch_plugin_manager,
-          octafile,
-          fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
-          summary: Arc::new(Summary::new()),
-          concurrency: None,
-          variable_resolver: None,
-          console,
-          runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
-        },
+        watch_runtime,
         &commands,
-        &ExecutionOptions {
-          parallel: false,
-          dry: false,
-          force: false,
-          failfast: false,
-          vars: Vec::new(),
-          task_args: Vec::new(),
-          quiet: false,
-          silence: None,
-          raw: false,
-        },
+        &RunOptions::default(),
         Duration::from_millis(25),
         watch_cancel_token,
       )
@@ -1551,7 +1235,7 @@ tasks:
     cancel_token.cancel();
 
     handle.await.unwrap().unwrap();
-    plugin_manager.shutdown_all().await;
+    runtime.shutdown().await;
   }
 
   #[test]
@@ -1657,51 +1341,6 @@ tasks:
   }
 
   #[test]
-  fn test_resolve_default_plugin_uses_configured_task_type() {
-    let schemas = HashMap::from([
-      (
-        "custom-shell-executable".to_string(),
-        Schema {
-          key: "shell-command".to_string(),
-          supports_raw: true,
-          capabilities: vec![SHELL_CAPABILITY.to_owned()],
-          input_schema: None,
-          output_schema: None,
-        },
-      ),
-      (
-        "custom".to_string(),
-        Schema {
-          key: "docker".to_string(),
-          supports_raw: false,
-          capabilities: Vec::new(),
-          input_schema: None,
-          output_schema: None,
-        },
-      ),
-    ]);
-
-    assert_eq!(resolve_default_plugin(None, &schemas).unwrap(), "shell-command");
-    assert_eq!(
-      resolve_default_plugin(Some("docker".to_string()), &schemas).unwrap(),
-      "docker"
-    );
-    assert!(resolve_default_plugin(Some("missing".to_string()), &schemas).is_err());
-
-    let legacy = HashMap::from([(
-      SHELL_PLUGIN_NAME.to_owned(),
-      Schema {
-        key: "legacy-shell".to_owned(),
-        supports_raw: false,
-        capabilities: Vec::new(),
-        input_schema: None,
-        output_schema: None,
-      },
-    )]);
-    assert_eq!(resolve_default_plugin(None, &legacy).unwrap(), "legacy-shell");
-  }
-
-  #[test]
   fn test_load_config_invalid() {
     let temp_dir = TempDir::new().unwrap();
     let config_content = r#"
@@ -1770,6 +1409,44 @@ tasks:
     assert_eq!(cli.output_group_begin.as_deref(), Some("begin {{.TASK}}"));
     assert_eq!(cli.output_group_end.as_deref(), Some("end"));
     assert_eq!(cli.output_group_error_only, Some(true));
+  }
+
+  #[test]
+  fn configured_presentation_applies_and_validates_cli_overrides() {
+    let group = Cli::parse_from([
+      "octa",
+      "--output",
+      "group",
+      "--output-group-begin",
+      "begin {{.TASK}}",
+      "--output-group-end",
+      "end",
+      "--output-group-error-only",
+      "true",
+      "build",
+    ]);
+    let presentation = configured_presentation(&group).unwrap();
+    assert_eq!(presentation.output.group.begin.as_deref(), Some("begin {{.TASK}}"));
+    assert_eq!(presentation.output.group.end.as_deref(), Some("end"));
+    assert!(presentation.output.group.error_only);
+
+    let wrong_mode = Cli::parse_from(["octa", "--output-group-begin", "begin", "build"]);
+    assert!(matches!(
+      configured_presentation(&wrong_mode),
+      Err(OctaError::InvalidOutputConfig(_))
+    ));
+    let invalid_template = Cli::parse_from(["octa", "--output", "group", "--output-group-begin", "{{", "build"]);
+    assert!(matches!(
+      configured_presentation(&invalid_template),
+      Err(OctaError::InvalidOutputConfig(_))
+    ));
+    let raw_json = Cli::parse_from(["octa", "--raw", "--output", "jsonl", "build"]);
+    assert!(matches!(
+      configured_presentation(&raw_json),
+      Err(OctaError::InvalidOutputConfig(_))
+    ));
+    let parallel = configured_presentation(&Cli::parse_from(["octa", "--parallel", "build"])).unwrap();
+    assert_eq!(parallel.output.mode, OutputMode::Prefixed);
   }
 
   #[test]

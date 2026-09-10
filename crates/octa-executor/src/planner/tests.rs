@@ -542,7 +542,7 @@ tasks:
     "shell",
   )?;
   let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../plugins")));
+  let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../target/debug")));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]

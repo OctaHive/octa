@@ -84,6 +84,8 @@ pub struct ExecutionEngine {
   console: Arc<Console>,
   concurrency: Option<Arc<Semaphore>>,
   variable_resolver: Option<Arc<dyn VariableResolver>>,
+  secret_session: Option<Arc<crate::SecretSession>>,
+  runtime_identity: serde_json::Value,
   summary: Option<Arc<Summary>>,
   scope_allocator: Arc<ConsoleScopeAllocator>,
   runtime_coordinator: Arc<RuntimeCoordinator>,
@@ -111,6 +113,8 @@ impl ExecutionEngine {
       console,
       concurrency: None,
       variable_resolver: None,
+      secret_session: None,
+      runtime_identity: serde_json::json!({"octa": env!("CARGO_PKG_VERSION")}),
       summary: None,
       scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
       runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
@@ -127,6 +131,18 @@ impl ExecutionEngine {
   /// Supplies an application-owned provider for required variable prompts.
   pub fn with_variable_resolver(mut self, variable_resolver: Arc<dyn VariableResolver>) -> Self {
     self.variable_resolver = Some(variable_resolver);
+    self
+  }
+
+  /// Resolves logical Octafile secret references for every execution owned by this engine.
+  pub fn with_secret_session(mut self, secret_session: Arc<crate::SecretSession>) -> Self {
+    self.secret_session = Some(secret_session);
+    self
+  }
+
+  /// Adds release and locked-plugin identity to persistent freshness decisions.
+  pub fn with_runtime_identity(mut self, runtime_identity: serde_json::Value) -> Self {
+    self.runtime_identity = runtime_identity;
     self
   }
 
@@ -245,12 +261,16 @@ impl ExecutionEngine {
     let mut builder = TaskGraphBuilder::new(self.plugin_manager.clone())?
       .with_scope_allocator(self.scope_allocator.clone())
       .with_output_overrides(quiet, silence, raw)
+      .with_runtime_identity(self.runtime_identity.clone())
       .with_variable_overrides(variables);
     if let Some(directory) = working_directory {
       builder = builder.with_working_directory(directory);
     }
     if let Some(resolver) = &self.variable_resolver {
       builder = builder.with_variable_resolver(resolver.clone());
+    }
+    if let Some(session) = &self.secret_session {
+      builder = builder.with_secret_session(session.clone());
     }
     let build = builder.build(self.octafile.clone(), &command, parallel, command_args);
     let plan = match &mode {
@@ -517,7 +537,7 @@ mod tests {
     .unwrap();
     let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_owned()], "shell").unwrap();
     let project_root = env!("CARGO_MANIFEST_DIR");
-    let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../plugins")));
+    let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../target/debug")));
     #[cfg(not(windows))]
     let plugin_name = "octa_plugin_shell";
     #[cfg(windows)]

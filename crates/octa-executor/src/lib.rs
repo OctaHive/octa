@@ -23,8 +23,10 @@ mod path_hash;
 mod path_pattern;
 mod planner;
 mod plugin;
+mod resource;
 mod runtime_coordinator;
 mod runtime_output;
+mod secrets;
 mod source;
 mod source_strategy;
 mod structured_output;
@@ -46,6 +48,7 @@ pub use execution_result::{
   TaskResult, TaskRole,
 };
 pub use runtime_coordinator::RuntimeCoordinator;
+pub use secrets::{SecretProfile, SecretProviderConfig, SecretSession, SecretValue, VaultAuth};
 pub use summary::Summary;
 pub use terminal::{RawTerminalConnector, RawTerminalInput, RawTerminalSession, UnsupportedRawTerminal};
 pub use vars::{VariablePrompt, VariableResolver};

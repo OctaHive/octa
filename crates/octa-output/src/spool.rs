@@ -101,6 +101,15 @@ fn estimated_memory(entry: &ConsoleEntry) -> usize {
           + progress.message.len()
           + progress.unit.as_ref().map_or(0, String::len)
       },
+      ExecutionEvent::ArtifactRegistered { scope, artifact, .. } => {
+        scope.label().len()
+          + artifact.name.len()
+          + artifact.path.as_os_str().len()
+          + artifact.content_type.as_ref().map_or(0, String::len)
+      },
+      ExecutionEvent::ReportRegistered { scope, report, .. } => {
+        scope.label().len() + report.name.len() + report.path.as_os_str().len()
+      },
     },
     ConsoleRecord::Diagnostic(diagnostic) => {
       diagnostic.message.len()

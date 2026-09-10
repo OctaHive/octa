@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use octa_output::{ConsoleStream, ProgressUpdate, SourceLocation};
 use octa_plugin::{
   logger::{collect_value_redactions, redact},
-  protocol::{DiagnosticLevel as PluginDiagnosticLevel, PluginResponse},
+  protocol::{ArtifactDeclaration, DiagnosticLevel as PluginDiagnosticLevel, PluginResponse, ReportDeclaration},
 };
 use octa_plugin_manager::plugin_client::PluginExecutionRequest;
 use octa_plugin_manager::plugin_manager::PluginManager;
@@ -65,6 +65,8 @@ pub(crate) struct PluginOutput {
   pub stdout: String,
   pub stderr: String,
   pub outputs: Map<String, Value>,
+  pub artifacts: Vec<ArtifactDeclaration>,
+  pub reports: Vec<ReportDeclaration>,
   pub failure_location: Option<SourceLocation>,
 }
 
@@ -107,6 +109,15 @@ impl PluginInvoker {
       dry,
       redact_params,
     } = request.context;
+    let mut redactions = Vec::new();
+    for value in secret_vars.iter().filter_map(|name| vars.get(name)) {
+      collect_value_redactions(value, &mut redactions);
+    }
+    if request.raw && !redactions.is_empty() {
+      return Err(ExecutorError::RawUnsupported(
+        "raw execution with resolved secrets cannot be safely redacted".to_owned(),
+      ));
+    }
 
     let client = self
       .manager
@@ -118,7 +129,7 @@ impl PluginInvoker {
       Value::String(command) => command,
       value => value.to_string(),
     };
-    let mut execution = client
+    let execution = client
       .start_execution(
         PluginExecutionRequest {
           params: command,
@@ -133,8 +144,14 @@ impl PluginInvoker {
         },
         cancel_token.clone(),
       )
-      .await
-      .map_err(io::Error::from)?;
+      .await;
+    let mut execution = match execution {
+      Ok(execution) => execution,
+      Err(_) if cancel_token.is_cancelled() => {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "Command cancelled").into());
+      },
+      Err(error) => return Err(io::Error::from(error).into()),
+    };
     let command_id = execution.id().to_owned();
     let mut raw_session = if request.raw {
       match &request.output {
@@ -171,23 +188,41 @@ impl PluginInvoker {
     let result: ExecutorResult<PluginOutput> = async {
       let mut output = OutputCapture::default();
       let mut failure_location = None;
+      let mut artifacts = Vec::new();
+      let mut reports = Vec::new();
+      let mut output_redactor = OutputRedactor::new(&redactions);
       loop {
         match execution.receive_output(&cancel_token).await {
-          Ok(Some(response)) => match route_plugin_response(
+          Ok(Some(response)) => match route_plugin_response_redacted(
             response,
             &command_id,
             request.output.as_ref(),
             raw_session.as_mut(),
             &mut output,
-            &plugin_name,
+            ResponseSecurity {
+              plugin_name: &plugin_name,
+              redactions: &redactions,
+            },
+            &mut output_redactor,
           )
           .await?
           {
             PluginResponseAction::Continue(location) => {
               failure_location = location.or(failure_location);
             },
+            PluginResponseAction::RegisterArtifact(artifact) => artifacts.push(artifact),
+            PluginResponseAction::RegisterReport(report) => reports.push(report),
             PluginResponseAction::Complete { code, outputs } => {
               terminal_response = true;
+              flush_redacted_bytes(
+                request.output.as_ref(),
+                raw_session.as_mut(),
+                &command_id,
+                &mut output,
+                &plugin_name,
+                &mut output_redactor,
+              )
+              .await?;
               let outputs = if code == 0 {
                 let outputs = Value::Object(outputs);
                 registration.validate_outputs(&outputs).map_err(|error| {
@@ -206,6 +241,8 @@ impl PluginInvoker {
                 stdout,
                 stderr,
                 outputs,
+                artifacts,
+                reports,
                 failure_location,
               });
             },
@@ -248,36 +285,71 @@ impl PluginInvoker {
 #[derive(Debug, Eq, PartialEq)]
 enum PluginResponseAction {
   Continue(Option<SourceLocation>),
+  RegisterArtifact(ArtifactDeclaration),
+  RegisterReport(ReportDeclaration),
   Complete { code: i32, outputs: Map<String, Value> },
   Error(String),
 }
 
-async fn route_plugin_response(
+async fn route_plugin_response_redacted(
   response: PluginResponse,
   command_id: &str,
   target: Option<&RuntimeOutput>,
   raw_session: Option<&mut octa_output::RawConsoleSession>,
   output: &mut OutputCapture,
-  plugin_name: &str,
+  security: ResponseSecurity<'_>,
+  output_redactor: &mut OutputRedactor,
 ) -> ExecutorResult<PluginResponseAction> {
+  let ResponseSecurity {
+    plugin_name,
+    redactions,
+  } = security;
   match response {
     PluginResponse::Stdout { id, line } if id == command_id => {
-      let line = without_line_ending(&line);
-      route_line(target, raw_session, command_id, ConsoleStream::Stdout, line).await?;
+      if output_redactor.has_pending(ConsoleStream::Stdout) {
+        let mut bytes = without_line_ending(&line).as_bytes().to_vec();
+        bytes.push(b'\n');
+        let mut bytes = output_redactor.push(ConsoleStream::Stdout, bytes);
+        bytes.extend(output_redactor.finish(ConsoleStream::Stdout));
+        output
+          .append(ConsoleStream::Stdout, &bytes)
+          .await
+          .map_err(|error| capture_error(plugin_name, error))?;
+        route_bytes(target, raw_session, command_id, ConsoleStream::Stdout, bytes).await?;
+        return Ok(PluginResponseAction::Continue(None));
+      }
+      let line = redact(without_line_ending(&line), redactions);
+      route_line(target, raw_session, command_id, ConsoleStream::Stdout, &line).await?;
       output
-        .append_line(ConsoleStream::Stdout, line)
+        .append_line(ConsoleStream::Stdout, &line)
         .await
         .map_err(|error| capture_error(plugin_name, error))?;
     },
     PluginResponse::Stderr { id, line } if id == command_id => {
-      let line = without_line_ending(&line);
-      route_line(target, raw_session, command_id, ConsoleStream::Stderr, line).await?;
+      if output_redactor.has_pending(ConsoleStream::Stderr) {
+        let mut bytes = without_line_ending(&line).as_bytes().to_vec();
+        bytes.push(b'\n');
+        let mut bytes = output_redactor.push(ConsoleStream::Stderr, bytes);
+        bytes.extend(output_redactor.finish(ConsoleStream::Stderr));
+        output
+          .append(ConsoleStream::Stderr, &bytes)
+          .await
+          .map_err(|error| capture_error(plugin_name, error))?;
+        route_bytes(target, raw_session, command_id, ConsoleStream::Stderr, bytes).await?;
+        return Ok(PluginResponseAction::Continue(None));
+      }
+      let line = redact(without_line_ending(&line), redactions);
+      route_line(target, raw_session, command_id, ConsoleStream::Stderr, &line).await?;
       output
-        .append_line(ConsoleStream::Stderr, line)
+        .append_line(ConsoleStream::Stderr, &line)
         .await
         .map_err(|error| capture_error(plugin_name, error))?;
     },
     PluginResponse::StdoutBytes { id, bytes } if id == command_id => {
+      let bytes = output_redactor.push(ConsoleStream::Stdout, bytes);
+      if bytes.is_empty() {
+        return Ok(PluginResponseAction::Continue(None));
+      }
       output
         .append(ConsoleStream::Stdout, &bytes)
         .await
@@ -285,6 +357,10 @@ async fn route_plugin_response(
       route_bytes(target, raw_session, command_id, ConsoleStream::Stdout, bytes).await?;
     },
     PluginResponse::StderrBytes { id, bytes } if id == command_id => {
+      let bytes = output_redactor.push(ConsoleStream::Stderr, bytes);
+      if bytes.is_empty() {
+        return Ok(PluginResponseAction::Continue(None));
+      }
       output
         .append(ConsoleStream::Stderr, &bytes)
         .await
@@ -300,7 +376,7 @@ async fn route_plugin_response(
             .progress(
               command_id,
               ProgressUpdate {
-                message: progress.message,
+                message: redact(&progress.message, redactions),
                 current: progress.current,
                 total: progress.total,
                 unit: progress.unit,
@@ -309,6 +385,12 @@ async fn route_plugin_response(
             .await?;
         }
       }
+    },
+    PluginResponse::RegisterArtifact { id, artifact } if id == command_id => {
+      return Ok(PluginResponseAction::RegisterArtifact(artifact));
+    },
+    PluginResponse::RegisterReport { id, report } if id == command_id => {
+      return Ok(PluginResponseAction::RegisterReport(report));
     },
     PluginResponse::Diagnostic {
       id,
@@ -330,14 +412,18 @@ async fn route_plugin_response(
         column: location.column,
       });
       if let Some(target) = target {
-        target.diagnostic(level, message, location.clone()).await?;
+        target
+          .diagnostic(level, redact(&message, redactions), location.clone())
+          .await?;
       }
       return Ok(PluginResponseAction::Continue(is_error.then_some(location).flatten()));
     },
     PluginResponse::Completed { id, code, outputs } if id == command_id => {
       return Ok(PluginResponseAction::Complete { code, outputs });
     },
-    PluginResponse::Error { id, message } if id == command_id => return Ok(PluginResponseAction::Error(message)),
+    PluginResponse::Error { id, message } if id == command_id => {
+      return Ok(PluginResponseAction::Error(redact(&message, redactions)));
+    },
     _ => {},
   }
   Ok(PluginResponseAction::Continue(None))
@@ -392,6 +478,151 @@ fn capture_error(plugin: &str, error: CaptureError) -> ExecutorError {
 fn without_line_ending(line: &str) -> &str {
   let line = line.strip_suffix('\n').unwrap_or(line);
   line.strip_suffix('\r').unwrap_or(line)
+}
+
+struct OutputRedactor {
+  stdout: Vec<u8>,
+  stderr: Vec<u8>,
+  needles: Vec<Vec<u8>>,
+  reserve: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ResponseSecurity<'a> {
+  plugin_name: &'a str,
+  redactions: &'a [String],
+}
+
+impl OutputRedactor {
+  fn new(redactions: &[String]) -> Self {
+    let needles = redactions
+      .iter()
+      .filter(|value| !value.is_empty())
+      .map(|value| value.as_bytes().to_vec())
+      .collect::<Vec<_>>();
+    let reserve = needles.iter().map(Vec::len).max().unwrap_or(1).saturating_sub(1);
+    Self {
+      stdout: Vec::new(),
+      stderr: Vec::new(),
+      needles,
+      reserve,
+    }
+  }
+
+  fn push(&mut self, stream: ConsoleStream, bytes: Vec<u8>) -> Vec<u8> {
+    let buffer = match stream {
+      ConsoleStream::Stdout => &mut self.stdout,
+      ConsoleStream::Stderr => &mut self.stderr,
+    };
+    buffer.extend(bytes);
+    emit_redacted_prefix(buffer, &self.needles, self.reserve)
+  }
+
+  fn finish(&mut self, stream: ConsoleStream) -> Vec<u8> {
+    let buffer = match stream {
+      ConsoleStream::Stdout => &mut self.stdout,
+      ConsoleStream::Stderr => &mut self.stderr,
+    };
+    redact_bytes(std::mem::take(buffer), &self.needles)
+  }
+
+  fn has_pending(&self, stream: ConsoleStream) -> bool {
+    match stream {
+      ConsoleStream::Stdout => !self.stdout.is_empty(),
+      ConsoleStream::Stderr => !self.stderr.is_empty(),
+    }
+  }
+}
+
+fn emit_redacted_prefix(buffer: &mut Vec<u8>, needles: &[Vec<u8>], reserve: usize) -> Vec<u8> {
+  if needles.is_empty() {
+    return std::mem::take(buffer);
+  }
+  let mut cut = buffer.len().saturating_sub(reserve);
+  loop {
+    let previous = cut;
+    for needle in needles {
+      for start in find_all(buffer, needle) {
+        let end = start + needle.len();
+        if start < cut && end > cut {
+          cut = end;
+        }
+      }
+    }
+    if cut == previous {
+      break;
+    }
+  }
+  let suffix = buffer.split_off(cut);
+  let prefix = std::mem::replace(buffer, suffix);
+  redact_bytes(prefix, needles)
+}
+
+fn redact_bytes(mut bytes: Vec<u8>, needles: &[Vec<u8>]) -> Vec<u8> {
+  for needle in needles {
+    let mut start = 0;
+    while let Some(relative) = bytes[start..].windows(needle.len()).position(|window| window == needle) {
+      let found = start + relative;
+      bytes.splice(found..found + needle.len(), b"*****".iter().copied());
+      start = found + 5;
+    }
+  }
+  bytes
+}
+
+fn find_all(bytes: &[u8], needle: &[u8]) -> Vec<usize> {
+  bytes
+    .windows(needle.len())
+    .enumerate()
+    .filter_map(|(index, candidate)| (candidate == needle).then_some(index))
+    .collect()
+}
+
+async fn flush_redacted_bytes(
+  target: Option<&RuntimeOutput>,
+  mut raw_session: Option<&mut octa_output::RawConsoleSession>,
+  command_id: &str,
+  output: &mut OutputCapture,
+  plugin_name: &str,
+  redactor: &mut OutputRedactor,
+) -> ExecutorResult<()> {
+  for stream in [ConsoleStream::Stdout, ConsoleStream::Stderr] {
+    let bytes = redactor.finish(stream);
+    if bytes.is_empty() {
+      continue;
+    }
+    output
+      .append(stream, &bytes)
+      .await
+      .map_err(|error| capture_error(plugin_name, error))?;
+    route_bytes(target, raw_session.as_deref_mut(), command_id, stream, bytes).await?;
+  }
+  Ok(())
+}
+
+#[cfg(test)]
+async fn route_plugin_response(
+  response: PluginResponse,
+  command_id: &str,
+  target: Option<&RuntimeOutput>,
+  raw_session: Option<&mut octa_output::RawConsoleSession>,
+  output: &mut OutputCapture,
+  plugin_name: &str,
+) -> ExecutorResult<PluginResponseAction> {
+  let mut redactor = OutputRedactor::new(&[]);
+  route_plugin_response_redacted(
+    response,
+    command_id,
+    target,
+    raw_session,
+    output,
+    ResponseSecurity {
+      plugin_name,
+      redactions: &[],
+    },
+    &mut redactor,
+  )
+  .await
 }
 
 /// Runtime context shared by structured plugin values and Terra plugin helpers.
@@ -526,9 +757,36 @@ mod tests {
   use octa_output::{
     Console, ConsoleEntry, ConsolePayload, ConsoleRecord, ConsoleRenderer, ConsoleScopeAllocator, ExecutionEvent,
   };
-  use octa_plugin::protocol::{ProgressUpdate as PluginProgressUpdate, SourceLocation as PluginSourceLocation};
+  use octa_plugin::protocol::{
+    ArtifactDeclaration as PluginArtifact, ProgressUpdate as PluginProgressUpdate, ReportDeclaration as PluginReport,
+    SourceLocation as PluginSourceLocation,
+  };
 
   use super::*;
+
+  #[test]
+  fn redacts_secrets_split_across_binary_frames() {
+    let mut redactor = OutputRedactor::new(&["split-secret".to_owned()]);
+    let mut output = redactor.push(ConsoleStream::Stdout, b"before split-".to_vec());
+    output.extend(redactor.push(ConsoleStream::Stdout, b"secret after".to_vec()));
+    output.extend(redactor.finish(ConsoleStream::Stdout));
+
+    let output = String::from_utf8(output).unwrap();
+    assert_eq!(output, "before ***** after");
+    assert!(!output.contains("split-secret"));
+  }
+
+  #[test]
+  fn redacts_secrets_across_binary_and_line_frames() {
+    let mut redactor = OutputRedactor::new(&["split-secret".to_owned()]);
+    let mut output = redactor.push(ConsoleStream::Stdout, b"before split-".to_vec());
+    output.extend(redactor.push(ConsoleStream::Stdout, b"secret\n".to_vec()));
+    output.extend(redactor.finish(ConsoleStream::Stdout));
+
+    let output = String::from_utf8(output).unwrap();
+    assert_eq!(output, "before *****\n");
+    assert!(!output.contains("split-secret"));
+  }
 
   #[derive(Clone, Default)]
   struct Recording(Arc<Mutex<Vec<ConsoleRecord>>>);
@@ -648,6 +906,48 @@ mod tests {
       .unwrap(),
       PluginResponseAction::Continue(None)
     );
+    let artifact = PluginArtifact {
+      name: "binary".to_owned(),
+      path: "dist/app".into(),
+      content_type: None,
+    };
+    assert_eq!(
+      route_plugin_response(
+        PluginResponse::RegisterArtifact {
+          id: "command".to_owned(),
+          artifact: artifact.clone(),
+        },
+        "command",
+        Some(&target),
+        None,
+        &mut output,
+        "shell",
+      )
+      .await
+      .unwrap(),
+      PluginResponseAction::RegisterArtifact(artifact)
+    );
+    let report = PluginReport {
+      name: "tests".to_owned(),
+      path: "junit.xml".into(),
+      format: "junit".to_owned(),
+    };
+    assert_eq!(
+      route_plugin_response(
+        PluginResponse::RegisterReport {
+          id: "command".to_owned(),
+          report: report.clone(),
+        },
+        "command",
+        Some(&target),
+        None,
+        &mut output,
+        "shell",
+      )
+      .await
+      .unwrap(),
+      PluginResponseAction::RegisterReport(report)
+    );
 
     assert_eq!(
       route_plugin_response(
@@ -738,6 +1038,68 @@ mod tests {
       ConsoleRecord::Diagnostic(diagnostic) => diagnostic.step_id == Some(step_id),
       _ => true,
     }));
+  }
+
+  #[tokio::test]
+  async fn redacts_secrets_split_between_byte_and_line_responses() {
+    let mut output = OutputCapture::default();
+    let mut redactor = OutputRedactor::new(&["split-secret".to_owned()]);
+    for (stream, bytes, line) in [
+      (ConsoleStream::Stdout, b"out split-".to_vec(), "secret\n"),
+      (ConsoleStream::Stderr, b"err split-".to_vec(), "secret\n"),
+    ] {
+      let bytes_response = match stream {
+        ConsoleStream::Stdout => PluginResponse::StdoutBytes {
+          id: "command".to_owned(),
+          bytes,
+        },
+        ConsoleStream::Stderr => PluginResponse::StderrBytes {
+          id: "command".to_owned(),
+          bytes,
+        },
+      };
+      route_plugin_response_redacted(
+        bytes_response,
+        "command",
+        None,
+        None,
+        &mut output,
+        ResponseSecurity {
+          plugin_name: "shell",
+          redactions: &["split-secret".to_owned()],
+        },
+        &mut redactor,
+      )
+      .await
+      .unwrap();
+      let line_response = match stream {
+        ConsoleStream::Stdout => PluginResponse::Stdout {
+          id: "command".to_owned(),
+          line: line.to_owned(),
+        },
+        ConsoleStream::Stderr => PluginResponse::Stderr {
+          id: "command".to_owned(),
+          line: line.to_owned(),
+        },
+      };
+      route_plugin_response_redacted(
+        line_response,
+        "command",
+        None,
+        None,
+        &mut output,
+        ResponseSecurity {
+          plugin_name: "shell",
+          redactions: &["split-secret".to_owned()],
+        },
+        &mut redactor,
+      )
+      .await
+      .unwrap();
+    }
+    let (stdout, stderr) = output.into_strings().await.unwrap();
+    assert_eq!(stdout, "out *****\n");
+    assert_eq!(stderr, "err *****\n");
   }
 
   #[tokio::test]

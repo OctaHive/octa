@@ -345,6 +345,7 @@ pub(crate) struct TaskNode {
 
   // Execution configuration
   pub(crate) dir: PathBuf,        // Working directory
+  workspace: PathBuf,             // Root constraining artifacts and reports
   pub(crate) ignore_errors: bool, // Whether to continue on error
   pub(crate) silence: octa_octafile::Silence,
   pub(crate) quiet: bool,
@@ -420,7 +421,10 @@ impl TaskItem for TaskNode {
   }
 
   fn requires_concurrency_permit(&self) -> bool {
-    !matches!(self.action, NodeAction::Barrier | NodeAction::FreshnessCommit(_))
+    !matches!(
+      self.action,
+      NodeAction::Barrier | NodeAction::FreshnessCommit(_) | NodeAction::RegisterResources { .. }
+    )
   }
 
   fn interactive_session(&self) -> Option<&str> {

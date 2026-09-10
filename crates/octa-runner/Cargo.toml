@@ -1,0 +1,34 @@
+[package]
+name = "octa-runner"
+description = "Headless Octa execution process"
+version = "0.3.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+include = ["src/", "schema/"]
+
+[[bin]]
+name = "octa-runner"
+path = "src/main.rs"
+
+[dependencies]
+octa-executor = { version = "0.3.0", path = "../octa-executor" }
+octa-octafile = { version = "0.3.0", path = "../octa-octafile" }
+octa-output = { version = "0.3.0", path = "../octa-output" }
+octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
+octa-runtime = { version = "0.3.0", path = "../octa-runtime" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+jsonschema = { workspace = true }
+octa-plugin-manager = { version = "0.3.0", path = "../octa-plugin-manager" }
+serde_yml = { workspace = true }
+tempfile = { workspace = true }
+wait-timeout = "0.2"

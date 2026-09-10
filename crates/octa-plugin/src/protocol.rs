@@ -3,8 +3,11 @@ use std::{collections::HashMap, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+pub const PLUGIN_PROTOCOL_VERSION: u16 = 1;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Version {
+  pub protocol_version: u16,
   pub version: String,
   pub features: Vec<String>,
 }
@@ -58,6 +61,24 @@ pub struct ProgressUpdate {
   /// Unit for `current` and `total`, for example `files` or `bytes`.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub unit: Option<String>,
+}
+
+/// Artifact path reported by a plugin, relative to the command working directory.
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+pub struct ArtifactDeclaration {
+  pub name: String,
+  pub path: PathBuf,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub content_type: Option<String>,
+}
+
+/// Report path reported by a plugin, relative to the command working directory.
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+pub struct ReportDeclaration {
+  pub name: String,
+  pub path: PathBuf,
+  /// Stable format identifier owned by the reporting plugin, for example `junit`.
+  pub format: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -141,6 +162,14 @@ pub enum PluginResponse {
     id: String,
     progress: ProgressUpdate,
   },
+  RegisterArtifact {
+    id: String,
+    artifact: ArtifactDeclaration,
+  },
+  RegisterReport {
+    id: String,
+    report: ReportDeclaration,
+  },
   /// Normal terminal result of a plugin operation.
   Completed {
     id: String,
@@ -181,7 +210,7 @@ mod base64_bytes {
 
 #[cfg(test)]
 mod tests {
-  use super::{OctaCommand, PluginResponse, ProgressUpdate, Schema};
+  use super::{OctaCommand, PluginResponse, ProgressUpdate, ReportDeclaration, Schema};
 
   #[test]
   fn schema_without_optional_schemas_uses_no_validation() {
@@ -257,6 +286,25 @@ mod tests {
         if id == "command"
           && outputs["digest"] == "sha256:test"
           && outputs["pushed"] == true
+    ));
+  }
+
+  #[test]
+  fn report_format_is_owned_by_the_plugin() {
+    let response = PluginResponse::RegisterReport {
+      id: "command".to_owned(),
+      report: ReportDeclaration {
+        name: "benchmark".to_owned(),
+        path: "reports/result.json".into(),
+        format: "acme/benchmark-v2".to_owned(),
+      },
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    let decoded = serde_json::from_str::<PluginResponse>(&json).unwrap();
+
+    assert!(matches!(
+      decoded,
+      PluginResponse::RegisterReport { report, .. } if report.format == "acme/benchmark-v2"
     ));
   }
 

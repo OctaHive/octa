@@ -19,6 +19,7 @@ class CommandHandler:
         response = {
             "type": "Hello",
             "payload": {
+              "protocol_version": 1,
               "version": "0.3.0",
               "features": []
             }

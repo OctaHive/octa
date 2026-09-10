@@ -7,7 +7,6 @@ use std::{
 };
 
 use interprocess::local_socket::{tokio::Stream as TokioStream, traits::tokio::Stream as StreamTrait, Name};
-use semver::{Version as SemVersion, VersionReq};
 use serde_json::Value;
 use tokio::{
   io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
@@ -17,7 +16,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use octa_plugin::protocol::{OctaCommand, PluginResponse, ProgressUpdate, Schema, Version};
+use octa_plugin::protocol::{OctaCommand, PluginResponse, ProgressUpdate, Schema, Version, PLUGIN_PROTOCOL_VERSION};
 
 const CONTROL_RESPONSE_CAPACITY: usize = 16;
 const COMMAND_RESPONSE_CAPACITY: usize = 32;
@@ -318,6 +317,7 @@ impl PluginClient {
 
   pub async fn handshake(&self) -> Result<(), PluginClientError> {
     let hello = OctaCommand::Hello(Version {
+      protocol_version: PLUGIN_PROTOCOL_VERSION,
       version: env!("CARGO_PKG_VERSION").to_string(),
       features: vec![],
     });
@@ -325,10 +325,7 @@ impl PluginClient {
 
     match self.receive_control().await? {
       PluginResponse::Hello(version) => {
-        let octa_version = SemVersion::parse(env!("CARGO_PKG_VERSION")).unwrap();
-        let req_version = VersionReq::parse(&version.version).unwrap();
-
-        if !req_version.matches(&octa_version) {
+        if version.protocol_version != PLUGIN_PROTOCOL_VERSION {
           return Err(PluginClientError::VersionMismatch);
         }
 
@@ -465,7 +462,9 @@ impl PluginClient {
       | PluginResponse::Stderr { id, .. }
       | PluginResponse::StdoutBytes { id, .. }
       | PluginResponse::StderrBytes { id, .. }
-      | PluginResponse::Diagnostic { id, .. } => (Some(id.clone()), false),
+      | PluginResponse::Diagnostic { id, .. }
+      | PluginResponse::RegisterArtifact { id, .. }
+      | PluginResponse::RegisterReport { id, .. } => (Some(id.clone()), false),
       PluginResponse::Completed { id, .. } | PluginResponse::Error { id, .. } => (Some(id.clone()), true),
       _ => (None, false),
     };
@@ -932,6 +931,7 @@ mod tests {
 
             // Send Hello response
             let response = PluginResponse::Hello(Version {
+              protocol_version: PLUGIN_PROTOCOL_VERSION,
               version: env!("CARGO_PKG_VERSION").to_string(),
               features: vec![],
             });
@@ -983,6 +983,11 @@ mod tests {
 
         let response = if buffer.contains("Hello") {
           Some(PluginResponse::Hello(Version {
+            protocol_version: if handle_type == "incompatible-protocol" {
+              PLUGIN_PROTOCOL_VERSION + 1
+            } else {
+              PLUGIN_PROTOCOL_VERSION
+            },
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![],
           }))
@@ -1088,6 +1093,19 @@ mod tests {
       "No Hello message found in messages: {:?}",
       messages
     );
+  }
+
+  #[tokio::test]
+  async fn handshake_rejects_an_incompatible_protocol_version() {
+    let mut server = TestServer::new().await;
+    server.start("incompatible-protocol".to_owned()).await;
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+
+    assert!(matches!(
+      client.handshake().await,
+      Err(PluginClientError::VersionMismatch)
+    ));
+    let _ = server.stop().await;
   }
 
   #[tokio::test]
@@ -1368,6 +1386,7 @@ mod tests {
         OctaCommand::Hello(_)
       ));
       let hello = PluginResponse::Hello(Version {
+        protocol_version: PLUGIN_PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         features: Vec::new(),
       });
@@ -1566,6 +1585,7 @@ mod tests {
         OctaCommand::Hello(_)
       ));
       let hello = PluginResponse::Hello(Version {
+        protocol_version: PLUGIN_PROTOCOL_VERSION,
         version: env!("CARGO_PKG_VERSION").to_owned(),
         features: Vec::new(),
       });
@@ -1681,6 +1701,7 @@ mod tests {
             write_response(
               &writer,
               PluginResponse::Hello(Version {
+                protocol_version: PLUGIN_PROTOCOL_VERSION,
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 features: Vec::new(),
               }),
@@ -1709,6 +1730,30 @@ mod tests {
                 .await;
               }
               tokio::time::sleep(Duration::from_millis(20)).await;
+              write_response(
+                &writer,
+                PluginResponse::RegisterArtifact {
+                  id: id.clone(),
+                  artifact: octa_plugin::protocol::ArtifactDeclaration {
+                    name: "binary".to_owned(),
+                    path: "dist/app".into(),
+                    content_type: None,
+                  },
+                },
+              )
+              .await;
+              write_response(
+                &writer,
+                PluginResponse::RegisterReport {
+                  id: id.clone(),
+                  report: octa_plugin::protocol::ReportDeclaration {
+                    name: "tests".to_owned(),
+                    path: "reports/junit.xml".into(),
+                    format: "junit".to_owned(),
+                  },
+                },
+              )
+              .await;
               write_response(
                 &writer,
                 PluginResponse::Stdout {
@@ -1750,12 +1795,18 @@ mod tests {
       client.start_execution(execution_request("second"), CancellationToken::new())
     );
 
-    async fn output(mut execution: PluginExecution) -> (Option<u64>, String) {
+    async fn output(mut execution: PluginExecution) -> (Option<u64>, bool, bool, String) {
       let mut latest_progress = None;
+      let mut received_artifact = false;
+      let mut received_report = false;
       loop {
         match execution.receive_output(&CancellationToken::new()).await.unwrap() {
           Some(PluginResponse::Progress { progress, .. }) => latest_progress = progress.current,
-          Some(PluginResponse::Stdout { line, .. }) => return (latest_progress, line),
+          Some(PluginResponse::RegisterArtifact { artifact, .. }) => received_artifact = artifact.name == "binary",
+          Some(PluginResponse::RegisterReport { report, .. }) => received_report = report.format == "junit",
+          Some(PluginResponse::Stdout { line, .. }) => {
+            return (latest_progress, received_artifact, received_report, line);
+          },
           Some(_) => {},
           None => panic!("command response stream closed"),
         }
@@ -1764,8 +1815,8 @@ mod tests {
 
     let (first, second) = tokio::join!(output(first.unwrap()), output(second.unwrap()));
     let expected_progress = Some((COMMAND_RESPONSE_CAPACITY * 4 - 1) as u64);
-    assert_eq!(first, (expected_progress, "first-output".to_owned()));
-    assert_eq!(second, (expected_progress, "second-output".to_owned()));
+    assert_eq!(first, (expected_progress, true, true, "first-output".to_owned()));
+    assert_eq!(second, (expected_progress, true, true, "second-output".to_owned()));
 
     client.shutdown().await.unwrap();
     server_handle.await.unwrap();
@@ -1792,6 +1843,7 @@ mod tests {
             write_response(
               &writer,
               PluginResponse::Hello(Version {
+                protocol_version: PLUGIN_PROTOCOL_VERSION,
                 version: env!("CARGO_PKG_VERSION").to_owned(),
                 features: Vec::new(),
               }),
@@ -1915,6 +1967,7 @@ mod tests {
         if reader.read_line(&mut buffer).await.is_ok() {
           messages.push(buffer.clone());
           let response = PluginResponse::Hello(Version {
+            protocol_version: PLUGIN_PROTOCOL_VERSION,
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![],
           });
@@ -1980,6 +2033,7 @@ mod tests {
         if reader.read_line(&mut buffer).await.is_ok() {
           messages.push(buffer.clone());
           let response = PluginResponse::Hello(Version {
+            protocol_version: PLUGIN_PROTOCOL_VERSION,
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![],
           });
@@ -2051,6 +2105,7 @@ mod tests {
         if reader.read_line(&mut buffer).await.is_ok() {
           messages.push(buffer.clone());
           let response = PluginResponse::Hello(Version {
+            protocol_version: PLUGIN_PROTOCOL_VERSION,
             version: env!("CARGO_PKG_VERSION").to_string(),
             features: vec![],
           });

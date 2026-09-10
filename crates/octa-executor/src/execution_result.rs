@@ -8,6 +8,7 @@ use std::{error::Error, fmt};
 
 use chrono::{DateTime, Utc};
 use octa_output::{ConsoleStatus, SourceLocation};
+use octa_output::{RegisteredArtifact, RegisteredReport};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -28,6 +29,8 @@ pub enum ExecutionFailureKind {
   Task,
   /// Plugin discovery, validation, or transport failed.
   Plugin,
+  /// A configured secret provider could not resolve a logical reference.
+  Secret,
   /// The requested execution could not be planned from its configuration.
   Configuration,
   /// Executor infrastructure failed independently of task configuration.
@@ -101,8 +104,11 @@ impl ExecutionFailure {
       | ExecutorError::DependencyOutputMissing { .. }
       | ExecutorError::InvalidTaskOutputReference { .. }
       | ExecutorError::InvalidTaskOutput { .. }
+      | ExecutorError::InvalidResource { .. }
       | ExecutorError::ExecutionIdentityError(_)
+      | ExecutorError::SecretProfile { .. }
       | ExecutorError::GetCotafile(_) => ExecutionFailureKind::Configuration,
+      ExecutorError::SecretProvider { .. } => ExecutionFailureKind::Secret,
       ExecutorError::ShutdownTimeout
       | ExecutorError::OpenFingerprintDbError(_)
       | ExecutorError::CalculateDurationError(_)
@@ -266,6 +272,12 @@ pub struct StepResult {
   /// Structured values returned by the plugin when the step completed.
   #[serde(default, skip_serializing_if = "Map::is_empty")]
   pub outputs: Map<String, Value>,
+  /// Artifacts registered by this plugin step.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub artifacts: Vec<RegisteredArtifact>,
+  /// Reports registered by this plugin step.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub reports: Vec<RegisteredReport>,
 }
 
 /// Terminal result of one task invocation.
@@ -295,6 +307,12 @@ pub struct TaskResult {
   /// Names of secret outputs withheld from this serializable result.
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub redacted_outputs: Vec<String>,
+  /// All artifacts registered by this task, including plugin step declarations.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub artifacts: Vec<RegisteredArtifact>,
+  /// All reports registered by this task, including plugin step declarations.
+  #[serde(default, skip_serializing_if = "Vec::is_empty")]
+  pub reports: Vec<RegisteredReport>,
   /// Executable steps in declaration order.
   pub steps: Vec<StepResult>,
 }
@@ -487,6 +505,8 @@ mod tests {
         output: OutputReference::task(11, 2),
         outputs: serde_json::Map::new(),
         redacted_outputs: Vec::new(),
+        artifacts: Vec::new(),
+        reports: Vec::new(),
         steps: vec![StepResult {
           step_id: 7,
           label: "shell".to_owned(),
@@ -495,6 +515,8 @@ mod tests {
           conclusion: ExecutionConclusion::Succeeded,
           output: OutputReference::step(11, 2, 7),
           outputs: serde_json::Map::new(),
+          artifacts: Vec::new(),
+          reports: Vec::new(),
         }],
       }],
       stdout: vec!["artifact".to_owned()],

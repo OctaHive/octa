@@ -34,8 +34,19 @@ impl fmt::Debug for Variable {
 pub enum VariableSource {
   Value(Value),
   Shell(String),
+  Secret(SecretRef),
   Required(RequiredMode),
   TaskOutput(TaskOutputReference),
+}
+
+/// Logical secret lookup resolved through an environment-specific provider profile.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRef {
+  pub provider: String,
+  pub key: String,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub field: Option<String>,
 }
 
 /// Structured output exported by a direct task dependency.
@@ -109,6 +120,7 @@ impl Variable {
     match self.source {
       VariableSource::Value(value) => Some(value),
       VariableSource::Shell(command) => Some(serde_json::json!({ "sh": command })),
+      VariableSource::Secret(_) => None,
       VariableSource::Required(_) => None,
       VariableSource::TaskOutput(_) => None,
     }
@@ -124,6 +136,7 @@ impl Variable {
     match &self.source {
       VariableSource::Value(value) => Some(value.clone()),
       VariableSource::Shell(command) => Some(serde_json::json!({ "sh": command })),
+      VariableSource::Secret(_) => None,
       VariableSource::Required(_) => None,
       VariableSource::TaskOutput(_) => None,
     }
@@ -173,9 +186,32 @@ impl Variable {
       return Err(format!("unknown variable option '{name}'"));
     }
 
-    let secret = definition
-      .remove("secret")
-      .map(|value| value.as_bool().ok_or_else(|| "'secret' must be a boolean".to_owned()))
+    let secret_option = definition.remove("secret");
+    if let Some(Value::Object(reference)) = secret_option.as_ref() {
+      if !definition.is_empty() {
+        return Err("a secret reference cannot define other variable options".to_owned());
+      }
+      let reference = serde_json::from_value::<SecretRef>(Value::Object(reference.clone()))
+        .map_err(|error| format!("invalid secret reference: {error}"))?;
+      if reference.provider.trim().is_empty() || reference.key.trim().is_empty() {
+        return Err("secret provider and key must not be empty".to_owned());
+      }
+      if reference.field.as_ref().is_some_and(|field| field.trim().is_empty()) {
+        return Err("secret field must not be empty".to_owned());
+      }
+      return Ok(Self {
+        source: VariableSource::Secret(reference),
+        secret: true,
+        enum_source: None,
+        question: None,
+      });
+    }
+    let secret = secret_option
+      .map(|value| {
+        value
+          .as_bool()
+          .ok_or_else(|| "'secret' must be a boolean or reference".to_owned())
+      })
       .transpose()?
       .unwrap_or(false);
     let required = match definition.remove("required") {
@@ -252,6 +288,7 @@ impl Variable {
       (VariableSource::Shell(command), false) => serde_json::json!({ "sh": command }),
       (VariableSource::Value(value), true) => serde_json::json!({ "value": value, "secret": true }),
       (VariableSource::Shell(command), true) => serde_json::json!({ "sh": command, "secret": true }),
+      (VariableSource::Secret(reference), _) => serde_json::json!({ "secret": reference }),
       (VariableSource::Required(mode), secret) => {
         let required = match mode {
           RequiredMode::Strict => Value::Bool(true),
@@ -398,6 +435,39 @@ mod tests {
       variable.configuration_value(),
       json!({ "required": "prompt", "enum": "{{ ENVIRONMENTS }}" })
     );
+  }
+
+  #[test]
+  fn parses_and_serializes_logical_secret_references() {
+    let value = json!({
+      "secret": {
+        "provider": "application",
+        "key": "service/token",
+        "field": "token"
+      }
+    });
+    let variable = Variable::from_json(value.clone()).unwrap();
+
+    assert!(variable.is_secret());
+    assert_eq!(variable.template_value(), None);
+    assert!(matches!(
+      variable.clone().into_source(),
+      VariableSource::Secret(SecretRef { provider, key, field })
+        if provider == "application" && key == "service/token" && field.as_deref() == Some("token")
+    ));
+    assert_eq!(variable.configuration_value(), value);
+    assert!(!format!("{variable:?}").contains("service/token"));
+  }
+
+  #[test]
+  fn rejects_invalid_secret_references() {
+    assert!(Variable::from_json(json!({ "secret": { "provider": "", "key": "token" } })).is_err());
+    assert!(Variable::from_json(json!({ "secret": { "provider": "app", "key": "" } })).is_err());
+    assert!(Variable::from_json(json!({
+      "secret": { "provider": "app", "key": "token" },
+      "value": "not-allowed"
+    }))
+    .is_err());
   }
 
   #[test]

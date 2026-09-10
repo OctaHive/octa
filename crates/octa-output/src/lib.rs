@@ -13,6 +13,7 @@ mod quiet;
 mod record;
 mod renderer;
 mod replacing;
+mod resource;
 mod router;
 mod scope;
 mod spool;
@@ -32,10 +33,12 @@ pub use prefixed::PrefixedRenderer;
 pub use quiet::QuietRenderer;
 pub use record::{
   ConsoleDiagnostic, ConsoleEntry, ConsoleLevel, ConsolePayload, ConsoleRecord, ConsoleStatus, ConsoleStream,
-  ExecutionEvent, ProgressUpdate, SourceLocation, EVENT_SCHEMA_V1, EVENT_SCHEMA_V2, EVENT_SCHEMA_VERSION,
+  ExecutionEvent, ProgressUpdate, SourceLocation, EVENT_SCHEMA_V1, EVENT_SCHEMA_V2, EVENT_SCHEMA_V3,
+  EVENT_SCHEMA_VERSION,
 };
 pub use renderer::{ConsoleRenderer, NullRenderer};
 pub use replacing::ReplacingRenderer;
+pub use resource::{RegisteredArtifact, RegisteredReport};
 pub use router::{OutputRouterConfig, OutputRouterRenderer};
 pub use scope::{ConsoleScope, ConsoleScopeAllocator, ConsoleStep};
 pub use template::{render_output_template, validate_output_template};

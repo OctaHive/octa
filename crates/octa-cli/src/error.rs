@@ -4,6 +4,8 @@ use thiserror::Error;
 use octa_executor::{ExecutionFailure, ExecutorError};
 use octa_monorepo::MonorepoError;
 use octa_octafile::OctafileError;
+use octa_plugin_manager::plugin_lock::PluginLockError;
+use octa_runtime::RuntimeError;
 
 pub type OctaResult<T> = Result<T, OctaError>;
 
@@ -28,6 +30,9 @@ pub enum OctaError {
   #[error("Failed to load config file: {0}")]
   ConfigLoadError(String),
 
+  #[error(transparent)]
+  PluginLock(Box<PluginLockError>),
+
   #[error("Invalid CLI variable: {0}")]
   InvalidVariable(String),
 
@@ -49,6 +54,27 @@ pub enum OctaError {
   #[error(transparent)]
   ExecutionFailed(#[from] Box<ExecutionFailure>),
 
+  #[error(transparent)]
+  RuntimeExecution(#[from] RuntimeError),
+
   #[error("Failed to open fingerprint db")]
   OpenFingerprintDbError(#[from] sled::Error),
+}
+
+impl From<PluginLockError> for OctaError {
+  fn from(error: PluginLockError) -> Self {
+    Self::PluginLock(Box::new(error))
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn preserves_plugin_lock_errors() {
+    let error = OctaError::from(PluginLockError::MissingPlugin("shell".to_owned()));
+    assert!(matches!(error, OctaError::PluginLock(_)));
+    assert!(error.to_string().contains("shell"));
+  }
 }

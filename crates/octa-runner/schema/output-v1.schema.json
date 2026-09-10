@@ -1,0 +1,259 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/OctaHive/octa/main/crates/octa-runner/schema/output-v1.schema.json",
+  "title": "Octa runner output protocol v1",
+  "oneOf": [
+    { "$ref": "#/$defs/hello" },
+    { "$ref": "#/$defs/capabilities" },
+    { "$ref": "#/$defs/accepted" },
+    { "$ref": "#/$defs/event" },
+    { "$ref": "#/$defs/finished" },
+    { "$ref": "#/$defs/error" }
+  ],
+  "$defs": {
+    "hello": {
+      "type": "object",
+      "required": ["type", "protocol_version", "octa_version", "event_schema_version", "plugin_protocol_version"],
+      "properties": {
+        "type": { "const": "hello" },
+        "protocol_version": { "const": 1 },
+        "octa_version": { "type": "string", "minLength": 1 },
+        "event_schema_version": { "type": "integer", "minimum": 1 },
+        "plugin_protocol_version": { "const": 1 }
+      },
+      "additionalProperties": false
+    },
+    "accepted": {
+      "type": "object",
+      "required": ["type", "request_id"],
+      "properties": {
+        "type": { "const": "accepted" },
+        "request_id": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["type", "octa_version", "runner_protocols", "event_schemas", "plugin_protocols", "octafile_versions", "platform", "features"],
+      "properties": {
+        "type": { "const": "capabilities" },
+        "octa_version": { "type": "string", "minLength": 1 },
+        "runner_protocols": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1, "uniqueItems": true },
+        "event_schemas": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1, "uniqueItems": true },
+        "plugin_protocols": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1, "uniqueItems": true },
+        "octafile_versions": { "type": "array", "items": { "type": "integer", "minimum": 1 }, "minItems": 1, "uniqueItems": true },
+        "platform": { "type": "string", "minLength": 1 },
+        "features": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "build_commit": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "event": {
+      "type": "object",
+      "required": ["type", "request_id", "event"],
+      "properties": {
+        "type": { "const": "event" },
+        "request_id": { "type": "string", "minLength": 1 },
+        "event": {
+          "type": "object",
+          "required": ["schema_version", "sequence", "timestamp", "category", "data"],
+          "properties": {
+            "schema_version": { "const": 3 },
+            "sequence": { "type": "integer", "minimum": 0 },
+            "timestamp": { "type": "string", "format": "date-time" },
+            "category": { "enum": ["execution", "diagnostic", "document"] },
+            "data": { "type": "object" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "finished": {
+      "type": "object",
+      "required": ["type", "request_id", "status", "results"],
+      "properties": {
+        "type": { "const": "finished" },
+        "request_id": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["succeeded", "failed", "cancelled"] },
+        "results": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/execution_result" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "required": ["type", "message"],
+      "properties": {
+        "type": { "const": "error" },
+        "request_id": { "type": "string", "minLength": 1 },
+        "message": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "execution_result": {
+      "type": "object",
+      "required": ["run_id", "command", "started_at", "finished_at", "conclusion", "tasks", "stdout"],
+      "properties": {
+        "run_id": { "type": "integer", "minimum": 0 },
+        "command": { "type": "string" },
+        "started_at": { "type": "string", "format": "date-time" },
+        "finished_at": { "type": "string", "format": "date-time" },
+        "conclusion": { "$ref": "#/$defs/conclusion" },
+        "tasks": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/task_result" }
+        },
+        "stdout": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "task_result": {
+      "type": "object",
+      "required": ["task_id", "parent_task_id", "label", "role", "started_at", "finished_at", "conclusion", "output", "steps"],
+      "properties": {
+        "task_id": { "type": "integer", "minimum": 0 },
+        "parent_task_id": { "type": ["integer", "null"], "minimum": 0 },
+        "label": { "type": "string" },
+        "role": { "enum": ["main", "deferred"] },
+        "started_at": {
+          "oneOf": [
+            { "type": "string", "format": "date-time" },
+            { "type": "null" }
+          ]
+        },
+        "finished_at": { "type": "string", "format": "date-time" },
+        "conclusion": { "$ref": "#/$defs/conclusion" },
+        "output": { "$ref": "#/$defs/output_reference" },
+        "outputs": { "type": "object" },
+        "redacted_outputs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "uniqueItems": true
+        },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/artifact" }
+        },
+        "reports": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/report" }
+        },
+        "steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/step_result" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "step_result": {
+      "type": "object",
+      "required": ["step_id", "label", "started_at", "finished_at", "conclusion", "output"],
+      "properties": {
+        "step_id": { "type": "integer", "minimum": 0 },
+        "label": { "type": "string" },
+        "started_at": {
+          "oneOf": [
+            { "type": "string", "format": "date-time" },
+            { "type": "null" }
+          ]
+        },
+        "finished_at": { "type": "string", "format": "date-time" },
+        "conclusion": { "$ref": "#/$defs/conclusion" },
+        "output": { "$ref": "#/$defs/output_reference" },
+        "outputs": { "type": "object" },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/artifact" }
+        },
+        "reports": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/report" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "conclusion": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["status"],
+          "properties": { "status": { "enum": ["succeeded", "skipped"] } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["status", "failure"],
+          "properties": {
+            "status": { "enum": ["failed", "cancelled"] },
+            "failure": { "$ref": "#/$defs/failure" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "failure": {
+      "type": "object",
+      "required": ["kind", "message"],
+      "properties": {
+        "kind": { "enum": ["cancelled", "timeout", "command", "task", "plugin", "secret", "configuration", "infrastructure"] },
+        "message": { "type": "string" },
+        "task_id": { "type": "integer", "minimum": 0 },
+        "step_id": { "type": "integer", "minimum": 0 },
+        "exit_code": { "type": "integer" },
+        "location": { "$ref": "#/$defs/source_location" }
+      },
+      "additionalProperties": false
+    },
+    "source_location": {
+      "type": "object",
+      "required": ["file"],
+      "properties": {
+        "file": { "type": "string" },
+        "line": { "type": "integer", "minimum": 0 },
+        "column": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "output_reference": {
+      "type": "object",
+      "required": ["run_id", "task_id"],
+      "properties": {
+        "run_id": { "type": "integer", "minimum": 0 },
+        "task_id": { "type": "integer", "minimum": 0 },
+        "step_id": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "required": ["name", "path"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "content_type": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "report": {
+      "type": "object",
+      "required": ["name", "path", "format"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "format": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._/+:-]*$"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -41,7 +41,7 @@ pub(crate) struct FreshnessIdentity {
   invocation_vars: Option<octa_octafile::Vars>,
   invocation_envs: Option<octa_octafile::Envs>,
   effective_vars: std::collections::HashMap<String, Value>,
-  effective_envs: std::collections::HashMap<String, octa_octafile::EnvValue>,
+  effective_envs: std::collections::HashMap<String, Value>,
 }
 
 impl std::fmt::Debug for FreshnessIdentity {
@@ -87,7 +87,7 @@ impl FreshnessIdentity {
   pub(crate) fn with_effective_inputs(
     mut self,
     vars: std::collections::HashMap<String, Value>,
-    envs: std::collections::HashMap<String, octa_octafile::EnvValue>,
+    envs: std::collections::HashMap<String, Value>,
   ) -> Self {
     self.effective_vars = vars;
     self.effective_envs = envs;
@@ -269,14 +269,19 @@ impl FreshnessSpec {
     .await??;
 
     let fingerprint = self.config.strategy.fingerprint(&sources, cancel_token).await?;
-    let mut effective_vars = vars.to_merged_hashmap();
-    if let Some(names) = &self.tracked_variables {
-      effective_vars.retain(|name, _| names.contains(name));
-    }
+    let effective_vars = vars.freshness_values(self.tracked_variables.as_ref());
+    let effective_envs = envs
+      .to_merged_hashmap()
+      .into_iter()
+      .map(|(name, value)| {
+        let value = serde_json::to_value(value).unwrap_or(Value::Null);
+        (name, vars.redact_for_persistence(value))
+      })
+      .collect();
     let invocation = self
       .identity
       .clone()
-      .with_effective_inputs(effective_vars, envs.to_merged_hashmap());
+      .with_effective_inputs(effective_vars, effective_envs);
     let identity = PersistedIdentity {
       invocation: &invocation,
       sources: &self.config.sources,

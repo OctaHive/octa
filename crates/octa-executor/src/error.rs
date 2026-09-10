@@ -75,6 +75,20 @@ pub enum ExecutorError {
   #[error("Failed to serialize structured plugin outputs: {0}")]
   StructuredOutputSerializationFailed(String),
 
+  /// An artifact or report declaration cannot be safely collected from the workspace.
+  #[error("Invalid {kind} '{name}': {message}")]
+  InvalidResource {
+    kind: &'static str,
+    name: String,
+    message: String,
+  },
+
+  #[error("Invalid secret profile: {message}")]
+  SecretProfile { message: String },
+
+  #[error("Secret provider '{provider}' failed: {message}")]
+  SecretProvider { provider: String, message: String },
+
   /// A plugin-backed template or condition evaluation returned a failure status.
   #[error("Plugin '{key}' evaluation failed with status {code}: {stderr}")]
   PluginEvaluationFailed {

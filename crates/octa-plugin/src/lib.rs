@@ -414,12 +414,28 @@ where
 
   match serde_json::from_str(&buffer) {
     Ok(OctaCommand::Hello(client_version)) => {
+      if client_version.protocol_version != protocol::PLUGIN_PROTOCOL_VERSION {
+        let response = PluginResponse::Error {
+          id: "protocol_error".to_owned(),
+          message: format!(
+            "Unsupported plugin protocol version {}",
+            client_version.protocol_version
+          ),
+        };
+        writer
+          .lock()
+          .await
+          .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+          .await?;
+        return Ok(());
+      }
       if let Err(e) = logger.log(&format!("Client connected with version: {}", client_version.version)) {
         eprintln!("Failed to log message: {}", e);
       }
 
       // Send server Hello response with plugin version
       let response = PluginResponse::Hello(Version {
+        protocol_version: protocol::PLUGIN_PROTOCOL_VERSION,
         version: plugin.version(),
         features: vec![],
       });
@@ -1256,6 +1272,7 @@ mod tests {
     let cancel_token = CancellationToken::new();
 
     let command = OctaCommand::Hello(Version {
+      protocol_version: protocol::PLUGIN_PROTOCOL_VERSION,
       version: "1.0.0".to_string(),
       features: vec![],
     });
@@ -1273,6 +1290,39 @@ mod tests {
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
     let log_messages = mock_logger.get_messages().await;
     assert!(!log_messages.is_empty());
+  }
+
+  #[tokio::test]
+  async fn test_handle_command_unexpected_schema() {
+    let (reader, writer) = tokio::io::duplex(1024);
+    let writer = Arc::new(Mutex::new(writer));
+    let logger = Arc::new(MockLogger::new());
+    let response_handle = tokio::spawn(async move { read_responses(reader).await });
+    let result = handle_command(
+      OctaCommand::Schema,
+      writer,
+      Arc::new(Mutex::new(HashMap::new())),
+      Arc::new(MockPlugin {
+        version: "1.0.0".to_owned(),
+        execution_delay: None,
+        should_fail: false,
+        output_lines: Vec::new(),
+      }),
+      logger.clone(),
+      CancellationToken::new(),
+    )
+    .await;
+
+    assert!(result.is_ok());
+    let responses = response_handle.await.unwrap();
+    assert!(matches!(responses.as_slice(), [PluginResponse::Error { id, .. }] if id == "protocol_error"));
+    assert!(!logger
+      .as_any()
+      .downcast_ref::<MockLogger>()
+      .unwrap()
+      .get_messages()
+      .await
+      .is_empty());
   }
 
   #[tokio::test]
@@ -1588,6 +1638,7 @@ mod tests {
 
     // Send a Hello command
     let hello_command = OctaCommand::Hello(Version {
+      protocol_version: protocol::PLUGIN_PROTOCOL_VERSION,
       version: "1.0.0".to_string(),
       features: vec!["feature1".to_string()],
     });

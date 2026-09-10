@@ -15,7 +15,7 @@ use std::{
 use async_trait::async_trait;
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
-use octa_octafile::{RequiredMode, TaskOutputReference, VariableEnum, VariableSource, Vars as OctafileVars};
+use octa_octafile::{RequiredMode, SecretRef, TaskOutputReference, VariableEnum, VariableSource, Vars as OctafileVars};
 use octa_plugin_manager::plugin_manager::PluginManager;
 use regex::Regex;
 use serde::Serialize;
@@ -26,6 +26,7 @@ use tracing::debug;
 use crate::{
   error::{ExecutorError, ExecutorResult},
   plugin::{ManagerPluginEvaluator, PluginEvaluator, PluginExecutionContext, PluginTarget},
+  secrets::SecretSession,
   template::{PluginTemplateContext, TemplateRenderer},
 };
 
@@ -41,6 +42,8 @@ pub struct Vars {
   secrets: HashSet<String>,
   required_vars: IndexMap<String, RequiredVar>,
   output_refs: IndexMap<String, TaskOutputReference>,
+  secret_refs: HashMap<String, SecretRef>,
+  secret_session: Option<Arc<SecretSession>>,
   parent: Option<Arc<Vars>>, // Link to parent variables
   dir: Option<PathBuf>,      // Directory used by shell-backed values in this context
   expanded: bool,            // Indicates that all inherited values have been expanded
@@ -52,6 +55,7 @@ struct VariableLayer {
   secrets: HashSet<String>,
   required_vars: IndexMap<String, RequiredVar>,
   output_refs: IndexMap<String, TaskOutputReference>,
+  secret_refs: HashMap<String, SecretRef>,
   dir: Option<PathBuf>,
 }
 
@@ -135,6 +139,7 @@ impl PartialEq for Vars {
       && self.secrets == other.secrets
       && self.required_vars == other.required_vars
       && self.output_refs == other.output_refs
+      && self.secret_refs == other.secret_refs
   }
 }
 
@@ -147,6 +152,8 @@ impl Vars {
       secrets: HashSet::new(),
       required_vars: IndexMap::new(),
       output_refs: IndexMap::new(),
+      secret_refs: HashMap::new(),
+      secret_session: None,
       parent: None,
       dir: None,
       expanded: false,
@@ -159,6 +166,8 @@ impl Vars {
       secrets: HashSet::new(),
       required_vars: IndexMap::new(),
       output_refs: IndexMap::new(),
+      secret_refs: HashMap::new(),
+      secret_session: None,
       parent: Some(Arc::new(parent)),
       dir: None,
       expanded: false,
@@ -195,6 +204,7 @@ impl Vars {
     self.secrets.clear();
     self.required_vars.clear();
     self.output_refs.clear();
+    self.secret_refs.clear();
     self.expanded = false;
   }
 
@@ -203,12 +213,17 @@ impl Vars {
     self.secrets.clear();
     self.required_vars.clear();
     self.output_refs.clear();
+    self.secret_refs.clear();
     self.extend_variables(variables);
   }
 
   pub fn set_parent(&mut self, parent: Option<Vars>) {
     self.parent = parent.map(Arc::new);
     self.expanded = false;
+  }
+
+  pub(crate) fn set_secret_session(&mut self, session: Option<Arc<SecretSession>>) {
+    self.secret_session = session;
   }
 
   /// Sets the working directory for `shell()` calls declared in this variable layer.
@@ -222,6 +237,7 @@ impl Vars {
       self.values.insert(key.to_owned(), value);
       self.secrets.remove(key);
       self.output_refs.shift_remove(key);
+      self.secret_refs.remove(key);
     }
     self.expanded = false;
   }
@@ -237,6 +253,7 @@ impl Vars {
         self.values.insert(key.clone(), value.clone());
         self.secrets.remove(key);
         self.output_refs.shift_remove(key);
+        self.secret_refs.remove(key);
       }
     }
     self.expanded = false;
@@ -248,6 +265,7 @@ impl Vars {
       self.values.insert(key.clone(), value);
       self.secrets.remove(&key);
       self.output_refs.shift_remove(&key);
+      self.secret_refs.remove(&key);
     }
     self.expanded = false;
   }
@@ -261,9 +279,19 @@ impl Vars {
       let value = match variable.into_source() {
         VariableSource::Value(value) => value,
         VariableSource::Shell(command) => serde_json::json!({ "sh": command }),
+        VariableSource::Secret(reference) => {
+          self.required_vars.shift_remove(&key);
+          self.output_refs.shift_remove(&key);
+          self.secret_refs.insert(key.clone(), reference);
+          // Preserve declaration order without ever storing the resolved value in configuration.
+          self.values.insert(key.clone(), Value::Null);
+          self.secrets.insert(key);
+          continue;
+        },
         VariableSource::Required(mode) => {
           self.values.shift_remove(&key);
           self.output_refs.shift_remove(&key);
+          self.secret_refs.remove(&key);
           self.required_vars.insert(
             key.clone(),
             RequiredVar {
@@ -283,6 +311,7 @@ impl Vars {
         VariableSource::TaskOutput(reference) => {
           self.values.shift_remove(&key);
           self.required_vars.shift_remove(&key);
+          self.secret_refs.remove(&key);
           self.output_refs.insert(key.clone(), reference);
           if secret {
             self.secrets.insert(key);
@@ -295,6 +324,7 @@ impl Vars {
 
       self.required_vars.shift_remove(&key);
       self.output_refs.shift_remove(&key);
+      self.secret_refs.remove(&key);
       self.values.insert(key.clone(), value);
       if secret {
         self.secrets.insert(key);
@@ -459,6 +489,7 @@ impl Vars {
         secrets: vars.secrets.clone(),
         required_vars: vars.required_vars.clone(),
         output_refs: vars.output_refs.clone(),
+        secret_refs: vars.secret_refs.clone(),
         dir: vars.dir.clone(),
       });
       current = vars.parent.as_ref().map(|p| p.as_ref());
@@ -510,6 +541,7 @@ impl Vars {
         secrets: layer_secrets,
         required_vars: _,
         output_refs: _,
+        secret_refs,
         dir,
       } = layer;
       let current_dir = match dir {
@@ -526,6 +558,19 @@ impl Vars {
           continue;
         }
         let secret = layer_secrets.contains(&key);
+
+        if let Some(reference) = secret_refs.get(&key) {
+          let session = self
+            .secret_session
+            .as_ref()
+            .ok_or_else(|| ExecutorError::SecretProfile {
+              message: format!("variable '{key}' requires a secrets profile"),
+            })?;
+          let value = session.resolve(reference, &cancel_token).await?.into_value();
+          accumulated.insert(key.clone(), value);
+          secrets.insert(key);
+          continue;
+        }
 
         // Literal values need neither a Tera instance nor a plugin execution context.
         if shell_command(&value).is_none() && !value_contains_template(&value) {
@@ -654,6 +699,33 @@ impl Vars {
     result
   }
 
+  /// Returns persistence-safe inputs: secret variables are removed and any occurrence of
+  /// their resolved scalar values inside other strings is replaced with a stable marker.
+  pub(crate) fn freshness_values(&self, tracked: Option<&HashSet<String>>) -> HashMap<String, Value> {
+    let secret_values = self
+      .values
+      .iter()
+      .filter(|(name, _)| self.secrets.contains(*name))
+      .map(|(_, value)| value.clone())
+      .collect::<Vec<_>>();
+    self
+      .to_merged_hashmap()
+      .into_iter()
+      .filter(|(name, _)| !self.secrets.contains(name) && tracked.is_none_or(|names| names.contains(name)))
+      .map(|(name, value)| (name, redact_persistent_value(value, &secret_values)))
+      .collect()
+  }
+
+  pub(crate) fn redact_for_persistence(&self, value: Value) -> Value {
+    let secret_values = self
+      .values
+      .iter()
+      .filter(|(name, _)| self.secrets.contains(*name))
+      .map(|(_, value)| value.clone())
+      .collect::<Vec<_>>();
+    redact_persistent_value(value, &secret_values)
+  }
+
   /// Names explicitly declared by Octa configuration or invocation layers.
   pub(crate) fn declared_names(&self) -> HashSet<String> {
     self
@@ -665,6 +737,7 @@ impl Vars {
           .into_keys()
           .chain(layer.required_vars.into_keys())
           .chain(layer.output_refs.into_keys())
+          .chain(layer.secret_refs.into_keys())
       })
       .collect()
   }
@@ -906,6 +979,39 @@ fn variable_error(key: &str, message: String, secret: bool) -> ExecutorError {
   }
 }
 
+fn redact_persistent_value(value: Value, secrets: &[Value]) -> Value {
+  if secrets.iter().any(|secret| secret == &value) {
+    return Value::String("<secret>".to_owned());
+  }
+  match value {
+    Value::String(mut value) => {
+      for secret in secrets {
+        let encoded = match secret {
+          Value::String(value) => value.clone(),
+          value => serde_json::to_string(value).unwrap_or_default(),
+        };
+        if !encoded.is_empty() {
+          value = value.replace(&encoded, "<secret>");
+        }
+      }
+      Value::String(value)
+    },
+    Value::Array(values) => Value::Array(
+      values
+        .into_iter()
+        .map(|value| redact_persistent_value(value, secrets))
+        .collect(),
+    ),
+    Value::Object(values) => Value::Object(
+      values
+        .into_iter()
+        .map(|(key, value)| (key, redact_persistent_value(value, secrets)))
+        .collect(),
+    ),
+    value => value,
+  }
+}
+
 impl Display for Vars {
   fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
     writeln!(f, "[")?;
@@ -961,6 +1067,8 @@ impl From<Context> for Vars {
       secrets: HashSet::new(),
       required_vars: IndexMap::new(),
       output_refs: IndexMap::new(),
+      secret_refs: HashMap::new(),
+      secret_session: None,
       parent: None,
       dir: None,
       expanded: false,
@@ -1283,6 +1391,22 @@ mod tests {
     assert!(!format!("{vars}").contains("token-123"));
     assert!(!format!("{vars:?}").contains("token-123"));
     assert!(format!("{vars}").contains("*****"));
+  }
+
+  #[test]
+  fn persistence_inputs_remove_secrets_and_redact_derived_strings() {
+    let mut vars = Vars::with_value(serde_json::json!({
+      "TOKEN": "do-not-persist",
+      "HEADER": "Bearer do-not-persist",
+      "PUBLIC": "visible"
+    }));
+    vars.secrets.insert("TOKEN".to_owned());
+
+    let values = vars.freshness_values(None);
+    assert!(!values.contains_key("TOKEN"));
+    assert_eq!(values["HEADER"], serde_json::json!("Bearer <secret>"));
+    assert_eq!(values["PUBLIC"], serde_json::json!("visible"));
+    assert!(!serde_json::to_string(&values).unwrap().contains("do-not-persist"));
   }
 
   #[tokio::test]

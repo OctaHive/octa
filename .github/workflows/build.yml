@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   TARGET_DIR: target_ci
+  OCTA_BUILD_COMMIT: ${{ github.sha }}
 
 jobs:
   build:
@@ -25,6 +26,7 @@ jobs:
             bin: octa
             name: octa-Linux-amd64.tar.gz
             cargo_command: cargo
+            runtime_platform: linux-x86_64
 
           - os_name: Windows-amd64
             os: windows-latest
@@ -32,6 +34,7 @@ jobs:
             bin: octa.exe
             name: octa-Windows-amd64.zip
             cargo_command: cargo
+            runtime_platform: windows-x86_64
 
           - os_name: macOS-aarch64
             os: macOS-latest
@@ -39,6 +42,7 @@ jobs:
             bin: octa
             name: octa-Darwin-aarch64.tar.gz
             cargo_command: cargo
+            runtime_platform: macos-aarch64
 
           - os_name: macOS-x86_64
             os: macOS-latest
@@ -46,6 +50,7 @@ jobs:
             bin: octa
             name: octa-Darwin-x86_64.tar.gz
             cargo_command: cargo
+            runtime_platform: macos-x86_64
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,8 +79,8 @@ jobs:
         shell: bash
         run: |
           strip target/${{ matrix.platform.target }}/release/${{ matrix.platform.bin }}
-        # strip doesn't work with cross-arch binaries on Linux or Windows.
-        if: ${{ !(matrix.platform.target == 'aarch64-pc-windows-msvc') }}
+        # GNU strip is not available for the Windows artifact in this job.
+        if: ${{ !contains(matrix.platform.os, 'windows') }}
 
       - name: Package as archive
         shell: bash
@@ -86,17 +91,43 @@ jobs:
           if [[ "${{ matrix.platform.os }}" == "windows-latest" ]]; then
             cp ./octa_plugin_shell.exe ./release/plugins
             cp ./octa_plugin_tpl.exe ./release/plugins
+            cp ./octa_plugin_junit.exe ./release/plugins
             cp octa.exe ./release
-
-            7z a ../../../${{ matrix.platform.name }} ./release/*
+            cp octa-runner.exe ./release
           else
             cp ./octa_plugin_shell ./release/plugins
             cp ./octa_plugin_tpl ./release/plugins
+            cp ./octa_plugin_junit ./release/plugins
             cp octa ./release
+            cp octa-runner ./release
+          fi
 
+          SHELL_ENTRY="octa_plugin_shell"
+          TPL_ENTRY="octa_plugin_tpl"
+          JUNIT_ENTRY="octa_plugin_junit"
+          if [[ "${{ matrix.platform.os }}" == "windows-latest" ]]; then
+            SHELL_ENTRY="${SHELL_ENTRY}.exe"
+            TPL_ENTRY="${TPL_ENTRY}.exe"
+            JUNIT_ENTRY="${JUNIT_ENTRY}.exe"
+          fi
+          SHELL_DIGEST=$(shasum -a 256 "./release/plugins/${SHELL_ENTRY}" | cut -d ' ' -f 1)
+          TPL_DIGEST=$(shasum -a 256 "./release/plugins/${TPL_ENTRY}" | cut -d ' ' -f 1)
+          JUNIT_DIGEST=$(shasum -a 256 "./release/plugins/${JUNIT_ENTRY}" | cut -d ' ' -f 1)
+          (cd ./release && shasum -a 256 "${{ matrix.platform.bin }}" "octa-runner${{ contains(matrix.platform.os, 'windows') && '.exe' || '' }}" > SHA256SUMS)
+          VERSION="${GITHUB_REF_NAME#v}"
+          printf 'manifest_version: 1\nname: shell\nversion: "%s"\nprotocol: 1\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\ncapabilities:\n  - shell\n' "$VERSION" "${{ matrix.platform.runtime_platform }}" "$SHELL_ENTRY" "$SHELL_DIGEST" > ./release/plugins/shell.plugin.yml
+          printf 'manifest_version: 1\nname: tpl\nversion: "%s"\nprotocol: 1\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "${{ matrix.platform.runtime_platform }}" "$TPL_ENTRY" "$TPL_DIGEST" > ./release/plugins/tpl.plugin.yml
+          printf 'manifest_version: 1\nname: junit\nversion: "%s"\nprotocol: 1\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "${{ matrix.platform.runtime_platform }}" "$JUNIT_ENTRY" "$JUNIT_DIGEST" > ./release/plugins/junit.plugin.yml
+          printf 'version: 1\nplugins:\n  junit:\n    version: "%s"\n    protocol: 1\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    source: junit.plugin.yml\n  shell:\n    version: "%s"\n    protocol: 1\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    capabilities: [shell]\n    source: shell.plugin.yml\n  tpl:\n    version: "%s"\n    protocol: 1\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    source: tpl.plugin.yml\n' "$VERSION" "${{ matrix.platform.runtime_platform }}" "$JUNIT_ENTRY" "$JUNIT_DIGEST" "$VERSION" "${{ matrix.platform.runtime_platform }}" "$SHELL_ENTRY" "$SHELL_DIGEST" "$VERSION" "${{ matrix.platform.runtime_platform }}" "$TPL_ENTRY" "$TPL_DIGEST" > ./release/Octa.lock
+
+          if [[ "${{ matrix.platform.os }}" == "windows-latest" ]]; then
+            7z a ../../../${{ matrix.platform.name }} ./release/*
+          else
             tar czvf ../../../${{ matrix.platform.name }} -C ./release .
           fi
           cd -
+
+          shasum -a 256 "${{ matrix.platform.name }}" > "${{ matrix.platform.name }}.sha256"
 
       - name: Publish release artifacts
         uses: actions/upload-artifact@v4

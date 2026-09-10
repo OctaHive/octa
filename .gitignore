@@ -24,3 +24,5 @@ target/
 .DS_Store
 .octa
 /crates/octa-plugin-manager/test_plugin.log
+/crates/octa-executor/test_plugin.log
+/benchmarks/agent-ready/results/

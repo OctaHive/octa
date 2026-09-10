@@ -55,6 +55,8 @@ const RESERVED_PLUGIN_KEYS: &[&str] = &[
   "sources",
   "output",
   "outputs",
+  "artifacts",
+  "reports",
   "source_strategy",
   "watch",
   "if",
@@ -112,6 +114,24 @@ impl Serialize for Timeout {
 pub enum ExecuteMode {
   Parallel,
   Sequentially,
+}
+
+/// File or directory made available to an external runner after a task.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ArtifactDeclaration {
+  pub name: String,
+  pub path: PathBuf,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub content_type: Option<String>,
+}
+
+/// Report file made available to an external runner after a task.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+pub struct ReportDeclaration {
+  pub name: String,
+  pub path: PathBuf,
+  /// Stable format identifier supplied by the report producer.
+  pub format: String,
 }
 
 impl From<String> for ExecuteMode {
@@ -843,6 +863,8 @@ pub struct Task {
   pub sources: Option<Vec<String>>,                  // Sources for fingerprinting
   pub output: Option<Vec<String>>,                   // Files produced by this task
   pub outputs: Option<IndexMap<String, TaskOutput>>, // Structured values exported from named steps
+  pub artifacts: Option<Vec<ArtifactDeclaration>>,   // Files/directories registered after this task
+  pub reports: Option<Vec<ReportDeclaration>>,       // Machine-readable reports registered after this task
   pub source_strategy: Option<SourceStrategies>,     // Strategy used to fingerprint sources
   pub watch: Option<bool>,                           // Watch sources and rerun the task
   pub condition: Option<TaskConditions>,             // Plugin conditions around dependency execution
@@ -930,6 +952,8 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "sources" => task.sources = map.next_value()?,
         "output" => task.output = map.next_value()?,
         "outputs" => task.outputs = map.next_value()?,
+        "artifacts" => task.artifacts = map.next_value()?,
+        "reports" => task.reports = map.next_value()?,
         "source_strategy" => task.source_strategy = map.next_value()?,
         "watch" => task.watch = map.next_value()?,
         "if" => {

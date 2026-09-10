@@ -7,11 +7,20 @@ tasks:
   build:
     shell: cargo build -p octa-cli
 
+  build-pligins:
+    cmds:
+      - task: build-shell-plugin
+      - task: build-tpl-plugin
+      - task: build-junit-plugin
+
   build-shell-plugin:
     shell: cargo build -p octa_plugin_shell
 
   build-tpl-plugin:
     shell: cargo build -p octa_plugin_tpl
+
+  build-junit-plugin:
+    shell: cargo build -p octa_plugin_junit
 
   lint:
     cmds:

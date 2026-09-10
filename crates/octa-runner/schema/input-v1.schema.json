@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/OctaHive/octa/main/crates/octa-runner/schema/input-v1.schema.json",
+  "title": "Octa runner input protocol v1",
+  "oneOf": [
+    { "$ref": "#/$defs/start" },
+    { "$ref": "#/$defs/cancel" }
+  ],
+  "$defs": {
+    "start": {
+      "type": "object",
+      "required": ["type", "protocol_version", "request_id", "request"],
+      "properties": {
+        "type": { "const": "start" },
+        "protocol_version": { "const": 1 },
+        "request_id": { "type": "string", "minLength": 1 },
+        "request": { "$ref": "#/$defs/request" }
+      },
+      "additionalProperties": false
+    },
+    "cancel": {
+      "type": "object",
+      "required": ["type", "request_id"],
+      "properties": {
+        "type": { "const": "cancel" },
+        "request_id": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "required": ["workspace", "commands"],
+      "properties": {
+        "workspace": { "type": "string", "minLength": 1 },
+        "octafile": { "type": ["string", "null"] },
+        "data_dir": { "type": "string" },
+        "plugins_dir": { "type": "string" },
+        "plugin_lock": { "type": ["string", "null"] },
+        "secrets_profile": { "type": ["string", "null"] },
+        "plugins": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "default_plugin": { "type": ["string", "null"] },
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "variables": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "arguments": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "concurrency": { "type": ["integer", "null"], "minimum": 1 },
+        "parallel": { "type": "boolean" },
+        "failfast": { "type": "boolean" },
+        "dry": { "type": "boolean" },
+        "force": { "type": "boolean" },
+        "quiet": { "type": "boolean" },
+        "silence": {
+          "oneOf": [
+            { "type": "boolean" },
+            { "enum": ["stdout", "stderr"] },
+            { "type": "null" }
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

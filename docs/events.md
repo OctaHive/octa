@@ -5,9 +5,9 @@ parse human output: terminal renderers may change their wording or layout withou
 contract.
 
 Every line is one UTF-8 JSON object described by the checked-in
-[version 2 JSON Schema](../crates/octa-output/schema/events-v2.schema.json). The current schema and
-the frozen version 1 schema are embedded in the `octa-output` crate as `EVENT_SCHEMA_V2` and
-`EVENT_SCHEMA_V1`; `EVENT_SCHEMA_VERSION` is written to every new entry.
+[version 3 JSON Schema](../crates/octa-output/schema/events-v3.schema.json). The current schema and
+the frozen version 1 and 2 schemas are embedded in `octa-output` as `EVENT_SCHEMA_V3`,
+`EVENT_SCHEMA_V2`, and `EVENT_SCHEMA_V1`; `EVENT_SCHEMA_VERSION` is written to every new entry.
 
 ## Envelope and ordering
 
@@ -15,7 +15,7 @@ Every entry contains:
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Event contract version; currently `2` |
+| `schema_version` | Event contract version; currently `3` |
 | `sequence` | Strictly increasing position in this Octa process's output stream |
 | `timestamp` | RFC 3339 emission time |
 | `category` | `execution`, `diagnostic`, or `document` |
@@ -61,6 +61,10 @@ bytes per `command_id` and stream before decoding when complete text is required
 "raw_bytes"` is reserved for an exclusive raw/PTY session. The number and boundaries of chunks are
 not stable API behavior.
 
+`artifact_registered` and `report_registered` contain paths already resolved and checked by Octa.
+Paths in these events are relative to the execution workspace. The future agent must still validate
+them immediately before collection because a task may modify the filesystem after registration.
+
 Scope and step declarations are emitted in plan declaration order before scheduling. A scope starts
 when its first DAG node is considered for execution. A step starts only after it has acquired
 scheduler capacity; condition, freshness, and cache evaluation are part of the started step. A
@@ -86,6 +90,12 @@ schema version change; those values are data, not protocol structure.
 
 JSON output cannot be combined with raw/PTY mode because terminal control bytes would corrupt the
 JSON Lines stream.
+
+Resolved secret values are redacted before ordinary output, progress,
+diagnostics, errors, and terminal results reach this stream. Raw/PTY execution
+is rejected when resolved secrets are present because arbitrary terminal bytes
+cannot provide the same guarantee. Provider configuration and trust boundaries
+are documented in [secret providers](secrets.md).
 
 ## Embedded execution API
 

@@ -10,6 +10,7 @@ use std::{
   },
 };
 
+use octa_output::{RegisteredArtifact, RegisteredReport};
 use serde_json::{Map, Value};
 
 use crate::error::{ExecutorError, ExecutorResult};
@@ -184,6 +185,8 @@ impl fmt::Debug for PublicTaskOutputs<'_> {
 pub(crate) struct CompletionOutputs {
   step: Arc<Map<String, Value>>,
   task: TaskOutputs,
+  artifacts: Arc<Vec<RegisteredArtifact>>,
+  reports: Arc<Vec<RegisteredReport>>,
 }
 
 /// One public task output selected from a plugin step result.
@@ -198,7 +201,15 @@ impl CompletionOutputs {
     Self {
       step: Arc::new(step),
       task,
+      artifacts: Arc::new(Vec::new()),
+      reports: Arc::new(Vec::new()),
     }
+  }
+
+  pub(crate) fn with_resources(mut self, artifacts: Vec<RegisteredArtifact>, reports: Vec<RegisteredReport>) -> Self {
+    self.artifacts = Arc::new(artifacts);
+    self.reports = Arc::new(reports);
+    self
   }
 
   pub(crate) fn step(&self) -> &Map<String, Value> {
@@ -215,6 +226,14 @@ impl CompletionOutputs {
 
   pub(crate) fn into_task(self) -> TaskOutputs {
     self.task
+  }
+
+  pub(crate) fn artifacts(&self) -> &[RegisteredArtifact] {
+    &self.artifacts
+  }
+
+  pub(crate) fn reports(&self) -> &[RegisteredReport] {
+    &self.reports
   }
 }
 

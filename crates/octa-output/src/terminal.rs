@@ -73,7 +73,9 @@ impl TerminalRenderer {
       | ExecutionEvent::StepDeclared { .. }
       | ExecutionEvent::StepStarted { .. }
       | ExecutionEvent::StepFinished { .. }
-      | ExecutionEvent::Progress { .. } => {},
+      | ExecutionEvent::Progress { .. }
+      | ExecutionEvent::ArtifactRegistered { .. }
+      | ExecutionEvent::ReportRegistered { .. } => {},
       ExecutionEvent::Output { stream, payload, .. } => match stream {
         ConsoleStream::Stdout => write_payload(&mut *self.stdout, payload)?,
         ConsoleStream::Stderr => write_payload(&mut *self.stderr, payload)?,

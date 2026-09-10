@@ -308,6 +308,10 @@ fn plugin_schema() -> PluginSchema {
   }
 }
 
+fn is_effect_free_noop(source: &str) -> bool {
+  source.trim() == ":"
+}
+
 #[async_trait]
 impl Plugin for ShellPlugin {
   /// Return plugin version
@@ -376,6 +380,24 @@ impl Plugin for ShellPlugin {
         cancel_token,
       )
       .await;
+    }
+
+    // `:` is the shell no-op. Running a separate Brush process for it adds
+    // process startup to every otherwise empty DAG node without providing any
+    // isolation benefit: the command cannot spawn children, mutate files, or
+    // produce output. Keep anything with arguments, expansions, redirects, or
+    // comments on the regular Brush path because those forms may have effects.
+    if is_effect_free_noop(&result) {
+      let response = serde_json::to_string(&PluginResponse::Completed {
+        id,
+        code: 0,
+        outputs: Default::default(),
+      })?
+        + "\n";
+      let mut writer = writer.lock().await;
+      writer.write_all(response.as_bytes()).await?;
+      writer.flush().await?;
+      return Ok(());
     }
 
     let (tx, mut rx): (mpsc::Sender<String>, mpsc::Receiver<String>) = mpsc::channel(100);
@@ -533,6 +555,15 @@ mod tests {
       schema.input_schema.unwrap().get("type"),
       Some(&Value::String("string".to_owned()))
     );
+  }
+
+  #[test]
+  fn recognizes_only_effect_free_noops() {
+    assert!(is_effect_free_noop(":"));
+    assert!(is_effect_free_noop("  :\n"));
+    for command in [": argument", ": > output", ": ${VALUE?}", ": # comment", "true", ""] {
+      assert!(!is_effect_free_noop(command), "unexpected no-op: {command:?}");
+    }
   }
 
   #[tokio::test]

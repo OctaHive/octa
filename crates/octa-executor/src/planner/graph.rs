@@ -212,7 +212,8 @@ impl TaskGraphBuilder {
         Self::command_cache_key(&command.name, 0),
       )?;
       Self::connect_parents(dag, &parents, &task)?;
-      return self.add_freshness_commit(dag, command, &context, freshness, vec![task]);
+      let terminal = self.add_freshness_commit(dag, command, &context, freshness, vec![task])?;
+      return self.add_resource_registration(dag, command, &context, terminal.into_iter().collect());
     };
 
     // Nested task calls publish their own scopes. Explicit outer barriers keep
@@ -335,6 +336,10 @@ impl TaskGraphBuilder {
       .add_freshness_commit(dag, command, &context, freshness, predecessors)?
       .into_iter()
       .collect();
+    let predecessors = self
+      .add_resource_registration(dag, command, &context, predecessors)?
+      .into_iter()
+      .collect();
 
     let terminal = self.attach_deferred_nodes(dag, deferred_nodes, predecessors)?;
 
@@ -451,6 +456,40 @@ impl TaskGraphBuilder {
       .silent(Some(true))
       .failfast(command.task.failfast.or(command.octafile.failfast))
       .action(NodeAction::FreshnessCommit(state))
+      .build()?;
+    let task = Arc::new(TaskNode::new(task));
+    dag.add_node(task.clone());
+    Self::connect_parents(dag, &predecessors, &task)?;
+    Ok(Some(task))
+  }
+
+  /// Appends one task-level collector after the successful body.
+  fn add_resource_registration(
+    &self,
+    dag: &mut DagNode,
+    command: &FindResult,
+    context: &InvocationContext,
+    mut predecessors: Vec<ArcNode>,
+  ) -> ExecutorResult<Option<ArcNode>> {
+    let artifacts = command.task.artifacts.clone().unwrap_or_default();
+    let reports = command.task.reports.clone().unwrap_or_default();
+    if artifacts.is_empty() && reports.is_empty() {
+      return self.join_nodes(dag, &mut predecessors, format!("Complete task {}", command.name));
+    }
+
+    let name = format!("Register resources for {}", command.name);
+    let task = TaskConfig::builder()
+      .id(Uuid::new_v4())
+      .name(name.clone())
+      .dep_name(command.name.clone())
+      .dir(self.task_working_dir(command))
+      .workspace(self.dir.clone())
+      .condition_runtime(ConditionRuntime::command(Vec::new(), context.conditions.guards.clone()))
+      .execution_binding(context.output_scope.clone().map(ExecutionBinding::for_task))
+      .interactive_session(context.interactive_session.clone())
+      .silent(Some(true))
+      .failfast(command.task.failfast.or(command.octafile.failfast))
+      .action(NodeAction::RegisterResources { artifacts, reports })
       .build()?;
     let task = Arc::new(TaskNode::new(task));
     dag.add_node(task.clone());
@@ -586,6 +625,8 @@ impl TaskGraphBuilder {
       command_args: self.command_args.clone(),
       variable_overrides: self.variable_overrides.clone(),
       variable_resolver: self.variable_resolver.clone(),
+      secret_session: self.secret_session.clone(),
+      runtime_identity: self.runtime_identity.clone(),
       source_strategies: self.source_strategies.clone(),
       scope_allocator: self.scope_allocator.clone(),
       force_quiet: self.force_quiet,
@@ -678,6 +719,7 @@ impl TaskGraphBuilder {
       .dep_name(context.dep_name.clone())
       .cache_key(cache_key)
       .dir(self.task_working_dir(cmd))
+      .workspace(self.dir.clone())
       .vars(runtime.vars().clone())
       .envs(runtime.configured_envs())
       .invocation_runtime(Some(runtime))
@@ -998,6 +1040,7 @@ impl TaskGraphBuilder {
         "source_strategy": Self::task_source_strategy(command),
         "failfast": Self::task_failfast(command),
       },
+      "runtime": self.runtime_identity,
     }))
   }
 

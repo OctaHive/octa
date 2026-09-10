@@ -6,6 +6,9 @@ on:
       - "*"
     paths:
       - "crates/**"
+      - "conformance/**"
+      - "benchmarks/**"
+      - "docs/**"
       - "Cargo.toml"
       - "Cargo.lock"
 
@@ -53,6 +56,8 @@ jobs:
           cp target/debug/octa_plugin_shell plugins
           cargo build -p octa_plugin_tpl
           cp target/debug/octa_plugin_tpl plugins
+          cargo build -p octa_plugin_junit
+          cp target/debug/octa_plugin_junit plugins
       - name: Build plugin for Windows
         if: matrix.os == 'windows-latest'
         run: |
@@ -60,8 +65,16 @@ jobs:
           cp target/debug/octa_plugin_shell.exe plugins
           cargo build -p octa_plugin_tpl
           cp target/debug/octa_plugin_tpl.exe plugins
+          cargo build -p octa_plugin_junit
+          cp target/debug/octa_plugin_junit.exe plugins
       - name: Run cargo test
         run: cargo test --workspace -- --nocapture
+      - name: Run black-box agent conformance
+        shell: bash
+        run: |
+          RUNNER="target/debug/octa-runner"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then RUNNER="${RUNNER}.exe"; fi
+          python conformance/agent_ready.py --runner "$RUNNER" --plugins target/debug
       - name: Upload Log to Github
         if: failure()
         uses: actions/upload-artifact@v4

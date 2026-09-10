@@ -13,8 +13,8 @@ pub use monorepo::{read_monorepo_config, MonorepoConfig};
 pub use octafile::{EnvValue, Envs, Octafile, PresentationConfig, ShellValue, SyntheticInclude, Vars, WatchInterval};
 pub use output::{GroupOutput, OutputConfig, OutputMode, TaskOutputMode, TaskPresentation};
 pub use task::{
-  AllowedRun, CommandOptions, CommandPayload, ComplexDep, ConditionEvaluation, Deps, ExecuteMode, PluginCommand,
-  PluginSchemas, PluginTypeSchema, Silence, SourceStrategies, Task, TaskCommand, TaskCondition, TaskConditions,
-  TaskOutput, Timeout,
+  AllowedRun, ArtifactDeclaration, CommandOptions, CommandPayload, ComplexDep, ConditionEvaluation, Deps, ExecuteMode,
+  PluginCommand, PluginSchemas, PluginTypeSchema, ReportDeclaration, Silence, SourceStrategies, Task, TaskCommand,
+  TaskCondition, TaskConditions, TaskOutput, Timeout,
 };
-pub use variable::{RequiredMode, TaskOutputReference, Variable, VariableEnum, VariableSource};
+pub use variable::{RequiredMode, SecretRef, TaskOutputReference, Variable, VariableEnum, VariableSource};
