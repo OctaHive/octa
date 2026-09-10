@@ -1,0 +1,18 @@
+[package]
+name = "octa-runner-protocol"
+description = "Versioned wire protocol for the headless Octa runner"
+version = "0.3.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme = "README.md"
+repository.workspace = true
+include = ["src/", "schema/", "README.md"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+jsonschema = { workspace = true }

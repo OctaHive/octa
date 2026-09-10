@@ -1,6 +1,7 @@
 use std::{io, process::ExitCode, sync::Arc};
 
 use octa_executor::{ExecutionConclusion, ExecutorError};
+use octa_octafile::Silence as RuntimeSilence;
 use octa_output::Console;
 use octa_runner::{
   capabilities, hello, read_frame, MessageWriter, RunRequest, RunStatus, RunnerCommand, RunnerMessage,
@@ -80,18 +81,11 @@ async fn run() -> Result<RunStatus, u8> {
     let _ = emit_error(&output, None, "request_id must not be empty");
     return Err(EXIT_INVALID_REQUEST);
   }
-  if let Err(error) = request.validate() {
+  if let Err(error) = validate_request(&request) {
     let _ = emit_error(&output, Some(&request_id), &error);
     return Err(EXIT_INVALID_REQUEST);
   }
-  if emit(
-    &output,
-    &RunnerMessage::Accepted {
-      request_id: &request_id,
-    },
-  )
-  .is_err()
-  {
+  if emit(&output, &RunnerMessage::accepted(request_id.as_str())).is_err() {
     return Err(EXIT_INFRASTRUCTURE);
   }
 
@@ -112,11 +106,11 @@ async fn run() -> Result<RunStatus, u8> {
       let _ = console.drain().await;
       emit(
         &output,
-        &RunnerMessage::Finished {
-          request_id: &request_id,
-          status: RunStatus::Cancelled,
-          results: &[],
-        },
+        &RunnerMessage::finished(
+          request_id.as_str(),
+          RunStatus::Cancelled,
+          &[] as &[octa_executor::ExecutionResult],
+        ),
       )
       .map_err(|_| EXIT_INFRASTRUCTURE)?;
       return Ok(RunStatus::Cancelled);
@@ -137,7 +131,7 @@ async fn run() -> Result<RunStatus, u8> {
     variables: request.variables.clone().into_iter().collect(),
     task_args: request.arguments.clone(),
     quiet: request.quiet,
-    silence: request.silence,
+    silence: request.silence.map(runtime_silence),
     raw: false,
   };
 
@@ -166,11 +160,7 @@ async fn run() -> Result<RunStatus, u8> {
       };
       emit(
         &output,
-        &RunnerMessage::Finished {
-          request_id: &request_id,
-          status,
-          results: &results,
-        },
+        &RunnerMessage::finished(request_id.as_str(), status, results.as_slice()),
       )
       .map_err(|_| EXIT_INFRASTRUCTURE)?;
       Ok(status)
@@ -178,11 +168,11 @@ async fn run() -> Result<RunStatus, u8> {
     Err(octa_runtime::RuntimeError::Cancelled) => {
       emit(
         &output,
-        &RunnerMessage::Finished {
-          request_id: &request_id,
-          status: RunStatus::Cancelled,
-          results: &[],
-        },
+        &RunnerMessage::finished(
+          request_id.as_str(),
+          RunStatus::Cancelled,
+          &[] as &[octa_executor::ExecutionResult],
+        ),
       )
       .map_err(|_| EXIT_INFRASTRUCTURE)?;
       Ok(RunStatus::Cancelled)
@@ -245,6 +235,17 @@ async fn load_runtime(
   config.concurrency = request.concurrency;
   config.cancellation = cancellation;
   Runtime::load(config).await
+}
+
+fn validate_request(request: &RunRequest) -> Result<(), String> {
+  request.validate()?;
+  if !request.workspace.is_dir() {
+    return Err(format!(
+      "workspace '{}' is not a directory",
+      request.workspace.display()
+    ));
+  }
+  Ok(())
 }
 
 async fn read_control(
@@ -319,12 +320,26 @@ fn install_signal_cancellation(cancellation: CancellationToken) {
   });
 }
 
-fn emit(output: &MessageWriter, message: &RunnerMessage<'_>) -> io::Result<()> {
+fn runtime_silence(silence: octa_runner::Silence) -> RuntimeSilence {
+  match silence {
+    octa_runner::Silence::None => RuntimeSilence::None,
+    octa_runner::Silence::All => RuntimeSilence::All,
+    octa_runner::Silence::Stdout => RuntimeSilence::Stdout,
+    octa_runner::Silence::Stderr => RuntimeSilence::Stderr,
+  }
+}
+
+fn emit<I, E, R>(output: &MessageWriter, message: &RunnerMessage<I, E, R>) -> io::Result<()>
+where
+  I: serde::Serialize,
+  E: serde::Serialize,
+  R: serde::Serialize,
+{
   output.write(message)
 }
 
 fn emit_error(output: &MessageWriter, request_id: Option<&str>, message: &str) -> io::Result<()> {
-  emit(output, &RunnerMessage::Error { request_id, message })
+  emit(output, &RunnerMessage::error(request_id, message))
 }
 
 #[cfg(test)]
@@ -367,5 +382,23 @@ mod tests {
       EXIT_INFRASTRUCTURE
     );
     assert_eq!(runtime_error_exit(&octa_runtime::RuntimeError::Cancelled), 130);
+  }
+
+  #[test]
+  fn maps_every_wire_silence_value_to_the_runtime() {
+    assert_eq!(runtime_silence(octa_runner::Silence::None), RuntimeSilence::None);
+    assert_eq!(runtime_silence(octa_runner::Silence::All), RuntimeSilence::All);
+    assert_eq!(runtime_silence(octa_runner::Silence::Stdout), RuntimeSilence::Stdout);
+    assert_eq!(runtime_silence(octa_runner::Silence::Stderr), RuntimeSilence::Stderr);
+  }
+
+  #[test]
+  fn rejects_a_workspace_that_is_not_a_directory() {
+    let request: RunRequest = serde_json::from_value(serde_json::json!({
+      "workspace": std::env::current_exe().unwrap(),
+      "commands": ["build"]
+    }))
+    .unwrap();
+    assert!(validate_request(&request).unwrap_err().contains("not a directory"));
   }
 }

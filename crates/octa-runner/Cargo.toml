@@ -8,7 +8,7 @@ homepage.workspace = true
 license.workspace = true
 readme.workspace = true
 repository.workspace = true
-include = ["src/", "schema/"]
+include = ["src/"]
 
 [[bin]]
 name = "octa-runner"
@@ -18,8 +18,8 @@ path = "src/main.rs"
 octa-executor = { version = "0.3.0", path = "../octa-executor" }
 octa-octafile = { version = "0.3.0", path = "../octa-octafile" }
 octa-output = { version = "0.3.0", path = "../octa-output" }
-octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
 octa-runtime = { version = "0.3.0", path = "../octa-runtime" }
+octa-runner-protocol = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
@@ -29,6 +29,7 @@ tokio-util = { workspace = true }
 assert_cmd = "2.2.2"
 jsonschema = { workspace = true }
 octa-plugin-manager = { version = "0.3.0", path = "../octa-plugin-manager" }
+octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
 serde_yml = { workspace = true }
 tempfile = { workspace = true }
 wait-timeout = "0.2"

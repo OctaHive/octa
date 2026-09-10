@@ -14,8 +14,7 @@ functionality missing, so I decided to create my own builder.
 * Support rendering templates and return result of rendering as task result
 
 Architecture and integration references: [runner protocol](docs/runner-protocol.md),
-[plugin distribution](docs/plugin-distribution.md), [secret providers](docs/secrets.md),
-and the [Agent Ready plan](docs/agent-readiness-plan.md).
+[plugin distribution](docs/plugin-distribution.md), and [secret providers](docs/secrets.md).
 
 # Installation
 

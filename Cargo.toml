@@ -10,6 +10,7 @@ members = [
   "crates/octa-executor",
   "crates/octa-runtime",
   "crates/octa-runner",
+  "crates/octa-runner-protocol",
   "crates/octa-plugin",
   "crates/octa-plugin-manager",
   "crates/octa_plugin_shell",
@@ -53,6 +54,7 @@ tracing-subscriber = { version = "0.3.23", features = [
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = "0.7.19"
 regex = "1.13.1"
+octa-runner-protocol = { version = "0.3.0", path = "crates/octa-runner-protocol" }
 uuid = { version = "1.26", features = ["v4"] }
 tempfile = "3.27"
 

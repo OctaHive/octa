@@ -2563,6 +2563,7 @@ dependencies = [
  "octa-output",
  "octa-plugin",
  "octa-plugin-manager",
+ "octa-runner-protocol",
  "octa-runtime",
  "serde",
  "serde_json",
@@ -2571,6 +2572,15 @@ dependencies = [
  "tokio",
  "tokio-util",
  "wait-timeout",
+]
+
+[[package]]
+name = "octa-runner-protocol"
+version = "0.3.0"
+dependencies = [
+ "jsonschema",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

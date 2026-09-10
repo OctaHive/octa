@@ -31,8 +31,8 @@ build commit.
 An input frame is limited to 1 MiB including its JSON payload. An oversized
 or unterminated frame is rejected without buffering unbounded input. The
 machine-readable schemas are
-[`input-v1.schema.json`](../crates/octa-runner/schema/input-v1.schema.json) and
-[`output-v1.schema.json`](../crates/octa-runner/schema/output-v1.schema.json).
+[`input-v1.schema.json`](../crates/octa-runner-protocol/schema/input-v1.schema.json) and
+[`output-v1.schema.json`](../crates/octa-runner-protocol/schema/output-v1.schema.json).
 
 Runtime event production uses a bounded queue. If the caller stops reading
 stdout, backpressure eventually pauses task output instead of accumulating an
@@ -76,6 +76,12 @@ request never contains secret values; see [secret providers](secrets.md).
 
 The request describes execution only. Repository, lease, sandbox, resource,
 and server transport settings intentionally do not belong to this protocol.
+
+Rust consumers should use the separately versioned
+[`octa-runner-protocol`](../crates/octa-runner-protocol) crate. It owns the
+wire DTOs, version constants, frame limit, and schemas without depending on
+Octa's executor, Octafile parser, plugin manager, or async transport. Its crate
+SemVer and `protocol_version` are independent compatibility boundaries.
 
 ## Cancel
 

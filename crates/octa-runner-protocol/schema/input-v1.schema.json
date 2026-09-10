@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/OctaHive/octa/main/crates/octa-runner/schema/input-v1.schema.json",
+  "$id": "https://raw.githubusercontent.com/OctaHive/octa/main/crates/octa-runner-protocol/schema/input-v1.schema.json",
   "title": "Octa runner input protocol v1",
   "oneOf": [
     { "$ref": "#/$defs/start" },
