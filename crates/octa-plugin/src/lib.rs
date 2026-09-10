@@ -322,9 +322,13 @@ async fn handle_conn(
   let mut reader = BufReader::new(reader);
   let mut buffer = String::new();
 
-  process_hello(plugin.clone(), &mut reader, writer.clone(), logger.clone()).await?;
+  if !process_hello(plugin.clone(), &mut reader, writer.clone(), logger.clone()).await? {
+    return Ok(());
+  }
 
-  process_schema(schema, &mut reader, writer.clone(), logger.clone()).await?;
+  if !process_schema(schema, &mut reader, writer.clone(), logger.clone()).await? {
+    return Ok(());
+  }
 
   loop {
     buffer.clear();
@@ -396,12 +400,13 @@ async fn handle_conn(
   Ok(())
 }
 
+/// Performs the Hello exchange and returns whether the connection may continue.
 pub async fn process_hello<W>(
   plugin: Arc<impl Plugin + 'static>,
   reader: &mut BufReader<ReadHalf<Stream>>,
   writer: Arc<Mutex<W>>,
   logger: Arc<impl Logger>,
-) -> anyhow::Result<()>
+) -> anyhow::Result<bool>
 where
   W: AsyncWrite + Send + Unpin + 'static,
 {
@@ -409,7 +414,7 @@ where
 
   // Wait for octa Hello
   if reader.read_line(&mut buffer).await? == 0 {
-    return Ok(());
+    return Ok(false);
   }
 
   match serde_json::from_str(&buffer) {
@@ -427,7 +432,7 @@ where
           .await
           .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
           .await?;
-        return Ok(());
+        return Ok(false);
       }
       if let Err(e) = logger.log(&format!("Client connected with version: {}", client_version.version)) {
         eprintln!("Failed to log message: {}", e);
@@ -456,7 +461,7 @@ where
         .await?;
 
       logger.log(&format!("Waiting for Hello command but received {:?}", command))?;
-      return Ok(());
+      return Ok(false);
     },
     Err(e) => {
       let response = PluginResponse::Error {
@@ -470,27 +475,28 @@ where
         .await?;
 
       logger.log("Failed to deserialize received command")?;
-      return Ok(());
+      return Ok(false);
     },
   }
 
-  Ok(())
+  Ok(true)
 }
 
+/// Performs the Schema exchange and returns whether the connection may continue.
 pub async fn process_schema<W>(
   schema: PluginSchema,
   reader: &mut BufReader<ReadHalf<Stream>>,
   writer: Arc<Mutex<W>>,
   logger: Arc<impl Logger>,
-) -> anyhow::Result<()>
+) -> anyhow::Result<bool>
 where
   W: AsyncWrite + Send + Unpin + 'static,
 {
   let mut buffer = String::new();
 
-  // Wait for octa Hello
+  // Wait for octa Schema
   if reader.read_line(&mut buffer).await? == 0 {
-    return Ok(());
+    return Ok(false);
   }
 
   match serde_json::from_str(&buffer) {
@@ -519,7 +525,7 @@ where
         .await?;
 
       logger.log(&format!("Waiting for Schema command but received {:?}", command))?;
-      return Ok(());
+      return Ok(false);
     },
     Err(e) => {
       let response = PluginResponse::Error {
@@ -533,11 +539,11 @@ where
         .await?;
 
       logger.log("Failed to deserialize received command")?;
-      return Ok(());
+      return Ok(false);
     },
   }
 
-  Ok(())
+  Ok(true)
 }
 
 pub async fn serve_plugin(plugin: impl Plugin + 'static, schema: PluginSchema) -> anyhow::Result<()> {
@@ -744,12 +750,11 @@ mod tests {
       writer.write_all(frame.as_bytes()).await.unwrap();
       writer.write_all(b"\n").await.unwrap();
     }
-    writer
-      .write_all((serde_json::to_string(&OctaCommand::Shutdown).unwrap() + "\n").as_bytes())
-      .await
-      .unwrap();
     drop(writer);
-    responses.await.unwrap()
+    tokio::time::timeout(Duration::from_secs(5), responses)
+      .await
+      .expect("plugin connection did not close within five seconds")
+      .unwrap()
   }
 
   #[tokio::test]
@@ -1596,7 +1601,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn test_handle_conn() {
+  async fn handle_conn_accepts_valid_and_rejects_invalid_handshakes() {
     // Create a temporary directory for the socket
     let temp_dir = tempdir().unwrap();
     let socket_path = temp_dir.path().join("test.sock");
@@ -1696,10 +1701,13 @@ mod tests {
     writer.write_all(shutdown_json.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
 
-    // Clean up
-    drop(writer); // Close the writer to signal no more data
+    // Release the client writer after the explicit protocol shutdown.
+    drop(writer);
 
-    let responses = response_handle.await.unwrap();
+    let responses = tokio::time::timeout(Duration::from_secs(5), response_handle)
+      .await
+      .expect("valid plugin connection did not close within five seconds")
+      .unwrap();
 
     // Verify the response
     match &responses[0] {
@@ -1724,31 +1732,40 @@ mod tests {
     // Verify the response
     assert!(matches!(&responses[2], PluginResponse::Started { .. }));
 
-    let wrong_commands = exchange_plugin_frames(
+    let wrong_hello =
+      exchange_plugin_frames(&socket_path, &[serde_json::to_string(&OctaCommand::Schema).unwrap()]).await;
+    assert!(matches!(
+      &wrong_hello[..],
+      [PluginResponse::Error { id, .. }] if id == "protocol_error"
+    ));
+
+    let wrong_schema = exchange_plugin_frames(
       &socket_path,
       &[
-        serde_json::to_string(&OctaCommand::Schema).unwrap(),
+        serde_json::to_string(&hello_command).unwrap(),
         serde_json::to_string(&hello_command).unwrap(),
       ],
     )
     .await;
     assert!(matches!(
-      &wrong_commands[..],
-      [
-        PluginResponse::Error { id: hello_id, .. },
-        PluginResponse::Error { id: schema_id, .. },
-        PluginResponse::Shutdown { .. }
-      ] if hello_id == "protocol_error" && schema_id == "protocol_error"
+      &wrong_schema[..],
+      [PluginResponse::Hello(_), PluginResponse::Error { id, .. }] if id == "protocol_error"
     ));
 
-    let malformed_commands = exchange_plugin_frames(&socket_path, &["{".to_owned(), "{".to_owned()]).await;
+    let malformed_hello = exchange_plugin_frames(&socket_path, &["{".to_owned()]).await;
     assert!(matches!(
-      &malformed_commands[..],
-      [
-        PluginResponse::Error { id: hello_id, .. },
-        PluginResponse::Error { id: schema_id, .. },
-        PluginResponse::Shutdown { .. }
-      ] if hello_id == "parse_error" && schema_id == "parse_error"
+      &malformed_hello[..],
+      [PluginResponse::Error { id, .. }] if id == "parse_error"
+    ));
+
+    let malformed_schema = exchange_plugin_frames(
+      &socket_path,
+      &[serde_json::to_string(&hello_command).unwrap(), "{".to_owned()],
+    )
+    .await;
+    assert!(matches!(
+      &malformed_schema[..],
+      [PluginResponse::Hello(_), PluginResponse::Error { id, .. }] if id == "parse_error"
     ));
 
     let incompatible_hello = OctaCommand::Hello(Version {
@@ -1756,21 +1773,11 @@ mod tests {
       version: "1.0.0".to_owned(),
       features: Vec::new(),
     });
-    let incompatible = exchange_plugin_frames(
-      &socket_path,
-      &[
-        serde_json::to_string(&incompatible_hello).unwrap(),
-        serde_json::to_string(&schema_command).unwrap(),
-      ],
-    )
-    .await;
+    let incompatible =
+      exchange_plugin_frames(&socket_path, &[serde_json::to_string(&incompatible_hello).unwrap()]).await;
     assert!(matches!(
       &incompatible[..],
-      [
-        PluginResponse::Error { id, .. },
-        PluginResponse::Schema(_),
-        PluginResponse::Shutdown { .. }
-      ] if id == "protocol_error"
+      [PluginResponse::Error { id, .. }] if id == "protocol_error"
     ));
 
     let malformed_command = exchange_plugin_frames(
@@ -1779,6 +1786,7 @@ mod tests {
         serde_json::to_string(&hello_command).unwrap(),
         serde_json::to_string(&schema_command).unwrap(),
         "{".to_owned(),
+        serde_json::to_string(&OctaCommand::Shutdown).unwrap(),
       ],
     )
     .await;
@@ -1788,6 +1796,9 @@ mod tests {
     ));
 
     cancel_token.cancel();
-    listener_handle.await.unwrap(); // Wait for the listener task to finish
+    tokio::time::timeout(Duration::from_secs(5), listener_handle)
+      .await
+      .expect("plugin listener did not stop within five seconds")
+      .unwrap();
   }
 }
