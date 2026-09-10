@@ -25,9 +25,15 @@ pub enum PluginLockError {
   #[error("failed to write plugin metadata '{path}': {source}")]
   Write { path: PathBuf, source: std::io::Error },
   #[error("failed to parse plugin metadata '{path}': {source}")]
-  Parse { path: PathBuf, source: serde_yml::Error },
+  Parse {
+    path: PathBuf,
+    source: Box<serde_yml::Error>,
+  },
   #[error("failed to serialize plugin metadata '{path}': {source}")]
-  Serialize { path: PathBuf, source: serde_yml::Error },
+  Serialize {
+    path: PathBuf,
+    source: Box<serde_yml::Error>,
+  },
   #[error("unsupported plugin manifest version {0}")]
   ManifestVersion(u8),
   #[error("unsupported plugin lock version {0}")]
@@ -81,7 +87,7 @@ impl PluginManifest {
     })?;
     let manifest: Self = serde_yml::from_str(&contents).map_err(|source| PluginLockError::Parse {
       path: path.to_path_buf(),
-      source,
+      source: Box::new(source),
     })?;
     if manifest.manifest_version != PLUGIN_MANIFEST_VERSION {
       return Err(PluginLockError::ManifestVersion(manifest.manifest_version));
@@ -143,7 +149,7 @@ impl PluginLock {
     })?;
     let lock: Self = serde_yml::from_str(&contents).map_err(|source| PluginLockError::Parse {
       path: path.to_path_buf(),
-      source,
+      source: Box::new(source),
     })?;
     if lock.version != PLUGIN_LOCK_VERSION {
       return Err(PluginLockError::LockVersion(lock.version));
@@ -224,7 +230,7 @@ impl PluginLock {
   pub fn write(&self, path: &Path) -> Result<(), PluginLockError> {
     let contents = serde_yml::to_string(self).map_err(|source| PluginLockError::Serialize {
       path: path.to_path_buf(),
-      source,
+      source: Box::new(source),
     })?;
     std::fs::write(path, contents).map_err(|source| PluginLockError::Write {
       path: path.to_path_buf(),
