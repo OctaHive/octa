@@ -272,7 +272,8 @@ mod tests {
     };
     assert!(request.validate().unwrap_err().contains("absolute"));
 
-    request.workspace = PathBuf::from("/definitely/missing/octa-runner-workspace");
+    let file = tempfile::NamedTempFile::new().unwrap();
+    request.workspace = file.path().to_path_buf();
     assert!(request.validate().unwrap_err().contains("not a directory"));
     let workspace = tempfile::tempdir().unwrap();
     request.workspace = workspace.path().to_path_buf();

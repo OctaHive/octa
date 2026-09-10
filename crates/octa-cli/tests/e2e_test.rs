@@ -75,6 +75,18 @@ fn test_no_octafile_file_discovered() {
 }
 
 #[test]
+fn test_completions_do_not_require_a_workspace() {
+  let workspace = TempDir::new().unwrap();
+  let mut command = Command::cargo_bin("octa").unwrap();
+  command
+    .current_dir(workspace.path())
+    .args(["--completions", "bash"])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("_octa"));
+}
+
+#[test]
 fn test_plugin_lock_and_verify_commands() {
   let workspace = TempDir::new().unwrap();
   let plugins = workspace.path().join("plugins");

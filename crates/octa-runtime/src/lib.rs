@@ -603,4 +603,21 @@ mod tests {
       RuntimeError::PluginInfrastructure(_)
     ));
   }
+
+  #[test]
+  fn preserves_plugin_lock_errors_at_the_runtime_boundary() {
+    let error = RuntimeError::from(PluginLockError::MissingPlugin("junit".to_owned()));
+    assert!(matches!(
+      error,
+      RuntimeError::PluginLock(error) if matches!(*error, PluginLockError::MissingPlugin(ref name) if name == "junit")
+    ));
+  }
+
+  #[test]
+  fn detects_pre_cancelled_runtime_loading() {
+    let cancellation = CancellationToken::new();
+    assert!(check_cancelled(&cancellation).is_ok());
+    cancellation.cancel();
+    assert!(matches!(check_cancelled(&cancellation), Err(RuntimeError::Cancelled)));
+  }
 }
