@@ -333,32 +333,30 @@ impl SecretSession {
       .stdin
       .take()
       .ok_or_else(|| provider_error(alias, "stdin is unavailable"))?;
-    let request = serde_json::to_vec(reference).map_err(|error| provider_error(alias, error.to_string()))?;
-    stdin
-      .write_all(&request)
-      .await
-      .map_err(|error| provider_error(alias, format!("failed to send request: {error}")))?;
-    drop(stdin);
     let mut stdout = child
       .stdout
       .take()
       .ok_or_else(|| provider_error(alias, "stdout is unavailable"))?;
+    let request = serde_json::to_vec(reference).map_err(|error| provider_error(alias, error.to_string()))?;
     let operation = async {
+      let send_result = stdin.write_all(&request).await;
+      drop(stdin);
       let mut bytes = Vec::new();
       (&mut stdout)
         .take((MAX_SECRET_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .await?;
       let status = child.wait().await?;
-      Ok::<_, std::io::Error>((status, bytes))
+      Ok::<_, std::io::Error>((status, bytes, send_result))
     };
-    let (status, bytes) = timeout(Duration::from_secs(timeout_seconds), operation)
+    let (status, bytes, send_result) = timeout(Duration::from_secs(timeout_seconds), operation)
       .await
       .map_err(|_| provider_error(alias, "command timed out"))?
       .map_err(|error| provider_error(alias, format!("command failed: {error}")))?;
     if !status.success() {
       return Err(provider_error(alias, "command returned a non-zero status"));
     }
+    send_result.map_err(|error| provider_error(alias, format!("failed to send request: {error}")))?;
     if bytes.len() > MAX_SECRET_BYTES {
       return Err(provider_error(alias, "value exceeds the 1 MiB limit"));
     }
