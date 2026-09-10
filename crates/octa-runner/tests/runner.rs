@@ -398,6 +398,30 @@ fn task_failure_is_a_finished_execution_with_a_failure_exit_code() {
 }
 
 #[test]
+fn missing_task_is_rejected_after_the_request_is_accepted() {
+  let workspace = TempDir::new().unwrap();
+  fs::write(
+    workspace.path().join("Octafile.yml"),
+    "version: 1\ntasks:\n  build:\n    shell: echo build\n",
+  )
+  .unwrap();
+
+  let mut command = Command::cargo_bin("octa-runner").unwrap();
+  let output = command.write_stdin(request(&workspace, "missing")).output().unwrap();
+  assert_eq!(output.status.code(), Some(2));
+
+  let messages = messages(&output.stdout);
+  assert_valid_output(&messages);
+  assert_eq!(messages[1]["type"], "accepted");
+  assert_eq!(messages.last().unwrap()["type"], "error");
+  assert_eq!(messages.last().unwrap()["request_id"], "test-run");
+  assert!(messages.last().unwrap()["message"]
+    .as_str()
+    .unwrap()
+    .contains("missing"));
+}
+
+#[test]
 fn rejects_an_incompatible_protocol_before_loading_the_workspace() {
   let mut command = Command::cargo_bin("octa-runner").unwrap();
   let output = command

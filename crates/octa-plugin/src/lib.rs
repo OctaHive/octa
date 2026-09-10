@@ -647,6 +647,7 @@ mod tests {
   use super::*;
   use logger::MockLogger;
   use std::{
+    path::Path,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -732,6 +733,19 @@ mod tests {
       responses.push(serde_json::from_str(&line).unwrap());
     }
     responses
+  }
+
+  async fn exchange_plugin_frames(socket_path: &Path, frames: &[String]) -> Vec<PluginResponse> {
+    let socket_name = interpret_local_socket_name(OsStr::new(socket_path)).unwrap();
+    let client_stream = Stream::connect(socket_name).await.unwrap();
+    let (reader, mut writer) = client_stream.split();
+    let responses = tokio::spawn(async move { read_responses(reader).await });
+    for frame in frames {
+      writer.write_all(frame.as_bytes()).await.unwrap();
+      writer.write_all(b"\n").await.unwrap();
+    }
+    drop(writer);
+    responses.await.unwrap()
   }
 
   #[tokio::test]
@@ -1673,8 +1687,6 @@ mod tests {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    cancel_token.cancel();
-
     let responses = response_handle.await.unwrap();
 
     // Verify the response
@@ -1700,6 +1712,60 @@ mod tests {
     // Verify the response
     assert!(matches!(&responses[2], PluginResponse::Started { .. }));
 
+    let wrong_commands = exchange_plugin_frames(
+      &socket_path,
+      &[
+        serde_json::to_string(&OctaCommand::Schema).unwrap(),
+        serde_json::to_string(&hello_command).unwrap(),
+      ],
+    )
+    .await;
+    assert!(matches!(
+      &wrong_commands[..],
+      [
+        PluginResponse::Error { id: hello_id, .. },
+        PluginResponse::Error { id: schema_id, .. },
+        PluginResponse::Shutdown { .. }
+      ] if hello_id == "protocol_error" && schema_id == "protocol_error"
+    ));
+
+    let malformed_commands = exchange_plugin_frames(&socket_path, &["{".to_owned(), "{".to_owned()]).await;
+    assert!(matches!(
+      &malformed_commands[..],
+      [
+        PluginResponse::Error { id: hello_id, .. },
+        PluginResponse::Error { id: schema_id, .. },
+        PluginResponse::Shutdown { .. }
+      ] if hello_id == "parse_error" && schema_id == "parse_error"
+    ));
+
+    let incompatible_hello = OctaCommand::Hello(Version {
+      protocol_version: protocol::PLUGIN_PROTOCOL_VERSION + 1,
+      version: "1.0.0".to_owned(),
+      features: Vec::new(),
+    });
+    let incompatible =
+      exchange_plugin_frames(&socket_path, &[serde_json::to_string(&incompatible_hello).unwrap()]).await;
+    assert!(matches!(
+      &incompatible[..],
+      [PluginResponse::Error { id, .. }, PluginResponse::Shutdown { .. }] if id == "protocol_error"
+    ));
+
+    let malformed_command = exchange_plugin_frames(
+      &socket_path,
+      &[
+        serde_json::to_string(&hello_command).unwrap(),
+        serde_json::to_string(&schema_command).unwrap(),
+        "{".to_owned(),
+      ],
+    )
+    .await;
+    assert!(matches!(
+      &malformed_command[2..],
+      [PluginResponse::Error { id, .. }, PluginResponse::Shutdown { .. }] if id == "parse_error"
+    ));
+
+    cancel_token.cancel();
     listener_handle.await.unwrap(); // Wait for the listener task to finish
   }
 }

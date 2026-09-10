@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use octa_octafile::{ArtifactDeclaration as OctafileArtifact, ReportDeclaration as OctafileReport};
 use octa_output::{RegisteredArtifact, RegisteredReport};
@@ -136,7 +136,7 @@ fn normalize_path(
   working_dir: &Path,
   workspace: &Path,
   require_file: bool,
-) -> ExecutorResult<PathBuf> {
+) -> ExecutorResult<String> {
   if path.is_absolute() {
     return Err(invalid_path(
       kind,
@@ -161,7 +161,15 @@ fn normalize_path(
     return Err(invalid_path(kind, name, path, "report path must resolve to a file"));
   }
 
-  Ok(relative.to_path_buf())
+  relative
+    .iter()
+    .map(|component| {
+      component
+        .to_str()
+        .ok_or_else(|| invalid_path(kind, name, path, "path must contain valid UTF-8"))
+    })
+    .collect::<ExecutorResult<Vec<_>>>()
+    .map(|components| components.join("/"))
 }
 
 fn invalid_path(kind: &'static str, name: &str, path: &Path, message: impl Into<String>) -> ExecutorError {
@@ -175,6 +183,7 @@ fn invalid_path(kind: &'static str, name: &str, path: &Path, message: impl Into<
 #[cfg(test)]
 mod tests {
   use std::fs;
+  use std::path::PathBuf;
 
   use super::*;
 
@@ -195,7 +204,7 @@ mod tests {
     )
     .unwrap();
 
-    assert_eq!(reports[0].path, PathBuf::from("project/junit.xml"));
+    assert_eq!(reports[0].path, "project/junit.xml");
   }
 
   #[cfg(unix)]
@@ -234,7 +243,7 @@ mod tests {
       workspace.path(),
     )
     .unwrap();
-    assert_eq!(artifacts[0].path, PathBuf::from("dist"));
+    assert_eq!(artifacts[0].path, "dist");
 
     let error = octafile_reports(
       &[OctafileReport {
@@ -289,7 +298,7 @@ mod tests {
       workspace.path(),
     )
     .unwrap();
-    assert_eq!(artifacts[0].path, PathBuf::from("junit.xml"));
+    assert_eq!(artifacts[0].path, "junit.xml");
 
     let reports = plugin_reports(
       &[
