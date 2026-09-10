@@ -744,6 +744,10 @@ mod tests {
       writer.write_all(frame.as_bytes()).await.unwrap();
       writer.write_all(b"\n").await.unwrap();
     }
+    writer
+      .write_all((serde_json::to_string(&OctaCommand::Shutdown).unwrap() + "\n").as_bytes())
+      .await
+      .unwrap();
     drop(writer);
     responses.await.unwrap()
   }
@@ -1621,7 +1625,7 @@ mod tests {
 
     // Spawn a task to accept connections
     let listener_handle = {
-      let cancel_token = cancel_token.clone();
+      let listener_cancel_token = cancel_token.clone();
 
       tokio::spawn(async move {
         loop {
@@ -1629,7 +1633,13 @@ mod tests {
             result = listener.accept() => {
               match result {
                 Ok(stream) => {
-                  let _ = handle_conn(stream, plugin.clone(), schema.clone(), logger.clone(), cancel_token.clone()).await;
+                  let _ = handle_conn(
+                    stream,
+                    plugin.clone(),
+                    schema.clone(),
+                    logger.clone(),
+                    CancellationToken::new(),
+                  ).await;
                 }
                 Err(_) => {
                   // Handle accept error if necessary
@@ -1637,7 +1647,7 @@ mod tests {
                 }
               }
             }
-            _ = cancel_token.cancelled() => {
+            _ = listener_cancel_token.cancelled() => {
               break; // Exit the loop if the token is cancelled
             }
           }
@@ -1682,10 +1692,12 @@ mod tests {
     writer.write_all(cmd_json.as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
 
+    let shutdown_json = serde_json::to_string(&OctaCommand::Shutdown).unwrap() + "\n";
+    writer.write_all(shutdown_json.as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+
     // Clean up
     drop(writer); // Close the writer to signal no more data
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let responses = response_handle.await.unwrap();
 
@@ -1744,11 +1756,21 @@ mod tests {
       version: "1.0.0".to_owned(),
       features: Vec::new(),
     });
-    let incompatible =
-      exchange_plugin_frames(&socket_path, &[serde_json::to_string(&incompatible_hello).unwrap()]).await;
+    let incompatible = exchange_plugin_frames(
+      &socket_path,
+      &[
+        serde_json::to_string(&incompatible_hello).unwrap(),
+        serde_json::to_string(&schema_command).unwrap(),
+      ],
+    )
+    .await;
     assert!(matches!(
       &incompatible[..],
-      [PluginResponse::Error { id, .. }, PluginResponse::Shutdown { .. }] if id == "protocol_error"
+      [
+        PluginResponse::Error { id, .. },
+        PluginResponse::Schema(_),
+        PluginResponse::Shutdown { .. }
+      ] if id == "protocol_error"
     ));
 
     let malformed_command = exchange_plugin_frames(
