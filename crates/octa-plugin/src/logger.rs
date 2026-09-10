@@ -96,7 +96,7 @@ pub struct LogWriter {
 
 pub struct LoggerSystem {
   logger: Arc<PluginLogger>,
-  writer_handle: thread::JoinHandle<()>,
+  writer_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl PluginLogger {
@@ -178,10 +178,17 @@ impl LoggerSystem {
     let (logger, mut log_writer) = PluginLogger::new(plugin_name, log_dir)?;
     let logger = Arc::new(logger);
 
-    // Spawn the log writer in a separate thread
-    let writer_handle = thread::spawn(move || {
-      log_writer.run();
-    });
+    // Silent logging never queues messages, so it does not need a thread
+    // waiting on an otherwise idle channel for the whole plugin lifetime.
+    let writer_handle = if logger.silent {
+      None
+    } else {
+      Some(
+        thread::Builder::new()
+          .name(format!("octa-plugin-{plugin_name}-logger"))
+          .spawn(move || log_writer.run())?,
+      )
+    };
 
     Ok(Self { logger, writer_handle })
   }
@@ -198,10 +205,11 @@ impl LoggerSystem {
 
     drop(self.logger);
 
-    self
-      .writer_handle
-      .join()
-      .map_err(|e| io::Error::other(format!("Failed to join logger thread: {:?}", e)))?;
+    if let Some(writer_handle) = self.writer_handle {
+      writer_handle
+        .join()
+        .map_err(|e| io::Error::other(format!("Failed to join logger thread: {:?}", e)))?;
+    }
 
     Ok(())
   }
