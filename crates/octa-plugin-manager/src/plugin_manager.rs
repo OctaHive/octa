@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::{
   plugin_client::PluginClient,
-  plugin_lock::{PluginLock, PluginLockError},
+  plugin_lock::{locked_plugin, verify_plugin, PluginLock, PluginLockError},
   plugin_process::{LocalPluginLauncher, PluginLaunchError, PluginLaunchRequest, PluginLauncher, PluginProcess},
 };
 
@@ -489,8 +489,8 @@ impl PluginManager {
       .plugin_lock
       .as_ref()
       .ok_or_else(|| PluginManagerError::StartError("plugin lock is not configured".to_owned()))?;
-    let mut expected_capabilities = lock.plugin(plugin_name)?.capabilities.clone();
-    let executable = lock.verify(plugin_name, &self.plugins_dir).await?;
+    let mut expected_capabilities = locked_plugin(lock, plugin_name)?.capabilities.clone();
+    let executable = verify_plugin(lock, plugin_name, &self.plugins_dir).await?;
     let schema = self.start_plugin(&executable.to_string_lossy()).await?;
     expected_capabilities.sort();
     let mut actual_capabilities = schema.capabilities.clone();

@@ -2532,6 +2532,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "octa-plugin-lock"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_yml",
+]
+
+[[package]]
 name = "octa-plugin-manager"
 version = "0.3.0"
 dependencies = [
@@ -2541,6 +2549,7 @@ dependencies = [
  "interprocess",
  "jsonschema",
  "octa-plugin",
+ "octa-plugin-lock",
  "serde",
  "serde_json",
  "serde_yml",

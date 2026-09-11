@@ -15,7 +15,7 @@ use octa_octafile::{Octafile, OctafileError, PluginTypeSchema, Silence, Syntheti
 use octa_output::{Console, ConsoleLevel};
 use octa_plugin::{protocol::Schema, SHELL_CAPABILITY};
 use octa_plugin_manager::{
-  plugin_lock::{PluginLock, PluginLockError},
+  plugin_lock::{load_plugin_lock, PluginLockError},
   plugin_manager::{PluginManager, PluginManagerError},
 };
 use thiserror::Error;
@@ -161,7 +161,7 @@ impl Runtime {
       .map(Arc::new);
     let plugin_lock = plugin_lock
       .map(|path| if path.is_absolute() { path } else { workspace.join(path) })
-      .map(|path| PluginLock::load(&path).map_err(RuntimeError::from))
+      .map(|path| load_plugin_lock(&path).map_err(RuntimeError::from))
       .transpose()?;
     let runtime_identity = serde_json::json!({
       "octa": env!("CARGO_PKG_VERSION"),

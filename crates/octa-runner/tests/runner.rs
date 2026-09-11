@@ -11,7 +11,8 @@ use std::{
 use assert_cmd::Command;
 use octa_plugin::protocol::PLUGIN_PROTOCOL_VERSION;
 use octa_plugin_manager::plugin_lock::{
-  current_platform, sha256_file, PluginLock, PluginManifest, PLUGIN_LOCK_VERSION, PLUGIN_MANIFEST_VERSION,
+  current_platform, sha256_file, write_plugin_lock, PluginLock, PluginManifest, PLUGIN_LOCK_VERSION,
+  PLUGIN_MANIFEST_VERSION,
 };
 use octa_runner::{MAX_RUNNER_INPUT_FRAME_BYTES, RUNNER_OUTPUT_SCHEMA_V1};
 use serde_json::{json, Value};
@@ -87,7 +88,7 @@ fn locked_plugins(workspace: &TempDir) -> (PathBuf, PathBuf) {
       .collect(),
   };
   let lock_path = workspace.path().join("Octa.lock");
-  lock.write(&lock_path).unwrap();
+  write_plugin_lock(&lock, &lock_path).unwrap();
   (directory, lock_path)
 }
 

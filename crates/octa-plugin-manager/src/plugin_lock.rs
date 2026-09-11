@@ -10,13 +10,13 @@ use std::{
 };
 
 use octa_plugin::protocol::PLUGIN_PROTOCOL_VERSION;
+pub use octa_plugin_lock::{LockedPlugin, PluginLock, PLUGIN_LOCK_VERSION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{fs::File, io::AsyncReadExt};
 
 pub const PLUGIN_MANIFEST_VERSION: u8 = 1;
-pub const PLUGIN_LOCK_VERSION: u8 = 1;
 
 #[derive(Debug, Error)]
 pub enum PluginLockError {
@@ -133,191 +133,170 @@ impl PluginManifest {
   }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PluginLock {
-  pub version: u8,
-  pub plugins: BTreeMap<String, LockedPlugin>,
+/// Loads a versioned lock file without touching plugin binaries.
+pub fn load_plugin_lock(path: &Path) -> Result<PluginLock, PluginLockError> {
+  let contents = std::fs::read_to_string(path).map_err(|source| PluginLockError::Read {
+    path: path.to_path_buf(),
+    source,
+  })?;
+  let lock: PluginLock = serde_yml::from_str(&contents).map_err(|source| PluginLockError::Parse {
+    path: path.to_path_buf(),
+    source: Box::new(source),
+  })?;
+  if lock.version != PLUGIN_LOCK_VERSION {
+    return Err(PluginLockError::LockVersion(lock.version));
+  }
+  Ok(lock)
 }
 
-impl PluginLock {
-  /// Loads a versioned lock file without touching plugin binaries.
-  pub fn load(path: &Path) -> Result<Self, PluginLockError> {
-    let contents = std::fs::read_to_string(path).map_err(|source| PluginLockError::Read {
-      path: path.to_path_buf(),
-      source,
-    })?;
-    let lock: Self = serde_yml::from_str(&contents).map_err(|source| PluginLockError::Parse {
-      path: path.to_path_buf(),
-      source: Box::new(source),
-    })?;
-    if lock.version != PLUGIN_LOCK_VERSION {
-      return Err(PluginLockError::LockVersion(lock.version));
-    }
-    Ok(lock)
-  }
+/// Verifies one locked plugin and returns its canonical executable path.
+pub async fn verify_plugin(lock: &PluginLock, plugin: &str, plugins_dir: &Path) -> Result<PathBuf, PluginLockError> {
+  let entry = lock
+    .plugins
+    .get(plugin)
+    .ok_or_else(|| PluginLockError::MissingPlugin(plugin.to_owned()))?;
+  verify_locked(entry, plugin, plugins_dir).await
+}
 
-  pub async fn verify(&self, plugin: &str, plugins_dir: &Path) -> Result<PathBuf, PluginLockError> {
-    let entry = self
-      .plugins
-      .get(plugin)
-      .ok_or_else(|| PluginLockError::MissingPlugin(plugin.to_owned()))?;
-    entry.verify(plugin, plugins_dir).await
-  }
+/// Returns metadata for one plugin without verifying its executable.
+pub fn locked_plugin<'a>(lock: &'a PluginLock, plugin: &str) -> Result<&'a LockedPlugin, PluginLockError> {
+  lock
+    .plugins
+    .get(plugin)
+    .ok_or_else(|| PluginLockError::MissingPlugin(plugin.to_owned()))
+}
 
-  pub fn plugin(&self, plugin: &str) -> Result<&LockedPlugin, PluginLockError> {
-    self
-      .plugins
-      .get(plugin)
-      .ok_or_else(|| PluginLockError::MissingPlugin(plugin.to_owned()))
-  }
-
-  /// Builds a deterministic lock from signed-distribution metadata beside plugin binaries.
-  pub async fn from_manifest_directory(plugins_dir: &Path) -> Result<Self, PluginLockError> {
-    let entries = std::fs::read_dir(plugins_dir).map_err(|source| PluginLockError::Read {
+/// Builds a deterministic lock from distribution manifests beside plugin binaries.
+pub async fn lock_from_manifest_directory(plugins_dir: &Path) -> Result<PluginLock, PluginLockError> {
+  let entries = std::fs::read_dir(plugins_dir).map_err(|source| PluginLockError::Read {
+    path: plugins_dir.to_path_buf(),
+    source,
+  })?;
+  let mut manifests = Vec::new();
+  for entry in entries {
+    let entry = entry.map_err(|source| PluginLockError::Read {
       path: plugins_dir.to_path_buf(),
       source,
     })?;
-    let mut manifests = Vec::new();
-    for entry in entries {
-      let entry = entry.map_err(|source| PluginLockError::Read {
-        path: plugins_dir.to_path_buf(),
-        source,
-      })?;
-      let path = entry.path();
-      if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(".plugin.yml"))
-      {
-        manifests.push(path);
-      }
-    }
-    manifests.sort();
-    if manifests.is_empty() {
-      return Err(PluginLockError::NoManifests(plugins_dir.to_path_buf()));
-    }
-
-    let mut plugins = BTreeMap::new();
-    for path in manifests {
-      let manifest = PluginManifest::load(&path)?;
-      let name = manifest.name.clone();
-      let source = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
-      if plugins.insert(name.clone(), manifest.into_locked(source)).is_some() {
-        return Err(PluginLockError::DuplicatePlugin(name));
-      }
-    }
-    let lock = Self {
-      version: PLUGIN_LOCK_VERSION,
-      plugins,
-    };
-    lock.verify_all(plugins_dir).await?;
-    Ok(lock)
-  }
-
-  pub async fn verify_all(&self, plugins_dir: &Path) -> Result<Vec<PathBuf>, PluginLockError> {
-    let mut verified = Vec::with_capacity(self.plugins.len());
-    for plugin in self.plugins.keys() {
-      verified.push(self.verify(plugin, plugins_dir).await?);
-    }
-    Ok(verified)
-  }
-
-  /// Writes the lock file in a deterministic mapping order.
-  pub fn write(&self, path: &Path) -> Result<(), PluginLockError> {
-    let contents = serde_yml::to_string(self).map_err(|source| PluginLockError::Serialize {
-      path: path.to_path_buf(),
-      source: Box::new(source),
-    })?;
-    std::fs::write(path, contents).map_err(|source| PluginLockError::Write {
-      path: path.to_path_buf(),
-      source,
-    })
-  }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LockedPlugin {
-  pub version: String,
-  pub protocol: u16,
-  pub platforms: Vec<String>,
-  pub entrypoint: PathBuf,
-  pub sha256: String,
-  #[serde(default, skip_serializing_if = "Vec::is_empty")]
-  pub capabilities: Vec<String>,
-  pub source: String,
-}
-
-impl LockedPlugin {
-  async fn verify(&self, plugin: &str, plugins_dir: &Path) -> Result<PathBuf, PluginLockError> {
-    if plugin.trim().is_empty() || self.version.trim().is_empty() || self.platforms.is_empty() {
-      return Err(PluginLockError::InvalidManifest {
-        plugin: plugin.to_owned(),
-        message: "name, version, and platforms must not be empty".to_owned(),
-      });
-    }
-    if self.protocol != PLUGIN_PROTOCOL_VERSION {
-      return Err(PluginLockError::Protocol {
-        plugin: plugin.to_owned(),
-        actual: self.protocol,
-        expected: PLUGIN_PROTOCOL_VERSION,
-      });
-    }
-    let platform = current_platform();
-    if !self.platforms.iter().any(|candidate| candidate == &platform) {
-      return Err(PluginLockError::Platform {
-        plugin: plugin.to_owned(),
-        platform,
-      });
-    }
-    if self.entrypoint.is_absolute()
-      || self
-        .entrypoint
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
+    let path = entry.path();
+    if path
+      .file_name()
+      .and_then(|name| name.to_str())
+      .is_some_and(|name| name.ends_with(".plugin.yml"))
     {
-      return Err(PluginLockError::Entrypoint {
-        plugin: plugin.to_owned(),
-        entrypoint: self.entrypoint.clone(),
-      });
+      manifests.push(path);
     }
-    if self.sha256.len() != 64 || !self.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-      return Err(PluginLockError::InvalidDigest {
-        plugin: plugin.to_owned(),
-        digest: self.sha256.clone(),
-      });
-    }
-
-    let root = dunce::canonicalize(plugins_dir).map_err(|source| PluginLockError::Read {
-      path: plugins_dir.to_path_buf(),
-      source,
-    })?;
-    let executable = dunce::canonicalize(root.join(&self.entrypoint)).map_err(|source| PluginLockError::Read {
-      path: root.join(&self.entrypoint),
-      source,
-    })?;
-    if !executable.starts_with(&root) {
-      return Err(PluginLockError::EscapedEntrypoint {
-        plugin: plugin.to_owned(),
-      });
-    }
-    let actual = sha256_file(&executable).await.map_err(|source| PluginLockError::Read {
-      path: executable.clone(),
-      source,
-    })?;
-    if !actual.eq_ignore_ascii_case(&self.sha256) {
-      return Err(PluginLockError::DigestMismatch {
-        plugin: plugin.to_owned(),
-        expected: self.sha256.clone(),
-        actual,
-      });
-    }
-    Ok(executable)
   }
+  manifests.sort();
+  if manifests.is_empty() {
+    return Err(PluginLockError::NoManifests(plugins_dir.to_path_buf()));
+  }
+
+  let mut plugins = BTreeMap::new();
+  for path in manifests {
+    let manifest = PluginManifest::load(&path)?;
+    let name = manifest.name.clone();
+    let source = path
+      .file_name()
+      .map(|name| name.to_string_lossy().into_owned())
+      .unwrap_or_else(|| path.display().to_string());
+    if plugins.insert(name.clone(), manifest.into_locked(source)).is_some() {
+      return Err(PluginLockError::DuplicatePlugin(name));
+    }
+  }
+  let lock = PluginLock {
+    version: PLUGIN_LOCK_VERSION,
+    plugins,
+  };
+  verify_plugin_lock(&lock, plugins_dir).await?;
+  Ok(lock)
+}
+
+/// Verifies every entry in a lock file.
+pub async fn verify_plugin_lock(lock: &PluginLock, plugins_dir: &Path) -> Result<Vec<PathBuf>, PluginLockError> {
+  let mut verified = Vec::with_capacity(lock.plugins.len());
+  for plugin in lock.plugins.keys() {
+    verified.push(verify_plugin(lock, plugin, plugins_dir).await?);
+  }
+  Ok(verified)
+}
+
+/// Writes a lock file in deterministic mapping order.
+pub fn write_plugin_lock(lock: &PluginLock, path: &Path) -> Result<(), PluginLockError> {
+  let contents = serde_yml::to_string(lock).map_err(|source| PluginLockError::Serialize {
+    path: path.to_path_buf(),
+    source: Box::new(source),
+  })?;
+  std::fs::write(path, contents).map_err(|source| PluginLockError::Write {
+    path: path.to_path_buf(),
+    source,
+  })
+}
+
+async fn verify_locked(locked: &LockedPlugin, plugin: &str, plugins_dir: &Path) -> Result<PathBuf, PluginLockError> {
+  if plugin.trim().is_empty() || locked.version.trim().is_empty() || locked.platforms.is_empty() {
+    return Err(PluginLockError::InvalidManifest {
+      plugin: plugin.to_owned(),
+      message: "name, version, and platforms must not be empty".to_owned(),
+    });
+  }
+  if locked.protocol != PLUGIN_PROTOCOL_VERSION {
+    return Err(PluginLockError::Protocol {
+      plugin: plugin.to_owned(),
+      actual: locked.protocol,
+      expected: PLUGIN_PROTOCOL_VERSION,
+    });
+  }
+  let platform = current_platform();
+  if !locked.platforms.iter().any(|candidate| candidate == &platform) {
+    return Err(PluginLockError::Platform {
+      plugin: plugin.to_owned(),
+      platform,
+    });
+  }
+  if locked.entrypoint.is_absolute()
+    || locked
+      .entrypoint
+      .components()
+      .any(|component| !matches!(component, Component::Normal(_)))
+  {
+    return Err(PluginLockError::Entrypoint {
+      plugin: plugin.to_owned(),
+      entrypoint: locked.entrypoint.clone(),
+    });
+  }
+  if locked.sha256.len() != 64 || !locked.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    return Err(PluginLockError::InvalidDigest {
+      plugin: plugin.to_owned(),
+      digest: locked.sha256.clone(),
+    });
+  }
+
+  let root = dunce::canonicalize(plugins_dir).map_err(|source| PluginLockError::Read {
+    path: plugins_dir.to_path_buf(),
+    source,
+  })?;
+  let executable = dunce::canonicalize(root.join(&locked.entrypoint)).map_err(|source| PluginLockError::Read {
+    path: root.join(&locked.entrypoint),
+    source,
+  })?;
+  if !executable.starts_with(&root) {
+    return Err(PluginLockError::EscapedEntrypoint {
+      plugin: plugin.to_owned(),
+    });
+  }
+  let actual = sha256_file(&executable).await.map_err(|source| PluginLockError::Read {
+    path: executable.clone(),
+    source,
+  })?;
+  if !actual.eq_ignore_ascii_case(&locked.sha256) {
+    return Err(PluginLockError::DigestMismatch {
+      plugin: plugin.to_owned(),
+      expected: locked.sha256.clone(),
+      actual,
+    });
+  }
+  Ok(executable)
 }
 
 pub fn current_platform() -> String {
@@ -348,7 +327,7 @@ mod tests {
 
   use super::*;
 
-  async fn locked_plugin(directory: &Path) -> LockedPlugin {
+  async fn locked_entry(directory: &Path) -> LockedPlugin {
     let executable = directory.join("plugin");
     tokio::fs::write(&executable, b"trusted").await.unwrap();
     LockedPlugin {
@@ -385,12 +364,12 @@ mod tests {
     };
 
     assert_eq!(
-      lock.verify("test", directory.path()).await.unwrap(),
+      verify_plugin(&lock, "test", directory.path()).await.unwrap(),
       dunce::canonicalize(&executable).unwrap()
     );
     tokio::fs::write(&executable, b"modified").await.unwrap();
     assert!(matches!(
-      lock.verify("test", directory.path()).await,
+      verify_plugin(&lock, "test", directory.path()).await,
       Err(PluginLockError::DigestMismatch { .. })
     ));
   }
@@ -414,7 +393,7 @@ mod tests {
       )]),
     };
     assert!(matches!(
-      lock.verify("test", directory.path()).await,
+      verify_plugin(&lock, "test", directory.path()).await,
       Err(PluginLockError::Entrypoint { .. })
     ));
   }
@@ -459,7 +438,7 @@ mod tests {
   #[tokio::test]
   async fn lock_round_trips_and_manifest_directory_is_deterministic() {
     let directory = tempfile::tempdir().unwrap();
-    let entry = locked_plugin(directory.path()).await;
+    let entry = locked_entry(directory.path()).await;
     let manifest = PluginManifest {
       manifest_version: PLUGIN_MANIFEST_VERSION,
       name: "test".to_owned(),
@@ -476,15 +455,18 @@ mod tests {
     )
     .unwrap();
 
-    let lock = PluginLock::from_manifest_directory(directory.path()).await.unwrap();
-    assert_eq!(lock.plugin("test").unwrap().source, "test.plugin.yml");
-    assert_eq!(lock.verify_all(directory.path()).await.unwrap().len(), 1);
+    let lock = lock_from_manifest_directory(directory.path()).await.unwrap();
+    assert_eq!(locked_plugin(&lock, "test").unwrap().source, "test.plugin.yml");
+    assert_eq!(verify_plugin_lock(&lock, directory.path()).await.unwrap().len(), 1);
     let path = directory.path().join("Octa.lock");
-    lock.write(&path).unwrap();
-    assert_eq!(PluginLock::load(&path).unwrap(), lock);
-    assert!(matches!(lock.plugin("missing"), Err(PluginLockError::MissingPlugin(_))));
+    write_plugin_lock(&lock, &path).unwrap();
+    assert_eq!(load_plugin_lock(&path).unwrap(), lock);
     assert!(matches!(
-      lock.write(directory.path()),
+      locked_plugin(&lock, "missing"),
+      Err(PluginLockError::MissingPlugin(_))
+    ));
+    assert!(matches!(
+      write_plugin_lock(&lock, directory.path()),
       Err(PluginLockError::Write { .. })
     ));
   }
@@ -493,16 +475,16 @@ mod tests {
   async fn rejects_missing_duplicate_and_incompatible_locked_plugins() {
     let empty = tempfile::tempdir().unwrap();
     assert!(matches!(
-      PluginLock::from_manifest_directory(empty.path()).await,
+      lock_from_manifest_directory(empty.path()).await,
       Err(PluginLockError::NoManifests(_))
     ));
     assert!(matches!(
-      PluginLock::from_manifest_directory(&empty.path().join("missing")).await,
+      lock_from_manifest_directory(&empty.path().join("missing")).await,
       Err(PluginLockError::Read { .. })
     ));
 
     let directory = tempfile::tempdir().unwrap();
-    let entry = locked_plugin(directory.path()).await;
+    let entry = locked_entry(directory.path()).await;
     let lock = |entry: LockedPlugin| PluginLock {
       version: PLUGIN_LOCK_VERSION,
       plugins: BTreeMap::from([("test".to_owned(), entry)]),
@@ -511,30 +493,30 @@ mod tests {
     let mut invalid = entry.clone();
     invalid.protocol += 1;
     assert!(matches!(
-      lock(invalid).verify("test", directory.path()).await,
+      verify_plugin(&lock(invalid), "test", directory.path()).await,
       Err(PluginLockError::Protocol { .. })
     ));
     let mut invalid = entry.clone();
     invalid.platforms = vec!["unsupported-platform".to_owned()];
     assert!(matches!(
-      lock(invalid).verify("test", directory.path()).await,
+      verify_plugin(&lock(invalid), "test", directory.path()).await,
       Err(PluginLockError::Platform { .. })
     ));
     let mut invalid = entry.clone();
     invalid.sha256 = "not-a-digest".to_owned();
     assert!(matches!(
-      lock(invalid).verify("test", directory.path()).await,
+      verify_plugin(&lock(invalid), "test", directory.path()).await,
       Err(PluginLockError::InvalidDigest { .. })
     ));
     let mut invalid = entry;
     invalid.version.clear();
     assert!(matches!(
-      lock(invalid).verify("test", directory.path()).await,
+      verify_plugin(&lock(invalid), "test", directory.path()).await,
       Err(PluginLockError::InvalidManifest { .. })
     ));
 
     let duplicate = tempfile::tempdir().unwrap();
-    let entry = locked_plugin(duplicate.path()).await;
+    let entry = locked_entry(duplicate.path()).await;
     let manifest = PluginManifest {
       manifest_version: PLUGIN_MANIFEST_VERSION,
       name: "test".to_owned(),
@@ -549,7 +531,7 @@ mod tests {
     fs::write(duplicate.path().join("a.plugin.yml"), &contents).unwrap();
     fs::write(duplicate.path().join("b.plugin.yml"), contents).unwrap();
     assert!(matches!(
-      PluginLock::from_manifest_directory(duplicate.path()).await,
+      lock_from_manifest_directory(duplicate.path()).await,
       Err(PluginLockError::DuplicatePlugin(_))
     ));
   }
@@ -558,28 +540,28 @@ mod tests {
   fn lock_loading_rejects_invalid_data_and_versions() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("Octa.lock");
-    assert!(matches!(PluginLock::load(&path), Err(PluginLockError::Read { .. })));
+    assert!(matches!(load_plugin_lock(&path), Err(PluginLockError::Read { .. })));
     fs::write(&path, "not: [valid").unwrap();
-    assert!(matches!(PluginLock::load(&path), Err(PluginLockError::Parse { .. })));
+    assert!(matches!(load_plugin_lock(&path), Err(PluginLockError::Parse { .. })));
     fs::write(&path, "version: 2\nplugins: {}\n").unwrap();
-    assert!(matches!(PluginLock::load(&path), Err(PluginLockError::LockVersion(2))));
+    assert!(matches!(load_plugin_lock(&path), Err(PluginLockError::LockVersion(2))));
   }
 
   #[tokio::test]
   async fn verification_reports_missing_directories_and_entrypoints() {
     let directory = tempfile::tempdir().unwrap();
-    let entry = locked_plugin(directory.path()).await;
+    let entry = locked_entry(directory.path()).await;
     let lock = PluginLock {
       version: PLUGIN_LOCK_VERSION,
       plugins: BTreeMap::from([("test".to_owned(), entry)]),
     };
     assert!(matches!(
-      lock.verify("test", &directory.path().join("missing")).await,
+      verify_plugin(&lock, "test", &directory.path().join("missing")).await,
       Err(PluginLockError::Read { .. })
     ));
     fs::remove_file(directory.path().join("plugin")).unwrap();
     assert!(matches!(
-      lock.verify("test", directory.path()).await,
+      verify_plugin(&lock, "test", directory.path()).await,
       Err(PluginLockError::Read { .. })
     ));
     assert!(sha256_file(&directory.path().join("missing")).await.is_err());
@@ -609,7 +591,7 @@ mod tests {
       )]),
     };
     assert!(matches!(
-      lock.verify("test", directory.path()).await,
+      verify_plugin(&lock, "test", directory.path()).await,
       Err(PluginLockError::EscapedEntrypoint { .. })
     ));
   }

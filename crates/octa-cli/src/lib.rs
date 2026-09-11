@@ -710,7 +710,9 @@ async fn run_plugin_management(
   plugins_dir: &Path,
   console: &Console,
 ) -> OctaResult<()> {
-  use octa_plugin_manager::plugin_lock::PluginLock;
+  use octa_plugin_manager::plugin_lock::{
+    load_plugin_lock, lock_from_manifest_directory, verify_plugin_lock, write_plugin_lock,
+  };
 
   let plugins_dir = if plugins_dir.is_absolute() {
     plugins_dir.to_path_buf()
@@ -726,8 +728,8 @@ async fn run_plugin_management(
       } else {
         workspace.join(output)
       };
-      let lock = PluginLock::from_manifest_directory(&plugins_dir).await?;
-      lock.write(&output)?;
+      let lock = lock_from_manifest_directory(&plugins_dir).await?;
+      write_plugin_lock(&lock, &output)?;
       console
         .message(
           ConsoleLevel::Info,
@@ -743,8 +745,8 @@ async fn run_plugin_management(
       } else {
         workspace.join(lock)
       };
-      let lock = PluginLock::load(&lock_path)?;
-      lock.verify_all(&plugins_dir).await?;
+      let lock = load_plugin_lock(&lock_path)?;
+      verify_plugin_lock(&lock, &plugins_dir).await?;
       console
         .message(
           ConsoleLevel::Info,

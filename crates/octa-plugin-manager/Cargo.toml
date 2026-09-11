@@ -17,6 +17,7 @@ interprocess = { git = "https://github.com/federico-terzi/interprocess", feature
   "tokio",
 ] }
 octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
+octa-plugin-lock = { version = "0.3.0", path = "../octa-plugin-lock" }
 dunce = "1.0.5"
 serde = { workspace = true }
 serde_json = { workspace = true }

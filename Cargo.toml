@@ -12,6 +12,7 @@ members = [
   "crates/octa-runner",
   "crates/octa-runner-protocol",
   "crates/octa-plugin",
+  "crates/octa-plugin-lock",
   "crates/octa-plugin-manager",
   "crates/octa_plugin_shell",
   "crates/octa_plugin_tpl",
