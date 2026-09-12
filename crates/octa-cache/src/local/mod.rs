@@ -600,7 +600,14 @@ fn create_cache_directory(path: &Path) -> CacheResult<()> {
     Err(error) if error.kind() == io::ErrorKind::NotFound => {},
     Err(error) => return Err(io_error("inspect local cache directory", path, error)),
   }
-  fs::create_dir(path).map_err(|error| io_error("create local cache directory", path, error))?;
+  // Another writer may create the same digest shard after our initial
+  // inspection. Treat that race as success only after the common validation
+  // below proves the winner created a real directory rather than a link.
+  match fs::create_dir(path) {
+    Ok(()) => {},
+    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+    Err(error) => return Err(io_error("create local cache directory", path, error)),
+  }
   let metadata =
     fs::symlink_metadata(path).map_err(|error| io_error("inspect created local cache directory", path, error))?;
   if !metadata.is_dir() || is_link_or_reparse(&metadata) {
