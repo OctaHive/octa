@@ -1,13 +1,13 @@
-use std::{io, process::ExitCode, sync::Arc};
+use std::{fs, io, path::Path, process::ExitCode, sync::Arc};
 
 use octa_executor::{ExecutionConclusion, ExecutorError};
 use octa_octafile::Silence as RuntimeSilence;
 use octa_output::Console;
 use octa_runner::{
   capabilities, hello, read_frame, MessageWriter, RunRequest, RunStatus, RunnerCommand, RunnerMessage,
-  RUNNER_PROTOCOL_VERSION,
+  MAX_CACHE_TOKEN_FILE_BYTES, RUNNER_PROTOCOL_VERSION,
 };
-use octa_runtime::{RunOptions, Runtime, RuntimeConfig};
+use octa_runtime::{RunOptions, Runtime, RuntimeCacheConfig, RuntimeConfig};
 use tokio::io::{BufReader, Stdin};
 use tokio_util::sync::CancellationToken;
 
@@ -133,6 +133,7 @@ async fn run() -> Result<RunStatus, u8> {
     quiet: request.quiet,
     silence: request.silence.map(runtime_silence),
     raw: false,
+    cache_probe: false,
   };
 
   let result = async {
@@ -186,12 +187,13 @@ async fn run() -> Result<RunStatus, u8> {
 
 fn runtime_error_exit(error: &octa_runtime::RuntimeError) -> u8 {
   match error {
-    octa_runtime::RuntimeError::Io(_) | octa_runtime::RuntimeError::State(_) | octa_runtime::RuntimeError::Join(_) => {
-      EXIT_INFRASTRUCTURE
-    },
+    octa_runtime::RuntimeError::Io(_)
+    | octa_runtime::RuntimeError::MonorepoState(_)
+    | octa_runtime::RuntimeError::Join(_) => EXIT_INFRASTRUCTURE,
     octa_runtime::RuntimeError::PluginManagerConfiguration(_) => EXIT_INVALID_REQUEST,
     octa_runtime::RuntimeError::PluginInfrastructure(_) => EXIT_INFRASTRUCTURE,
     octa_runtime::RuntimeError::Execution(error) => executor_error_exit(error),
+    octa_runtime::RuntimeError::Cache(_) => EXIT_INVALID_REQUEST,
     octa_runtime::RuntimeError::Octafile(_)
     | octa_runtime::RuntimeError::Monorepo(_)
     | octa_runtime::RuntimeError::PluginLock(_)
@@ -204,9 +206,7 @@ fn executor_error_exit(error: &ExecutorError) -> u8 {
   match error {
     ExecutorError::ShutdownTimeout
     | ExecutorError::ExecutionIdentityError(_)
-    | ExecutorError::OpenFingerprintDbError(_)
-    | ExecutorError::FreshnessStateUnavailable(_)
-    | ExecutorError::FreshnessStateAlreadyPublished
+    | ExecutorError::Cache(_)
     | ExecutorError::ChannelError
     | ExecutorError::ConcurrencyLimiterClosed
     | ExecutorError::IoError(_)
@@ -229,6 +229,18 @@ async fn load_runtime(
   config.octafile = request.octafile.clone();
   config.plugin_lock = request.plugin_lock.clone();
   config.secrets_profile = request.secrets_profile.clone();
+  config.result_cache = request
+    .cache
+    .as_ref()
+    .map(|cache| {
+      RuntimeCacheConfig::local(
+        cache.mode,
+        cache.namespace.clone(),
+        cache.local_directory.clone(),
+        cache.runtime.clone(),
+      )
+    })
+    .transpose()?;
   config.plugins = request.plugins.clone();
   config.default_plugin = request.default_plugin.clone();
   config.variables = request.variables.clone().into_iter().collect();
@@ -245,7 +257,77 @@ fn validate_request(request: &RunRequest) -> Result<(), String> {
       request.workspace.display()
     ));
   }
+  if let Some(remote) = request.cache.as_ref().and_then(|cache| cache.remote.as_ref()) {
+    let _token = open_token_file(&remote.token_file)?;
+    return Err("remote task-result cache transport is not available in this runner build".to_owned());
+  }
   Ok(())
+}
+
+/// Opens and validates a credential without reading or logging its secret value.
+///
+/// Returning the handle keeps future transport code from reopening a path that
+/// may have changed after validation.
+fn open_token_file(path: &Path) -> Result<fs::File, String> {
+  let metadata = fs::symlink_metadata(path)
+    .map_err(|error| format!("cannot inspect remote cache token file '{}': {error}", path.display()))?;
+  if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+    return Err(format!(
+      "remote cache token file '{}' must be a regular non-symlink file",
+      path.display()
+    ));
+  }
+  if metadata.len() == 0 || metadata.len() > MAX_CACHE_TOKEN_FILE_BYTES {
+    return Err(token_size_error(path));
+  }
+  let file = fs::File::open(path)
+    .map_err(|error| format!("remote cache token file '{}' is not readable: {error}", path.display()))?;
+  let opened = file.metadata().map_err(|error| {
+    format!(
+      "cannot inspect opened remote cache token file '{}': {error}",
+      path.display()
+    )
+  })?;
+  let current = fs::symlink_metadata(path).map_err(|error| {
+    format!(
+      "cannot re-inspect remote cache token file '{}': {error}",
+      path.display()
+    )
+  })?;
+  let same = same_file::Handle::from_file(
+    file
+      .try_clone()
+      .map_err(|error| format!("cannot retain remote cache token file '{}': {error}", path.display()))?,
+  )
+  .and_then(|opened| same_file::Handle::from_path(path).map(|current| opened == current))
+  .map_err(|error| format!("cannot identify remote cache token file '{}': {error}", path.display()))?;
+  if !same || !current.file_type().is_file() || current.file_type().is_symlink() || !opened.is_file() {
+    return Err(format!(
+      "remote cache token file '{}' changed while it was being opened",
+      path.display()
+    ));
+  }
+  if opened.len() == 0 || opened.len() > MAX_CACHE_TOKEN_FILE_BYTES {
+    return Err(token_size_error(path));
+  }
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::MetadataExt as _;
+    if opened.mode() & 0o077 != 0 {
+      return Err(format!(
+        "remote cache token file '{}' must not grant group or other permissions",
+        path.display()
+      ));
+    }
+  }
+  Ok(file)
+}
+
+fn token_size_error(path: &Path) -> String {
+  format!(
+    "remote cache token file '{}' must contain between 1 and {MAX_CACHE_TOKEN_FILE_BYTES} bytes",
+    path.display()
+  )
 }
 
 async fn read_control(
@@ -345,6 +427,7 @@ fn emit_error(output: &MessageWriter, request_id: Option<&str>, message: &str) -
 #[cfg(test)]
 mod tests {
   use octa_plugin_manager::{plugin_lock::PluginLockError, plugin_manager::PluginManagerError};
+  use tempfile::TempDir;
 
   use super::*;
 
@@ -381,6 +464,12 @@ mod tests {
       runtime_error_exit(&octa_runtime::RuntimeError::Io(io::Error::other("closed"))),
       EXIT_INFRASTRUCTURE
     );
+    assert_eq!(
+      runtime_error_exit(&octa_runtime::RuntimeError::Cache(
+        octa_runtime::RuntimeCacheError::Invalid("profile".to_owned())
+      )),
+      EXIT_INVALID_REQUEST
+    );
     assert_eq!(runtime_error_exit(&octa_runtime::RuntimeError::Cancelled), 130);
   }
 
@@ -400,5 +489,30 @@ mod tests {
     }))
     .unwrap();
     assert!(validate_request(&request).unwrap_err().contains("not a directory"));
+  }
+
+  #[test]
+  fn token_file_validation_rejects_missing_empty_and_exposed_credentials() {
+    let directory = TempDir::new().unwrap();
+    let token = directory.path().join("token");
+    assert!(open_token_file(&token).unwrap_err().contains("cannot inspect"));
+    fs::create_dir(&token).unwrap();
+    assert!(open_token_file(&token).unwrap_err().contains("regular non-symlink"));
+    fs::remove_dir(&token).unwrap();
+    fs::write(&token, []).unwrap();
+    assert!(open_token_file(&token).unwrap_err().contains("between 1"));
+    fs::write(&token, "secret").unwrap();
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt as _;
+      fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    assert!(open_token_file(&token).is_ok());
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt as _;
+      fs::set_permissions(&token, fs::Permissions::from_mode(0o644)).unwrap();
+      assert!(open_token_file(&token).unwrap_err().contains("permissions"));
+    }
   }
 }

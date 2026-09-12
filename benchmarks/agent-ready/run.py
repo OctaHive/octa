@@ -66,20 +66,6 @@ def fixtures(root: Path) -> dict[str, Path]:
     go_wide.append(f"  run:\n    deps: [{dependencies}]\n")
     add("wide", "".join(octa_wide), "".join(go_wide))
 
-    cache_octa = """  run:
-    sources: [input.txt]
-    output: [output.txt]
-    shell: cp input.txt output.txt
-"""
-    cache_go = """  run:
-    sources: [input.txt]
-    generates: [output.txt]
-    cmds: ['cp input.txt output.txt']
-    silent: true
-"""
-    add("cache", cache_octa, cache_go)
-    (result["cache"] / "input.txt").write_text("benchmark\n", encoding="utf-8")
-
     add(
         "output",
         "  run:\n    shell: 'seq 1 20000; seq 1 20000 >&2'\n",
@@ -100,7 +86,7 @@ def runner_command(binary: Path, plugins: Path, workspace: Path, task: str) -> s
     request = json.dumps(
         {
             "type": "start",
-            "protocol_version": 1,
+            "protocol_version": 2,
             "request_id": "benchmark",
             "request": {
                 "workspace": str(workspace),
@@ -176,18 +162,6 @@ def main() -> None:
             commands = [(label, octa_command(binary, plugins, workspace, "run", octa_extra)) for label, binary, plugins in tools]
             commands.append(("go-task", task_command(args.task, workspace, "run", task_extra)))
             run_hyperfine(args.output, f"wide-{mode}", commands, args.warmup, args.runs)
-
-        cache = workspaces["cache"]
-        cold_prepare = f"rm -rf {quote(cache / '.octa')} {quote(cache / '.task')} {quote(cache / 'output.txt')}"
-        cold_commands = [(label, octa_command(binary, plugins, cache, "run")) for label, binary, plugins in tools]
-        cold_commands.append(("go-task", task_command(args.task, cache, "run", f"--temp-dir {quote(cache / '.task')}")))
-        run_hyperfine(args.output, "cache-cold", cold_commands, args.warmup, args.runs, cold_prepare)
-
-        subprocess.run(octa_command(args.octa, args.plugins, cache, "run"), shell=True, check=True)
-        subprocess.run(task_command(args.task, cache, "run", f"--temp-dir {quote(cache / '.task')}"), shell=True, check=True)
-        warm_commands = [(label, octa_command(binary, plugins, cache, "run")) for label, binary, plugins in tools]
-        warm_commands.append(("go-task", task_command(args.task, cache, "run", f"--temp-dir {quote(cache / '.task')}")))
-        run_hyperfine(args.output, "cache-warm", warm_commands, args.warmup, args.runs)
 
         runner_workspace = workspaces["noop"]
         run_hyperfine(

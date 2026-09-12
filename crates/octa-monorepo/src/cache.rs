@@ -8,6 +8,10 @@ use crate::{model::DiscoveryResult, MonorepoError, MonorepoProject};
 const CACHE_TREE: &str = "monorepo_discovery_v1";
 const CACHE_VERSION: u8 = 1;
 
+pub(crate) fn open(path: &Path) -> Result<sled::Db, MonorepoError> {
+  Ok(sled::open(path)?)
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct DirectoryStamp {
   path: String,
@@ -87,7 +91,11 @@ pub(crate) fn store(
   Ok(())
 }
 
-pub(crate) fn clear(cache: &sled::Db) -> Result<(), MonorepoError> {
+pub(crate) fn clear(path: &Path) -> Result<(), MonorepoError> {
+  if !path.try_exists()? {
+    return Ok(());
+  }
+  let cache = open(path)?;
   cache.drop_tree(CACHE_TREE)?;
   cache.flush()?;
   Ok(())

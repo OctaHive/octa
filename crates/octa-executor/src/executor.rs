@@ -92,7 +92,7 @@ struct PlanExecution {
 
 /// Value returned by one spawned DAG node.
 struct NodeExecution {
-  output: Arc<str>,
+  output: Option<Arc<str>>,
   nested_tasks: Vec<TaskResult>,
 }
 
@@ -620,7 +620,9 @@ impl<T: Eq + Hash + Executable + Send + Sync + Clone + 'static> Executor<T> {
     while let Some((index, result)) = handles.next().await {
       match result {
         Ok(Ok(result)) => {
-          indexed_outputs.push((index, result.output));
+          if let Some(output) = result.output {
+            indexed_outputs.push((index, output));
+          }
           nested_tasks.extend(result.nested_tasks);
         },
         Ok(Err(error)) => record_execution_error(&mut first_error, error),
@@ -679,7 +681,9 @@ impl<T: Eq + Hash + Executable + Send + Sync + Clone + 'static> Executor<T> {
     for result in results {
       match result {
         Ok(Ok(result)) => {
-          stdout.push(result.output.to_string());
+          if let Some(output) = result.output {
+            stdout.push(output.to_string());
+          }
           nested_tasks.extend(result.nested_tasks);
         },
         Ok(Err(error)) => {
@@ -773,7 +777,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
           .complete_scope(result, Some(binding))
           .await
           .map(|output| NodeExecution {
-            output,
+            output: self.task.contributes_run_output().then_some(output),
             nested_tasks: Vec::new(),
           });
       }
@@ -788,13 +792,13 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
           .complete_scope(result, binding.as_ref())
           .await
           .map(|output| NodeExecution {
-            output,
+            output: self.task.contributes_run_output().then_some(output),
             nested_tasks: Vec::new(),
           });
       },
     };
     // A step starts after scheduler capacity has been acquired. Conditions,
-    // freshness and cache checks are part of evaluating that executable step;
+    // condition and cache checks are part of evaluating that executable step;
     // a cancellation while queued therefore finishes it without a start event.
     if let Some(binding) = &binding {
       if let Err(error) = self.context.recorder.start_step(binding).await {
@@ -803,7 +807,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
           .complete_scope(result, Some(binding))
           .await
           .map(|output| NodeExecution {
-            output,
+            output: self.task.contributes_run_output().then_some(output),
             nested_tasks: Vec::new(),
           });
       }
@@ -830,6 +834,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
           mark_deferred(&mut result.tasks);
           nested_tasks = result.tasks;
           if let Some(failure) = failure {
+            self.task.record_deferred_failure().await;
             match self
               .context
               .runtime
@@ -872,7 +877,10 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
     self
       .complete_scope(result, binding.as_ref())
       .await
-      .map(|output| NodeExecution { output, nested_tasks })
+      .map(|output| NodeExecution {
+        output: self.task.contributes_run_output().then_some(output),
+        nested_tasks,
+      })
   }
 
   async fn complete_scope(
@@ -938,7 +946,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
       return Ok(Arc::from(""));
     }
 
-    if status == ConsoleStatus::Success && !self.task.is_internal() {
+    if status == ConsoleStatus::Success && self.task.records_summary() {
       if let Ok(elapsed) = start_time.elapsed() {
         self
           .context
@@ -1247,12 +1255,13 @@ mod tests {
     TaskRuntime {
       plugin_manager: Arc::new(PluginManager::new(plugin_dir.path())),
       terminal: Arc::new(UnsupportedRawTerminal),
-      cache: Arc::new(Mutex::new(IndexMap::new())),
-      fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      invocation_results: Arc::new(Mutex::new(IndexMap::new())),
+      result_cache: None,
       console,
       run_id,
       dry: false,
       force: false,
+      cache_probe: false,
       deferred_exit_code: None,
       structured_output_budget: Arc::new(crate::structured_output::StructuredOutputBudget::default()),
     }
@@ -1445,7 +1454,7 @@ mod tests {
     let executor = test_executor(DAG::new(), ExecutorConfig::default());
     let completed = tokio::spawn(async {
       Ok(NodeExecution {
-        output: Arc::from("completed"),
+        output: Some(Arc::from("completed")),
         nested_tasks: Vec::new(),
       })
     })

@@ -32,9 +32,9 @@ pub use mode::RenderMode;
 pub use prefixed::PrefixedRenderer;
 pub use quiet::QuietRenderer;
 pub use record::{
-  ConsoleDiagnostic, ConsoleEntry, ConsoleLevel, ConsolePayload, ConsoleRecord, ConsoleStatus, ConsoleStream,
-  ExecutionEvent, ProgressUpdate, SourceLocation, EVENT_SCHEMA_V1, EVENT_SCHEMA_V2, EVENT_SCHEMA_V3,
-  EVENT_SCHEMA_VERSION,
+  CacheReason, ConsoleDiagnostic, ConsoleEntry, ConsoleLevel, ConsolePayload, ConsoleRecord, ConsoleStatus,
+  ConsoleStream, ExecutionEvent, ProgressUpdate, SourceLocation, EVENT_SCHEMA_V1, EVENT_SCHEMA_V2, EVENT_SCHEMA_V3,
+  EVENT_SCHEMA_V4, EVENT_SCHEMA_VERSION,
 };
 pub use renderer::{ConsoleRenderer, NullRenderer};
 pub use replacing::ReplacingRenderer;

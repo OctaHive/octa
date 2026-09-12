@@ -1,6 +1,11 @@
 //! Shared plugin invocation used by task commands and value evaluation.
 
-use std::{collections::HashMap, io, path::PathBuf, sync::Arc};
+use std::{
+  collections::{HashMap, HashSet},
+  io,
+  path::PathBuf,
+  sync::{Arc, Mutex as StdMutex},
+};
 
 use async_trait::async_trait;
 use octa_output::{ConsoleStream, ProgressUpdate, SourceLocation};
@@ -20,7 +25,7 @@ use crate::{
   terminal::{RawTerminalConnector, RawTerminalInput, UnsupportedRawTerminal},
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum PluginTarget {
   Key(String),
   Capability(String),
@@ -641,12 +646,23 @@ pub(crate) trait PluginEvaluator: Send + Sync {
 #[derive(Clone)]
 pub(crate) struct ManagerPluginEvaluator {
   invoker: PluginInvoker,
+  uses: Option<Arc<StdMutex<HashSet<PluginTarget>>>>,
 }
 
 impl ManagerPluginEvaluator {
   pub(crate) fn new(manager: Arc<PluginManager>) -> Self {
     Self {
       invoker: PluginInvoker::new(manager),
+      uses: None,
+    }
+  }
+
+  /// Records the selectors actually evaluated while resolving task values,
+  /// conditions, and preconditions for later action-key construction.
+  pub(crate) fn tracking(manager: Arc<PluginManager>, uses: Arc<StdMutex<HashSet<PluginTarget>>>) -> Self {
+    Self {
+      invoker: PluginInvoker::new(manager),
+      uses: Some(uses),
     }
   }
 }
@@ -655,6 +671,12 @@ impl ManagerPluginEvaluator {
 impl PluginEvaluator for ManagerPluginEvaluator {
   async fn evaluate(&self, request: EvaluationRequest, cancel_token: CancellationToken) -> ExecutorResult<String> {
     let key = request.target.name().to_owned();
+    if let Some(uses) = &self.uses {
+      uses
+        .lock()
+        .map_err(|_| ExecutorError::LockError("plugin use tracker poisoned".to_owned()))?
+        .insert(request.target.clone());
+    }
     let mut redactions = Vec::new();
     for value in request
       .context

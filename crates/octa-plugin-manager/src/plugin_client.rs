@@ -315,7 +315,8 @@ impl PluginClient {
       .ok_or(PluginClientError::ConnectionClosed)
   }
 
-  pub async fn handshake(&self) -> Result<(), PluginClientError> {
+  /// Negotiates the process protocol and returns the plugin's own version.
+  pub async fn handshake_version(&self) -> Result<Version, PluginClientError> {
     let hello = OctaCommand::Hello(Version {
       protocol_version: PLUGIN_PROTOCOL_VERSION,
       version: env!("CARGO_PKG_VERSION").to_string(),
@@ -329,11 +330,16 @@ impl PluginClient {
           return Err(PluginClientError::VersionMismatch);
         }
 
-        Ok(())
+        Ok(version)
       },
       PluginResponse::Error { message, .. } => Err(PluginClientError::Protocol(message)),
       _ => Err(PluginClientError::Protocol("Unexpected response to Hello".into())),
     }
+  }
+
+  /// Negotiates the process protocol for callers that do not need identity metadata.
+  pub async fn handshake(&self) -> Result<(), PluginClientError> {
+    self.handshake_version().await.map(|_| ())
   }
 
   pub async fn get_schema(&self) -> Result<Schema, PluginClientError> {

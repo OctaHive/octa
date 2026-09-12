@@ -14,6 +14,7 @@ pub struct ConsoleLayer {
 }
 
 impl ConsoleLayer {
+  /// Creates a tracing layer that weakly references the destination console.
   pub fn new(console: &Arc<Console>) -> Self {
     Self {
       console: Arc::downgrade(console),

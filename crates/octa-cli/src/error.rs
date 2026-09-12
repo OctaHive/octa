@@ -5,7 +5,7 @@ use octa_executor::{ExecutionFailure, ExecutorError};
 use octa_monorepo::MonorepoError;
 use octa_octafile::OctafileError;
 use octa_plugin_manager::plugin_lock::PluginLockError;
-use octa_runtime::RuntimeError;
+use octa_runtime::{RuntimeCacheError, RuntimeError};
 
 pub type OctaResult<T> = Result<T, OctaError>;
 
@@ -30,6 +30,15 @@ pub enum OctaError {
   #[error("Failed to load config file: {0}")]
   ConfigLoadError(String),
 
+  #[error("cache management requires --cache-profile PATH")]
+  CacheProfileRequired,
+
+  #[error("selected task graph has no cacheable task to explain")]
+  CacheExplainUnavailable,
+
+  #[error(transparent)]
+  Cache(#[from] RuntimeCacheError),
+
   #[error(transparent)]
   PluginLock(Box<PluginLockError>),
 
@@ -39,7 +48,7 @@ pub enum OctaError {
   #[error("Invalid output configuration: {0}")]
   InvalidOutputConfig(String),
 
-  #[error("Watch mode requires at least one task with sources")]
+  #[error("Watch mode requires at least one task with files.inputs")]
   WatchSourcesMissing,
 
   #[error(transparent)]
@@ -56,9 +65,6 @@ pub enum OctaError {
 
   #[error(transparent)]
   RuntimeExecution(#[from] RuntimeError),
-
-  #[error("Failed to open fingerprint db")]
-  OpenFingerprintDbError(#[from] sled::Error),
 }
 
 impl From<PluginLockError> for OctaError {

@@ -1,3 +1,5 @@
+//! Process entry point for the interactive `octa` command.
+
 #[tokio::main]
 async fn main() {
   // The Windows main thread has a smaller stack than Tokio workers. Poll the

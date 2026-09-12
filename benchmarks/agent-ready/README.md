@@ -2,9 +2,11 @@
 
 This suite compares release binaries using equivalent local-only DAGs. It
 covers startup/no-op, a shell command, a DAG-only 25-node chain, no-op and
-effectful 25-node shell chains, wide DAGs, sequential and parallel scheduling, cold and warm
-freshness, large stdout/stderr, and the additional `octa-runner`
-process/protocol overhead.
+effectful 25-node shell chains, wide DAGs, sequential and parallel scheduling,
+large stdout/stderr, and the additional `octa-runner` process/protocol overhead.
+Legacy cold/warm freshness scenarios are no longer executable after the task
+result cache replaced `sources` and `output`; their recorded results remain a
+historical comparison for the cache suite in `../cache/`.
 
 Build release binaries first, then run:
 

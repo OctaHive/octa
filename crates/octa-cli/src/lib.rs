@@ -1,3 +1,8 @@
+//! Interactive command-line frontend for loading and executing Octa tasks.
+//!
+//! Argument parsing and terminal presentation live here; reusable workspace
+//! composition and execution remain in `octa-runtime`.
+
 use std::{
   collections::HashMap,
   env,
@@ -12,7 +17,6 @@ use async_trait::async_trait;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::aot::{generate, Generator, Shell};
 use dialoguer::{Input, Password, Select};
-use lazy_static::lazy_static;
 pub use logger::ConsoleLayer;
 use serde::Deserialize;
 #[cfg(test)]
@@ -27,9 +31,10 @@ use octa_executor::{SourceWatcher, VariablePrompt, VariableResolver};
 use octa_finder::OctaFinder;
 use octa_octafile::{Octafile, OctafileError, OutputConfig, OutputMode, PresentationConfig, Silence, WatchInterval};
 use octa_output::{CliDocument, Console, ConsoleLevel, SummaryItem, TaskListItem};
-use octa_runtime::{RunOptions, Runtime, RuntimeConfig};
+use octa_runtime::{RunOptions, Runtime, RuntimeCacheConfig, RuntimeConfig};
 use presentation::{terminal_console, CiMode};
 
+mod cache_commands;
 mod error;
 mod logger;
 mod presentation;
@@ -60,10 +65,6 @@ fn load_config<P: AsRef<Path>>(config_path: P) -> OctaResult<PluginConfig> {
 
   let config: PluginConfig = serde_yml::from_str(&contents).map_err(|e| OctaError::ConfigLoadError(e.to_string()))?;
   Ok(config)
-}
-
-lazy_static! {
-  static ref OCTA_DATA_DIR: String = env::var("OCTA_CACHE_DIR").unwrap_or_else(|_| ".octa".to_string());
 }
 
 #[derive(Parser)]
@@ -101,6 +102,10 @@ pub(crate) struct Cli {
   /// Resolve logical secret references using this provider profile.
   #[arg(long, value_name = "PATH", env = "OCTA_SECRETS_PROFILE")]
   pub secrets_profile: Option<PathBuf>,
+
+  /// Load machine-specific task-result cache settings from this TOML profile.
+  #[arg(long, value_name = "PATH", env = "OCTA_CACHE_PROFILE")]
+  pub cache_profile: Option<PathBuf>,
 
   #[arg(short = 'e', long = "env-file", value_name = "PATH")]
   pub env_files: Vec<PathBuf>,
@@ -171,8 +176,9 @@ pub(crate) struct Cli {
   #[arg(short, long, default_value_t = false)]
   pub global: bool,
 
+  /// Clear Octa's workspace discovery state without touching the result cache.
   #[arg(long, default_value_t = false)]
-  pub clean_cache: bool,
+  pub clean_state: bool,
 
   #[arg(long, default_value_t = false)]
   pub summary: bool,
@@ -210,6 +216,27 @@ enum ManagementCommand {
   Plugin {
     #[command(subcommand)]
     command: PluginCommand,
+  },
+  /// Inspect and maintain the local task-result cache.
+  Cache {
+    #[command(subcommand)]
+    command: CacheCommand,
+  },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum CacheCommand {
+  /// Show the active local cache path and capacity.
+  Status,
+  /// Remove least-recently-used actions and unreachable blobs.
+  Prune,
+  /// Resolve exact task context and inspect the cache without running task bodies.
+  ///
+  /// Variable, secret, and plugin-backed context providers are evaluated because
+  /// their resolved values participate in the real action identity.
+  Explain {
+    /// Task whose cacheable dependency graph should be inspected.
+    task: String,
   },
 }
 
@@ -420,7 +447,7 @@ async fn execute_watch(
   let mut watcher = tokio::select! {
     biased;
     _ = cancel_token.cancelled() => return Ok(()),
-    watcher = SourceWatcher::new(targets, cancel_token.clone()) => watcher?,
+    watcher = SourceWatcher::with_snapshotter(targets, runtime.input_snapshotter(), cancel_token.clone()) => watcher?,
   };
   if let Err(error) = run_prepared(&runtime, tasks, options).await {
     runtime
@@ -434,7 +461,7 @@ async fn execute_watch(
 
   runtime
     .console()
-    .message(ConsoleLevel::Info, "Watching sources for changes")
+    .message(ConsoleLevel::Info, "Watching task inputs for changes")
     .await?;
   loop {
     tokio::select! {
@@ -481,6 +508,7 @@ async fn run_prepared(
   Ok(())
 }
 
+/// Parses process arguments and runs one CLI invocation to completion.
 pub async fn run() -> OctaResult<()> {
   let args = Cli::parse();
   let presentation = configured_presentation(&args)?;
@@ -639,16 +667,14 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
     Some(path) => env::current_dir()?.join(path),
     None => env::current_dir()?,
   };
-  let data_dir = PathBuf::from(OCTA_DATA_DIR.as_str());
-  if args.clean_cache {
+  let data_dir = PathBuf::from(env::var_os("OCTA_DATA_DIR").unwrap_or_else(|| ".octa".into()));
+  if args.clean_state {
     let data_dir = if data_dir.is_absolute() {
       data_dir
     } else {
       workspace.join(data_dir)
     };
-    let fingerprint = sled::open(data_dir.join("fingerprint"))?;
-    fingerprint.clear()?;
-    octa_monorepo::clear_cache(&fingerprint)?;
+    octa_monorepo::clear_cache(&data_dir.join("monorepo"))?;
     return Ok(());
   }
 
@@ -656,8 +682,27 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
     (!args.non_interactive && io::stdin().is_terminal() && io::stderr().is_terminal())
       .then(|| Arc::new(TerminalVariableResolver::new()) as Arc<dyn VariableResolver>);
   let plugins_dir = PathBuf::from(std::env::var_os("OCTA_PLUGINS_DIR").unwrap_or_else(|| "plugins".into()));
-  if let Some(command) = &args.management {
-    return run_plugin_management(command, &workspace, &plugins_dir, &console).await;
+  let cache_command = match &args.management {
+    Some(ManagementCommand::Cache { command }) => Some(command),
+    _ => None,
+  };
+  let cache_explain = cache_commands::explain_task(cache_command);
+  match &args.management {
+    Some(ManagementCommand::Plugin { command }) => {
+      return run_plugin_management(command, &workspace, &plugins_dir, &console).await;
+    },
+    Some(ManagementCommand::Cache { command }) if cache_explain.is_none() => {
+      return cache_commands::run_management(command, &workspace, args.cache_profile.as_deref(), &console).await;
+    },
+    _ => {},
+  }
+  let result_cache = args
+    .cache_profile
+    .as_deref()
+    .map(|path| RuntimeCacheConfig::load_profile(path, &workspace))
+    .transpose()?;
+  if cache_explain.is_some() && result_cache.is_none() {
+    return Err(OctaError::CacheProfileRequired);
   }
   let cancellation = CancellationToken::new();
   setup_signal_handling(cancellation.clone(), console.clone()).await;
@@ -670,6 +715,7 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
       plugins_dir,
       plugin_lock: args.plugin_lock.clone(),
       secrets_profile: args.secrets_profile.clone(),
+      result_cache,
       plugins: config.plugins,
       default_plugin: config.default_plugin,
       variables: args.vars.clone(),
@@ -699,13 +745,16 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
       .await?;
   }
 
-  let result = run_loaded_runtime(runtime.clone(), console, args).await;
+  let result = match cache_explain {
+    Some(task) => cache_commands::run_explain(runtime.clone(), &console, task, &args).await,
+    None => run_loaded_runtime(runtime.clone(), console, args).await,
+  };
   runtime.shutdown().await;
   result
 }
 
 async fn run_plugin_management(
-  command: &ManagementCommand,
+  command: &PluginCommand,
   workspace: &Path,
   plugins_dir: &Path,
   console: &Console,
@@ -720,9 +769,7 @@ async fn run_plugin_management(
     workspace.join(plugins_dir)
   };
   match command {
-    ManagementCommand::Plugin {
-      command: PluginCommand::Lock { output },
-    } => {
+    PluginCommand::Lock { output } => {
       let output = if output.is_absolute() {
         output.clone()
       } else {
@@ -737,9 +784,7 @@ async fn run_plugin_management(
         )
         .await?;
     },
-    ManagementCommand::Plugin {
-      command: PluginCommand::Verify { lock },
-    } => {
+    PluginCommand::Verify { lock } => {
       let lock_path = if lock.is_absolute() {
         lock.clone()
       } else {
@@ -811,6 +856,7 @@ async fn run_loaded_runtime(runtime: Arc<Runtime>, console: Arc<Console>, args: 
     quiet: args.quiet,
     silence: args.silent,
     raw: args.raw,
+    cache_probe: false,
   };
   let watch = args.watch || runtime.commands_request_watch(&commands);
 
@@ -904,10 +950,6 @@ mod tests {
       .await
       .unwrap(),
     )
-  }
-
-  fn glob_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
   }
 
   async fn wait_for_lines(path: &Path, expected: usize) {
@@ -1075,8 +1117,9 @@ version: 1
 tasks:
   watched:
     watch: true
-    sources:
-      - source.txt
+    files:
+      inputs:
+        - source.txt
     shell: echo watched
 
   dependency:
@@ -1106,20 +1149,18 @@ tasks:
     fs::write(&source, "initial").unwrap();
     fs::write(
       temp_dir.path().join("Octafile.yml"),
-      format!(
-        r#"
+      r#"
 version: 1
 interval: 25ms
 
 tasks:
   build:
     watch: true
-    sources:
-      - "{}"
+    files:
+      inputs:
+        - source.txt
     shell: echo run >> runs.txt
 "#,
-        glob_path(&source),
-      ),
     )
     .unwrap();
 
@@ -1152,7 +1193,7 @@ tasks:
   }
 
   #[tokio::test]
-  async fn test_watch_requires_sources() {
+  async fn test_watch_requires_inputs() {
     let temp_dir = TempDir::new().unwrap();
     fs::write(
       temp_dir.path().join("Octafile.yml"),
@@ -1187,17 +1228,15 @@ tasks:
     fs::write(&source, "initial").unwrap();
     fs::write(
       temp_dir.path().join("Octafile.yml"),
-      format!(
-        r#"
+      r#"
 version: 1
 tasks:
   build:
-    sources:
-      - "{}"
+    files:
+      inputs:
+        - source.txt
     shell: exit 1
 "#,
-        glob_path(&source),
-      ),
     )
     .unwrap();
 

@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://octahive.dev/schemas/cache/action-descriptor-v1.schema.json",
+  "title": "Octa cache action descriptor v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "key_format",
+    "task_definition",
+    "input_root",
+    "working_directory",
+    "variables",
+    "environment",
+    "runtime",
+    "plugins",
+    "arguments"
+  ],
+  "properties": {
+    "key_format": { "const": 1 },
+    "task_definition": { "$ref": "#/$defs/blake3Digest" },
+    "input_root": { "$ref": "#/$defs/blake3Digest" },
+    "working_directory": { "$ref": "#/$defs/relativePath" },
+    "variables": { "$ref": "#/$defs/blake3Digest" },
+    "environment": { "$ref": "#/$defs/blake3Digest" },
+    "runtime": { "$ref": "#/$defs/runtime" },
+    "plugins": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/plugin" }
+    },
+    "arguments": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "type": "string", "maxLength": 16384, "x-maxUtf8Bytes": 16384 }
+    },
+    "timeout": { "$ref": "#/$defs/duration" },
+    "salt": { "$ref": "#/$defs/boundedNonControlString" }
+  },
+  "$defs": {
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hash", "size_bytes"],
+      "properties": {
+        "algorithm": { "enum": ["blake3", "sha256"] },
+        "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "blake3Digest": {
+      "allOf": [
+        { "$ref": "#/$defs/digest" },
+        { "properties": { "algorithm": { "const": "blake3" } } }
+      ]
+    },
+    "sha256Digest": {
+      "allOf": [
+        { "$ref": "#/$defs/digest" },
+        { "properties": { "algorithm": { "const": "sha256" } } }
+      ]
+    },
+    "boundedNonControlString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+      "x-maxUtf8Bytes": 16384
+    },
+    "relativePath": {
+      "oneOf": [
+        { "const": "." },
+        {
+          "allOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 16384,
+              "pattern": "^[^/\\\\:\\u0000-\\u001f\\u007f]+(?:/[^/\\\\:\\u0000-\\u001f\\u007f]+)*$",
+              "x-maxUtf8Bytes": 16384
+            },
+            { "not": { "pattern": "(^|/)\\.{1,2}(/|$)" } }
+          ]
+        }
+      ]
+    },
+    "duration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seconds", "nanoseconds"],
+      "properties": {
+        "seconds": { "type": "integer", "minimum": 0 },
+        "nanoseconds": { "type": "integer", "minimum": 0, "maximum": 999999999 }
+      }
+    },
+    "platformOs": { "enum": ["linux", "windows", "macos"] },
+    "platformArchitecture": { "enum": ["amd64", "arm64"] },
+    "runtime": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "os", "architecture", "environment"],
+          "properties": {
+            "kind": { "const": "native" },
+            "os": { "$ref": "#/$defs/platformOs" },
+            "architecture": { "$ref": "#/$defs/platformArchitecture" },
+            "environment": { "$ref": "#/$defs/blake3Digest" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "os", "architecture", "image"],
+          "properties": {
+            "kind": { "const": "oci" },
+            "os": { "$ref": "#/$defs/platformOs" },
+            "architecture": { "$ref": "#/$defs/platformArchitecture" },
+            "image": { "$ref": "#/$defs/sha256Digest" }
+          }
+        }
+      ]
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "protocol_version", "executable"],
+      "properties": {
+        "name": { "$ref": "#/$defs/boundedNonControlString" },
+        "version": { "$ref": "#/$defs/boundedNonControlString" },
+        "protocol_version": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "executable": { "$ref": "#/$defs/sha256Digest" }
+      }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 //! Public embedding facade for preparing and starting an execution.
 //!
-//! The engine owns long-lived services such as plugins, fingerprints, and
+//! The engine owns long-lived services such as plugins, cache hashing, and
 //! runtime coordination. Per-run options stay in [`ExecutionRequest`], while a
 //! prepared plan can be started immediately or attached to an external parent
 //! cancellation token.
@@ -11,7 +11,6 @@ use indexmap::IndexMap;
 use octa_octafile::{Octafile, Silence};
 use octa_output::{Console, ConsoleScopeAllocator, ConsoleStatus};
 use octa_plugin_manager::plugin_manager::PluginManager;
-use sled::Db;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -44,7 +43,7 @@ pub struct ExecutionRequest {
   pub parallel: bool,
   /// Whether plugins should describe work without mutating the workspace.
   pub dry: bool,
-  /// Whether freshness checks should be bypassed.
+  /// Whether persistent result lookup and execution-local shortcuts should be bypassed.
   pub force: bool,
   /// Whether the first task failure should cancel the remaining plan.
   pub failfast: bool,
@@ -54,6 +53,8 @@ pub struct ExecutionRequest {
   pub silence: Option<Silence>,
   /// Whether the selected command should own a raw terminal session.
   pub raw: bool,
+  /// Probe cache identity and availability without invoking task commands.
+  pub cache_probe: bool,
 }
 
 impl ExecutionRequest {
@@ -71,6 +72,7 @@ impl ExecutionRequest {
       quiet: false,
       silence: None,
       raw: false,
+      cache_probe: false,
     }
   }
 }
@@ -80,12 +82,12 @@ impl ExecutionRequest {
 pub struct ExecutionEngine {
   plugin_manager: Arc<PluginManager>,
   octafile: Arc<Octafile>,
-  fingerprint: Arc<Db>,
+  result_cache: Option<Arc<crate::result_cache::ResultCache>>,
+  input_snapshotter: octa_cache::InputSnapshotter,
   console: Arc<Console>,
   concurrency: Option<Arc<Semaphore>>,
   variable_resolver: Option<Arc<dyn VariableResolver>>,
   secret_session: Option<Arc<crate::SecretSession>>,
-  runtime_identity: serde_json::Value,
   summary: Option<Arc<Summary>>,
   scope_allocator: Arc<ConsoleScopeAllocator>,
   runtime_coordinator: Arc<RuntimeCoordinator>,
@@ -100,26 +102,33 @@ enum PreparationMode<'a> {
 
 impl ExecutionEngine {
   /// Creates an engine from application-owned runtime services.
-  pub fn new(
-    plugin_manager: Arc<PluginManager>,
-    octafile: Arc<Octafile>,
-    fingerprint: Arc<Db>,
-    console: Arc<Console>,
-  ) -> Self {
+  pub fn new(plugin_manager: Arc<PluginManager>, octafile: Arc<Octafile>, console: Arc<Console>) -> Self {
     Self {
       plugin_manager,
       octafile,
-      fingerprint,
+      result_cache: None,
+      input_snapshotter: octa_cache::InputSnapshotter::default(),
       console,
       concurrency: None,
       variable_resolver: None,
       secret_session: None,
-      runtime_identity: serde_json::json!({"octa": env!("CARGO_PKG_VERSION")}),
       summary: None,
       scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
       runtime_coordinator: Arc::new(RuntimeCoordinator::default()),
       terminal: Arc::new(UnsupportedRawTerminal),
     }
+  }
+
+  /// Enables persistent task-result caching and shares its hashing budget with watch mode.
+  pub fn with_result_cache(mut self, cache: Arc<crate::result_cache::ResultCache>) -> Self {
+    self.input_snapshotter = cache.snapshotter();
+    self.result_cache = Some(cache);
+    self
+  }
+
+  /// Returns the runtime-wide input snapshotter used by cache and watch.
+  pub fn input_snapshotter(&self) -> octa_cache::InputSnapshotter {
+    self.input_snapshotter.clone()
   }
 
   /// Shares one concurrency budget between executions created by this engine.
@@ -137,12 +146,6 @@ impl ExecutionEngine {
   /// Resolves logical Octafile secret references for every execution owned by this engine.
   pub fn with_secret_session(mut self, secret_session: Arc<crate::SecretSession>) -> Self {
     self.secret_session = Some(secret_session);
-    self
-  }
-
-  /// Adds release and locked-plugin identity to persistent freshness decisions.
-  pub fn with_runtime_identity(mut self, runtime_identity: serde_json::Value) -> Self {
-    self.runtime_identity = runtime_identity;
     self
   }
 
@@ -256,12 +259,12 @@ impl ExecutionEngine {
       quiet,
       silence,
       raw,
+      cache_probe,
     } = request;
     let parallel = parallel && !raw;
     let mut builder = TaskGraphBuilder::new(self.plugin_manager.clone())?
       .with_scope_allocator(self.scope_allocator.clone())
       .with_output_overrides(quiet, silence, raw)
-      .with_runtime_identity(self.runtime_identity.clone())
       .with_variable_overrides(variables);
     if let Some(directory) = working_directory {
       builder = builder.with_working_directory(directory);
@@ -272,8 +275,8 @@ impl ExecutionEngine {
     if let Some(session) = &self.secret_session {
       builder = builder.with_secret_session(session.clone());
     }
-    let build = builder.build(self.octafile.clone(), &command, parallel, command_args);
-    let plan = match &mode {
+    let build = builder.build_with_watch_targets(self.octafile.clone(), &command, parallel, command_args);
+    let built = match &mode {
       PreparationMode::Immediate(cancellation) => {
         tokio::select! {
           biased;
@@ -283,14 +286,14 @@ impl ExecutionEngine {
       },
       PreparationMode::Inspectable => build.await?,
     };
-    let is_linear = plan.is_linear()?;
+    let is_linear = built.plan.is_linear()?;
     let watch_targets = if matches!(mode, PreparationMode::Inspectable) {
-      plan.nodes().iter().filter_map(|node| node.watch_target()).collect()
+      built.watch_targets
     } else {
       Vec::new()
     };
     let executor = Executor::new(
-      plan,
+      built.plan,
       ExecutorConfig {
         failfast,
         concurrency: self.concurrency.clone(),
@@ -301,12 +304,13 @@ impl ExecutionEngine {
       TaskRuntime {
         plugin_manager: self.plugin_manager.clone(),
         terminal: self.terminal.clone(),
-        cache: Arc::new(Mutex::new(IndexMap::new())),
-        fingerprint: self.fingerprint.clone(),
+        invocation_results: Arc::new(Mutex::new(IndexMap::new())),
+        result_cache: self.result_cache.clone(),
         console: self.console.clone(),
         run_id,
         dry,
         force,
+        cache_probe,
         deferred_exit_code: None,
         structured_output_budget: Arc::new(crate::structured_output::StructuredOutputBudget::default()),
       },
@@ -375,11 +379,13 @@ impl PreparedExecution {
 mod tests {
   use std::{fs, io, sync::Mutex};
 
+  use octa_cache::{BundleLimits, LocalCacheConfig, LocalCacheStore, RestoreManager};
+  use octa_cache_protocol::{Digest, PlatformArchitecture, PlatformOs, RuntimeIdentity};
   use octa_output::{ConsoleEntry, ConsoleRecord, ConsoleRenderer, ExecutionEvent};
   use tempfile::TempDir;
 
   use super::*;
-  use crate::ExecutionConclusion;
+  use crate::{ExecutionConclusion, ResultCache};
 
   #[derive(Clone, Default)]
   struct RecordingRenderer(Arc<Mutex<Vec<ConsoleRecord>>>);
@@ -407,10 +413,9 @@ mod tests {
     .unwrap();
     let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_owned()], "shell").unwrap();
     let plugin_manager = Arc::new(PluginManager::new(directory.path()));
-    let fingerprint = Arc::new(sled::Config::new().temporary(true).open().unwrap());
     let renderer = RecordingRenderer::default();
     let console = Arc::new(Console::new(renderer.clone()));
-    let engine = ExecutionEngine::new(plugin_manager, octafile, fingerprint, console.clone());
+    let engine = ExecutionEngine::new(plugin_manager, octafile, console.clone());
     (directory, engine, console, renderer)
   }
 
@@ -536,19 +541,13 @@ mod tests {
     )
     .unwrap();
     let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_owned()], "shell").unwrap();
-    let project_root = env!("CARGO_MANIFEST_DIR");
-    let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../target/debug")));
+    let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
     #[cfg(not(windows))]
     let plugin_name = "octa_plugin_shell";
     #[cfg(windows)]
     let plugin_name = "octa_plugin_shell.exe";
     plugin_manager.start_plugin(plugin_name).await.unwrap();
-    let engine = ExecutionEngine::new(
-      plugin_manager.clone(),
-      octafile,
-      Arc::new(sled::Config::new().temporary(true).open().unwrap()),
-      Arc::new(Console::default()),
-    );
+    let engine = ExecutionEngine::new(plugin_manager.clone(), octafile, Arc::new(Console::default()));
     let mut request = ExecutionRequest::new("interactive");
     request.raw = true;
 
@@ -559,5 +558,301 @@ mod tests {
       .failure()
       .is_some_and(|failure| failure.message.contains("host terminal connector")));
     plugin_manager.shutdown_all().await;
+  }
+
+  #[tokio::test]
+  async fn task_cache_restores_deleted_outputs_and_preserves_materialized_files() {
+    let directory = TempDir::new().unwrap();
+    fs::write(directory.path().join("input.txt"), "input").unwrap();
+    let octafile_path = directory.path().join("Octafile.yml");
+    fs::write(
+      &octafile_path,
+      r#"
+        version: 1
+        tasks:
+          build:
+            files:
+              inputs: [input.txt]
+              outputs: [artifact.txt, reports]
+            cache: {}
+            shell: 'printf run >> runs.txt; printf artifact > artifact.txt; mkdir -p reports; printf "<testsuite/>" > reports/junit.xml; printf cached-stdout'
+            artifacts:
+              - name: application
+                path: artifact.txt
+                content_type: text/plain
+            reports:
+              - name: tests
+                path: reports/junit.xml
+                format: junit
+          skipped:
+            if: exit 1
+            files:
+              inputs: [input.txt]
+            cache: {}
+            shell: printf should-not-run > skipped.txt
+          no-filesystem-output:
+            files:
+              inputs: []
+            cache: {}
+            shell: 'printf run >> no-output-runs.txt; printf logical-result'
+          secret-input:
+            vars:
+              TOKEN:
+                value: hidden
+                secret: true
+            files:
+              inputs: []
+            cache: {}
+            shell: printf run >> secret-runs.txt
+          deferred-output:
+            files:
+              inputs: [input.txt]
+              outputs: [deferred-output.txt]
+            cache: {}
+            cmds:
+              - shell: 'printf body >> deferred-runs.txt; printf incomplete > deferred-output.txt'
+              - defer: 'printf cleanup >> deferred-runs.txt; printf complete > deferred-output.txt'
+          failed-deferred-output:
+            files:
+              inputs: [input.txt]
+              outputs: [failed-deferred-output.txt]
+            cache: {}
+            cmds:
+              - shell: 'printf body >> failed-deferred-runs.txt; printf incomplete > failed-deferred-output.txt'
+              - defer: 'printf cleanup >> failed-deferred-runs.txt; exit 1'
+          command-condition:
+            files:
+              inputs: []
+            cache: {}
+            cmds:
+              - shell: printf skipped >> condition-runs.txt
+                if: exit 1
+              - shell: 'printf run >> condition-runs.txt; printf condition-result'
+          shell-environment:
+            env:
+              GENERATED:
+                sh: printf generated
+            files:
+              inputs: []
+            cache: {}
+            shell: 'printf run >> environment-runs.txt; printf "$GENERATED"'
+      "#,
+    )
+    .unwrap();
+    let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
+    #[cfg(not(windows))]
+    let plugin_name = "octa_plugin_shell";
+    #[cfg(windows)]
+    let plugin_name = "octa_plugin_shell.exe";
+    plugin_manager.start_plugin(plugin_name).await.unwrap();
+    let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_owned()], "shell").unwrap();
+    let mut missing_cache_request = ExecutionRequest::new("build");
+    missing_cache_request.working_directory = Some(directory.path().to_path_buf());
+    let missing_cache = ExecutionEngine::new(plugin_manager.clone(), octafile.clone(), Arc::new(Console::default()))
+      .start(missing_cache_request)
+      .wait()
+      .await
+      .unwrap();
+    assert!(missing_cache
+      .failure()
+      .is_some_and(|failure| failure.message.contains("no result cache was configured")));
+
+    let store = Arc::new(LocalCacheStore::open(LocalCacheConfig::new(directory.path().join("cache"))).unwrap());
+    let restore = RestoreManager::open(store.layout_root(), BundleLimits::default()).unwrap();
+    let cache = Arc::new(
+      ResultCache::new(
+        store,
+        restore,
+        "tests",
+        RuntimeIdentity::Native {
+          os: current_os(),
+          architecture: current_architecture(),
+          environment: Digest::blake3(b"test-toolchain"),
+        },
+      )
+      .unwrap(),
+    );
+    let engine =
+      ExecutionEngine::new(plugin_manager.clone(), octafile, Arc::new(Console::default())).with_result_cache(cache);
+    let request = || {
+      let mut request = ExecutionRequest::new("build");
+      request.working_directory = Some(directory.path().to_path_buf());
+      request
+    };
+
+    let first = engine.start(request()).wait().await.unwrap();
+    assert!(first.is_success(), "{:?}", first.failure());
+    assert_eq!(first.stdout, ["cached-stdout"]);
+    assert_eq!(fs::read_to_string(directory.path().join("runs.txt")).unwrap(), "run");
+    assert_eq!(
+      fs::read_to_string(directory.path().join("artifact.txt")).unwrap(),
+      "artifact"
+    );
+
+    fs::remove_file(directory.path().join("artifact.txt")).unwrap();
+    let second = engine.start(request()).wait().await.unwrap();
+    assert!(second.is_success());
+    assert_eq!(second.stdout, ["cached-stdout"]);
+    assert_eq!(fs::read_to_string(directory.path().join("runs.txt")).unwrap(), "run");
+    assert_eq!(
+      fs::read_to_string(directory.path().join("artifact.txt")).unwrap(),
+      "artifact"
+    );
+    assert!(second.tasks.iter().any(|task| {
+      task
+        .cache
+        .as_ref()
+        .is_some_and(|cache| cache.status == crate::CacheStatus::Hit)
+    }));
+    let cached_task = second.tasks.iter().find(|task| task.label == "build").unwrap();
+    assert_eq!(cached_task.artifacts.len(), 1);
+    assert_eq!(cached_task.reports.len(), 1);
+
+    let modified = fs::metadata(directory.path().join("artifact.txt"))
+      .unwrap()
+      .modified()
+      .unwrap();
+    let third = engine.start(request()).wait().await.unwrap();
+    assert!(third.is_success());
+    assert_eq!(
+      fs::metadata(directory.path().join("artifact.txt"))
+        .unwrap()
+        .modified()
+        .unwrap(),
+      modified
+    );
+    let mut skipped_request = ExecutionRequest::new("skipped");
+    skipped_request.working_directory = Some(directory.path().to_path_buf());
+    let skipped = engine.start(skipped_request).wait().await.unwrap();
+    assert!(skipped.is_success(), "{:?}", skipped.failure());
+    assert!(!directory.path().join("skipped.txt").exists());
+
+    let mut no_output_request = ExecutionRequest::new("no-filesystem-output");
+    no_output_request.working_directory = Some(directory.path().to_path_buf());
+    let no_output_first = engine.start(no_output_request.clone()).wait().await.unwrap();
+    let no_output_second = engine.start(no_output_request).wait().await.unwrap();
+    assert_eq!(no_output_first.stdout, ["logical-result"]);
+    assert_eq!(no_output_second.stdout, ["logical-result"]);
+    assert_eq!(
+      fs::read_to_string(directory.path().join("no-output-runs.txt")).unwrap(),
+      "run"
+    );
+
+    let mut secret_request = ExecutionRequest::new("secret-input");
+    secret_request.working_directory = Some(directory.path().to_path_buf());
+    let secret_first = engine.start(secret_request.clone()).wait().await.unwrap();
+    let secret_second = engine.start(secret_request).wait().await.unwrap();
+    assert!(secret_first.is_success() && secret_second.is_success());
+    assert_eq!(
+      fs::read_to_string(directory.path().join("secret-runs.txt")).unwrap(),
+      "runrun"
+    );
+    assert!(secret_second.tasks.iter().any(|task| {
+      task.cache.as_ref().is_some_and(|cache| {
+        cache.status == crate::CacheStatus::Bypassed && cache.reason == Some(octa_output::CacheReason::SecretVariables)
+      })
+    }));
+
+    let mut deferred_request = ExecutionRequest::new("deferred-output");
+    deferred_request.working_directory = Some(directory.path().to_path_buf());
+    let deferred_first = engine.start(deferred_request.clone()).wait().await.unwrap();
+    assert!(deferred_first.is_success(), "{:?}", deferred_first.failure());
+    assert_eq!(
+      fs::read_to_string(directory.path().join("deferred-runs.txt")).unwrap(),
+      "bodycleanup"
+    );
+    assert_eq!(
+      fs::read_to_string(directory.path().join("deferred-output.txt")).unwrap(),
+      "complete"
+    );
+    fs::remove_file(directory.path().join("deferred-output.txt")).unwrap();
+    let deferred_second = engine.start(deferred_request).wait().await.unwrap();
+    assert!(deferred_second.is_success(), "{:?}", deferred_second.failure());
+    assert_eq!(
+      fs::read_to_string(directory.path().join("deferred-runs.txt")).unwrap(),
+      "bodycleanup"
+    );
+    assert_eq!(
+      fs::read_to_string(directory.path().join("deferred-output.txt")).unwrap(),
+      "complete"
+    );
+
+    // Cleanup failure remains non-fatal for the task, but the partially
+    // finalized output must never become a reusable action result.
+    let mut failed_deferred_request = ExecutionRequest::new("failed-deferred-output");
+    failed_deferred_request.working_directory = Some(directory.path().to_path_buf());
+    let failed_deferred_first = engine.start(failed_deferred_request.clone()).wait().await.unwrap();
+    let failed_deferred_second = engine.start(failed_deferred_request).wait().await.unwrap();
+    assert!(failed_deferred_first.is_success() && failed_deferred_second.is_success());
+    assert_eq!(
+      fs::read_to_string(directory.path().join("failed-deferred-runs.txt")).unwrap(),
+      "bodycleanupbodycleanup"
+    );
+    assert!(failed_deferred_second.tasks.iter().any(|task| {
+      task
+        .cache
+        .as_ref()
+        .is_some_and(|cache| cache.reason == Some(octa_output::CacheReason::DeferredFailed))
+    }));
+
+    let mut condition_request = ExecutionRequest::new("command-condition");
+    condition_request.working_directory = Some(directory.path().to_path_buf());
+    let condition_first = engine.start(condition_request.clone()).wait().await.unwrap();
+    let condition_second = engine.start(condition_request).wait().await.unwrap();
+    assert!(condition_first.is_success() && condition_second.is_success());
+    assert_eq!(condition_first.stdout, ["condition-result"]);
+    assert_eq!(condition_second.stdout, ["condition-result"]);
+    assert_eq!(
+      fs::read_to_string(directory.path().join("condition-runs.txt")).unwrap(),
+      "run"
+    );
+
+    // The shell capability used to resolve an environment value contributes
+    // its exact plugin identity even though it is not the task command key.
+    let mut environment_request = ExecutionRequest::new("shell-environment");
+    environment_request.working_directory = Some(directory.path().to_path_buf());
+    let environment_first = engine.start(environment_request.clone()).wait().await.unwrap();
+    let environment_second = engine.start(environment_request).wait().await.unwrap();
+    assert!(environment_first.is_success() && environment_second.is_success());
+    assert_eq!(environment_first.stdout, ["generated"]);
+    assert_eq!(environment_second.stdout, ["generated"]);
+    assert_eq!(
+      fs::read_to_string(directory.path().join("environment-runs.txt")).unwrap(),
+      "run"
+    );
+
+    let mut dry_request = request();
+    dry_request.dry = true;
+    assert!(engine.start(dry_request).wait().await.unwrap().is_success());
+    assert_eq!(fs::read_to_string(directory.path().join("runs.txt")).unwrap(), "run");
+
+    let mut force_request = request();
+    force_request.force = true;
+    let forced = engine.start(force_request).wait().await.unwrap();
+    assert!(forced.is_success());
+    assert_eq!(fs::read_to_string(directory.path().join("runs.txt")).unwrap(), "runrun");
+    assert!(forced.tasks.iter().any(|task| {
+      task.cache.as_ref().is_some_and(|cache| {
+        cache.status == crate::CacheStatus::Miss && cache.reason == Some(octa_output::CacheReason::Force)
+      })
+    }));
+    plugin_manager.shutdown_all().await;
+  }
+
+  fn current_os() -> PlatformOs {
+    match std::env::consts::OS {
+      "linux" => PlatformOs::Linux,
+      "windows" => PlatformOs::Windows,
+      "macos" => PlatformOs::Macos,
+      other => panic!("unsupported test OS {other}"),
+    }
+  }
+
+  fn current_architecture() -> PlatformArchitecture {
+    match std::env::consts::ARCH {
+      "x86_64" => PlatformArchitecture::Amd64,
+      "aarch64" => PlatformArchitecture::Arm64,
+      other => panic!("unsupported test architecture {other}"),
+    }
   }
 }

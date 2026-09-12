@@ -1,3 +1,11 @@
+//! Discovery and persistent metadata caching for Octafile monorepos.
+//!
+//! The crate first resolves whether an entry belongs to a configured monorepo.
+//! Only configured monorepos open the private discovery cache; ordinary
+//! standalone projects do not create state.
+
+#![warn(missing_docs)]
+
 use std::path::Path;
 
 mod cache;
@@ -13,11 +21,15 @@ pub use error::MonorepoError;
 pub use model::{MonorepoProject, MonorepoResolution};
 
 /// Resolves the active monorepo root and discovers its project Octafiles.
+///
+/// `state_directory` is opened only after a monorepo configuration has been
+/// found. Standalone projects therefore do not create persistent discovery
+/// state merely by loading an Octafile.
 pub fn resolve(
   entry_octafile: &Path,
   working_dir: &Path,
   explicit_entry: bool,
-  cache: &sled::Db,
+  state_directory: &Path,
 ) -> Result<MonorepoResolution, MonorepoError> {
   let entry_octafile = entry_octafile.canonicalize()?;
   let Some((root_octafile, config)) = root::find_root(&entry_octafile, explicit_entry)? else {
@@ -26,11 +38,12 @@ pub fn resolve(
   config.validate().map_err(MonorepoError::InvalidConfiguration)?;
 
   let root_dir = root_octafile.parent().expect("a canonical Octafile has a parent");
-  let (projects, cache_hit) = match cache::load(cache, &root_octafile, root_dir, &config)? {
+  let cache = cache::open(state_directory)?;
+  let (projects, cache_hit) = match cache::load(&cache, &root_octafile, root_dir, &config)? {
     Some(projects) => (projects, true),
     None => {
       let result = discovery::discover(root_dir, &root_octafile, &config)?;
-      cache::store(cache, &root_octafile, root_dir, &config, &result)?;
+      cache::store(&cache, &root_octafile, root_dir, &config, &result)?;
       (result.projects, false)
     },
   };
@@ -49,9 +62,12 @@ pub fn resolve(
   })
 }
 
-/// Clears the cached monorepo discovery manifests stored in the supplied database.
-pub fn clear_cache(cache: &sled::Db) -> Result<(), MonorepoError> {
-  cache::clear(cache)
+/// Clears the monorepo discovery manifests when the state directory exists.
+///
+/// A missing directory is a successful no-op so cleaning a standalone project
+/// does not create the state it was asked to remove.
+pub fn clear_cache(state_directory: &Path) -> Result<(), MonorepoError> {
+  cache::clear(state_directory)
 }
 
 fn standalone(root_octafile: std::path::PathBuf) -> MonorepoResolution {

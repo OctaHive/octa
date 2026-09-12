@@ -1,0 +1,10 @@
+{
+  "result_version": 1,
+  "action": {
+    "algorithm": "blake3",
+    "hash": "0909090909090909090909090909090909090909090909090909090909090909",
+    "size_bytes": 909
+  },
+  "stdout": "checks passed",
+  "task_outputs": { "status": "ok" }
+}

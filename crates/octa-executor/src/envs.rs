@@ -155,14 +155,6 @@ impl Envs {
     EnvsIter::new(self.context.clone())
   }
 
-  pub(crate) fn to_merged_hashmap(&self) -> HashMap<String, EnvValue> {
-    let mut result = HashMap::new();
-    for (context, _) in self.collect_context_chain() {
-      result.extend(context);
-    }
-    result
-  }
-
   pub async fn expand(&mut self) -> ExecutorResult<()> {
     self
       .expand_with_evaluator_option(&Vars::new(), None, false, CancellationToken::new())
@@ -582,6 +574,7 @@ impl IntoIterator for &Envs {
 mod tests {
   use std::fs;
 
+  use octa_octafile::ShellValue;
   use serde_json::json;
   use tempfile::TempDir;
 
@@ -629,6 +622,33 @@ mod tests {
     let envs = Envs::with_parent(parent);
     assert!(envs.parent.is_some());
     assert!(!envs.expanded);
+  }
+
+  #[tokio::test]
+  async fn parent_replacement_and_plugin_expansion_preserve_layer_semantics() {
+    let mut envs = Envs::from(HashMap::from([
+      ("LITERAL".to_owned(), EnvValue::String("value".to_owned())),
+      (
+        "COMMAND".to_owned(),
+        EnvValue::Shell(ShellValue {
+          sh: "ignored".to_owned(),
+        }),
+      ),
+    ]));
+    assert_eq!(envs.get("COMMAND"), None);
+    envs.set_parent(Some(Envs::with_value(HashMap::from([(
+      "PARENT".to_owned(),
+      "parent".to_owned(),
+    )]))));
+    assert!(envs.parent.is_some());
+    envs.set_parent(None);
+    assert!(envs.parent.is_none());
+
+    let directory = TempDir::new().unwrap();
+    let manager = Arc::new(PluginManager::new(directory.path()));
+    let mut literal = Envs::with_value(HashMap::from([("NAME".to_owned(), "Octa".to_owned())]));
+    literal.expand_with_plugins(&Vars::new(), manager, false).await.unwrap();
+    assert_eq!(literal.get("NAME"), Some(&"Octa".to_owned()));
   }
 
   #[test]

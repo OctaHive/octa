@@ -3,7 +3,7 @@
 //! The planner has already reduced task syntax to a [`TaskNode`] and its
 //! [`NodeAction`]. Execution then follows one ordered pipeline: inherited gate
 //! decisions, graph-only action, invocation context resolution, command
-//! conditions, preconditions, run-mode cache, and finally plugin invocation.
+//! conditions, preconditions, invocation reuse, and finally plugin invocation.
 //! Keeping that order here is important: work skipped by an ancestor condition
 //! must not prompt for variables or execute shell-backed environment values.
 
@@ -12,20 +12,27 @@ use super::*;
 /// Per-call values needed only by hidden graph actions.
 ///
 /// Keeping these outside [`TaskRuntime`] leaves unrelated terminal and cache
-/// services out of graph-action code; required evaluator/fingerprint services
+/// services out of graph-action code; required evaluator/cache services
 /// are passed explicitly to `execute_graph_action`.
 struct GraphActionRuntime<'a> {
   /// Whether filesystem-changing work should be suppressed.
   dry: bool,
-  /// Whether freshness should be treated as stale.
-  force: bool,
   /// Execution-local cooperative cancellation.
   cancel_token: &'a CancellationToken,
-  /// Exit status exposed while executing a deferred plan.
-  deferred_exit_code: Option<i32>,
 }
 
 impl TaskNode {
+  /// Returns the output ownership declared by this invocation's cache lookup.
+  ///
+  /// Only the lookup node represents the boundary, so planner validation sees
+  /// each cacheable invocation exactly once rather than once per command.
+  pub(crate) fn cache_output_contract(&self) -> Option<(&Path, &[octa_cache_protocol::RelativePath])> {
+    match &self.action {
+      NodeAction::CacheLookup { plan, .. } => Some((&plan.workspace, &plan.outputs)),
+      _ => None,
+    }
+  }
+
   /// Ensures a deferred status is present on the node-owned context snapshot.
   ///
   /// Deferred plans own their invocation runtime and use one exit code for all
@@ -73,7 +80,7 @@ impl TaskNode {
       deps_res: Arc::new(Mutex::new(HashMap::default())),
       action: config.action,
       condition_runtime: config.condition_runtime,
-      freshness_runtime: config.freshness_runtime,
+      task_cache_runtime: config.task_cache_runtime,
       preconditions: config.preconditions,
       timeout: config.timeout,
       execution_binding: config.execution_binding,
@@ -104,35 +111,6 @@ impl TaskNode {
   /// Returns the shared interactive-session identity used by this node.
   pub(crate) fn interactive_session(&self) -> Option<&str> {
     self.interactive_session.as_deref()
-  }
-
-  /// Returns watch metadata only from the node that owns freshness evaluation.
-  ///
-  /// Command and commit nodes deliberately return nothing so one invocation
-  /// cannot register the same source tree multiple times.
-  pub(crate) fn watch_target(&self) -> Option<WatchTarget> {
-    match &self.action {
-      NodeAction::FreshnessCheck { spec, .. } => spec.watch_target(),
-      _ => None,
-    }
-  }
-
-  #[cfg(test)]
-  /// Exposes the selected freshness method for planner tests.
-  pub(crate) fn source_method(&self) -> Option<SourceMethod> {
-    match &self.action {
-      NodeAction::FreshnessCheck { spec, .. } => Some(spec.method()),
-      _ => None,
-    }
-  }
-
-  #[cfg(test)]
-  /// Exposes the concrete source-strategy key for planner tests.
-  pub(crate) fn source_strategy_key(&self) -> Option<&'static str> {
-    match &self.action {
-      NodeAction::FreshnessCheck { spec, .. } => Some(spec.strategy_key()),
-      _ => None,
-    }
   }
 
   /// Renders a potentially templated task directory from resolved variables.
@@ -300,7 +278,13 @@ impl TaskNode {
         environment.set_last_dir(dir.clone());
         let envs = environment.resolve(&vars, Some(evaluator), dry, cancel_token).await?;
 
-        Ok::<RuntimeContext, ExecutorError>(RuntimeContext { vars, envs, dir })
+        Ok::<RuntimeContext, ExecutorError>(RuntimeContext {
+          vars,
+          envs,
+          dir,
+          identity_names: self.invocation_runtime.identity_names.clone(),
+          plugin_uses: self.invocation_runtime.plugin_uses.clone(),
+        })
       })
       .await?;
 
@@ -337,7 +321,7 @@ impl TaskNode {
 
   /// Emits informational task messages only for visible command nodes.
   ///
-  /// Hidden condition/freshness/barrier nodes must not create user-facing
+  /// Hidden condition/cache/barrier nodes must not create user-facing
   /// "Starting task" noise, and quiet mode suppresses the remaining messages.
   async fn log_info(&self, output: &RuntimeOutput, message: String) -> ExecutorResult<()> {
     if self.action.is_command() && !self.quiet {
@@ -352,74 +336,28 @@ impl TaskNode {
   /// common condition/precondition/plugin pipeline below.
   async fn execute_graph_action(
     &self,
-    fingerprint: &Db,
-    evaluator: Arc<dyn PluginEvaluator>,
+    result_cache: Option<&crate::result_cache::ResultCache>,
     output: &RuntimeOutput,
     runtime: GraphActionRuntime<'_>,
   ) -> ExecutorResult<Option<TaskOutcome>> {
-    if !self.freshness_runtime.should_run()? {
-      // A skipped condition gate must still publish a result so descendants do not observe an
-      // unevaluated gate when an ancestor freshness check suppresses the whole invocation.
-      self.condition_runtime.publish(false);
-      if let NodeAction::FreshnessCheck { state, .. } = &self.action {
-        state.publish_skipped()?;
-      }
-      return Ok(Some(TaskOutcome::skipped(String::new())));
-    }
-
     match &self.action {
       // Condition nodes use the common plugin-condition path. Command nodes
       // continue all the way to their configured plugin invocation.
-      NodeAction::Command | NodeAction::Condition => Ok(None),
+      NodeAction::Command
+      | NodeAction::Condition
+      | NodeAction::CacheLookup { .. }
+      | NodeAction::RegisterResources { .. } => Ok(None),
       // Barrier nodes only preserve graph ordering and carry no runtime payload.
       NodeAction::Barrier => Ok(Some(TaskOutcome::success(String::new()))),
-      NodeAction::FreshnessCheck { spec, state } => {
-        let runtime_context = self
-          .resolve_runtime_context(
-            evaluator,
-            runtime.dry,
-            runtime.cancel_token.clone(),
-            runtime.deferred_exit_code,
-          )
-          .await?;
-        let outcome = spec
-          .evaluate(
-            fingerprint,
-            runtime.force,
-            &runtime_context.vars,
-            &runtime_context.envs,
-            runtime.cancel_token,
-          )
-          .await?;
-        // Publish before returning so every downstream node observes a fully
-        // initialized decision when the scheduler releases it.
-        let should_run = outcome.should_run();
-        state.publish(outcome)?;
-        if !should_run {
-          output
-            .message(ConsoleLevel::Info, format!("Task {} is up to date", self.dep_name))
-            .await?;
-        }
-        Ok(Some(if should_run {
-          TaskOutcome::success(String::new())
-        } else {
-          TaskOutcome::skipped(String::new())
-        }))
-      },
-      NodeAction::FreshnessCommit(state) => {
-        // Dry runs evaluate freshness for accurate planning output but never
-        // persist state describing work that was not actually performed.
-        if !runtime.dry {
-          state.commit(fingerprint)?;
-        }
-        Ok(Some(TaskOutcome::success(String::new())))
-      },
-      NodeAction::RegisterResources { artifacts, reports } => {
-        let artifacts = crate::resource::octafile_artifacts(artifacts, &self.dir, &self.workspace)?;
-        let reports = crate::resource::octafile_reports(reports, &self.dir, &self.workspace)?;
-        Ok(Some(TaskOutcome::success(String::new()).with_outputs(
-          CompletionOutputs::default().with_resources(artifacts, reports),
-        )))
+      NodeAction::CacheFinalize { plan, state } => {
+        let Some(cache) = result_cache else {
+          return Err(ExecutorError::InvalidCacheConfiguration(
+            "task enables caching but no result cache was configured".to_owned(),
+          ));
+        };
+        let (stdout, outputs, _) =
+          crate::result_cache::finalize(cache, plan, state, output, runtime.cancel_token, runtime.dry).await?;
+        Ok(Some(TaskOutcome::success(stdout).with_outputs(outputs)))
       },
     }
   }
@@ -552,21 +490,21 @@ impl TaskNode {
   ///
   /// `once` ignores variable changes, while `changed` reuses output only for an
   /// equal resolved variable set. `always` never consults the cache.
-  async fn check_cache(
+  async fn check_invocation_result(
     &self,
     vars: &Vars,
-    cache: &Arc<Mutex<IndexMap<String, CacheItem>>>,
-  ) -> ExecutorResult<Option<CacheItem>> {
+    results: &Arc<Mutex<IndexMap<String, InvocationResult>>>,
+  ) -> ExecutorResult<Option<InvocationResult>> {
     if self.run_mode == RunMode::Always {
       return Ok(None);
     }
 
-    let cache_lock = cache.lock().await;
-    if let Some(cached_result) = cache_lock.get(&self.cache_key) {
+    let results = results.lock().await;
+    if let Some(cached_result) = results.get(&self.cache_key) {
       if self.run_mode == RunMode::Once {
         return Ok(Some(cached_result.clone()));
       } else if &cached_result.vars == vars {
-        debug!("Cache hit for task: {}", self.name);
+        debug!("Invocation result reused for task: {}", self.name);
         return Ok(Some(cached_result.clone()));
       }
     }
@@ -574,20 +512,20 @@ impl TaskNode {
   }
 
   /// Stores a successful result for `once` and `changed` run modes.
-  async fn update_cache(
+  async fn update_invocation_result(
     &self,
     result: &str,
     vars: &Vars,
     outputs: &CompletionOutputs,
-    cache: &Arc<Mutex<IndexMap<String, CacheItem>>>,
+    results: &Arc<Mutex<IndexMap<String, InvocationResult>>>,
   ) -> ExecutorResult<()> {
     if self.run_mode != RunMode::Always {
-      let mut cache_lock = cache.lock().await;
-      cache_lock.insert(
+      let mut results = results.lock().await;
+      results.insert(
         self.cache_key.clone(),
-        CacheItem::new(result.to_string(), vars.clone(), outputs.clone()),
+        InvocationResult::new(result.to_string(), vars.clone(), outputs.clone()),
       );
-      debug!("Cached result for task: {}", self.name);
+      debug!("Stored invocation result for task: {}", self.name);
     }
     Ok(())
   }
@@ -640,38 +578,42 @@ impl TaskNode {
     let TaskRuntime {
       plugin_manager,
       terminal,
-      cache,
-      fingerprint,
+      invocation_results,
+      result_cache,
       console,
       run_id,
       dry,
       force,
+      cache_probe,
       deferred_exit_code,
       structured_output_budget,
     } = runtime;
     let console_target = RuntimeOutput::with_silence(console, run_id, self.execution_binding.clone(), self.silence);
-    let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::new(plugin_manager.clone()));
+    let evaluator: Arc<dyn PluginEvaluator> = Arc::new(ManagerPluginEvaluator::tracking(
+      plugin_manager.clone(),
+      self.invocation_runtime.plugin_uses.clone(),
+    ));
 
     // Inherited gates are checked before runtime-context resolution. This is
     // what prevents required-variable prompts for tasks already known to skip.
     if !self.condition_runtime.should_run(&self.name)? {
-      if let NodeAction::FreshnessCheck { state, .. } = &self.action {
-        state.publish_skipped()?;
-      }
       return Ok(TaskOutcome::skipped(String::new()));
     }
 
-    // Barriers and freshness nodes can finish without entering command setup.
+    // Cache guards precede graph actions so an outer hit suppresses nested
+    // lookup/finalize nodes as well as ordinary commands.
+    if !self.task_cache_runtime.should_run().await {
+      return Ok(TaskOutcome::skipped(String::new()));
+    }
+
+    // Barriers and cache finalizers can finish without command setup.
     if let Some(result) = self
       .execute_graph_action(
-        &fingerprint,
-        evaluator.clone(),
+        result_cache.as_deref(),
         &console_target,
         GraphActionRuntime {
           dry,
-          force,
           cancel_token: &cancel_token,
-          deferred_exit_code,
         },
       )
       .await?
@@ -681,7 +623,13 @@ impl TaskNode {
 
     // From this point on every check and the command itself shares one resolved
     // variables/environment/directory snapshot.
-    let RuntimeContext { vars, envs, dir } = self
+    let RuntimeContext {
+      vars,
+      envs,
+      dir,
+      identity_names,
+      plugin_uses,
+    } = self
       .resolve_runtime_context(evaluator.clone(), dry, cancel_token.clone(), deferred_exit_code)
       .await?;
     // Output prefix templates are runtime metadata on the scope. Resolve them
@@ -697,12 +645,17 @@ impl TaskNode {
       }
     }
     let condition_passed = self
-      .check_condition(plugin_manager.clone(), dry, cancel_token.clone(), &vars, &envs, &dir)
+      .check_condition(
+        plugin_manager.clone(),
+        dry || cache_probe,
+        cancel_token.clone(),
+        &vars,
+        &envs,
+        &dir,
+      )
       .await?;
     self.condition_runtime.publish(condition_passed);
     if !condition_passed {
-      // A condition skip must also suppress the later freshness commit.
-      self.freshness_runtime.mark_condition_skipped();
       self
         .log_info(
           &console_target,
@@ -712,11 +665,11 @@ impl TaskNode {
       return Ok(TaskOutcome::skipped(String::new()));
     }
 
-    // `force` is an explicit request to run regardless of freshness and
-    // precondition shortcuts; cancellation still remains active.
+    // `force` bypasses precondition shortcuts and persistent cache lookup;
+    // cancellation still remains active.
     if !force
       && !self
-        .check_preconditions(evaluator, &vars, &envs, &dir, dry, cancel_token.clone())
+        .check_preconditions(evaluator, &vars, &envs, &dir, dry || cache_probe, cancel_token.clone())
         .await?
     {
       self
@@ -729,7 +682,52 @@ impl TaskNode {
       )));
     }
 
-    if let Some(cached) = self.check_cache(&vars, &cache).await? {
+    if let NodeAction::CacheLookup { plan, state } = &self.action {
+      let Some(cache) = result_cache.as_deref() else {
+        return Err(ExecutorError::InvalidCacheConfiguration(
+          "task enables caching but no result cache was configured".to_owned(),
+        ));
+      };
+      state.set_probe(cache_probe).await;
+      crate::result_cache::lookup(
+        cache,
+        crate::result_cache::CacheLookup {
+          plan,
+          state,
+          plugin_manager: &plugin_manager,
+          context: &RuntimeContext {
+            vars,
+            envs,
+            dir,
+            identity_names,
+            plugin_uses,
+          },
+          output: &console_target,
+          cancel: &cancel_token,
+          dry,
+          force,
+        },
+      )
+      .await?;
+      return Ok(TaskOutcome::success(String::new()));
+    }
+
+    if let NodeAction::RegisterResources { artifacts, reports } = &self.action {
+      if cache_probe {
+        return Ok(TaskOutcome::skipped(String::new()));
+      }
+      let artifacts = crate::resource::octafile_artifacts(artifacts, &self.dir, &self.workspace)?;
+      let reports = crate::resource::octafile_reports(reports, &self.dir, &self.workspace)?;
+      let outputs = CompletionOutputs::default().with_resources(artifacts, reports);
+      self.task_cache_runtime.record("", &outputs).await;
+      return Ok(TaskOutcome::success(String::new()).with_outputs(outputs));
+    }
+
+    if cache_probe {
+      return Ok(TaskOutcome::skipped(String::new()));
+    }
+
+    if let Some(cached) = self.check_invocation_result(&vars, &invocation_results).await? {
       structured_output_budget.reserve(&cached.outputs)?;
       return Ok(TaskOutcome::skipped(cached.result).with_outputs(cached.outputs));
     }
@@ -809,10 +807,14 @@ impl TaskNode {
             )
           }
         } else {
-          // Only successful command output participates in task run-mode cache.
+          // Only successful command output participates in invocation reuse and
+          // persistent cache capture.
           let outputs = self.completion_outputs(outputs, &artifacts, &reports, &working_dir)?;
           structured_output_budget.reserve(&outputs)?;
-          self.update_cache(stdout.trim(), &vars, &outputs, &cache).await?;
+          self
+            .update_invocation_result(stdout.trim(), &vars, &outputs, &invocation_results)
+            .await?;
+          self.task_cache_runtime.record(stdout.trim(), &outputs).await;
           (Ok(stdout.trim().to_string()), outputs)
         }
       },

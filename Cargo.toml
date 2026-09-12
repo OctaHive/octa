@@ -11,6 +11,8 @@ members = [
   "crates/octa-runtime",
   "crates/octa-runner",
   "crates/octa-runner-protocol",
+  "crates/octa-cache-protocol",
+  "crates/octa-cache",
   "crates/octa-plugin",
   "crates/octa-plugin-lock",
   "crates/octa-plugin-manager",
@@ -31,6 +33,7 @@ readme = "README.md"
 anyhow = "1.0.104"
 async-trait = "0.1.92"
 base64 = "0.22.1"
+blake3 = "1.8.2"
 crossterm = "0.29.0"
 console = "0.16.4"
 lazy_static = "1.5.0"
@@ -58,6 +61,9 @@ regex = "1.13.1"
 octa-runner-protocol = { version = "0.3.0", path = "crates/octa-runner-protocol" }
 uuid = { version = "1.26", features = ["v4"] }
 tempfile = "3.27"
+same-file = "1.0.6"
+zstd = "0.13.3"
+toml = "0.9"
 
 # default to small, optimized workspace release binaries
 [profile.release]

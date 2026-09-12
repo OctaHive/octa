@@ -232,7 +232,7 @@ mod tests {
   #[traced_test]
   #[test]
   fn test_find_nested_task() {
-    let finder = OctaFinder::new();
+    let finder = OctaFinder::default();
 
     // Create child octafile
     let (child_dir, child_path) = create_gen_test_yaml(vec![("child_task", create_test_task("child"))]);
@@ -257,10 +257,17 @@ mod tests {
     std::fs::write(&root_path, root_content).unwrap();
 
     let root = Octafile::load(Some(root_path), false, vec!["shell".to_string()], "shell").unwrap();
-    let results = finder.find_by_path(root, "child:child_task");
+    let results = finder.find_by_path(Arc::clone(&root), "child:child_task");
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].name, "child:child_task");
+    let child = Arc::clone(&results[0].octafile);
+    assert_eq!(
+      finder.find_by_path(Arc::clone(&child), ":root_task")[0].name,
+      "root_task"
+    );
+    assert_eq!(finder.find_by_path(child, "::root_task")[0].name, "root_task");
+    assert!(finder.find_by_path(root, ":root_task").is_empty());
 
     // Keep directories alive until test ends
     drop(temp_dir);

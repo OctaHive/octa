@@ -360,18 +360,18 @@ fn create_test_task(name: &str, cmd: Option<&str>, tpl: Option<String>, run_mode
 
 fn runtime(
   plugin_manager: Arc<PluginManager>,
-  cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-  fingerprint: Arc<Db>,
+  invocation_results: Arc<Mutex<IndexMap<String, InvocationResult>>>,
 ) -> TaskRuntime {
   TaskRuntime {
     plugin_manager,
     terminal: Arc::new(crate::UnsupportedRawTerminal),
-    cache,
-    fingerprint,
+    invocation_results,
+    result_cache: None,
     console: Arc::new(Console::default()),
     run_id: 1,
     dry: false,
     force: false,
+    cache_probe: false,
     deferred_exit_code: None,
     structured_output_budget: Arc::new(StructuredOutputBudget::default()),
   }
@@ -498,17 +498,10 @@ async fn test_prepare_dir_dry_run_propagates_canonicalize_error() {
 
 #[tokio::test]
 async fn test_basic_command_execution() {
-  let db = sled::Config::new()
-    .temporary(true)
-    .open()
-    .expect("Failed to open in-memory Sled database");
-
   let task = create_test_task("test_task", Some("echo hello world"), None, None);
 
   let cache = Arc::new(Mutex::new(IndexMap::new()));
-  let fingerprint = Arc::new(db);
-  let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -522,10 +515,7 @@ async fn test_basic_command_execution() {
   plugin_manager.start_plugin(plugin_name).await.unwrap();
 
   let result = task
-    .execute(
-      runtime(plugin_manager.clone(), cache, fingerprint),
-      CancellationToken::new(),
-    )
+    .execute(runtime(plugin_manager.clone(), cache), CancellationToken::new())
     .await
     .unwrap();
   assert_eq!(result.output().trim(), "hello world");
@@ -546,8 +536,7 @@ async fn plugin_stdout_and_stderr_are_routed_as_structured_events() {
       .build()
       .unwrap(),
   );
-  let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../target/debug")));
+  let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -558,12 +547,13 @@ async fn plugin_stdout_and_stderr_are_routed_as_structured_events() {
   let runtime = TaskRuntime {
     plugin_manager: plugin_manager.clone(),
     terminal: Arc::new(crate::UnsupportedRawTerminal),
-    cache: Arc::new(Mutex::new(IndexMap::new())),
-    fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+    invocation_results: Arc::new(Mutex::new(IndexMap::new())),
+    result_cache: None,
     console,
     run_id: 7,
     dry: false,
     force: false,
+    cache_probe: false,
     deferred_exit_code: None,
     structured_output_budget: Arc::new(StructuredOutputBudget::default()),
   };
@@ -586,11 +576,6 @@ async fn plugin_stdout_and_stderr_are_routed_as_structured_events() {
 
 #[tokio::test]
 async fn test_template_rendering() {
-  let db = sled::Config::new()
-    .temporary(true)
-    .open()
-    .expect("Failed to open in-memory Sled database");
-
   let mut vars = Vars::new();
   vars.insert("name", &"world");
 
@@ -608,9 +593,7 @@ async fn test_template_rendering() {
   let task = TaskNode::new(task_config);
 
   let cache = Arc::new(Mutex::new(IndexMap::new()));
-  let fingerprint = Arc::new(db);
-  let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_tpl";
   #[cfg(windows)]
@@ -618,10 +601,7 @@ async fn test_template_rendering() {
   plugin_manager.start_plugin(plugin_name).await.unwrap();
 
   let result = task
-    .execute(
-      runtime(plugin_manager.clone(), cache, fingerprint),
-      CancellationToken::new(),
-    )
+    .execute(runtime(plugin_manager.clone(), cache), CancellationToken::new())
     .await
     .unwrap();
   assert_eq!(result.output(), "Hello world!");
@@ -630,16 +610,10 @@ async fn test_template_rendering() {
 
 #[tokio::test]
 async fn test_cache_behavior() {
-  let db = sled::Config::new()
-    .temporary(true)
-    .open()
-    .expect("Failed to open in-memory Sled database");
   let task = create_test_task("cache_task", Some("echo cached result"), None, Some(RunMode::Once));
 
   let cache = Arc::new(Mutex::new(IndexMap::new()));
-  let fingerprint = Arc::new(db);
-  let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -654,20 +628,14 @@ async fn test_cache_behavior() {
 
   // First execution
   let result1 = task
-    .execute(
-      runtime(plugin_manager.clone(), cache.clone(), fingerprint.clone()),
-      CancellationToken::new(),
-    )
+    .execute(runtime(plugin_manager.clone(), cache.clone()), CancellationToken::new())
     .await
     .unwrap();
   assert_eq!(result1.output().trim(), "cached result");
 
   // Second execution should return cached result
   let result2 = task
-    .execute(
-      runtime(plugin_manager.clone(), cache.clone(), fingerprint.clone()),
-      CancellationToken::new(),
-    )
+    .execute(runtime(plugin_manager.clone(), cache.clone()), CancellationToken::new())
     .await
     .unwrap();
   assert_eq!(result1.output(), result2.output());
@@ -685,21 +653,21 @@ async fn test_cache_behavior() {
 
   let first = first_position
     .execute(
-      runtime(plugin_manager.clone(), position_cache.clone(), fingerprint.clone()),
+      runtime(plugin_manager.clone(), position_cache.clone()),
       CancellationToken::new(),
     )
     .await
     .unwrap();
   let second = second_position
     .execute(
-      runtime(plugin_manager.clone(), position_cache.clone(), fingerprint.clone()),
+      runtime(plugin_manager.clone(), position_cache.clone()),
       CancellationToken::new(),
     )
     .await
     .unwrap();
   let second_cached = second_position
     .execute(
-      runtime(plugin_manager.clone(), position_cache, fingerprint),
+      runtime(plugin_manager.clone(), position_cache),
       CancellationToken::new(),
     )
     .await
@@ -715,17 +683,10 @@ async fn test_cache_behavior() {
 
 #[tokio::test]
 async fn test_error_handling() {
-  let db = sled::Config::new()
-    .temporary(true)
-    .open()
-    .expect("Failed to open in-memory Sled database");
-
   let task = create_test_task("error_task", Some("nonexistent_command"), None, None);
 
   let cache = Arc::new(Mutex::new(IndexMap::new()));
-  let fingerprint = Arc::new(db);
-  let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -739,10 +700,7 @@ async fn test_error_handling() {
   plugin_manager.start_plugin(plugin_name).await.unwrap();
 
   let result = task
-    .execute(
-      runtime(plugin_manager.clone(), cache, fingerprint),
-      CancellationToken::new(),
-    )
+    .execute(runtime(plugin_manager.clone(), cache), CancellationToken::new())
     .await;
   assert!(matches!(
     result,
@@ -767,11 +725,7 @@ async fn failed_precondition_cancels_the_task_before_plugin_execution() {
   let plugin_manager = Arc::new(PluginManager::new(TempDir::new().unwrap().path()));
   let result = task
     .execute(
-      runtime(
-        plugin_manager,
-        Arc::new(Mutex::new(IndexMap::new())),
-        Arc::new(sled::Config::new().temporary(true).open().unwrap()),
-      ),
+      runtime(plugin_manager, Arc::new(Mutex::new(IndexMap::new()))),
       CancellationToken::new(),
     )
     .await;
@@ -799,12 +753,13 @@ async fn missing_plugin_errors_can_be_propagated_or_ignored() {
         TaskRuntime {
           plugin_manager: Arc::new(PluginManager::new(TempDir::new().unwrap().path())),
           terminal: Arc::new(crate::UnsupportedRawTerminal),
-          cache: Arc::new(Mutex::new(IndexMap::new())),
-          fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+          invocation_results: Arc::new(Mutex::new(IndexMap::new())),
+          result_cache: None,
           console: Arc::new(Console::new(RecordingRenderer(events.clone()))),
           run_id: 7,
           dry: false,
           force: false,
+          cache_probe: false,
           deferred_exit_code: None,
           structured_output_budget: Arc::new(StructuredOutputBudget::default()),
         },
@@ -831,11 +786,6 @@ async fn missing_plugin_errors_can_be_propagated_or_ignored() {
 
 #[tokio::test]
 async fn test_task_cancellation() {
-  let db = sled::Config::new()
-    .temporary(true)
-    .open()
-    .expect("Failed to open in-memory Sled database");
-
   let cancel_token = CancellationToken::new();
   let task_config = TaskConfig::builder()
     .id("long_task".to_string())
@@ -851,9 +801,7 @@ async fn test_task_cancellation() {
   let task = TaskNode::new(task_config);
 
   let cache = Arc::new(Mutex::new(IndexMap::new()));
-  let fingerprint = Arc::new(db);
-  let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -875,9 +823,7 @@ async fn test_task_cancellation() {
     }
   });
 
-  let result = task
-    .execute(runtime(plugin_manager.clone(), cache, fingerprint), cancel_token)
-    .await;
+  let result = task.execute(runtime(plugin_manager.clone(), cache), cancel_token).await;
   assert!(matches!(result, Err(ExecutorError::TaskCancelled(_))));
 
   cancel_handle.await.unwrap();
@@ -886,10 +832,8 @@ async fn test_task_cancellation() {
 
 #[tokio::test]
 async fn test_task_timeout_stops_command_and_keeps_plugin_reusable() {
-  let db = Arc::new(sled::Config::new().temporary(true).open().unwrap());
   let cache = Arc::new(Mutex::new(IndexMap::new()));
-  let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -911,10 +855,7 @@ async fn test_task_timeout_stops_command_and_keeps_plugin_reusable() {
   );
 
   let result = timed_task
-    .execute(
-      runtime(plugin_manager.clone(), cache.clone(), db.clone()),
-      CancellationToken::new(),
-    )
+    .execute(runtime(plugin_manager.clone(), cache.clone()), CancellationToken::new())
     .await;
   assert!(matches!(result, Err(ExecutorError::TaskTimedOut { .. })));
 
@@ -929,7 +870,7 @@ async fn test_task_timeout_stops_command_and_keeps_plugin_reusable() {
       .unwrap(),
   );
   let result = next_task
-    .execute(runtime(plugin_manager.clone(), cache, db), CancellationToken::new())
+    .execute(runtime(plugin_manager.clone(), cache), CancellationToken::new())
     .await;
 
   assert_eq!(result.unwrap().output(), "reusable");
@@ -938,11 +879,6 @@ async fn test_task_timeout_stops_command_and_keeps_plugin_reusable() {
 
 #[tokio::test]
 async fn test_ignore_errors() {
-  let db = sled::Config::new()
-    .temporary(true)
-    .open()
-    .expect("Failed to open in-memory Sled database");
-
   let task_config = TaskConfig::builder()
     .id("ignore_error_task".to_string())
     .name("ignore_error_task".to_string())
@@ -958,9 +894,7 @@ async fn test_ignore_errors() {
   let task = TaskNode::new(task_config);
 
   let cache = Arc::new(Mutex::new(IndexMap::new()));
-  let fingerprint = Arc::new(db);
-  let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -974,10 +908,7 @@ async fn test_ignore_errors() {
   plugin_manager.start_plugin(plugin_name).await.unwrap();
 
   let result = task
-    .execute(
-      runtime(plugin_manager.clone(), cache, fingerprint),
-      CancellationToken::new(),
-    )
+    .execute(runtime(plugin_manager.clone(), cache), CancellationToken::new())
     .await;
   assert!(result.is_ok());
   assert_eq!(result.unwrap().output(), "");
@@ -986,11 +917,6 @@ async fn test_ignore_errors() {
 
 #[tokio::test]
 async fn test_dependency_results() {
-  let db = sled::Config::new()
-    .temporary(true)
-    .open()
-    .expect("Failed to open in-memory Sled database");
-
   let task = create_test_task(
     "dep_task",
     None,
@@ -1006,9 +932,7 @@ async fn test_dependency_results() {
     .await;
 
   let cache = Arc::new(Mutex::new(IndexMap::new()));
-  let fingerprint = Arc::new(db);
-  let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{}/../../target/debug", project_root)));
+  let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -1022,10 +946,7 @@ async fn test_dependency_results() {
   plugin_manager.start_plugin(plugin_name).await.unwrap();
 
   let result = task
-    .execute(
-      runtime(plugin_manager.clone(), cache, fingerprint),
-      CancellationToken::new(),
-    )
+    .execute(runtime(plugin_manager.clone(), cache), CancellationToken::new())
     .await
     .unwrap();
   assert_eq!(result.output(), "Result: dep_output");

@@ -12,13 +12,16 @@ pub(crate) enum NodeAction {
   Barrier,
   /// Evaluate and publish a shared condition decision.
   Condition,
-  /// Evaluate source/output freshness and publish the decision.
-  FreshnessCheck {
-    spec: Box<FreshnessSpec>,
-    state: Arc<FreshnessState>,
+  /// Compute the task action, look it up, and restore a verified hit.
+  CacheLookup {
+    plan: Arc<crate::result_cache::TaskCachePlan>,
+    state: Arc<crate::result_cache::TaskCacheState>,
   },
-  /// Commit a successful freshness decision after command completion.
-  FreshnessCommit(Arc<FreshnessState>),
+  /// Recheck inputs and publish a fully successful task result.
+  CacheFinalize {
+    plan: Arc<crate::result_cache::TaskCachePlan>,
+    state: Arc<crate::result_cache::TaskCacheState>,
+  },
   /// Validate and publish task-level artifact and report declarations.
   RegisterResources {
     artifacts: Vec<octa_octafile::ArtifactDeclaration>,
@@ -32,7 +35,10 @@ impl NodeAction {
   }
 
   fn needs_working_directory(&self) -> bool {
-    matches!(self, Self::Command | Self::RegisterResources { .. })
+    matches!(
+      self,
+      Self::Command | Self::CacheLookup { .. } | Self::RegisterResources { .. }
+    )
   }
 
   pub(super) fn needs_runtime_lock(&self) -> bool {
@@ -41,24 +47,73 @@ impl NodeAction {
 }
 
 #[derive(Clone, Debug, Default)]
-/// Access to the invocation-level freshness decision shared by command nodes.
-pub(crate) struct FreshnessRuntime {
-  state: Option<Arc<FreshnessState>>,
+/// Access to the task-level cache decision and ordered capture position.
+pub(crate) struct TaskCacheRuntime {
+  guards: Vec<Arc<crate::result_cache::TaskCacheState>>,
+  capture: Option<CacheCapture>,
 }
 
-impl FreshnessRuntime {
-  pub(crate) fn guarded(state: Option<Arc<FreshnessState>>) -> Self {
-    Self { state }
+#[derive(Clone, Debug)]
+enum CacheCapture {
+  Command {
+    state: Arc<crate::result_cache::TaskCacheState>,
+    position: usize,
+  },
+  Resources(Arc<crate::result_cache::TaskCacheState>),
+}
+
+impl TaskCacheRuntime {
+  pub(crate) fn guarded(guards: Vec<Arc<crate::result_cache::TaskCacheState>>) -> Self {
+    Self { guards, capture: None }
   }
 
-  pub(super) fn should_run(&self) -> ExecutorResult<bool> {
-    self.state.as_ref().map_or(Ok(true), |state| state.should_run())
-  }
-
-  pub(super) fn mark_condition_skipped(&self) {
-    if let Some(state) = &self.state {
-      state.mark_condition_skipped();
+  pub(crate) fn command(
+    guards: Vec<Arc<crate::result_cache::TaskCacheState>>,
+    state: Option<Arc<crate::result_cache::TaskCacheState>>,
+    position: usize,
+  ) -> Self {
+    Self {
+      guards,
+      capture: state.map(|state| CacheCapture::Command { state, position }),
     }
+  }
+
+  pub(crate) fn resources(
+    guards: Vec<Arc<crate::result_cache::TaskCacheState>>,
+    state: Option<Arc<crate::result_cache::TaskCacheState>>,
+  ) -> Self {
+    Self {
+      guards,
+      capture: state.map(CacheCapture::Resources),
+    }
+  }
+
+  pub(super) async fn should_run(&self) -> bool {
+    for state in &self.guards {
+      if state.should_skip_body().await {
+        return false;
+      }
+    }
+    true
+  }
+
+  pub(super) async fn record(&self, stdout: &str, outputs: &CompletionOutputs) {
+    match &self.capture {
+      Some(CacheCapture::Command { state, position }) => state.record_command(*position, stdout, outputs).await,
+      Some(CacheCapture::Resources(state)) => state.record_resources(outputs).await,
+      None => {},
+    }
+  }
+
+  /// Marks every containing cache boundary unsafe after non-fatal cleanup failure.
+  pub(super) async fn block_publication(&self, reason: octa_output::CacheReason) {
+    for state in &self.guards {
+      state.block_publication(reason).await;
+    }
+  }
+
+  pub(super) fn captures_result(&self) -> bool {
+    self.capture.is_some()
   }
 }
 
@@ -166,13 +221,13 @@ impl ConditionRuntime {
 
 /// Output and variable context cached for a task configured to run once.
 #[derive(Clone, Debug)]
-pub(crate) struct CacheItem {
+pub(crate) struct InvocationResult {
   pub(super) result: String,
   pub(super) vars: Vars,
   pub(super) outputs: CompletionOutputs,
 }
 
-impl CacheItem {
+impl InvocationResult {
   pub(crate) fn new(result: String, vars: Vars, outputs: CompletionOutputs) -> Self {
     Self { result, vars, outputs }
   }
@@ -202,7 +257,7 @@ pub(crate) struct TaskConfig {
   pub envs: Envs,        // Task environments
   pub(super) invocation_runtime: Option<Arc<InvocationRuntime>>,
   pub(super) condition_runtime: ConditionRuntime, // Conditions attached to this graph node
-  pub(super) freshness_runtime: FreshnessRuntime, // Task-level source and output state
+  pub(super) task_cache_runtime: TaskCacheRuntime, // Persistent cache decision and capture state
   pub preconditions: Option<Vec<String>>,         // Task preconditions
   pub timeout: Option<Timeout>,                   // Maximum task execution time
   pub(super) execution_binding: Option<ExecutionBinding>,
@@ -240,7 +295,7 @@ pub(crate) struct TaskConfigBuilder {
   pub envs: Option<Envs>,
   invocation_runtime: Option<Arc<InvocationRuntime>>,
   condition_runtime: ConditionRuntime,
-  freshness_runtime: FreshnessRuntime,
+  task_cache_runtime: TaskCacheRuntime,
   pub preconditions: Option<Vec<String>>,
   pub timeout: Option<Timeout>,
   execution_binding: Option<ExecutionBinding>,
@@ -284,8 +339,8 @@ impl TaskConfigBuilder {
     self
   }
 
-  pub(crate) fn freshness_runtime(mut self, freshness_runtime: FreshnessRuntime) -> Self {
-    self.freshness_runtime = freshness_runtime;
+  pub(crate) fn task_cache_runtime(mut self, task_cache_runtime: TaskCacheRuntime) -> Self {
+    self.task_cache_runtime = task_cache_runtime;
     self
   }
 
@@ -404,7 +459,7 @@ impl TaskConfigBuilder {
       envs: self.envs.unwrap_or_default(),
       invocation_runtime: self.invocation_runtime,
       condition_runtime: self.condition_runtime,
-      freshness_runtime: self.freshness_runtime,
+      task_cache_runtime: self.task_cache_runtime,
       preconditions: self.preconditions,
       timeout: self.timeout,
       execution_binding: self.execution_binding,

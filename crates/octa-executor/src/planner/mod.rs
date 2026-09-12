@@ -1,6 +1,8 @@
 //! Compiles Octafile task declarations into executable plans.
 
+mod cache;
 mod graph;
+mod nodes;
 mod platform;
 mod task_context;
 
@@ -23,22 +25,21 @@ use crate::error::{ExecutorError, ExecutorResult};
 #[cfg(test)]
 use crate::executor::Executor;
 use crate::executor::{DeferredAction, ExecutionPlan};
-use crate::freshness::{FreshnessConfig, FreshnessIdentity, FreshnessState};
-#[cfg(test)]
-use crate::source_strategy::SourceStrategy;
-use crate::source_strategy::{SourceMethod, SourceStrategyRegistry};
+use crate::result_cache::{TaskCachePlan, TaskCacheState};
 use crate::structured_output::StepExport;
 use crate::task::{self, TaskNode};
 use crate::task::{
-  ConditionRuntime, ConditionState, ExecutionBinding, FreshnessRuntime, NodeAction, PluginInvocation, TaskConfig,
+  ConditionRuntime, ConditionState, ExecutionBinding, NodeAction, PluginInvocation, TaskCacheRuntime, TaskConfig,
 };
 use crate::task_identity;
 use crate::vars::{TaskOutputVariable, VariableResolver, Vars};
+use crate::watcher::WatchTarget;
+use octa_cache_protocol::RelativePath;
 use octa_dag::DAG;
 use octa_finder::{FindResult, OctaFinder};
 use octa_octafile::{
-  AllowedRun, CommandOptions, CommandPayload, ConditionEvaluation, Deps, ExecuteMode, Octafile, PluginCommand,
-  SourceStrategies, Task, TaskCommand, TaskOutputMode,
+  AllowedRun, CommandOptions, CommandPayload, ConditionEvaluation, Deps, ExecuteMode, Octafile, PluginCommand, Task,
+  TaskCommand, TaskOutputMode,
 };
 use octa_output::{ConsoleScope, ConsoleScopeAllocator, RenderMode};
 
@@ -62,7 +63,12 @@ struct InvocationContext {
   envs: Option<octa_octafile::Envs>,
   conditions: ConditionScope,
   runtime: Option<Arc<task::InvocationRuntime>>,
-  freshness: Option<Arc<FreshnessState>>,
+  /// Cache decisions owned by containing task invocations.
+  ///
+  /// A hit on any ancestor suppresses the complete nested subgraph. The child
+  /// may still add an independent cache boundary without confusing ownership.
+  cache_guards: Vec<Arc<TaskCacheState>>,
+  task_cache: Option<Arc<TaskCacheState>>,
   parent_task_id: Option<u64>,
   output_scope: Option<ConsoleScope>,
   interactive_session: Option<String>,
@@ -81,7 +87,8 @@ impl InvocationContext {
       envs,
       conditions,
       runtime: None,
-      freshness: None,
+      cache_guards: Vec::new(),
+      task_cache: None,
       parent_task_id: None,
       output_scope: None,
       interactive_session: None,
@@ -103,14 +110,21 @@ impl InvocationContext {
       envs,
       conditions: self.conditions.clone(),
       runtime: None,
-      // Every referenced task owns its freshness boundary. Carrying the caller's
-      // decision across this boundary would hide changes to the child's sources,
-      // outputs, dotenv files, and dynamic variables.
-      freshness: None,
+      // A referenced task owns its result, but it must still obey a hit on the
+      // containing task so no nested work leaks through the outer boundary.
+      cache_guards: self.cache_guards.clone(),
+      task_cache: None,
       parent_task_id: self.output_scope.as_ref().map(ConsoleScope::id),
       output_scope: None,
       interactive_session: self.interactive_session.clone(),
     }
+  }
+
+  /// Retains the owning cache's hit guard for cleanup, but prevents deferred
+  /// stdout and structured values from becoming the task's logical result.
+  fn deferred(mut self) -> Self {
+    self.task_cache = None;
+    self
   }
 }
 
@@ -147,13 +161,13 @@ struct InvocationRequest {
   command_condition: Option<PluginCommand>,
 }
 
-/// Invocation context after task-local variables, conditions, and freshness are resolved.
+/// Invocation context after task-local variables, conditions, and cache state are resolved.
 struct PreparedInvocation {
   context: InvocationContext,
   parents: Vec<ArcNode>,
 }
 
-/// Resolved runtime values plus names that participate in freshness identity.
+/// Resolved runtime values plus names that participate in action identity.
 struct CollectedVars {
   runtime: Vars,
   identity_names: HashSet<String>,
@@ -182,8 +196,6 @@ pub(crate) struct TaskGraphBuilder {
   // Optional input provider shared by the main graph and nested deferred plans.
   variable_resolver: Option<Arc<dyn VariableResolver>>,
   secret_session: Option<Arc<crate::SecretSession>>,
-  runtime_identity: serde_json::Value,
-  source_strategies: SourceStrategyRegistry,
   scope_allocator: Arc<ConsoleScopeAllocator>,
   force_quiet: bool,
   force_silence: Option<octa_octafile::Silence>,
@@ -195,6 +207,14 @@ pub(crate) struct TaskGraphBuilder {
   defer_order: usize,
   // Deferred actions are collected separately and attached to the DAG when the plan is complete.
   deferred: HashMap<String, Arc<DeferredAction<TaskNode>>>,
+  /// Distinct task input sets used by watch mode, independent of caching.
+  watch_targets: Vec<WatchTarget>,
+}
+
+/// Executable graph plus planner metadata consumed outside the scheduler.
+pub(crate) struct BuiltTaskGraph {
+  pub(crate) plan: ExecutionPlan<TaskNode>,
+  pub(crate) watch_targets: Vec<WatchTarget>,
 }
 
 impl TaskGraphBuilder {
@@ -212,8 +232,6 @@ impl TaskGraphBuilder {
       variable_overrides: Vec::new(),
       variable_resolver: None,
       secret_session: None,
-      runtime_identity: serde_json::json!({"octa": env!("CARGO_PKG_VERSION")}),
-      source_strategies: SourceStrategyRegistry::default(),
       scope_allocator: Arc::new(ConsoleScopeAllocator::default()),
       force_quiet: false,
       force_silence: None,
@@ -223,6 +241,7 @@ impl TaskGraphBuilder {
       os_type,
       defer_order: 0,
       deferred: HashMap::new(),
+      watch_targets: Vec::new(),
     })
   }
 
@@ -234,11 +253,15 @@ impl TaskGraphBuilder {
 
   /// Sets the workspace used to resolve task working directories.
   pub(crate) fn with_working_directory(mut self, directory: PathBuf) -> Self {
-    self.dir = if directory.is_absolute() {
+    let directory = if directory.is_absolute() {
       directory
     } else {
       self.dir.join(directory)
     };
+    // Existing workspaces are canonicalized once so macOS `/var` aliases and
+    // Windows path normalization cannot break later containment checks. A
+    // missing path is retained for the executor's normal creation/error path.
+    self.dir = dunce::canonicalize(&directory).unwrap_or(directory);
     self
   }
 
@@ -250,11 +273,6 @@ impl TaskGraphBuilder {
 
   pub(crate) fn with_secret_session(mut self, session: Arc<crate::SecretSession>) -> Self {
     self.secret_session = Some(session);
-    self
-  }
-
-  pub(crate) fn with_runtime_identity(mut self, identity: serde_json::Value) -> Self {
-    self.runtime_identity = identity;
     self
   }
 
@@ -277,16 +295,6 @@ impl TaskGraphBuilder {
     self
   }
 
-  /// Replaces the implementation used for one configured source strategy.
-  #[cfg(test)]
-  pub(crate) fn with_source_strategy<S>(mut self, method: SourceMethod, strategy: S) -> Self
-  where
-    S: SourceStrategy + 'static,
-  {
-    self.source_strategies.register(method, strategy);
-    self
-  }
-
   /// Builds a DAG (Directed Acyclic Graph) of tasks from the given Octafile
   ///
   /// # Arguments
@@ -294,13 +302,30 @@ impl TaskGraphBuilder {
   /// * `command` - Command to execute
   /// * `run_parallel` - Whether the caller forces parallel execution
   /// * `command_args` - Additional command line arguments
+  #[cfg(test)]
   pub(crate) async fn build(
-    mut self,
+    self,
     octafile: Arc<Octafile>,
     command: &str,
     run_parallel: bool,
     command_args: Vec<String>,
   ) -> ExecutorResult<ExecutionPlan<TaskNode>> {
+    Ok(
+      self
+        .build_with_watch_targets(octafile, command, run_parallel, command_args)
+        .await?
+        .plan,
+    )
+  }
+
+  /// Builds a graph and returns the input sets selected by its invocations.
+  pub(crate) async fn build_with_watch_targets(
+    mut self,
+    octafile: Arc<Octafile>,
+    command: &str,
+    run_parallel: bool,
+    command_args: Vec<String>,
+  ) -> ExecutorResult<BuiltTaskGraph> {
     debug!(
       "Building DAG for command {} with provided args {:?}",
       command, command_args
@@ -339,6 +364,9 @@ impl TaskGraphBuilder {
 
     self.validate_dag(&dag, command)?;
 
-    Ok(ExecutionPlan::new(dag, self.deferred, self.scopes))
+    Ok(BuiltTaskGraph {
+      plan: ExecutionPlan::new(dag, self.deferred, self.scopes),
+      watch_targets: self.watch_targets,
+    })
   }
 }

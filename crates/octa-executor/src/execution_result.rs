@@ -4,10 +4,12 @@
 //! errors. Embedders can persist them without reconstructing state from the
 //! event stream.
 
+use std::time::Duration;
 use std::{error::Error, fmt};
 
 use chrono::{DateTime, Utc};
-use octa_output::{ConsoleStatus, SourceLocation};
+use octa_cache_protocol::CacheLayer;
+use octa_output::{CacheReason, ConsoleStatus, SourceLocation};
 use octa_output::{RegisteredArtifact, RegisteredReport};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -83,13 +85,13 @@ impl ExecutionFailure {
       | ExecutorError::TaskNotFound(_)
       | ExecutorError::TemplateParseFailed(_)
       | ExecutorError::TemplateRenderError(_)
-      | ExecutorError::FreshnessStateUnavailable(_)
-      | ExecutorError::FreshnessStateAlreadyPublished
-      | ExecutorError::FreshnessIdentityError(_)
-      | ExecutorError::SourceStrategyUnavailable(_)
+      | ExecutorError::ActionIdentityError(_)
+      | ExecutorError::ActionIdentitySerialization(_)
+      | ExecutorError::InvalidCacheConfiguration(_)
+      | ExecutorError::CacheState(_)
+      | ExecutorError::CacheProtocol(_)
       | ExecutorError::TaskConfigFieldMissing(_)
       | ExecutorError::DotenvError { .. }
-      | ExecutorError::OctaignoreError(_)
       | ExecutorError::ValueExpandError(..)
       | ExecutorError::ExtraValueConvertError(..)
       | ExecutorError::MissingWorkDir
@@ -110,9 +112,7 @@ impl ExecutionFailure {
       | ExecutorError::GetCotafile(_) => ExecutionFailureKind::Configuration,
       ExecutorError::SecretProvider { .. } => ExecutionFailureKind::Secret,
       ExecutorError::ShutdownTimeout
-      | ExecutorError::OpenFingerprintDbError(_)
-      | ExecutorError::CalculateDurationError(_)
-      | ExecutorError::ExtendSourceError(_)
+      | ExecutorError::Cache(_)
       | ExecutorError::AddDependencyError(_)
       | ExecutorError::ChannelError
       | ExecutorError::ConcurrencyLimiterClosed
@@ -172,6 +172,88 @@ pub enum TaskRole {
   Main,
   /// Cleanup work registered by a `defer` command; its failure does not replace the main result.
   Deferred,
+}
+
+/// Terminal cache disposition for one task invocation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CacheStatus {
+  /// A verified action result was restored instead of executing the task body.
+  Hit,
+  /// Lookup found no reusable result and the task executed normally.
+  Miss,
+  /// Policy or task semantics intentionally disabled lookup/publication.
+  Bypassed,
+  /// Cache infrastructure failed and execution continued without reuse.
+  Error,
+}
+
+/// Machine-readable cache result attached to a task terminal snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct CacheOutcome {
+  /// Result of lookup and optional publication.
+  pub status: CacheStatus,
+  /// Canonical action digest, when one was computed.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub action: Option<String>,
+  /// Storage layer that served a hit.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub layer: Option<CacheLayer>,
+  /// Expanded bytes installed into the workspace; zero also means already materialized.
+  pub restored_bytes: u64,
+  /// Lookup, validation, and restore wall time.
+  pub elapsed_millis: u64,
+  /// Stable reason used by diagnostics and future `cache explain` output.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub reason: Option<CacheReason>,
+}
+
+impl CacheOutcome {
+  pub(crate) fn hit(action: String, layer: CacheLayer, restored_bytes: u64, elapsed: Duration) -> Self {
+    Self {
+      status: CacheStatus::Hit,
+      action: Some(action),
+      layer: Some(layer),
+      restored_bytes,
+      elapsed_millis: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+      reason: None,
+    }
+  }
+
+  pub(crate) fn miss(action: String, reason: CacheReason, elapsed: Duration) -> Self {
+    Self {
+      status: CacheStatus::Miss,
+      action: Some(action),
+      layer: None,
+      restored_bytes: 0,
+      elapsed_millis: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+      reason: Some(reason),
+    }
+  }
+
+  pub(crate) fn bypassed(reason: CacheReason) -> Self {
+    Self {
+      status: CacheStatus::Bypassed,
+      action: None,
+      layer: None,
+      restored_bytes: 0,
+      elapsed_millis: 0,
+      reason: Some(reason),
+    }
+  }
+
+  pub(crate) fn error(action: Option<String>, reason: CacheReason, elapsed: Duration) -> Self {
+    Self {
+      status: CacheStatus::Error,
+      action,
+      layer: None,
+      restored_bytes: 0,
+      elapsed_millis: elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+      reason: Some(reason),
+    }
+  }
 }
 
 impl fmt::Display for ExecutionFailure {
@@ -313,6 +395,9 @@ pub struct TaskResult {
   /// All reports registered by this task, including plugin step declarations.
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub reports: Vec<RegisteredReport>,
+  /// Persistent cache activity for this invocation, when caching was configured.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub cache: Option<CacheOutcome>,
   /// Executable steps in declaration order.
   pub steps: Vec<StepResult>,
 }
@@ -495,6 +580,7 @@ mod tests {
       finished_at: now,
       conclusion: ExecutionConclusion::Failed(failure.clone()),
       tasks: vec![TaskResult {
+        cache: None,
         task_id: 2,
         parent_task_id: Some(1),
         label: "compile".to_owned(),

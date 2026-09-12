@@ -75,6 +75,21 @@ struct PluginInstance {
   process: PluginProcess,
   socket_path: OsString,
   client: PluginClient,
+  identity: PluginBinaryIdentity,
+}
+
+/// Exact implementation identity of one running plugin process.
+///
+/// This manager-owned DTO avoids coupling plugin lifecycle code to consumers
+/// such as the task-result cache while still exposing enough information to
+/// prevent reuse across different plugin binaries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginBinaryIdentity {
+  pub name: String,
+  pub version: String,
+  pub protocol_version: u16,
+  pub sha256: String,
+  pub executable_size: u64,
 }
 
 struct StartupReservation {
@@ -395,6 +410,8 @@ impl PluginManager {
         plugin_full_path.to_string_lossy().to_string(),
       ));
     }
+    let initial_size = tokio::fs::metadata(&plugin_full_path).await?.len();
+    let initial_sha256 = crate::plugin_lock::sha256_file(&plugin_full_path).await?;
 
     let socket_name =
       interpret_local_socket_name(&socket_path).map_err(|e| PluginManagerError::SocketPath(e.to_string()))?;
@@ -426,8 +443,8 @@ impl PluginManager {
       let client = PluginClient::connect(&socket_name)
         .await
         .map_err(|error| PluginManagerError::ConnectionError(error.to_string()))?;
-      client
-        .handshake()
+      let version = client
+        .handshake_version()
         .await
         .map_err(|error| PluginManagerError::StartError(error.to_string()))?;
       let schema = client
@@ -435,11 +452,11 @@ impl PluginManager {
         .await
         .map_err(|error| PluginManagerError::StartError(error.to_string()))?;
 
-      Ok::<_, PluginManagerError>((client, schema))
+      Ok::<_, PluginManagerError>((client, schema, version))
     })
     .await;
 
-    let (client, schema) = match startup {
+    let (client, schema, version) = match startup {
       Ok(Ok(result)) => result,
       Ok(Err(error)) => {
         let diagnostics = Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
@@ -465,6 +482,28 @@ impl PluginManager {
         ));
       },
     };
+    let identity = async {
+      Ok::<_, std::io::Error>((
+        tokio::fs::metadata(&plugin_full_path).await?.len(),
+        crate::plugin_lock::sha256_file(&plugin_full_path).await?,
+      ))
+    }
+    .await;
+    let (executable_size, sha256) = match identity {
+      Ok(identity) => identity,
+      Err(error) => {
+        drop(client);
+        let _ = Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
+        return Err(error.into());
+      },
+    };
+    if executable_size != initial_size || sha256 != initial_sha256 {
+      drop(client);
+      let _ = Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
+      return Err(PluginManagerError::StartError(format!(
+        "plugin '{plugin_name}' executable changed during startup"
+      )));
+    }
     if let Err(error) = self.plugin_registry.lock().await.register(registration) {
       drop(client);
       let _ = Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
@@ -477,6 +516,13 @@ impl PluginManager {
         process,
         socket_path,
         client,
+        identity: PluginBinaryIdentity {
+          name: plugin_name.clone(),
+          version: version.version,
+          protocol_version: version.protocol_version,
+          sha256,
+          executable_size,
+        },
       },
     );
 
@@ -523,6 +569,27 @@ impl PluginManager {
   /// Resolves an execution capability independently of a plugin's task key.
   pub async fn resolve_capability(&self, capability: &str) -> Option<PluginRegistration> {
     self.plugin_registry.lock().await.capabilities.get(capability).cloned()
+  }
+
+  /// Returns the exact running binary behind a registered task key.
+  pub async fn identity_for_key(&self, key: &str) -> Option<PluginBinaryIdentity> {
+    let plugin_name = self.resolve_key(key).await?.plugin_name().to_owned();
+    self.identity_for_plugin(&plugin_name).await
+  }
+
+  /// Returns the exact running binary behind a registered capability.
+  pub async fn identity_for_capability(&self, capability: &str) -> Option<PluginBinaryIdentity> {
+    let plugin_name = self.resolve_capability(capability).await?.plugin_name().to_owned();
+    self.identity_for_plugin(&plugin_name).await
+  }
+
+  async fn identity_for_plugin(&self, plugin_name: &str) -> Option<PluginBinaryIdentity> {
+    self
+      .active_plugins
+      .lock()
+      .await
+      .get(plugin_name)
+      .map(|plugin| plugin.identity.clone())
   }
 
   /// Clones a connected client without holding the manager lifecycle lock during execution.
@@ -925,6 +992,18 @@ mod tests {
     assert!(result.unwrap().is_ok());
 
     assert!(setup.plugin_manager.is_plugin_running("test").await);
+    let identity = setup.plugin_manager.identity_for_key("key").await.unwrap();
+    assert_eq!(identity.name, "test");
+    assert_eq!(identity.version, "0.3.0");
+    assert_eq!(identity.protocol_version, 1);
+    assert_eq!(
+      identity.executable_size,
+      std::fs::metadata(&setup.plugin_path).unwrap().len()
+    );
+    assert_eq!(
+      identity.sha256,
+      crate::plugin_lock::sha256_file(&setup.plugin_path).await.unwrap()
+    );
   }
 
   #[tokio::test]

@@ -10,9 +10,9 @@ use std::{
 
 use octa_output::{ConsoleEntry, ConsoleRenderer};
 pub use octa_runner_protocol::{
-  RunRequest, RunStatus, RunnerCommand, RunnerMessage, Silence, MAX_RUNNER_INPUT_FRAME_BYTES,
-  RUNNER_EVENT_SCHEMA_VERSION, RUNNER_INPUT_SCHEMA_V1, RUNNER_OUTPUT_SCHEMA_V1, RUNNER_PLUGIN_PROTOCOL_VERSION,
-  RUNNER_PROTOCOL_VERSION,
+  CacheMode, CacheSessionSpec, RemoteCacheSession, RunRequest, RunStatus, RunnerCommand, RunnerMessage, Silence,
+  MAX_CACHE_TOKEN_FILE_BYTES, MAX_RUNNER_INPUT_FRAME_BYTES, RUNNER_EVENT_SCHEMA_VERSION, RUNNER_INPUT_SCHEMA_V2,
+  RUNNER_OUTPUT_SCHEMA_V2, RUNNER_PLUGIN_PROTOCOL_VERSION, RUNNER_PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
@@ -42,6 +42,7 @@ pub fn capabilities() -> RunnerMessage<String, (), ()> {
       "vault-secrets",
       "graceful-cancellation",
       "versioned-events",
+      "task-result-cache-v1",
     ]
     .into_iter()
     .map(str::to_owned)

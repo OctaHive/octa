@@ -99,9 +99,10 @@ the complete data object.
 The runner protocol transports only the profile path and logical references.
 Resolved values are marked secret before template/plugin execution, redacted
 from normal stdout, stderr, progress, diagnostics, errors, terminal results,
-and persistent freshness metadata. Raw/PTY execution is rejected when resolved
-secrets are present because an arbitrary terminal byte stream cannot be
-reliably scrubbed.
+and persistent cache identity or result metadata. A task that resolves secret
+variables is bypassed by the cache. Raw/PTY execution is rejected when resolved
+secrets are present because an arbitrary terminal byte stream cannot be reliably
+scrubbed.
 
 Plugins execute inside the job trust boundary and receive values needed by the
 task. A plugin can intentionally exfiltrate data through files or the network;

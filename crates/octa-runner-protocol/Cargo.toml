@@ -11,6 +11,7 @@ repository.workspace = true
 include = ["src/", "schema/", "README.md"]
 
 [dependencies]
+octa-cache-protocol = { version = "0.3.0", path = "../octa-cache-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

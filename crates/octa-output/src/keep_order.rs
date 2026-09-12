@@ -169,6 +169,11 @@ impl<R: ConsoleRenderer> KeepOrderRenderer<R> {
 }
 
 fn record_scope(record: &ConsoleRecord) -> Option<&ConsoleScope> {
+  if let ConsoleRecord::Execution(event) = record {
+    if let Some(scope) = event.cache_scope() {
+      return Some(scope);
+    }
+  }
   match record {
     ConsoleRecord::Execution(ExecutionEvent::ScopeStarted { scope, .. })
     | ConsoleRecord::Execution(ExecutionEvent::ScopeFinished { scope, .. })

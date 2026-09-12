@@ -213,6 +213,11 @@ impl ConsoleRenderer for OutputRouterRenderer {
 }
 
 fn record_scope(record: &ConsoleRecord) -> Option<&ConsoleScope> {
+  if let ConsoleRecord::Execution(event) = record {
+    if let Some(scope) = event.cache_scope() {
+      return Some(scope);
+    }
+  }
   match record {
     ConsoleRecord::Execution(ExecutionEvent::ScopeDeclared { scope, .. })
     | ConsoleRecord::Execution(ExecutionEvent::ScopeStarted { scope, .. })

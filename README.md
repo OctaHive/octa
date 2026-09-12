@@ -14,7 +14,8 @@ functionality missing, so I decided to create my own builder.
 * Support rendering templates and return result of rendering as task result
 
 Architecture and integration references: [runner protocol](docs/runner-protocol.md),
-[plugin distribution](docs/plugin-distribution.md), and [secret providers](docs/secrets.md).
+[plugin distribution](docs/plugin-distribution.md), [secret providers](docs/secrets.md),
+and the [task-result cache profile](docs/cache-profile.md).
 
 # Installation
 
@@ -224,7 +225,8 @@ monorepo configuration.
 
 Octa caches only the discovered project paths, not parsed tasks. The cache is reused while the
 traversed directory hierarchy is unchanged and is rebuilt when directories or discovered
-Octafiles are added or removed. Use `--clean-cache` to clear it manually.
+Octafiles are added or removed. Its state directory is created lazily only after a `monorepo`
+configuration is found. Use `--clean-state` to clear it manually.
 
 See [`example/monorepo`](example/monorepo) for a runnable layout.
 
@@ -613,9 +615,9 @@ tasks:
 ```
 
 Required variables are resolved when their task reaches runtime. A task suppressed by an inherited
-condition or freshness gate therefore does not validate or prompt for values it will never use.
-A task's own condition or freshness check still resolves that task's variables before the check,
-because the variables are part of its evaluation context and freshness identity.
+condition or cache hit therefore does not validate or prompt for values it will never use. A task's
+own condition and cache lookup resolve that task's variables because public values participate in
+its action identity.
 
 A required variable cannot define `value` or `sh`. CLI variables, process environment variables,
 include variables, and variables passed by another task can satisfy the requirement. Validation is
@@ -1032,7 +1034,7 @@ octa --output jsonl build | jq -c 'select(.category == "execution")'
 
 JSON Lines includes run, task, and step lifecycle events, command output, progress, and diagnostics.
 Version 2 is the current stable contract. See the
-[JSON Schema](crates/octa-output/schema/events-v2.schema.json) and
+[JSON Schema](crates/octa-output/schema/events-v4.schema.json) and
 [runtime event documentation](docs/events.md) for the complete field reference and compatibility
 policy.
 
@@ -1059,8 +1061,9 @@ let handle = engine.start(ExecutionRequest::new("build"));
 let result = handle.wait().await?;
 ```
 
-`ExecutionEngine` is created from a loaded `Octafile`, a running `PluginManager`, the fingerprint
-database, and a `Console`. Attach an `EventSink` with `Console::with_event_sink` to receive
+`ExecutionEngine` is created from a loaded `Octafile`, a running `PluginManager`, and a `Console`.
+An embedding application can attach a `ResultCache` backed by a `CacheStore`; CLI and runner cache
+profile composition is introduced separately. Attach an `EventSink` with `Console::with_event_sink` to receive
 structured entries independently of terminal presentation. Details are in the
 [runtime event documentation](docs/events.md#embedded-execution-api).
 
@@ -1391,9 +1394,8 @@ tasks:
 Octa validates the step ID and plugin output field while loading the Octafile, and validates the
 dependency and exported task field while building the execution plan. Values retain their JSON
 type—strings, numbers, booleans, arrays, and objects are not converted through stdout. A task only
-exports values after a successful command. Output-producing commands cannot be deferred, and tasks
-with structured outputs currently cannot use source/file freshness because there is no previous-run
-value to restore when such a task is skipped. Set `secret: true` for sensitive values: they remain
+exports values after a successful command. Public structured outputs are stored and replayed with a
+cached result. Set `secret: true` for sensitive values: they make the task uncacheable, remain
 available to dependent task variables, but are omitted from step/task result values and their names
 are listed as redacted outputs.
 
@@ -1441,6 +1443,10 @@ tasks:
 You can also set `run` at the Octafile level. It becomes the default for tasks declared in that file;
 a task-level value takes precedence. Included Octafiles use their own `run` setting.
 
+`run` controls only repeated references inside one in-memory execution plan. It does not persist
+between Octa processes and does not inspect files. Use the task-result cache below for reusable
+results across separate runs or workspaces.
+
 ```yaml
 version: 1
 run: changed
@@ -1454,94 +1460,74 @@ tasks:
     shell: cargo publish
 ```
 
-# Prevent run task
-Often, if your source files have not changed, there is no need to run the task. To handle this, you can specify 
-the `sources` parameter for the task, where you can list the files whose changes need to be tracked. When the 
-task is executed, Octa will check the checksums of the specified files, and if they have not changed, the task
-will complete without being executed.
+# Persistent task-result cache
+
+`files` declares the filesystem contract of a task. `inputs` is an ordered set of
+workspace-relative glob patterns; `outputs` contains exact workspace-relative files or directory
+roots. Adding `cache: {}` opts the complete successful task result into persistent reuse:
 
 ```yaml
 version: 1
 
 tasks:
   build:
-    sources:
-      - ./src/*
-    shell: echo Run build
-```
-
-If we run this task again, the command will complete without actually executing:
-
-```console
-$ ./octa build
-2024-12-22 16:59:06 [octa] Building DAG for command build with provided args []
-2024-12-22 16:59:06 [octa] Starting execution plan for command build
-2024-12-22 16:59:06 [octa] Starting task build
-Run build
-2024-12-22 16:59:06 [octa] All tasks completed successfully
-
-$ ./octa build
-2024-12-22 16:59:08 [octa] Building DAG for command build with provided args []
-2024-12-22 16:59:08 [octa] Starting execution plan for command build
-2024-12-22 16:59:08 [octa] Task build are up to date
-2024-12-22 16:59:08 [octa] All tasks completed successfully
-```
-
-Use `output` to declare files or directories produced by the task. A missing output makes all
-commands owned by that task stale. Referenced tasks keep their own independent freshness checks:
-
-```yaml
-version: 1
-source_strategy: hash
-
-tasks:
-  build:
-    sources:
-      - ./src/**/*.rs
-      - "!./src/generated/**"
-      - ./Cargo.toml
-    output:
-      - ./target/release/*
-      - "!./target/release/*.map"
+    files:
+      inputs:
+        - src/**/*.rs
+        - "!src/generated/**"
+        - Cargo.toml
+        - Cargo.lock
+      outputs:
+        - target/release/octa
+        - generated
+    cache:
+      environment:
+        - RUSTFLAGS
+        - CARGO_PROFILE_RELEASE_LTO
+      salt: rust-release-v1
     shell: cargo build --release
 ```
 
-Set `source_strategy` at the Octafile level to provide the default for tasks declared in that file,
-or override it for one task:
+Every cacheable task must declare `files.inputs`; use `inputs: []` when it intentionally has no
+filesystem inputs. `files.outputs` may be empty for tasks that only return stdout or public
+structured outputs. Inputs are identified by path, entry kind, executable bit, symlink target, and
+BLAKE3 content digest—timestamps are never a correctness strategy. Configured public variables and
+task environment values are included automatically. `cache.environment` selects ambient process
+variables that also affect the result; missing and empty values are distinct. `salt` is an optional
+manual invalidation value, not a substitute for declaring real inputs.
 
-```yaml
-source_strategy: hash
+Storage and native toolchain identity are configured outside the Octafile:
 
-tasks:
-  build:
-    source_strategy: timestamp
-    sources: [./src/**/*]
-    output: [./dist/app]
-    shell: ./build.sh
+```console
+octa --cache-profile cache.toml build
+octa --cache-profile cache.toml cache explain build
 ```
 
-With the default `hash` source strategy, Octa compares the source fingerprint and checks that every
-`output` pattern has at least one match. Output contents are not included in the hash. With
-`source_strategy: timestamp`, Octa also
-reruns the task when the newest source is newer than the oldest output. Output directories are
-inspected recursively, while parent directory timestamps are ignored when tracked descendants
-exist. Fingerprints are stored only after the main task body completes successfully, so failed and
-partially completed tasks are retried. Source and output paths are resolved from the root Octafile
-directory.
+See the [cache profile reference](docs/cache-profile.md) for local capacity,
+read/write modes, inspection, and pruning.
 
-Freshness identities include task configuration and resolved variables explicitly declared in
-Octafile or on the command line. Dynamic `sh` values are resolved once during the freshness check
-and the same values are reused by every command in that task invocation. Process environment
-variables remain available at runtime, but declare values that affect generated outputs in `vars`
-or `env` so they are tracked without making every unrelated environment change invalidate the task.
+On a verified hit Octa restores the output bundle transactionally and replays stdout, public task
+outputs, artifacts, and reports without invoking the command. Existing outputs whose canonical
+bundle already matches are left untouched. A miss executes normally and publishes only after every
+command and resource registration succeeds and the input tree is rechecked. Cache storage or
+restore failures are reported but fall back to normal execution; cancellation remains fatal.
 
-Prefix a pattern with `!` to exclude its matches from `sources` or `output`. Patterns are applied
-in declaration order, so a later positive pattern can re-include a path. Quote exclusions in YAML
-to prevent `!` from being parsed as a tag. Use `\!` at the beginning for a literal path whose name
-starts with `!`.
+Inputs and outputs must not overlap. Output roots within a task must be disjoint, and independently
+runnable cacheable tasks cannot own overlapping roots. Version one places cache boundaries only on
+executable leaf tasks: nested task calls, raw or interactive execution, ignored failures, and
+secret structured outputs are rejected. Deferred commands finish before output capture, and
+per-command conditions remain part of the cached task semantics. A task that resolves secret
+variables safely bypasses lookup and publication for that invocation. Ordinary task conditions and
+preconditions run before lookup. `--force` bypasses lookup but permits a successful result to be
+published under its immutable action key.
 
-Use `artifacts` and `reports` for files that an external runner should collect. Unlike freshness
-`output` patterns, these are exact paths relative to the task working directory:
+Patterns are applied in declaration order. Prefix an input pattern with `!` to exclude matches and
+quote it in YAML; prefix with `\!` for a literal leading exclamation mark. Paths use `/` separators
+on every operating system and stay inside the workspace.
+
+Use `artifacts` and `reports` for files that an external runner should collect. These are exact
+paths relative to the task working directory and should also be covered by `files.outputs` when the
+registrations must survive a cache hit:
 
 ```yaml
 tasks:
@@ -1584,11 +1570,8 @@ tasks:
           path: reports/junit.xml
 ```
 
-You can use glob patterns when specify source targets.
-
-To exclude files or directories matched by `sources`, create `.octaignore` files anywhere under the root
-`Octafile` directory. Each file uses `.gitignore` syntax, applies to its directory and descendants, and works with
-both the `hash` and `timestamp` source strategies:
+To exclude discovered inputs, create `.octaignore` files anywhere under the root `Octafile`
+directory. Each file uses `.gitignore` syntax and applies to its directory and descendants:
 
 ```gitignore
 # Ignore generated files and directories
@@ -1599,30 +1582,22 @@ src/generated/
 !src/generated/schema.generated.rs
 ```
 
-Patterns in nested `.octaignore` files override matching rules inherited from parent directories. As with
-`.gitignore`, a file cannot be re-included if one of its parent directories is still ignored. Sources outside the
-root `Octafile` directory are not filtered by `.octaignore`.
-
-By default, Octa calculates file checksums, but you can switch it to track file modification
-timestamps by setting `source_strategy: timestamp` at either the Octafile or task level.
-
-By default, Octa stores all the necessary information for tracking sources in the `.octa` directory.
-You can override this directory by setting the `OCTA_CACHE_DIR` environment variable.
-
-If you still want the task to run even though the source files have not changed, you can use 
-the `--force` or `-f` flag.
+Patterns in nested `.octaignore` files override matching rules inherited from parent directories.
+As with `.gitignore`, a file cannot be re-included while one of its parent directories remains
+ignored.
 
 ## Watch mode
 
-Use `--watch` or `-w` to run a task immediately and rerun it whenever a source file is created,
-modified, or removed. At least one task in the execution plan must define `sources`.
+Use `--watch` or `-w` to run a task immediately and rerun it whenever a declared input is created,
+modified, or removed. At least one task in the execution plan must define `files.inputs`; caching is
+not required.
 
 ```console
 octa --watch build
 ```
 
-Watch mode applies glob expansion and `.octaignore` rules in the same way as regular source
-fingerprinting. When multiple commands are selected, a change reruns all of them. A failed run does
+Watch mode uses the same canonical input snapshotter, glob expansion, and `.octaignore` rules as
+action identity. When multiple commands are selected, a change reruns all of them. A failed run does
 not stop the watcher; Octa waits for the next source change. Press Ctrl-C to stop watching.
 
 A task can enable watch mode when it is selected directly from the command line:
@@ -1635,8 +1610,9 @@ interval: 500ms
 tasks:
   build:
     watch: true
-    sources:
-      - src/**/*.rs
+    files:
+      inputs:
+        - src/**/*.rs
     shell: cargo build
 ```
 

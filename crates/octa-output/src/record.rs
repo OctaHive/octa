@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use super::{CliDocument, ConsoleScope, ConsoleStep, RegisteredArtifact, RegisteredReport};
 
 /// Version of the externally supported JSON Lines event contract.
-pub const EVENT_SCHEMA_VERSION: u16 = 3;
+pub const EVENT_SCHEMA_VERSION: u16 = 4;
 
 /// JSON Schema for [`ConsoleEntry`] version 1.
 pub const EVENT_SCHEMA_V1: &str = include_str!("../schema/events-v1.schema.json");
@@ -12,6 +12,8 @@ pub const EVENT_SCHEMA_V1: &str = include_str!("../schema/events-v1.schema.json"
 pub const EVENT_SCHEMA_V2: &str = include_str!("../schema/events-v2.schema.json");
 /// JSON Schema for [`ConsoleEntry`] version 3.
 pub const EVENT_SCHEMA_V3: &str = include_str!("../schema/events-v3.schema.json");
+/// JSON Schema for the version-four stream with task-result cache lifecycle events.
+pub const EVENT_SCHEMA_V4: &str = include_str!("../schema/events-v4.schema.json");
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +72,91 @@ pub enum ConsoleLevel {
   Info,
   Warn,
   Error,
+}
+
+/// Stable explanation for a cache miss, bypass, or recoverable cache error.
+///
+/// These values are part of the event and structured-result wire contracts.
+/// Keeping them typed prevents the CLI, runner, and future remote cache client
+/// from silently inventing incompatible spellings for the same condition.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CacheReason {
+  /// Dry-run mode intentionally disabled cache I/O.
+  DryRun,
+  /// Secret task variables make replay unsafe in protocol version one.
+  SecretVariables,
+  /// Forced execution skipped an otherwise valid lookup.
+  Force,
+  /// The active cache profile permits publication but not lookup.
+  ReadDisabled,
+  /// No action result exists for the computed digest.
+  ActionNotFound,
+  /// Initial filesystem identity could not be computed.
+  InputSnapshotFailed,
+  /// Inputs could not be checked again at a race-sensitive boundary.
+  InputRecheckFailed,
+  /// Inputs changed between lookup and restoration.
+  InputsChangedDuringLookup,
+  /// Inputs changed while the task was executing.
+  InputsChangedBeforePublish,
+  /// The action store could not complete a lookup.
+  LookupFailed,
+  /// Blob presence could not be queried before publication.
+  BlobLookupFailed,
+  /// A referenced output blob could not be opened.
+  BlobReadFailed,
+  /// A verified output bundle could not be restored transactionally.
+  RestoreFailed,
+  /// Result metadata omitted the bundle required by declared outputs.
+  MissingOutputBundle,
+  /// Declared outputs could not be captured safely.
+  OutputCaptureFailed,
+  /// An immutable blob key was already bound to different bytes.
+  BlobConflict,
+  /// The output blob could not be published.
+  BlobPublicationFailed,
+  /// Result metadata exceeded a bound or violated its wire contract.
+  ResultMetadataInvalid,
+  /// A registered artifact or report is not reproducible from declared outputs.
+  ResourceContractInvalid,
+  /// Non-fatal deferred cleanup failed, making the final state unsafe to reuse.
+  DeferredFailed,
+  /// The action key was already bound to a different logical result.
+  NondeterministicResult,
+  /// Action metadata could not be published.
+  PublicationFailed,
+}
+
+impl CacheReason {
+  /// Returns the exact snake-case token used by serialized protocols.
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::DryRun => "dry_run",
+      Self::SecretVariables => "secret_variables",
+      Self::Force => "force",
+      Self::ReadDisabled => "read_disabled",
+      Self::ActionNotFound => "action_not_found",
+      Self::InputSnapshotFailed => "input_snapshot_failed",
+      Self::InputRecheckFailed => "input_recheck_failed",
+      Self::InputsChangedDuringLookup => "inputs_changed_during_lookup",
+      Self::InputsChangedBeforePublish => "inputs_changed_before_publish",
+      Self::LookupFailed => "lookup_failed",
+      Self::BlobLookupFailed => "blob_lookup_failed",
+      Self::BlobReadFailed => "blob_read_failed",
+      Self::RestoreFailed => "restore_failed",
+      Self::MissingOutputBundle => "missing_output_bundle",
+      Self::OutputCaptureFailed => "output_capture_failed",
+      Self::BlobConflict => "blob_conflict",
+      Self::BlobPublicationFailed => "blob_publication_failed",
+      Self::ResultMetadataInvalid => "result_metadata_invalid",
+      Self::ResourceContractInvalid => "resource_contract_invalid",
+      Self::DeferredFailed => "deferred_failed",
+      Self::NondeterministicResult => "nondeterministic_result",
+      Self::PublicationFailed => "publication_failed",
+    }
+  }
 }
 
 /// Transient progress reported by a concrete plugin command.
@@ -166,6 +253,73 @@ pub enum ExecutionEvent {
     step_id: Option<u64>,
     report: RegisteredReport,
   },
+  /// Begins lookup after the complete action identity has been computed.
+  CacheLookupStarted {
+    run_id: u64,
+    scope: ConsoleScope,
+    action: String,
+  },
+  /// Reports a verified reusable result.
+  CacheHit {
+    run_id: u64,
+    scope: ConsoleScope,
+    action: String,
+    restored_bytes: u64,
+  },
+  /// Reports why no reusable action result was selected.
+  CacheMiss {
+    run_id: u64,
+    scope: ConsoleScope,
+    action: String,
+    reason: CacheReason,
+  },
+  /// Completes verified filesystem restoration for a hit.
+  CacheRestoreFinished {
+    run_id: u64,
+    scope: ConsoleScope,
+    action: String,
+    restored_bytes: u64,
+  },
+  /// Begins publication after task success and input revalidation.
+  CachePublishStarted {
+    run_id: u64,
+    scope: ConsoleScope,
+    action: String,
+  },
+  /// Completes immutable action-result publication.
+  CachePublished {
+    run_id: u64,
+    scope: ConsoleScope,
+    action: String,
+  },
+  /// Reports a cache failure that did not replace the task result.
+  CacheError {
+    run_id: u64,
+    scope: ConsoleScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    reason: CacheReason,
+    message: String,
+  },
+}
+
+impl ExecutionEvent {
+  /// Returns the task scope shared by every cache lifecycle event.
+  ///
+  /// Buffering and routing renderers use this single classification point so
+  /// adding a cache event cannot silently leave one presentation mode behind.
+  pub(crate) fn cache_scope(&self) -> Option<&ConsoleScope> {
+    match self {
+      Self::CacheLookupStarted { scope, .. }
+      | Self::CacheHit { scope, .. }
+      | Self::CacheMiss { scope, .. }
+      | Self::CacheRestoreFinished { scope, .. }
+      | Self::CachePublishStarted { scope, .. }
+      | Self::CachePublished { scope, .. }
+      | Self::CacheError { scope, .. } => Some(scope),
+      _ => None,
+    }
+  }
 }
 
 /// Human-oriented diagnostic enriched with optional execution context.
@@ -345,8 +499,97 @@ mod tests {
   }
 
   #[test]
+  fn cache_events_expose_one_shared_scope_classification() {
+    let scope = ConsoleScopeAllocator::default().scope("build");
+    let events = [
+      ExecutionEvent::CacheLookupStarted {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "action".to_owned(),
+      },
+      ExecutionEvent::CacheHit {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "action".to_owned(),
+        restored_bytes: 1,
+      },
+      ExecutionEvent::CacheMiss {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "action".to_owned(),
+        reason: CacheReason::ActionNotFound,
+      },
+      ExecutionEvent::CacheRestoreFinished {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "action".to_owned(),
+        restored_bytes: 1,
+      },
+      ExecutionEvent::CachePublishStarted {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "action".to_owned(),
+      },
+      ExecutionEvent::CachePublished {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "action".to_owned(),
+      },
+      ExecutionEvent::CacheError {
+        run_id: 1,
+        scope: scope.clone(),
+        action: Some("action".to_owned()),
+        reason: CacheReason::LookupFailed,
+        message: "offline".to_owned(),
+      },
+    ];
+    assert!(events
+      .iter()
+      .all(|event| event.cache_scope().map(ConsoleScope::id) == Some(scope.id())));
+    assert!(ExecutionEvent::RunStarted {
+      run_id: 1,
+      command: "build".to_owned()
+    }
+    .cache_scope()
+    .is_none());
+  }
+
+  #[test]
+  fn cache_reason_tokens_match_their_serialized_form() {
+    for reason in [
+      CacheReason::DryRun,
+      CacheReason::SecretVariables,
+      CacheReason::Force,
+      CacheReason::ReadDisabled,
+      CacheReason::ActionNotFound,
+      CacheReason::InputSnapshotFailed,
+      CacheReason::InputRecheckFailed,
+      CacheReason::InputsChangedDuringLookup,
+      CacheReason::InputsChangedBeforePublish,
+      CacheReason::LookupFailed,
+      CacheReason::BlobLookupFailed,
+      CacheReason::BlobReadFailed,
+      CacheReason::RestoreFailed,
+      CacheReason::MissingOutputBundle,
+      CacheReason::OutputCaptureFailed,
+      CacheReason::BlobConflict,
+      CacheReason::BlobPublicationFailed,
+      CacheReason::ResultMetadataInvalid,
+      CacheReason::ResourceContractInvalid,
+      CacheReason::DeferredFailed,
+      CacheReason::NondeterministicResult,
+      CacheReason::PublicationFailed,
+    ] {
+      assert_eq!(
+        serde_json::to_string(&reason).unwrap(),
+        format!("\"{}\"", reason.as_str())
+      );
+    }
+  }
+
+  #[test]
   fn current_schema_validates_every_public_record_shape() {
-    let schema = serde_json::from_str(EVENT_SCHEMA_V3).unwrap();
+    let schema = serde_json::from_str(EVENT_SCHEMA_V4).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     let allocator = ConsoleScopeAllocator::default();
     let parent = allocator.scope("build");
@@ -447,6 +690,46 @@ mod tests {
           format: "acme/tests-v2".to_owned(),
         },
       }),
+      ConsoleRecord::Execution(ExecutionEvent::CacheLookupStarted {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action:1".to_owned(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CacheHit {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action:1".to_owned(),
+        restored_bytes: 42,
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CacheMiss {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action:1".to_owned(),
+        reason: CacheReason::ActionNotFound,
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CacheRestoreFinished {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action:1".to_owned(),
+        restored_bytes: 42,
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CachePublishStarted {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action:1".to_owned(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CachePublished {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action:1".to_owned(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CacheError {
+        run_id: 1,
+        scope: scope.clone(),
+        action: None,
+        reason: CacheReason::LookupFailed,
+        message: "unavailable".to_owned(),
+      }),
       ConsoleRecord::Diagnostic(ConsoleDiagnostic {
         run_id: Some(1),
         scope: Some(scope.clone()),
@@ -493,7 +776,10 @@ mod tests {
 
     for record in records {
       let value = serde_json::to_value(ConsoleEntry::new(record)).unwrap();
-      assert!(validator.is_valid(&value), "event does not match v2 schema: {value}");
+      assert!(
+        validator.is_valid(&value),
+        "event does not match current schema: {value}"
+      );
     }
   }
 
@@ -543,7 +829,7 @@ mod tests {
 
   #[test]
   fn current_schema_rejects_mismatched_categories_and_unknown_fields() {
-    let schema = serde_json::from_str(EVENT_SCHEMA_V3).unwrap();
+    let schema = serde_json::from_str(EVENT_SCHEMA_V4).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     let mut value = serde_json::to_value(ConsoleEntry::new(ConsoleRecord::Execution(
       ExecutionEvent::RunStarted {

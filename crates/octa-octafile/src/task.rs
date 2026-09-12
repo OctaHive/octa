@@ -52,12 +52,11 @@ const RESERVED_PLUGIN_KEYS: &[&str] = &[
   "execute_mode",
   "failfast",
   "timeout",
-  "sources",
-  "output",
+  "files",
+  "cache",
   "outputs",
   "artifacts",
   "reports",
-  "source_strategy",
   "watch",
   "if",
   "preconditions",
@@ -134,63 +133,37 @@ pub struct ReportDeclaration {
   pub format: String,
 }
 
-impl From<String> for ExecuteMode {
-  fn from(value: String) -> Self {
-    match value.as_str() {
-      "parallel" => ExecuteMode::Parallel,
-      "sequentially" => ExecuteMode::Sequentially,
-      _ => unimplemented!(),
-    }
-  }
+/// Filesystem inputs that define a task and exact roots it may materialize.
+///
+/// `inputs` remains optional in the parser model so a non-cached task may use
+/// `files.outputs` solely to constrain artifacts. Caching and watch mode both
+/// require it to be present, including when the intended set is explicitly
+/// empty. This distinction prevents a missing declaration from silently
+/// becoming a reusable action with no filesystem inputs.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskFiles {
+  /// Ordered include/exclude patterns used for content identity and watch.
+  pub inputs: Option<Vec<String>>,
+  /// Exact files or directory roots owned by the task result.
+  #[serde(default)]
+  pub outputs: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SourceStrategies {
-  Timestamp,
-  Hash,
-  Custom(String),
-}
-
-impl From<String> for SourceStrategies {
-  fn from(value: String) -> Self {
-    match value.as_str() {
-      "timestamp" => SourceStrategies::Timestamp,
-      "hash" => SourceStrategies::Hash,
-      _ => SourceStrategies::Custom(value),
-    }
-  }
-}
-
-impl SourceStrategies {
-  pub fn as_str(&self) -> &str {
-    match self {
-      Self::Timestamp => "timestamp",
-      Self::Hash => "hash",
-      Self::Custom(value) => value,
-    }
-  }
-}
-
-impl Serialize for SourceStrategies {
-  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-  where
-    S: serde::Serializer,
-  {
-    serializer.serialize_str(self.as_str())
-  }
-}
-
-impl<'de> Deserialize<'de> for SourceStrategies {
-  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-  where
-    D: Deserializer<'de>,
-  {
-    let value = String::deserialize(deserializer)?;
-    if value.trim().is_empty() {
-      return Err(serde::de::Error::custom("source strategy must not be empty"));
-    }
-    Ok(value.into())
-  }
+/// Task-result cache inputs that are not represented by the filesystem tree.
+///
+/// Configured task variables and environment values are included
+/// automatically. `environment` names only ambient process variables whose
+/// values intentionally affect the result; `salt` is an explicit manual
+/// invalidation input.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskCache {
+  /// Ambient process variable names explicitly included in action identity.
+  #[serde(default)]
+  pub environment: Vec<String>,
+  /// Optional user-controlled value for deliberate invalidation.
+  pub salt: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
@@ -199,17 +172,6 @@ pub enum AllowedRun {
   Always,
   Once,
   Changed,
-}
-
-impl From<String> for AllowedRun {
-  fn from(value: String) -> Self {
-    match value.as_str() {
-      "once" => AllowedRun::Once,
-      "always" => AllowedRun::Always,
-      "changed" => AllowedRun::Changed,
-      _ => unimplemented!(),
-    }
-  }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -727,11 +689,37 @@ impl Context {
     Ok(TaskCommand { payload, options })
   }
 
-  fn validate_task_outputs(&self, task: &Task) -> Result<(), String> {
-    if task.outputs.as_ref().is_some_and(|outputs| !outputs.is_empty())
-      && (task.sources.is_some() || task.output.is_some())
-    {
-      return Err("structured task outputs cannot be combined with freshness sources or file outputs".to_owned());
+  fn validate_task_contract(&self, task: &Task) -> Result<(), String> {
+    if task.cache.is_some() && task.files.as_ref().and_then(|files| files.inputs.as_ref()).is_none() {
+      return Err(
+        "a cached task must declare 'files.inputs'; use an explicit empty list when it has no file inputs".to_owned(),
+      );
+    }
+    if task.watch == Some(true) && task.files.as_ref().and_then(|files| files.inputs.as_ref()).is_none() {
+      return Err("a watched task must declare 'files.inputs'".to_owned());
+    }
+    if let Some(files) = &task.files {
+      if files
+        .inputs
+        .as_ref()
+        .is_some_and(|inputs| inputs.iter().any(|input| input.trim().is_empty()))
+      {
+        return Err("file input patterns must not be empty".to_owned());
+      }
+      if files.outputs.iter().any(|output| output.trim().is_empty()) {
+        return Err("file output roots must not be empty".to_owned());
+      }
+    }
+    if let Some(cache) = &task.cache {
+      let mut names = HashSet::new();
+      for name in &cache.environment {
+        if name.trim().is_empty() || !names.insert(name) {
+          return Err("cache environment names must be non-empty and unique".to_owned());
+        }
+      }
+      if cache.salt.as_ref().is_some_and(|salt| salt.trim().is_empty()) {
+        return Err("cache salt must not be empty".to_owned());
+      }
     }
     let mut steps = HashMap::<&str, Vec<(&str, bool)>>::new();
     for command in task.cmds.as_deref().unwrap_or_default() {
@@ -860,13 +848,12 @@ pub struct Task {
   pub execute_mode: Option<ExecuteMode>,             // How execute task commands
   pub failfast: Option<bool>,                        // Cancel parallel work after the first failure
   pub timeout: Option<Timeout>,                      // Default timeout for task commands
-  pub sources: Option<Vec<String>>,                  // Sources for fingerprinting
-  pub output: Option<Vec<String>>,                   // Files produced by this task
+  pub files: Option<TaskFiles>,                      // Inputs and exact filesystem output roots
+  pub cache: Option<TaskCache>,                      // Enables persistent task-result caching
   pub outputs: Option<IndexMap<String, TaskOutput>>, // Structured values exported from named steps
   pub artifacts: Option<Vec<ArtifactDeclaration>>,   // Files/directories registered after this task
   pub reports: Option<Vec<ReportDeclaration>>,       // Machine-readable reports registered after this task
-  pub source_strategy: Option<SourceStrategies>,     // Strategy used to fingerprint sources
-  pub watch: Option<bool>,                           // Watch sources and rerun the task
+  pub watch: Option<bool>,                           // Watch declared file inputs and rerun the task
   pub condition: Option<TaskConditions>,             // Plugin conditions around dependency execution
   pub preconditions: Option<Vec<String>>,            // Commands to check should run command
   pub plugin: Option<PluginCommand>,                 // Plugin command executed by this task
@@ -920,8 +907,12 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
     M: MapAccess<'de>,
   {
     let mut task = Task::default();
+    let mut seen = HashSet::new();
 
     while let Some(key) = map.next_key::<String>()? {
+      if !seen.insert(key.clone()) {
+        return Err(serde::de::Error::custom(format!("duplicate task field '{key}'")));
+      }
       match key.as_str() {
         "dir" => task.dir = map.next_value()?,
         "desc" => task.desc = map.next_value()?,
@@ -949,12 +940,11 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
         "execute_mode" => task.execute_mode = map.next_value()?,
         "failfast" => task.failfast = map.next_value()?,
         "timeout" => task.timeout = map.next_value()?,
-        "sources" => task.sources = map.next_value()?,
-        "output" => task.output = map.next_value()?,
+        "files" => task.files = map.next_value()?,
+        "cache" => task.cache = map.next_value()?,
         "outputs" => task.outputs = map.next_value()?,
         "artifacts" => task.artifacts = map.next_value()?,
         "reports" => task.reports = map.next_value()?,
-        "source_strategy" => task.source_strategy = map.next_value()?,
         "watch" => task.watch = map.next_value()?,
         "if" => {
           let condition: Option<Value> = map.next_value()?;
@@ -993,7 +983,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
 
     self
       .context
-      .validate_task_outputs(&task)
+      .validate_task_contract(&task)
       .map_err(serde::de::Error::custom)?;
 
     Ok(task)
@@ -1165,10 +1155,6 @@ outputs:
         "cmds:\n  - { id: build, docker: run }\noutputs:\n  value: { step: missing, field: digest }",
         "unknown plugin step 'missing'",
       ),
-      (
-        "sources: [src]\ncmds:\n  - { id: build, docker: run }\noutputs:\n  value: { step: build, field: digest }",
-        "cannot be combined with freshness",
-      ),
       ("cmds:\n  - { id: '', docker: run }", "command id must not be empty"),
       ("cmds:\n  - { id: nested, task: child }", "belongs to a task reference"),
       (
@@ -1182,12 +1168,47 @@ outputs:
   }
 
   #[test]
-  fn an_explicit_empty_structured_output_map_does_not_disable_file_freshness() {
+  fn file_contract_and_structured_outputs_are_independent() {
     parse_task(
       &structured_context(),
-      "sources: [src]\noutput: [target]\noutputs: {}\ndocker: build",
+      "files:\n  inputs: [src]\n  outputs: [target]\noutputs: {}\ndocker: build",
     )
     .unwrap();
+  }
+
+  #[test]
+  fn validates_cache_and_watch_file_contracts() {
+    let task = parse_task(
+      &context(),
+      "files:\n  inputs: [src/**, '!src/generated/**']\n  outputs: [target/app]\ncache:\n  environment: [RUSTFLAGS]\n  salt: v1\nwatch: true\nshell: build",
+    )
+    .unwrap();
+    assert_eq!(task.files.unwrap().outputs, ["target/app"]);
+    assert_eq!(task.cache.unwrap().environment, ["RUSTFLAGS"]);
+
+    for (yaml, expected) in [
+      ("cache: {}\nshell: build", "must declare 'files.inputs'"),
+      ("watch: true\nshell: build", "watched task must declare"),
+      (
+        "files: { inputs: [''], outputs: [] }\ncache: {}\nshell: build",
+        "input patterns must not be empty",
+      ),
+      (
+        "files: { inputs: [], outputs: [''] }\ncache: {}\nshell: build",
+        "output roots must not be empty",
+      ),
+      (
+        "files: { inputs: [] }\ncache: { environment: [RUSTFLAGS, RUSTFLAGS] }\nshell: build",
+        "environment names must be non-empty and unique",
+      ),
+      (
+        "files: { inputs: [] }\ncache: { salt: ' ' }\nshell: build",
+        "cache salt must not be empty",
+      ),
+    ] {
+      let error = parse_task(&context(), yaml).unwrap_err();
+      assert!(error.contains(expected), "{error}");
+    }
   }
 
   #[test]
@@ -1220,27 +1241,6 @@ outputs:
       timeout
     );
 
-    assert_eq!(ExecuteMode::from("parallel".to_owned()), ExecuteMode::Parallel);
-    assert_eq!(ExecuteMode::from("sequentially".to_owned()), ExecuteMode::Sequentially);
-    assert_eq!(
-      SourceStrategies::from("timestamp".to_owned()),
-      SourceStrategies::Timestamp
-    );
-    assert_eq!(SourceStrategies::from("hash".to_owned()), SourceStrategies::Hash);
-    assert_eq!(
-      SourceStrategies::from("content-addressed".to_owned()),
-      SourceStrategies::Custom("content-addressed".to_owned())
-    );
-    assert_eq!(serde_yml::to_string(&SourceStrategies::Hash).unwrap().trim(), "hash");
-    assert_eq!(
-      serde_yml::to_string(&SourceStrategies::Custom("content-addressed".to_owned()))
-        .unwrap()
-        .trim(),
-      "content-addressed"
-    );
-    assert_eq!(AllowedRun::from("once".to_owned()), AllowedRun::Once);
-    assert_eq!(AllowedRun::from("always".to_owned()), AllowedRun::Always);
-    assert_eq!(AllowedRun::from("changed".to_owned()), AllowedRun::Changed);
     assert!(matches!(Deps::from("build".to_owned()), Deps::Simple(task) if task == "build"));
   }
 
@@ -1313,10 +1313,10 @@ outputs:
   }
 
   #[test]
-  fn parses_task_specific_presentation_without_colliding_with_artifact_outputs() {
+  fn parses_task_specific_presentation_without_colliding_with_file_outputs() {
     let task = parse_task(
       &context(),
-      "presentation:\n  output: replacing\noutput: [dist/app]\nshell: echo ready",
+      "presentation:\n  output: replacing\nfiles:\n  outputs: [dist/app]\nshell: echo ready",
     )
     .unwrap();
 
@@ -1324,7 +1324,7 @@ outputs:
       task.presentation.and_then(|presentation| presentation.output),
       Some(crate::TaskOutputMode::Replacing)
     );
-    assert_eq!(task.output, Some(vec!["dist/app".to_owned()]));
+    assert_eq!(task.files.unwrap().outputs, ["dist/app"]);
   }
 
   #[test]

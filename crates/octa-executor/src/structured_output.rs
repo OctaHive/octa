@@ -187,6 +187,7 @@ pub(crate) struct CompletionOutputs {
   task: TaskOutputs,
   artifacts: Arc<Vec<RegisteredArtifact>>,
   reports: Arc<Vec<RegisteredReport>>,
+  cache: Option<crate::execution_result::CacheOutcome>,
 }
 
 /// One public task output selected from a plugin step result.
@@ -203,6 +204,7 @@ impl CompletionOutputs {
       task,
       artifacts: Arc::new(Vec::new()),
       reports: Arc::new(Vec::new()),
+      cache: None,
     }
   }
 
@@ -234,6 +236,16 @@ impl CompletionOutputs {
 
   pub(crate) fn reports(&self) -> &[RegisteredReport] {
     &self.reports
+  }
+
+  /// Attaches task-level cache metadata without mixing it into plugin outputs.
+  pub(crate) fn with_cache(mut self, cache: crate::execution_result::CacheOutcome) -> Self {
+    self.cache = Some(cache);
+    self
+  }
+
+  pub(crate) fn cache(&self) -> Option<&crate::execution_result::CacheOutcome> {
+    self.cache.as_ref()
   }
 }
 

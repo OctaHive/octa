@@ -1,0 +1,27 @@
+{
+  "result_version": 1,
+  "action": {
+    "algorithm": "blake3",
+    "hash": "0707070707070707070707070707070707070707070707070707070707070707",
+    "size_bytes": 707
+  },
+  "output_bundle": {
+    "digest": {
+      "algorithm": "blake3",
+      "hash": "0808080808080808080808080808080808080808080808080808080808080808",
+      "size_bytes": 808
+    },
+    "encoding": "zstd_v1",
+    "encoded_size_bytes": 404,
+    "expanded_size_bytes": 808,
+    "entry_count": 2
+  },
+  "stdout": "compiled",
+  "task_outputs": { "binary": "target/release/octa" },
+  "artifacts": [
+    { "name": "octa", "path": "target/release/octa", "content_type": "application/octet-stream" }
+  ],
+  "reports": [
+    { "name": "tests", "path": "reports/junit.xml", "format": "junit" }
+  ]
+}

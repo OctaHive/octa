@@ -49,12 +49,12 @@ impl TaskGraphBuilder {
     let mut vars = root.vars.clone().map(Vars::with_variables).unwrap_or_default();
     vars.set_dir(root.dir.clone());
 
-    vars.insert("ROOT_DIR", &root.dir.display().to_string());
-    vars.insert("OCTAFILE_DIR", &root.dir.display().to_string());
-    vars.insert("USER_WORKING_DIR", &self.dir.display().to_string());
-    vars.insert("COMMAND_ARGS", &self.command_args);
-    vars.insert("OCTA_OS", &os_type.to_string());
-    vars.insert("OCTA_ARCH", &os_arch.to_string());
+    vars.insert_transient("ROOT_DIR", &root.dir.display().to_string());
+    vars.insert_transient("OCTAFILE_DIR", &root.dir.display().to_string());
+    vars.insert_transient("USER_WORKING_DIR", &self.dir.display().to_string());
+    vars.insert_transient("COMMAND_ARGS", &self.command_args);
+    vars.insert_transient("OCTA_OS", &os_type.to_string());
+    vars.insert_transient("OCTA_ARCH", &os_arch.to_string());
 
     vars
   }
@@ -78,7 +78,7 @@ impl TaskGraphBuilder {
             new_vars.set_variables(nested_vars);
           }
           new_vars.set_dir(nested_octafile.dir.clone());
-          new_vars.insert("TASKFILE_DIR", &current.dir.display().to_string());
+          new_vars.insert_transient("TASKFILE_DIR", &current.dir.display().to_string());
 
           *vars = new_vars;
           current = Arc::clone(&nested_octafile);

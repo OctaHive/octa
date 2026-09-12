@@ -30,9 +30,9 @@ build commit.
 
 An input frame is limited to 1 MiB including its JSON payload. An oversized
 or unterminated frame is rejected without buffering unbounded input. The
-machine-readable schemas are
-[`input-v1.schema.json`](../crates/octa-runner-protocol/schema/input-v1.schema.json) and
-[`output-v1.schema.json`](../crates/octa-runner-protocol/schema/output-v1.schema.json).
+machine-readable schemas are published as
+[v2 input](../crates/octa-runner-protocol/schema/input-v2.schema.json) and
+[v2 output](../crates/octa-runner-protocol/schema/output-v2.schema.json).
 
 Runtime event production uses a bounded queue. If the caller stops reading
 stdout, backpressure eventually pauses task output instead of accumulating an
@@ -43,7 +43,7 @@ unbounded in-memory event backlog.
 ```json
 {
   "type": "start",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "request_id": "job-42-attempt-1",
   "request": {
     "workspace": "/workspace/project",
@@ -52,6 +52,21 @@ unbounded in-memory event backlog.
     "plugins_dir": "/opt/octa/plugins",
     "plugin_lock": "Octa.lock",
     "secrets_profile": ".octa/secrets.agent.yml",
+    "cache": {
+      "mode": "read_write",
+      "namespace": "project/example",
+      "local_directory": "/var/cache/octa",
+      "runtime": {
+        "kind": "native",
+        "os": "linux",
+        "architecture": "amd64",
+        "environment": {
+          "algorithm": "blake3",
+          "hash": "d8e5a0f5d4c2dff70ef36b654c5e56b6137595bd97e6c5816c9a1c6bf040f15e",
+          "size_bytes": 28
+        }
+      }
+    },
     "commands": ["ci"],
     "variables": {"PROFILE": "release"},
     "arguments": [],
@@ -76,6 +91,18 @@ request never contains secret values; see [secret providers](secrets.md).
 
 The request describes execution only. Repository, lease, sandbox, resource,
 and server transport settings intentionally do not belong to this protocol.
+
+Protocol v1 is intentionally not accepted: Octa does not maintain a partial
+compatibility adapter for the pre-cache runner contract. `local_directory` is agent-selected and absolute;
+`runtime` is the exact Native environment or immutable OCI image identity used
+by the job. The optional `remote` member reserves the Phase 6 HTTPS transport
+contract, but the current runner rejects it and does not advertise a remote-cache
+feature. Its token value is never serialized. Agents
+must provide a regular, non-symlink token file containing 1 to 64 KiB; on Unix
+it must not grant group or other permissions. Agents must inspect
+`capabilities.features` before requesting a transport: the current
+`task-result-cache-v1` feature advertises the shared cache engine and local CAS,
+not the later HTTP transport.
 
 Rust consumers should use the separately versioned
 [`octa-runner-protocol`](../crates/octa-runner-protocol) crate. It owns the
@@ -102,9 +129,9 @@ The initial handshake reports protocol compatibility:
 ```json
 {
   "type": "hello",
-  "protocol_version": 1,
+  "protocol_version": 2,
   "octa_version": "0.3.0",
-  "event_schema_version": 3,
+  "event_schema_version": 4,
   "plugin_protocol_version": 1
 }
 ```

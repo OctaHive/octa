@@ -1,4 +1,4 @@
-//! Stable, executor-owned representations used by freshness fingerprints.
+//! Stable, executor-owned task semantics used by persistent action identities.
 //!
 //! These values deliberately do not reuse `Serialize` on the public parser
 //! model. Parsing and cache identity can therefore evolve independently.
@@ -13,35 +13,34 @@ use crate::error::{ExecutorError, ExecutorResult};
 
 pub(crate) fn task_definition(task: &Task) -> ExecutorResult<Value> {
   // Keep this destructuring exhaustive: adding a Task field must force an explicit decision about
-  // whether and how it participates in the persisted freshness identity.
+  // whether and how it participates in the persistent action identity.
   let Task {
     env,
     dotenv,
     dir,
-    desc,
+    desc: _,
     prefix: _,
     presentation: _,
     vars,
     cmds,
-    internal,
-    platforms,
+    internal: _,
+    platforms: _,
     ignore_error,
     deps,
-    run,
+    run: _,
     quiet: _,
     silent: _,
     raw,
     interactive,
     execute_mode,
-    failfast,
+    failfast: _,
     timeout,
-    sources,
-    output,
+    files,
+    cache: _,
     outputs,
     artifacts,
     reports,
-    source_strategy,
-    watch,
+    watch: _,
     condition,
     preconditions,
     plugin,
@@ -51,26 +50,18 @@ pub(crate) fn task_definition(task: &Task) -> ExecutorResult<Value> {
     "env": env,
     "dotenv": dotenv,
     "dir": dir,
-    "desc": desc,
     "vars": vars,
     "cmds": cmds.as_deref().map(command_definitions).transpose()?,
-    "internal": internal,
-    "platforms": platforms,
     "ignore_error": ignore_error,
     "deps": deps.as_deref().map(dep_definitions),
-    "run": run,
     "raw": raw,
     "interactive": interactive,
     "execute_mode": execute_mode,
-    "failfast": failfast,
     "timeout": timeout,
-    "sources": sources,
-    "output": output,
+    "files": files,
     "outputs": outputs,
     "artifacts": artifacts,
     "reports": reports,
-    "source_strategy": source_strategy,
-    "watch": watch,
     "condition": condition.as_ref().map(condition_definitions).transpose()?,
     "preconditions": preconditions,
     "plugin": plugin.as_ref().map(plugin_definition).transpose()?,
@@ -175,12 +166,12 @@ fn plugin_definition(plugin: &PluginCommand) -> ExecutorResult<Value> {
 }
 
 fn json_value<T: Serialize>(value: &T) -> ExecutorResult<Value> {
-  serde_json::to_value(value).map_err(|error| ExecutorError::FreshnessIdentityError(error.to_string()))
+  serde_json::to_value(value).map_err(ExecutorError::ActionIdentitySerialization)
 }
 
 #[cfg(test)]
 mod tests {
-  use octa_octafile::ConditionEvaluation;
+  use octa_octafile::{AllowedRun, ConditionEvaluation, ExecuteMode, Silence, TaskFiles};
 
   use super::*;
 
@@ -220,5 +211,53 @@ mod tests {
     .unwrap();
     assert_eq!(conditions["before_deps"]["evaluate"], "once");
     assert_eq!(conditions["after_deps"]["evaluate"], "per_command");
+  }
+
+  #[test]
+  fn semantic_definition_includes_execution_but_excludes_presentation_policy() {
+    let plugin = |value: &str| PluginCommand {
+      key: "shell".to_owned(),
+      value: serde_yml::Value::String(value.to_owned()),
+    };
+    let task = Task {
+      dir: Some("work".into()),
+      desc: Some("human description".to_owned()),
+      prefix: Some("pretty".to_owned()),
+      cmds: Some(vec![TaskCommand {
+        payload: CommandPayload::Plugin(plugin("build")),
+        options: CommandOptions {
+          id: Some("compile".to_owned()),
+          platforms: Some(vec!["linux".to_owned()]),
+          deferred: true,
+          timeout: Some(serde_yml::from_str("1s").unwrap()),
+          condition: Some(plugin("test -f input")),
+          quiet: Some(true),
+          silent: Some(Silence::All),
+          raw: Some(false),
+          ignore_error: Some(false),
+        },
+      }]),
+      run: Some(AllowedRun::Once),
+      quiet: Some(true),
+      silent: Some(Silence::All),
+      execute_mode: Some(ExecuteMode::Sequentially),
+      files: Some(TaskFiles {
+        inputs: Some(vec!["input".to_owned()]),
+        outputs: vec!["output".to_owned()],
+      }),
+      ..Task::default()
+    };
+
+    let identity = task_definition(&task).unwrap();
+    assert_eq!(identity["dir"], "work");
+    assert_eq!(identity["cmds"][0]["payload"]["type"], "plugin");
+    assert_eq!(identity["cmds"][0]["options"]["id"], "compile");
+    assert_eq!(identity["cmds"][0]["options"]["deferred"], true);
+    assert_eq!(identity["files"]["outputs"][0], "output");
+    assert!(identity.get("desc").is_none());
+    assert!(identity.get("prefix").is_none());
+    assert!(identity.get("run").is_none());
+    assert!(identity.get("quiet").is_none());
+    assert!(identity.get("silent").is_none());
   }
 }

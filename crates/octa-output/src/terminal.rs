@@ -75,7 +75,14 @@ impl TerminalRenderer {
       | ExecutionEvent::StepFinished { .. }
       | ExecutionEvent::Progress { .. }
       | ExecutionEvent::ArtifactRegistered { .. }
-      | ExecutionEvent::ReportRegistered { .. } => {},
+      | ExecutionEvent::ReportRegistered { .. }
+      | ExecutionEvent::CacheLookupStarted { .. }
+      | ExecutionEvent::CacheHit { .. }
+      | ExecutionEvent::CacheMiss { .. }
+      | ExecutionEvent::CacheRestoreFinished { .. }
+      | ExecutionEvent::CachePublishStarted { .. }
+      | ExecutionEvent::CachePublished { .. }
+      | ExecutionEvent::CacheError { .. } => {},
       ExecutionEvent::Output { stream, payload, .. } => match stream {
         ConsoleStream::Stdout => write_payload(&mut *self.stdout, payload)?,
         ConsoleStream::Stderr => write_payload(&mut *self.stderr, payload)?,

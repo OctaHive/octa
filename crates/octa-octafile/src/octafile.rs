@@ -20,7 +20,7 @@ use crate::{
   monorepo::MonorepoConfig,
   output::OutputConfig,
   parser::{self, location_error, Node},
-  task::{AllowedRun, Context, PluginCommand, PluginSchemas, Silence, SourceStrategies, Task, TaskSeed},
+  task::{AllowedRun, Context, PluginCommand, PluginSchemas, Silence, Task, TaskSeed},
   variable::Variable,
 };
 
@@ -189,9 +189,6 @@ pub struct Octafile {
   // Default task run mode
   pub run: Option<AllowedRun>,
 
-  // Default source fingerprinting strategy
-  pub source_strategy: Option<SourceStrategies>,
-
   // Stop parallel execution after the first failure
   pub failfast: Option<bool>,
 
@@ -254,7 +251,6 @@ impl fmt::Debug for Octafile {
       .field("name", &self._name)
       .field("dotenv", &self.dotenv)
       .field("run", &self.run)
-      .field("source_strategy", &self.source_strategy)
       .field("failfast", &self.failfast)
       .field("concurrency", &self.concurrency)
       .field("interval", &self.interval)
@@ -497,9 +493,6 @@ impl Octafile {
         },
         "run" => {
           octafile.run = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
-        },
-        "source_strategy" => {
-          octafile.source_strategy = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
         },
         "failfast" => {
           octafile.failfast = serde_yml::from_value(value.into_value()?).map_err(|e| e.to_string())?;
@@ -1104,12 +1097,13 @@ mod tests {
     let content = r#"
       version: 1
       run: changed
-      source_strategy: hash
       concurrency: 4
       interval: 250ms
       tasks:
         test:
           watch: true
+          files:
+            inputs: []
           shell: echo "hello"
     "#;
     let (_temp_dir, file_path) = create_temp_octafile(content, "load_basic_octafile");
@@ -1117,7 +1111,6 @@ mod tests {
     let octafile = Octafile::load(Some(file_path), false, vec!["shell".to_string()], "shell").unwrap();
     assert_eq!(octafile.version, 1);
     assert_eq!(octafile.run, Some(AllowedRun::Changed));
-    assert_eq!(octafile.source_strategy, Some(SourceStrategies::Hash));
     assert_eq!(octafile.concurrency.map(|limit| limit.get()), Some(4));
     assert_eq!(octafile.interval.unwrap().duration(), Duration::from_millis(250));
     assert_eq!(octafile.tasks["test"].watch, Some(true));
@@ -1162,13 +1155,10 @@ mod tests {
   }
 
   #[test]
-  fn rejects_invalid_octafile_source_strategy() {
-    for strategy in ["''", "[]"] {
-      let content = format!("version: 1\nsource_strategy: {strategy}\ntasks: {{}}\n");
-      let (_temp_dir, file_path) = create_temp_octafile(&content, "invalid_octafile_source_strategy");
-
-      assert!(Octafile::load(Some(file_path), false, vec!["shell".to_string()], "shell").is_err());
-    }
+  fn rejects_removed_root_source_strategy() {
+    let content = "version: 1\nsource_strategy: hash\ntasks: {}\n";
+    let (_temp_dir, file_path) = create_temp_octafile(content, "removed_source_strategy");
+    assert!(Octafile::load(Some(file_path), false, vec!["shell".to_string()], "shell").is_err());
   }
 
   #[test]
@@ -2498,11 +2488,11 @@ tasks: {}
           silent: true
           execute_mode: parallel
           timeout: 2m
-          sources:
-            - "src/**/*.rs"
-          output:
-            - "target/app"
-          source_strategy: hash
+          files:
+            inputs:
+              - "src/**/*.rs"
+            outputs:
+              - "target/app"
           watch: true
           if: test -f "Cargo.toml"
           preconditions:
@@ -2525,9 +2515,11 @@ tasks: {}
     assert_eq!(task.silent, Some(Silence::All));
     assert!(task.execute_mode.is_some());
     assert_eq!(task.timeout.unwrap().duration(), std::time::Duration::from_secs(120));
-    assert!(task.sources.is_some());
-    assert_eq!(task.output, Some(vec!["target/app".to_owned()]));
-    assert!(task.source_strategy.is_some());
+    assert_eq!(
+      task.files.as_ref().and_then(|files| files.inputs.as_ref()).unwrap(),
+      &["src/**/*.rs"]
+    );
+    assert_eq!(task.files.as_ref().unwrap().outputs, ["target/app"]);
     assert_eq!(task.watch, Some(true));
     assert_eq!(
       task

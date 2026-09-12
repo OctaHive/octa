@@ -110,6 +110,18 @@ fn estimated_memory(entry: &ConsoleEntry) -> usize {
       ExecutionEvent::ReportRegistered { scope, report, .. } => {
         scope.label().len() + report.name.len() + report.path.len()
       },
+      ExecutionEvent::CacheLookupStarted { scope, action, .. }
+      | ExecutionEvent::CachePublishStarted { scope, action, .. }
+      | ExecutionEvent::CachePublished { scope, action, .. } => scope.label().len() + action.len(),
+      ExecutionEvent::CacheHit { scope, action, .. } | ExecutionEvent::CacheRestoreFinished { scope, action, .. } => {
+        scope.label().len() + action.len()
+      },
+      ExecutionEvent::CacheMiss {
+        scope, action, reason, ..
+      } => scope.label().len() + action.len() + reason.as_str().len(),
+      ExecutionEvent::CacheError {
+        scope, action, message, ..
+      } => scope.label().len() + action.as_ref().map_or(0, String::len) + message.len(),
     },
     ConsoleRecord::Diagnostic(diagnostic) => {
       diagnostic.message.len()
@@ -196,7 +208,10 @@ mod tests {
 
   #[test]
   fn estimates_dynamic_memory_for_each_record_shape() {
-    use crate::{CliDocument, ConsoleDiagnostic, ConsoleLevel, ConsoleScopeAllocator, ConsoleStatus, ProgressUpdate};
+    use crate::{
+      CliDocument, ConsoleDiagnostic, ConsoleLevel, ConsoleScopeAllocator, ConsoleStatus, ProgressUpdate,
+      RegisteredArtifact, RegisteredReport,
+    };
 
     let scope = ConsoleScopeAllocator::default().scope("scope");
     let records = [
@@ -213,6 +228,10 @@ mod tests {
         run_id: 1,
         scope: scope.clone(),
       }),
+      ConsoleRecord::Execution(ExecutionEvent::ScopeDeclared {
+        run_id: 1,
+        scope: scope.clone(),
+      }),
       ConsoleRecord::Execution(ExecutionEvent::Progress {
         run_id: 1,
         scope: Some(scope.clone()),
@@ -224,6 +243,66 @@ mod tests {
           total: Some(2),
           unit: Some("files".to_owned()),
         },
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::ArtifactRegistered {
+        run_id: 1,
+        scope: scope.clone(),
+        step_id: None,
+        artifact: RegisteredArtifact {
+          name: "binary".to_owned(),
+          path: "target/app".to_owned(),
+          content_type: Some("application/octet-stream".to_owned()),
+        },
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::ReportRegistered {
+        run_id: 1,
+        scope: scope.clone(),
+        step_id: None,
+        report: RegisteredReport {
+          name: "tests".to_owned(),
+          path: "reports/junit.xml".to_owned(),
+          format: "junit".to_owned(),
+        },
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CacheLookupStarted {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action".to_owned(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CacheHit {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action".to_owned(),
+        restored_bytes: 10,
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CacheMiss {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action".to_owned(),
+        reason: crate::CacheReason::ActionNotFound,
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CacheRestoreFinished {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action".to_owned(),
+        restored_bytes: 10,
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CachePublishStarted {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action".to_owned(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CachePublished {
+        run_id: 1,
+        scope: scope.clone(),
+        action: "blake3:action".to_owned(),
+      }),
+      ConsoleRecord::Execution(ExecutionEvent::CacheError {
+        run_id: 1,
+        scope: scope.clone(),
+        action: Some("blake3:action".to_owned()),
+        reason: crate::CacheReason::LookupFailed,
+        message: "offline".to_owned(),
       }),
       ConsoleRecord::Diagnostic(ConsoleDiagnostic {
         run_id: Some(1),

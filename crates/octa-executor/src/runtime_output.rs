@@ -8,8 +8,8 @@ use std::{io, sync::Arc};
 
 use octa_octafile::Silence;
 use octa_output::{
-  Console, ConsoleLevel, ConsolePayload, ConsoleStep, ConsoleStream, ExecutionEvent, ProgressUpdate, RawConsoleSession,
-  SourceLocation,
+  CacheReason, Console, ConsoleLevel, ConsolePayload, ConsoleStep, ConsoleStream, ExecutionEvent, ProgressUpdate,
+  RawConsoleSession, SourceLocation,
 };
 
 #[cfg(test)]
@@ -27,6 +27,101 @@ pub(crate) struct RuntimeOutput {
 }
 
 impl RuntimeOutput {
+  fn cache_scope(&self) -> io::Result<octa_output::ConsoleScope> {
+    self
+      .binding
+      .as_ref()
+      .map(|binding| binding.scope().clone())
+      .ok_or_else(|| io::Error::other("cache lifecycle event has no task scope"))
+  }
+
+  pub(crate) async fn cache_lookup_started(&self, action: String) -> io::Result<()> {
+    self
+      .console
+      .event(ExecutionEvent::CacheLookupStarted {
+        run_id: self.run_id,
+        scope: self.cache_scope()?,
+        action,
+      })
+      .await
+  }
+
+  pub(crate) async fn cache_hit(&self, action: String, restored_bytes: u64) -> io::Result<()> {
+    self
+      .console
+      .event(ExecutionEvent::CacheHit {
+        run_id: self.run_id,
+        scope: self.cache_scope()?,
+        action,
+        restored_bytes,
+      })
+      .await
+  }
+
+  pub(crate) async fn cache_miss(&self, action: String, reason: CacheReason) -> io::Result<()> {
+    self
+      .console
+      .event(ExecutionEvent::CacheMiss {
+        run_id: self.run_id,
+        scope: self.cache_scope()?,
+        action,
+        reason,
+      })
+      .await
+  }
+
+  pub(crate) async fn cache_restore_finished(&self, action: String, restored_bytes: u64) -> io::Result<()> {
+    self
+      .console
+      .event(ExecutionEvent::CacheRestoreFinished {
+        run_id: self.run_id,
+        scope: self.cache_scope()?,
+        action,
+        restored_bytes,
+      })
+      .await
+  }
+
+  pub(crate) async fn cache_publish_started(&self, action: String) -> io::Result<()> {
+    self
+      .console
+      .event(ExecutionEvent::CachePublishStarted {
+        run_id: self.run_id,
+        scope: self.cache_scope()?,
+        action,
+      })
+      .await
+  }
+
+  pub(crate) async fn cache_published(&self, action: String) -> io::Result<()> {
+    self
+      .console
+      .event(ExecutionEvent::CachePublished {
+        run_id: self.run_id,
+        scope: self.cache_scope()?,
+        action,
+      })
+      .await
+  }
+
+  pub(crate) async fn cache_error(
+    &self,
+    action: Option<String>,
+    reason: CacheReason,
+    message: impl Into<String>,
+  ) -> io::Result<()> {
+    self
+      .console
+      .event(ExecutionEvent::CacheError {
+        run_id: self.run_id,
+        scope: self.cache_scope()?,
+        action,
+        reason,
+        message: message.into(),
+      })
+      .await
+  }
+
   #[cfg(test)]
   pub(crate) fn new(console: Arc<Console>, run_id: u64, scope: Option<ConsoleScope>) -> Self {
     Self {

@@ -3,9 +3,6 @@
 //! These errors retain executor-specific context internally. Public terminal
 //! results convert them into stable `ExecutionFailure` values at the API edge.
 
-use std::time::SystemTimeError;
-
-use glob::PatternError;
 use octa_dag::error::DAGError;
 use octa_octafile::OctafileError;
 use octa_output::SourceLocation;
@@ -151,41 +148,33 @@ pub enum ExecutorError {
   #[error("Invalid execution identity: {0}")]
   ExecutionIdentityError(String),
 
-  /// Persistent fingerprint storage could not be read or updated.
-  #[error("Failed to get or set fingerprint db")]
-  OpenFingerprintDbError(#[from] sled::Error),
+  /// Semantic task inputs could not be converted into a stable action identity.
+  #[error("Failed to build cache action identity: {0}")]
+  ActionIdentityError(String),
 
-  /// A freshness-dependent node ran before its shared decision was available.
-  #[error("Freshness state is unavailable: {0}")]
-  FreshnessStateUnavailable(String),
+  /// Structured action inputs could not be encoded canonically.
+  #[error("Failed to serialize cache action identity: {0}")]
+  ActionIdentitySerialization(#[source] serde_json::Error),
 
-  /// A freshness decision was published more than once.
-  #[error("Freshness state has already been published")]
-  FreshnessStateAlreadyPublished,
-
-  /// Inputs used as the persistent freshness identity could not be serialized.
-  #[error("Failed to build freshness identity: {0}")]
-  FreshnessIdentityError(String),
-
-  /// No registered strategy can fingerprint the configured sources.
-  #[error("No source strategy provider is registered for '{0}'")]
-  SourceStrategyUnavailable(String),
+  /// A task cache contract is unsafe or cannot reproduce the task result.
+  #[error("Invalid task cache configuration: {0}")]
+  InvalidCacheConfiguration(String),
 
   /// An internal task node was built without a required configuration value.
   #[error("Missing mandatory task configuration field: {0}")]
   TaskConfigFieldMissing(&'static str),
 
-  /// A filesystem timestamp predates the supported epoch.
-  #[error("Failed to calculate duration for time")]
-  CalculateDurationError(#[from] SystemTimeError),
+  /// Cache orchestration reached an impossible lifecycle state.
+  #[error("Invalid cache lifecycle state: {0}")]
+  CacheState(&'static str),
 
-  /// A configured source or output glob is invalid.
-  #[error("Failed to expand file pattern")]
-  ExtendSourceError(#[from] PatternError),
+  /// Cache protocol metadata failed validation at the executor boundary.
+  #[error("Invalid cache protocol value: {0}")]
+  CacheProtocol(#[source] Box<octa_cache_protocol::CacheProtocolError>),
 
-  /// Loading or applying an `.octaignore` file failed.
-  #[error("Failed to load .octaignore: {0}")]
-  OctaignoreError(#[from] ignore::Error),
+  /// Cache filesystem, metadata, or storage operation failed.
+  #[error("Cache operation failed: {0}")]
+  Cache(#[source] Box<octa_cache::CacheError>),
 
   /// A selected dotenv file could not be parsed or read.
   #[error("Failed to load environment file '{path}': {source}")]
@@ -304,6 +293,18 @@ pub enum ExecutorError {
   /// A shared runtime resource could not be locked.
   #[error("Lock error: {0}")]
   LockError(String),
+}
+
+impl From<octa_cache::CacheError> for ExecutorError {
+  fn from(error: octa_cache::CacheError) -> Self {
+    Self::Cache(Box::new(error))
+  }
+}
+
+impl From<octa_cache_protocol::CacheProtocolError> for ExecutorError {
+  fn from(error: octa_cache_protocol::CacheProtocolError) -> Self {
+    Self::CacheProtocol(Box::new(error))
+  }
 }
 
 impl ExecutorError {

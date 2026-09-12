@@ -1,7 +1,7 @@
 //! Expansion of task invocations into executable DAG nodes.
 //!
 //! An Octafile task is hierarchical: it may have conditions, dependencies,
-//! nested task calls, plugin commands, freshness checks, and deferred cleanup.
+//! nested task calls, plugin commands, task-result cache boundaries, and deferred cleanup.
 //! The scheduler intentionally knows none of those concepts, so this module
 //! lowers them into a flat graph of executable and barrier nodes.
 //!
@@ -72,8 +72,22 @@ impl TaskGraphBuilder {
     self.scopes.push(scope.clone());
     request.context.output_scope = Some(scope);
 
+    // Watching is a property of the declared input set, not of persistent
+    // caching. Register it once per distinct invocation input contract so a
+    // non-cached task can still participate in `--watch`.
+    if let Some(inputs) = command.task.files.as_ref().and_then(|files| files.inputs.as_ref()) {
+      let target = WatchTarget::new(inputs.clone(), self.dir.clone());
+      if !self
+        .watch_targets
+        .iter()
+        .any(|existing| existing.inputs == target.inputs && existing.workspace == target.workspace)
+      {
+        self.watch_targets.push(target);
+      }
+    }
+
     // Variables and environments are collected once per invocation and shared
-    // by all of its condition, freshness, command, and barrier nodes.
+    // by all of its condition, cache, command, and barrier nodes.
     let collected_vars = self.collect_vars_with_identity(command, request.context.vars.clone())?;
     self.validate_task_output_references(command, &collected_vars.runtime)?;
     let environment = self.collect_environment_plan(command, request.context.envs.clone())?;
@@ -197,23 +211,24 @@ impl TaskGraphBuilder {
     parents: Vec<ArcNode>,
     run_parallel: Option<bool>,
   ) -> ExecutorResult<Option<ArcNode>> {
-    // Freshness guards the task body after dependencies have completed. Each
-    // dependency owns its own freshness boundary and is evaluated separately.
-    let (context, parents, freshness) = self.add_freshness_gate(dag, command, context, parents)?;
+    // Persistent lookup belongs after dependencies and task-level conditions.
+    // Each dependency owns its own cache boundary and is evaluated separately.
+    let (context, parents, cache_plan) = self.add_cache_lookup(dag, command, context, parents).await?;
 
     // Shorthand tasks contain one plugin payload directly instead of `cmds`.
     let Some(commands) = &command.task.cmds else {
       let task = self.create_task_node(
-        dag,
         command,
         &context,
         None,
         None,
         Self::command_cache_key(&command.name, 0),
+        0,
       )?;
+      dag.add_node(task.clone());
       Self::connect_parents(dag, &parents, &task)?;
-      let terminal = self.add_freshness_commit(dag, command, &context, freshness, vec![task])?;
-      return self.add_resource_registration(dag, command, &context, terminal.into_iter().collect());
+      let terminal = self.add_resource_registration(dag, command, &context, vec![task])?;
+      return self.add_cache_finalize(dag, command, &context, cache_plan, terminal.into_iter().collect());
     };
 
     // Nested task calls publish their own scopes. Explicit outer barriers keep
@@ -297,13 +312,14 @@ impl TaskGraphBuilder {
         CommandPayload::Plugin(plugin) => {
           let simple = self.create_simple_command(plugin, command, &command_item.options);
           let task = self.create_task_node(
-            dag,
             &simple,
             &context,
             command_item.options.condition.clone(),
             command_item.options.id.as_deref(),
             Self::command_cache_key(&command.name, command_index),
+            command_index,
           )?;
+          dag.add_node(task.clone());
           Self::connect_parents(dag, &entries, &task)?;
           vec![task]
         },
@@ -328,20 +344,21 @@ impl TaskGraphBuilder {
     } else {
       sequential_parent.into_iter().collect()
     };
-    // Parallel bodies need one completion point before freshness commit and
+    // Parallel bodies need one completion point before cache finalization and
     // deferred ordering. Sequential bodies already have a single tail.
     let terminal = self.join_nodes(dag, &mut terminals, format!("Complete task {}", command.name))?;
     let predecessors = terminal.map_or(parents, |terminal| vec![terminal]);
+    // Cleanup may mutate declared outputs. Run it before validating resources
+    // and capturing the bundle, otherwise a hit could restore pre-cleanup state.
     let predecessors = self
-      .add_freshness_commit(dag, command, &context, freshness, predecessors)?
+      .attach_deferred_nodes(dag, deferred_nodes, predecessors)?
       .into_iter()
       .collect();
     let predecessors = self
       .add_resource_registration(dag, command, &context, predecessors)?
       .into_iter()
       .collect();
-
-    let terminal = self.attach_deferred_nodes(dag, deferred_nodes, predecessors)?;
+    let terminal = self.add_cache_finalize(dag, command, &context, cache_plan, predecessors)?;
 
     // The closing scope barrier is required only when the explicit opening
     // barrier above was inserted for a body containing nested task calls.
@@ -354,461 +371,6 @@ impl TaskGraphBuilder {
     let finish = self.create_scope_barrier(dag, format!("Finish task scope {}", command.name), scope)?;
     dag.add_dependency(&terminal, &finish)?;
     Ok(Some(finish))
-  }
-
-  fn add_freshness_gate(
-    &self,
-    dag: &mut DagNode,
-    command: &FindResult,
-    mut context: InvocationContext,
-    parents: Vec<ArcNode>,
-  ) -> ExecutorResult<(InvocationContext, Vec<ArcNode>, Option<Arc<FreshnessState>>)> {
-    if command.task.sources.is_none() && command.task.output.is_none() {
-      return Ok((context, parents, None));
-    }
-
-    // One decision object is written by the check node and read by every node
-    // in this invocation. It avoids repeated filesystem scans per command.
-    let state = Arc::new(FreshnessState::default());
-    let runtime = context
-      .runtime
-      .clone()
-      .ok_or(ExecutorError::TaskConfigFieldMissing("invocation_runtime"))?;
-    let method = Self::task_source_strategy(command)
-      .map(SourceMethod::from)
-      .unwrap_or(SourceMethod::Hash);
-    let strategy = self.source_strategies.resolve(&method)?;
-    let identity = FreshnessIdentity::new(
-      command.name.clone(),
-      context.dep_name.clone(),
-      self.execution_definition(command)?,
-    )
-    .with_invocation_inputs(
-      self.command_args.clone(),
-      self.variable_overrides.clone(),
-      context.vars.clone(),
-      context.envs.clone(),
-    );
-    let spec = FreshnessConfig::new(
-      command.task.sources.clone(),
-      command.task.output.clone(),
-      command.octafile.root().dir.clone(),
-      method,
-      strategy,
-    )
-    .spec(identity)
-    .track_variables(runtime.identity_names().clone());
-    let name = format!("Check freshness for {}", command.name);
-    // The check is a real hidden node because it must obey dependency order and
-    // cancellation, but it is silent and shares the invocation lifecycle.
-    let task = TaskConfig::builder()
-      .id(Uuid::new_v4())
-      .name(name.clone())
-      .dep_name(command.name.clone())
-      .dir(self.task_working_dir(command))
-      .vars(runtime.vars().clone())
-      .envs(runtime.configured_envs())
-      .invocation_runtime(Some(runtime))
-      .condition_runtime(ConditionRuntime::command(Vec::new(), context.conditions.guards.clone()))
-      .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
-      .execution_binding(context.output_scope.clone().map(ExecutionBinding::for_task))
-      .interactive_session(context.interactive_session.clone())
-      .silent(Some(true))
-      .failfast(command.task.failfast.or(command.octafile.failfast))
-      .action(NodeAction::FreshnessCheck {
-        spec: Box::new(spec),
-        state: state.clone(),
-      })
-      .build()?;
-    let task = Arc::new(TaskNode::new(task));
-    dag.add_node(task.clone());
-    Self::connect_parents(dag, &parents, &task)?;
-
-    context.freshness = Some(state.clone());
-    Ok((context, vec![task], Some(state)))
-  }
-
-  /// Appends the commit node after every non-deferred command in the invocation.
-  ///
-  /// Separating check from commit ensures a failed, skipped, or cancelled body
-  /// never persists a fingerprint for work that did not complete.
-  fn add_freshness_commit(
-    &self,
-    dag: &mut DagNode,
-    command: &FindResult,
-    context: &InvocationContext,
-    state: Option<Arc<FreshnessState>>,
-    predecessors: Vec<ArcNode>,
-  ) -> ExecutorResult<Option<ArcNode>> {
-    let Some(state) = state else {
-      let mut predecessors = predecessors;
-      return self.join_nodes(dag, &mut predecessors, format!("Complete task {}", command.name));
-    };
-
-    let name = format!("Commit freshness for {}", command.name);
-    let task = TaskConfig::builder()
-      .id(Uuid::new_v4())
-      .name(name.clone())
-      .dep_name(command.name.clone())
-      .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
-      .execution_binding(context.output_scope.clone().map(ExecutionBinding::for_task))
-      .interactive_session(context.interactive_session.clone())
-      .silent(Some(true))
-      .failfast(command.task.failfast.or(command.octafile.failfast))
-      .action(NodeAction::FreshnessCommit(state))
-      .build()?;
-    let task = Arc::new(TaskNode::new(task));
-    dag.add_node(task.clone());
-    Self::connect_parents(dag, &predecessors, &task)?;
-    Ok(Some(task))
-  }
-
-  /// Appends one task-level collector after the successful body.
-  fn add_resource_registration(
-    &self,
-    dag: &mut DagNode,
-    command: &FindResult,
-    context: &InvocationContext,
-    mut predecessors: Vec<ArcNode>,
-  ) -> ExecutorResult<Option<ArcNode>> {
-    let artifacts = command.task.artifacts.clone().unwrap_or_default();
-    let reports = command.task.reports.clone().unwrap_or_default();
-    if artifacts.is_empty() && reports.is_empty() {
-      return self.join_nodes(dag, &mut predecessors, format!("Complete task {}", command.name));
-    }
-
-    let name = format!("Register resources for {}", command.name);
-    let task = TaskConfig::builder()
-      .id(Uuid::new_v4())
-      .name(name.clone())
-      .dep_name(command.name.clone())
-      .dir(self.task_working_dir(command))
-      .workspace(self.dir.clone())
-      .condition_runtime(ConditionRuntime::command(Vec::new(), context.conditions.guards.clone()))
-      .execution_binding(context.output_scope.clone().map(ExecutionBinding::for_task))
-      .interactive_session(context.interactive_session.clone())
-      .silent(Some(true))
-      .failfast(command.task.failfast.or(command.octafile.failfast))
-      .action(NodeAction::RegisterResources { artifacts, reports })
-      .build()?;
-    let task = Arc::new(TaskNode::new(task));
-    dag.add_node(task.clone());
-    Self::connect_parents(dag, &predecessors, &task)?;
-    Ok(Some(task))
-  }
-
-  /// Connects every incoming terminal to the first node of a new subgraph.
-  fn connect_parents(dag: &mut DagNode, parents: &[ArcNode], task: &ArcNode) -> ExecutorResult<()> {
-    for parent in parents {
-      dag.add_dependency(parent, task)?;
-    }
-    Ok(())
-  }
-
-  /// Returns one terminal for zero, one, or many parallel branches.
-  ///
-  /// The single-node case is returned directly; only true fan-in allocates a
-  /// barrier. Besides reducing graph size, this preserves the original node as
-  /// the lifecycle endpoint whenever no join is needed.
-  fn join_nodes(&self, dag: &mut DagNode, nodes: &mut Vec<ArcNode>, name: String) -> ExecutorResult<Option<ArcNode>> {
-    match nodes.len() {
-      0 => Ok(None),
-      1 => Ok(nodes.pop()),
-      _ => {
-        let group = self.create_group_node(dag, Some(AllowedRun::Always), name)?;
-        for node in nodes.drain(..) {
-          dag.add_dependency(&node, &group)?;
-        }
-        Ok(Some(group))
-      },
-    }
-  }
-
-  /// Compiles a deferred command into a nested execution plan.
-  ///
-  /// The main graph receives only a registration/ordering barrier. The nested
-  /// plan is retained in `DeferredAction` and can therefore run during normal
-  /// traversal or shutdown without teaching the scheduler about command shapes.
-  async fn create_deferred_node(
-    &mut self,
-    dag: &mut DagNode,
-    command: &FindResult,
-    deferred: &TaskCommand,
-    context: InvocationContext,
-    registered_after: Vec<String>,
-  ) -> ExecutorResult<ArcNode> {
-    let order = self.defer_order;
-    self.defer_order += 1;
-    let name = format!("Deferred command {order} for {}", command.name);
-
-    // Normalize `defer` into an ordinary one-command task so shell commands, task references,
-    // and plugin commands all use the existing graph-building path.
-    let deferred_command = FindResult {
-      name: name.clone(),
-      octafile: command.octafile.clone(),
-      task: Task {
-        cmds: Some(vec![TaskCommand {
-          payload: deferred.payload.clone(),
-          options: CommandOptions {
-            platforms: None,
-            deferred: false,
-            ..deferred.options.clone()
-          },
-        }]),
-        deps: None,
-        platforms: None,
-        condition: None,
-        preconditions: None,
-        sources: None,
-        output: None,
-        timeout: deferred.options.timeout.or(command.task.timeout),
-        run: Some(AllowedRun::Always),
-        plugin: None,
-        ..command.task.clone()
-      },
-    };
-
-    // Each deferred action owns its nested cleanup scope, including defers declared by a
-    // referenced task. This keeps nested cleanup ordering local to that task invocation.
-    let mut nested_builder = self.nested_builder();
-    let mut deferred_dag = DAG::new();
-    nested_builder
-      .build_invocation(
-        &mut deferred_dag,
-        &deferred_command,
-        InvocationRequest {
-          context,
-          entry_parents: Vec::new(),
-          command_condition: None,
-        },
-        Some(false),
-      )
-      .await?;
-
-    if deferred_dag.node_count() == 0 {
-      nested_builder.create_group_node(&mut deferred_dag, Some(AllowedRun::Always), format!("Skipped {name}"))?;
-    }
-
-    let plan = ExecutionPlan::new(deferred_dag, nested_builder.deferred, nested_builder.scopes);
-
-    // The barrier node preserves ordering in the main DAG. Its executable payload is stored
-    // in `DeferredAction`, not in `TaskNode`.
-    let task = TaskConfig::builder()
-      .id(Uuid::new_v4())
-      .name(name.clone())
-      .dep_name(name.clone())
-      .action(NodeAction::Barrier)
-      .build()?;
-    let task = Arc::new(TaskNode::new(task));
-    dag.add_node(task.clone());
-    self.deferred.insert(
-      task.id.clone(),
-      Arc::new(DeferredAction {
-        command: name,
-        plan,
-        order,
-        registered_after,
-      }),
-    );
-
-    Ok(task)
-  }
-
-  /// Creates an isolated collector for a nested deferred plan.
-  fn nested_builder(&self) -> Self {
-    // Runtime context is inherited, while cleanup order and collected actions belong to
-    // the nested plan and therefore start from an empty state.
-    Self {
-      plugin_manager: self.plugin_manager.clone(),
-      finder: self.finder.clone(),
-      dir: self.dir.clone(),
-      command_args: self.command_args.clone(),
-      variable_overrides: self.variable_overrides.clone(),
-      variable_resolver: self.variable_resolver.clone(),
-      secret_session: self.secret_session.clone(),
-      runtime_identity: self.runtime_identity.clone(),
-      source_strategies: self.source_strategies.clone(),
-      scope_allocator: self.scope_allocator.clone(),
-      force_quiet: self.force_quiet,
-      force_silence: self.force_silence,
-      force_raw: self.force_raw,
-      scopes: Vec::new(),
-      os_arch: self.os_arch.clone(),
-      os_type: self.os_type.clone(),
-      defer_order: 0,
-      deferred: HashMap::new(),
-    }
-  }
-
-  /// Connects cleanup barriers after completed work in reverse declaration order.
-  ///
-  /// Empty predecessors receive a synthetic registration root so a task made
-  /// only of defers still has a reachable graph. Whether an unvisited cleanup is
-  /// eligible during shutdown is decided from `registered_after` by Executor.
-  fn attach_deferred_nodes(
-    &self,
-    dag: &mut DagNode,
-    mut deferred_nodes: Vec<ArcNode>,
-    mut predecessors: Vec<ArcNode>,
-  ) -> ExecutorResult<Option<ArcNode>> {
-    if deferred_nodes.is_empty() {
-      return self.join_nodes(dag, &mut predecessors, "Complete task scope".to_string());
-    }
-
-    if predecessors.is_empty() {
-      predecessors.push(self.create_group_node(
-        dag,
-        Some(AllowedRun::Always),
-        "Register deferred commands".to_string(),
-      )?);
-    }
-
-    // Reversing declaration order produces defer-N -> ... -> defer-1 (LIFO).
-    deferred_nodes.reverse();
-    for deferred in deferred_nodes {
-      for predecessor in &predecessors {
-        dag.add_dependency(predecessor, &deferred)?;
-      }
-      predecessors = vec![deferred];
-    }
-
-    Ok(predecessors.pop())
-  }
-
-  /// Creates one executable plugin node from normalized task configuration.
-  ///
-  /// A plugin node receives a step binding; internal barrier-like nodes receive
-  /// only the task binding. This is where the `run -> task -> step` identity
-  /// hierarchy becomes attached to executable graph nodes.
-  fn create_task_node(
-    &self,
-    dag: &mut DagNode,
-    cmd: &FindResult,
-    context: &InvocationContext,
-    command_condition: Option<PluginCommand>,
-    configured_step_id: Option<&str>,
-    cache_key: String,
-  ) -> ExecutorResult<ArcNode> {
-    let plugin = cmd.task.plugin.clone().map(plugin_invocation).transpose()?;
-
-    // Per-command conditions inherited from the invocation are evaluated on
-    // every executable node; an inline command condition is appended last.
-    let mut conditions = context.conditions.per_command.clone();
-    if let Some(condition) = command_condition {
-      conditions.push(plugin_invocation(condition)?);
-    }
-    let runtime = context
-      .runtime
-      .clone()
-      .ok_or(ExecutorError::TaskConfigFieldMissing("invocation_runtime"))?;
-
-    let id = Uuid::new_v4().to_string();
-    let execution_binding = context.output_scope.clone().map(|scope| {
-      if let Some(plugin) = &plugin {
-        let step = self
-          .scope_allocator
-          .step(&scope, configured_step_id.unwrap_or_else(|| plugin.key()));
-        ExecutionBinding::for_step(scope, step)
-      } else {
-        ExecutionBinding::for_task(scope)
-      }
-    });
-    let task_config = TaskConfig::builder()
-      .id(id)
-      .name(cmd.name.clone())
-      .dep_name(context.dep_name.clone())
-      .cache_key(cache_key)
-      .dir(self.task_working_dir(cmd))
-      .workspace(self.dir.clone())
-      .vars(runtime.vars().clone())
-      .envs(runtime.configured_envs())
-      .invocation_runtime(Some(runtime))
-      .condition_runtime(ConditionRuntime::command(conditions, context.conditions.guards.clone()))
-      .freshness_runtime(FreshnessRuntime::guarded(context.freshness.clone()))
-      .preconditions(cmd.task.preconditions.clone())
-      .timeout(cmd.task.timeout)
-      .execution_binding(execution_binding)
-      .prefix_template(cmd.task.prefix.clone())
-      .step_exports(step_exports(&cmd.task, configured_step_id))
-      .interactive_session(context.interactive_session.clone())
-      .silent(self.force_silence.or(cmd.task.silent).or(cmd.octafile.silent))
-      .quiet(if self.force_quiet {
-        Some(true)
-      } else {
-        cmd.task.quiet.or(cmd.octafile.quiet)
-      })
-      .raw(if self.force_raw || context.interactive_session.is_some() {
-        Some(true)
-      } else {
-        cmd.task.raw.or(cmd.octafile.raw)
-      })
-      .failfast(cmd.task.failfast.or(cmd.octafile.failfast))
-      .ignore_errors(cmd.task.ignore_error)
-      .run_mode(self.task_run_mode(cmd))
-      .plugin(plugin);
-
-    let task = TaskNode::new(task_config.build()?);
-    let arc_task = Arc::new(task);
-
-    dag.add_node(arc_task.clone());
-
-    Ok(arc_task)
-  }
-
-  /// Returns a cache identity shared by repeated invocations of the same
-  /// task definition, but not by separate commands with equal payloads.
-  fn command_cache_key(task_name: &str, command_index: usize) -> String {
-    format!("{task_name}::command[{command_index}]")
-  }
-
-  /// Creates a single-evaluation condition node and adds its result to the task scope.
-  ///
-  /// Descendant nodes receive the same `ConditionState` as a guard. They can
-  /// skip without reevaluating the plugin and fail explicitly if graph ordering
-  /// ever lets them observe an unpublished decision.
-  fn add_condition_gate(
-    &self,
-    dag: &mut DagNode,
-    command: &FindResult,
-    mut request: GateRequest,
-  ) -> ExecutorResult<(InvocationContext, ArcNode)> {
-    let runtime = request
-      .context
-      .runtime
-      .clone()
-      .ok_or(ExecutorError::TaskConfigFieldMissing("invocation_runtime"))?;
-    let state = Arc::new(ConditionState::default());
-    let name = format!("{} condition for {}", request.phase.label(), command.name);
-    let task = TaskConfig::builder()
-      .id(Uuid::new_v4())
-      .name(name.clone())
-      .dep_name(name)
-      .dir(self.task_working_dir(command))
-      .vars(runtime.vars().clone())
-      .envs(runtime.configured_envs())
-      .invocation_runtime(Some(runtime))
-      .condition_runtime(ConditionRuntime::gate(
-        request.condition,
-        state.clone(),
-        request.context.conditions.guards.clone(),
-      ))
-      .freshness_runtime(FreshnessRuntime::guarded(request.context.freshness.clone()))
-      .execution_binding(request.context.output_scope.clone().map(ExecutionBinding::for_task))
-      .interactive_session(request.context.interactive_session.clone())
-      .timeout(command.task.timeout)
-      .silent(Some(true))
-      .failfast(command.task.failfast.or(command.octafile.failfast))
-      .run_mode(Some(AllowedRun::Always))
-      .action(NodeAction::Condition)
-      .build()?;
-    let task = Arc::new(TaskNode::new(task));
-    dag.add_node(task.clone());
-    for parent in request.parents {
-      dag.add_dependency(&parent, &task)?;
-    }
-
-    request.context.conditions.guards.push(state);
-    Ok((request.context, task))
   }
 
   /// Builds the ordered condition/dependency prefix for a task invocation.
@@ -1008,40 +570,13 @@ impl TaskGraphBuilder {
   }
 
   /// Resolves task-level run mode with the Octafile default as fallback.
-  fn task_run_mode(&self, cmd: &FindResult) -> Option<AllowedRun> {
+  pub(super) fn task_run_mode(&self, cmd: &FindResult) -> Option<AllowedRun> {
     cmd.task.run.clone().or_else(|| cmd.octafile.run.clone())
-  }
-
-  /// Resolves task-level fingerprint strategy with the Octafile default as fallback.
-  fn task_source_strategy(cmd: &FindResult) -> Option<SourceStrategies> {
-    cmd
-      .task
-      .source_strategy
-      .clone()
-      .or_else(|| cmd.octafile.source_strategy.clone())
   }
 
   /// Resolves fail-fast as an effective boolean for inheritance and scheduling.
   fn task_failfast(cmd: &FindResult) -> bool {
     cmd.task.failfast.or(cmd.octafile.failfast).unwrap_or(false)
-  }
-
-  /// Captures the task definition together with inherited execution defaults.
-  ///
-  /// Referenced tasks own separate freshness boundaries and therefore keep
-  /// their definitions and resolved inputs out of the caller's identity.
-  fn execution_definition(&self, command: &FindResult) -> ExecutorResult<serde_json::Value> {
-    Ok(serde_json::json!({
-      "name": command.name,
-      "task": task_identity::task_definition(&command.task)?,
-      "effective": {
-        "dir": self.task_working_dir(command),
-        "run": self.task_run_mode(command),
-        "source_strategy": Self::task_source_strategy(command),
-        "failfast": Self::task_failfast(command),
-      },
-      "runtime": self.runtime_identity,
-    }))
   }
 
   /// Resolves a task-reference selector and applies call-site execution options.
@@ -1155,50 +690,6 @@ impl TaskGraphBuilder {
       .or(task.ignore_error);
   }
 
-  /// Creates a zero-work node used only for graph fan-in or ordering.
-  pub(super) fn create_group_node(
-    &self,
-    dag: &mut DagNode,
-    run: Option<AllowedRun>,
-    name: String,
-  ) -> ExecutorResult<Arc<TaskNode>> {
-    let task_config = TaskConfig::builder()
-      .id(Uuid::new_v4())
-      .name(name.clone())
-      .run_mode(run)
-      .dep_name(name)
-      .action(NodeAction::Barrier);
-
-    let task = TaskNode::new(task_config.build()?);
-    let arc_task = Arc::new(task);
-
-    dag.add_node(arc_task.clone());
-
-    Ok(arc_task)
-  }
-
-  /// Creates a zero-work node that participates in a task scope lifecycle.
-  ///
-  /// These barriers bracket outer task scopes that contain nested task calls;
-  /// ordinary join barriers deliberately remain unscoped.
-  fn create_scope_barrier(
-    &self,
-    dag: &mut DagNode,
-    name: String,
-    output_scope: ConsoleScope,
-  ) -> ExecutorResult<ArcNode> {
-    let task = TaskConfig::builder()
-      .id(Uuid::new_v4())
-      .name(name.clone())
-      .dep_name(name)
-      .execution_binding(Some(ExecutionBinding::for_task(output_scope)))
-      .action(NodeAction::Barrier)
-      .build()?;
-    let task = Arc::new(TaskNode::new(task));
-    dag.add_node(task.clone());
-    Ok(task)
-  }
-
   /// Rejects empty plans and dependency cycles before the scheduler sees them.
   pub(super) fn validate_dag(&self, dag: &DagNode, command: &str) -> ExecutorResult<()> {
     if dag.node_count() == 0 {
@@ -1209,12 +700,14 @@ impl TaskGraphBuilder {
       return Err(ExecutorError::CycleDetected);
     }
 
+    self.validate_parallel_cache_outputs(dag)?;
+
     Ok(())
   }
 }
 
 /// Converts parser-level task output configuration into renderer-level mode.
-fn task_output_mode(mode: TaskOutputMode) -> RenderMode {
+pub(super) fn task_output_mode(mode: TaskOutputMode) -> RenderMode {
   match mode {
     TaskOutputMode::Interleaved => RenderMode::Interleaved,
     TaskOutputMode::Group => RenderMode::Group,
@@ -1224,26 +717,4 @@ fn task_output_mode(mode: TaskOutputMode) -> RenderMode {
     TaskOutputMode::Replacing => RenderMode::Replacing,
     TaskOutputMode::Timed => RenderMode::Timed,
   }
-}
-
-fn step_exports(task: &Task, step_id: Option<&str>) -> HashMap<String, StepExport> {
-  let Some(step_id) = step_id else {
-    return HashMap::new();
-  };
-  task
-    .outputs
-    .as_ref()
-    .into_iter()
-    .flat_map(|outputs| outputs.iter())
-    .filter(|(_, output)| output.step == step_id)
-    .map(|(name, output)| {
-      (
-        name.clone(),
-        StepExport {
-          field: output.field.clone(),
-          secret: output.secret,
-        },
-      )
-    })
-    .collect()
 }

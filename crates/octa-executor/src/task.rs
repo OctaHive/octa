@@ -20,7 +20,6 @@ use indexmap::IndexMap;
 use octa_plugin_manager::plugin_manager::PluginManager;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use sled::Db;
 use tera::Context;
 use tokio::{
   sync::{Mutex, OnceCell},
@@ -36,7 +35,6 @@ use octa_output::{Console, ConsoleLevel, ConsoleScope, ConsoleStatus, ConsoleSte
 use crate::{
   envs::{EnvironmentPlan, Envs},
   error::{ExecutorError, ExecutorResult},
-  freshness::{FreshnessSpec, FreshnessState},
   plugin::{
     ManagerPluginEvaluator, PluginEvaluator, PluginExecutionContext, PluginInvoker, PluginOutput, PluginRequest,
   },
@@ -45,7 +43,6 @@ use crate::{
   template::{PluginTemplateContext, TemplateRenderer},
   terminal::RawTerminalConnector,
   vars::{VariableOverrides, VariableResolver, Vars},
-  watcher::WatchTarget,
 };
 
 /// Services and execution settings shared by every node in one executor.
@@ -55,18 +52,20 @@ pub(crate) struct TaskRuntime {
   pub(crate) plugin_manager: Arc<PluginManager>,
   /// Host adapter used only by raw interactive commands.
   pub(crate) terminal: Arc<dyn RawTerminalConnector>,
-  /// Per-execution cache shared by nodes in the graph.
-  pub(crate) cache: Arc<Mutex<IndexMap<String, CacheItem>>>,
-  /// Persistent source and output fingerprints.
-  pub(crate) fingerprint: Arc<Db>,
+  /// Results reused only by repeated nodes in this execution.
+  pub(crate) invocation_results: Arc<Mutex<IndexMap<String, InvocationResult>>>,
+  /// Persistent result-cache services selected by the embedding application.
+  pub(crate) result_cache: Option<Arc<crate::result_cache::ResultCache>>,
   /// Destination for command output events.
   pub(crate) console: Arc<Console>,
   /// Identifier shared by all events emitted for this execution.
   pub(crate) run_id: u64,
   /// Whether plugins should describe work without changing the filesystem.
   pub(crate) dry: bool,
-  /// Whether freshness checks should be bypassed.
+  /// Whether persistent result lookup and execution-local shortcuts should be bypassed.
   pub(crate) force: bool,
+  /// Whether this execution may inspect cache state but must not invoke plugins.
+  pub(crate) cache_probe: bool,
   /// Exit code exposed to commands executing as part of a deferred action.
   pub(crate) deferred_exit_code: Option<i32>,
   /// Shared bound for structured values retained by this execution.
@@ -178,9 +177,6 @@ pub(crate) trait Executable: TaskItem {
   async fn bypass_result(&self, result: HashMap<String, DependencyResult>);
 }
 
-#[cfg(test)]
-pub(crate) use crate::source_strategy::SourceMethod;
-
 /// Output identity attached to one executable DAG node.
 ///
 /// Keeping task and step identity in one value prevents a step from being
@@ -231,6 +227,16 @@ pub(crate) trait TaskItem: Identifiable {
     false
   }
 
+  /// Whether successful execution contributes a visible timing summary row.
+  fn records_summary(&self) -> bool {
+    !self.is_internal()
+  }
+
+  /// Whether this node's stdout belongs to the public run result.
+  fn contributes_run_output(&self) -> bool {
+    true
+  }
+
   async fn get_deps_result(&self) -> HashMap<String, DependencyResult>;
   fn failfast(&self) -> bool;
   fn requires_concurrency_permit(&self) -> bool;
@@ -242,6 +248,9 @@ pub(crate) trait TaskItem: Identifiable {
   fn requires_runtime_lock(&self) -> bool {
     self.requires_concurrency_permit()
   }
+
+  /// Observes a cleanup failure whose diagnostics are retained without failing the main run.
+  async fn record_deferred_failure(&self) {}
 
   /// Associates this node with a task invocation.
   ///
@@ -267,9 +276,11 @@ pub(crate) enum RunMode {
 /// Values resolved once and reused throughout one task invocation.
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeContext {
-  vars: Vars,
-  envs: Envs,
-  dir: PathBuf,
+  pub(crate) vars: Vars,
+  pub(crate) envs: Envs,
+  pub(crate) dir: PathBuf,
+  pub(crate) identity_names: HashSet<String>,
+  pub(crate) plugin_uses: Arc<std::sync::Mutex<HashSet<crate::plugin::PluginTarget>>>,
 }
 
 /// Lazily resolved values shared by every graph node in one logical task invocation.
@@ -278,6 +289,7 @@ pub(crate) struct InvocationRuntime {
   environment: EnvironmentPlan,
   identity_names: HashSet<String>,
   resolver: Option<Arc<dyn VariableResolver>>,
+  plugin_uses: Arc<std::sync::Mutex<HashSet<crate::plugin::PluginTarget>>>,
   context: OnceCell<RuntimeContext>,
 }
 
@@ -293,6 +305,7 @@ impl InvocationRuntime {
       environment,
       identity_names,
       resolver,
+      plugin_uses: Arc::new(std::sync::Mutex::new(HashSet::new())),
       context: OnceCell::new(),
     }
   }
@@ -303,10 +316,6 @@ impl InvocationRuntime {
 
   pub(crate) fn configured_envs(&self) -> Envs {
     self.environment.configured_envs()
-  }
-
-  pub(crate) fn identity_names(&self) -> &HashSet<String> {
-    &self.identity_names
   }
 }
 
@@ -331,8 +340,8 @@ impl From<AllowedRun> for RunMode {
 }
 
 mod config;
-pub(crate) use config::{CacheItem, TaskConfig};
-pub(crate) use config::{ConditionRuntime, ConditionState, FreshnessRuntime, NodeAction, PluginInvocation};
+pub(crate) use config::{ConditionRuntime, ConditionState, NodeAction, PluginInvocation, TaskCacheRuntime};
+pub(crate) use config::{InvocationResult, TaskConfig};
 
 /// Represents a single executable task with its configuration and state.
 #[derive(Debug, Clone)]
@@ -360,10 +369,10 @@ pub(crate) struct TaskNode {
   #[cfg(test)]
   pub(crate) envs: Envs, // Task environments
   invocation_runtime: Arc<InvocationRuntime>,
-  condition_runtime: ConditionRuntime, // Conditions attached to this graph node
-  freshness_runtime: FreshnessRuntime, // Task-level source and output state
+  condition_runtime: ConditionRuntime,  // Conditions attached to this graph node
+  task_cache_runtime: TaskCacheRuntime, // Persistent task-result cache state
   pub(crate) preconditions: Option<Vec<String>>, // Task run preconditions
-  pub(crate) timeout: Option<Timeout>, // Maximum task execution time
+  pub(crate) timeout: Option<Timeout>,  // Maximum task execution time
   execution_binding: Option<ExecutionBinding>,
   prefix_template: Option<String>,
   step_exports: HashMap<String, crate::structured_output::StepExport>,
@@ -413,7 +422,16 @@ impl TaskItem for TaskNode {
   }
 
   fn is_internal(&self) -> bool {
-    !self.action.is_command()
+    !matches!(self.action, NodeAction::Command | NodeAction::CacheFinalize { .. })
+  }
+
+  fn records_summary(&self) -> bool {
+    self.action.is_command()
+  }
+
+  fn contributes_run_output(&self) -> bool {
+    matches!(self.action, NodeAction::CacheFinalize { .. })
+      || (self.action.is_command() && !self.task_cache_runtime.captures_result())
   }
 
   fn failfast(&self) -> bool {
@@ -423,7 +441,7 @@ impl TaskItem for TaskNode {
   fn requires_concurrency_permit(&self) -> bool {
     !matches!(
       self.action,
-      NodeAction::Barrier | NodeAction::FreshnessCommit(_) | NodeAction::RegisterResources { .. }
+      NodeAction::Barrier | NodeAction::CacheFinalize { .. } | NodeAction::RegisterResources { .. }
     )
   }
 
@@ -433,6 +451,13 @@ impl TaskItem for TaskNode {
 
   fn requires_runtime_lock(&self) -> bool {
     self.action.needs_runtime_lock()
+  }
+
+  async fn record_deferred_failure(&self) {
+    self
+      .task_cache_runtime
+      .block_publication(octa_output::CacheReason::DeferredFailed)
+      .await;
   }
 
   fn output_scope(&self) -> Option<ConsoleScope> {

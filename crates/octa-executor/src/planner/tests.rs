@@ -8,6 +8,7 @@ use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+  planner::graph::task_output_mode,
   task::{TaskItem, TaskRuntime},
   terminal::UnsupportedRawTerminal,
   vars::VariablePrompt,
@@ -15,19 +16,6 @@ use crate::{
 use octa_output::{Console, ConsoleRecord, ConsoleRenderer, ExecutionEvent};
 
 struct TestVariableResolver;
-
-struct TestSourceStrategy;
-
-#[async_trait::async_trait]
-impl SourceStrategy for TestSourceStrategy {
-  fn key(&self) -> &'static str {
-    "test"
-  }
-
-  async fn fingerprint(&self, _sources: &[PathBuf], _cancel_token: &CancellationToken) -> ExecutorResult<Vec<u8>> {
-    Ok(vec![1])
-  }
-}
 
 #[async_trait::async_trait]
 impl VariableResolver for TestVariableResolver {
@@ -296,12 +284,13 @@ tasks:
     TaskRuntime {
       plugin_manager: plugin_manager.clone(),
       terminal: Arc::new(UnsupportedRawTerminal),
-      cache: Arc::new(tokio::sync::Mutex::new(indexmap::IndexMap::new())),
-      fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      invocation_results: Arc::new(tokio::sync::Mutex::new(indexmap::IndexMap::new())),
+      result_cache: None,
       console,
       run_id: 1,
       dry: false,
       force: false,
+      cache_probe: false,
       deferred_exit_code: None,
       structured_output_budget: Arc::new(crate::structured_output::StructuredOutputBudget::default()),
     },
@@ -339,9 +328,7 @@ fn test_matches_platform_and_architecture() {
 async fn test_task_graph_builder_new() -> ExecutorResult<()> {
   let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
   let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
-  let builder = TaskGraphBuilder::new(plugin_manager)?
-    .with_variable_resolver(Arc::new(TestVariableResolver))
-    .with_source_strategy(SourceMethod::Hash, TestSourceStrategy);
+  let builder = TaskGraphBuilder::new(plugin_manager)?.with_variable_resolver(Arc::new(TestVariableResolver));
   assert!(builder.command_args.is_empty());
   assert!(builder.variable_overrides.is_empty());
   assert!(builder.variable_resolver.is_some());
@@ -359,7 +346,6 @@ async fn test_task_graph_builder_new() -> ExecutorResult<()> {
       .await,
     Ok("value".to_owned())
   );
-  assert_eq!(builder.source_strategies.resolve(&SourceMethod::Hash)?.key(), "test");
   assert!(builder.dir.exists());
 
   let current_dir = builder.dir.clone();
@@ -424,7 +410,7 @@ async fn working_directory_resolves_relative_task_directories_consistently() -> 
     .await?;
 
   let task = plan.nodes().iter().find(|node| !node.is_internal()).unwrap();
-  assert_eq!(task.dir, temp_dir.path().join("work"));
+  assert_eq!(task.dir, dunce::canonicalize(temp_dir.path())?.join("work"));
   Ok(())
 }
 
@@ -541,8 +527,7 @@ tasks:
     vec!["shell".to_owned()],
     "shell",
   )?;
-  let project_root = env!("CARGO_MANIFEST_DIR");
-  let plugin_manager = Arc::new(PluginManager::new(format!("{project_root}/../../target/debug")));
+  let plugin_manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
   #[cfg(not(windows))]
   let plugin_name = "octa_plugin_shell";
   #[cfg(windows)]
@@ -561,12 +546,13 @@ tasks:
     TaskRuntime {
       plugin_manager: plugin_manager.clone(),
       terminal: Arc::new(UnsupportedRawTerminal),
-      cache: Arc::new(tokio::sync::Mutex::new(indexmap::IndexMap::new())),
-      fingerprint: Arc::new(sled::Config::new().temporary(true).open().unwrap()),
+      invocation_results: Arc::new(tokio::sync::Mutex::new(indexmap::IndexMap::new())),
+      result_cache: None,
       console,
       run_id: 1,
       dry: false,
       force: false,
+      cache_probe: false,
       deferred_exit_code: None,
       structured_output_budget: Arc::new(crate::structured_output::StructuredOutputBudget::default()),
     },
@@ -788,11 +774,9 @@ async fn test_failfast_inherits_and_overrides_octafile_default() -> ExecutorResu
       failfast: true
       tasks:
         inherited:
-          sources: [Octafile.yml]
           shell: echo inherited
         overridden:
           failfast: false
-          sources: [Octafile.yml]
           shell: echo overridden
     "#;
   let octafile_path = temp_dir.path().join("Octafile.yml");
@@ -809,21 +793,6 @@ async fn test_failfast_inherits_and_overrides_octafile_default() -> ExecutorResu
   let overridden = dag.nodes().iter().find(|task| task.name == "overridden").unwrap();
   assert!(inherited.failfast);
   assert!(!overridden.failfast);
-
-  for phase in ["Check freshness", "Commit freshness"] {
-    let inherited = dag
-      .nodes()
-      .iter()
-      .find(|task| task.name == format!("{phase} for inherited"))
-      .unwrap();
-    let overridden = dag
-      .nodes()
-      .iter()
-      .find(|task| task.name == format!("{phase} for overridden"))
-      .unwrap();
-    assert!(inherited.failfast);
-    assert!(!overridden.failfast);
-  }
 
   Ok(())
 }
@@ -872,26 +841,20 @@ async fn test_octafile_defaults_are_inherited_and_can_be_overridden() -> Executo
   let content = r#"
       version: 1
       run: once
-      source_strategy: hash
       includes:
         child: child.yml
       tasks:
         inherited:
-          sources: [Octafile.yml]
           shell: echo inherited
         overridden:
           run: changed
-          source_strategy: timestamp
-          sources: [Octafile.yml]
           shell: echo overridden
     "#;
   let child_content = r#"
       version: 1
       run: changed
-      source_strategy: timestamp
       tasks:
         child_inherited:
-          sources: [child.yml]
           shell: echo child
     "#;
   let octafile_path = temp_dir.path().join("Octafile.yml");
@@ -901,7 +864,7 @@ async fn test_octafile_defaults_are_inherited_and_can_be_overridden() -> Executo
   let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_string()], "shell")?;
   let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
   let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
-  let builder = TaskGraphBuilder::new(plugin_manager)?.with_source_strategy(SourceMethod::Hash, TestSourceStrategy);
+  let builder = TaskGraphBuilder::new(plugin_manager)?;
   let dag = builder.build(octafile, "**", true, vec![]).await?;
 
   let inherited = dag.nodes().iter().find(|task| task.name == "inherited").unwrap();
@@ -914,56 +877,282 @@ async fn test_octafile_defaults_are_inherited_and_can_be_overridden() -> Executo
   assert_eq!(inherited.run_mode, task::RunMode::Once);
   assert_eq!(overridden.run_mode, task::RunMode::Changed);
   assert_eq!(child.run_mode, task::RunMode::Changed);
-  let inherited_gate = dag
-    .nodes()
-    .iter()
-    .find(|task| task.name == "Check freshness for inherited")
-    .unwrap();
-  let overridden_gate = dag
-    .nodes()
-    .iter()
-    .find(|task| task.name == "Check freshness for overridden")
-    .unwrap();
-  assert_eq!(inherited_gate.source_method(), Some(SourceMethod::Hash));
-  assert_eq!(inherited_gate.source_strategy_key(), Some("test"));
-  assert_eq!(overridden_gate.source_method(), Some(SourceMethod::Timestamp));
-  assert_eq!(overridden_gate.source_strategy_key(), Some("timestamp"));
-
   Ok(())
 }
 
 #[tokio::test]
-async fn custom_source_strategy_can_be_selected_from_octafile() -> ExecutorResult<()> {
+async fn cached_task_has_one_lookup_and_one_finalize_boundary() -> ExecutorResult<()> {
   let temp_dir = TempDir::new().unwrap();
   let octafile_path = temp_dir.path().join("Octafile.yml");
   fs::write(
     &octafile_path,
     r#"
 version: 1
-source_strategy: content-addressed
 tasks:
   build:
-    sources: [Octafile.yml]
+    files:
+      inputs: [Octafile.yml]
+      outputs: [target/app]
+    cache: {}
     shell: echo build
 "#,
   )?;
 
+  let octafile = Octafile::load(Some(octafile_path.clone()), false, vec!["shell".to_owned()], "shell")?;
+  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+  let dag = TaskGraphBuilder::new(plugin_manager)?
+    .build(octafile, "build", false, vec![])
+    .await?;
+  assert_eq!(
+    dag
+      .nodes()
+      .iter()
+      .filter(|task| task.name == "Lookup cache for build")
+      .count(),
+    1
+  );
+  assert_eq!(
+    dag
+      .nodes()
+      .iter()
+      .filter(|task| task.name == "Finalize cache for build")
+      .count(),
+    1
+  );
+  Ok(())
+}
+
+#[tokio::test]
+async fn rejects_parallel_cache_output_owners_but_allows_dependency_order() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let octafile_path = temp_dir.path().join("Octafile.yml");
+  let write_octafile = |dependency: &str| {
+    fs::write(
+      &octafile_path,
+      format!(
+        r#"
+version: 1
+tasks:
+  package:
+    files: {{ inputs: [Octafile.yml], outputs: [target] }}
+    cache: {{}}
+    shell: echo package
+  metadata:
+    {dependency}
+    files: {{ inputs: [Octafile.yml], outputs: [target/metadata] }}
+    cache: {{}}
+    shell: echo metadata
+"#
+      ),
+    )
+  };
+  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+
+  write_octafile("")?;
+  let octafile = Octafile::load(Some(octafile_path.clone()), false, vec!["shell".to_owned()], "shell")?;
+  let result = TaskGraphBuilder::new(plugin_manager.clone())?
+    .build(octafile, "**", true, vec![])
+    .await;
+  assert!(matches!(
+    result,
+    Err(ExecutorError::InvalidCacheConfiguration(message))
+      if message.contains("parallel cacheable tasks") && message.contains("target")
+  ));
+
+  write_octafile("deps: [package]")?;
+  let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_owned()], "shell")?;
+  TaskGraphBuilder::new(plugin_manager)?
+    .build(octafile, "metadata", false, vec![])
+    .await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn rejects_cache_boundaries_that_cannot_be_replayed_completely() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let path = temp_dir.path().join("Octafile.yml");
+  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+  let cases = [
+    ("raw: true\n    shell: build", "raw, interactive, or ignores failures"),
+    (
+      "cmds:\n      - task: nested",
+      "place the cache boundary on executable leaf tasks",
+    ),
+    (
+      "artifacts:\n      - { name: app, path: other/app }\n    shell: build",
+      "is not contained by files.outputs",
+    ),
+    (
+      "files:\n      inputs: [target/**]\n      outputs: [target]\n    cache: {}\n    shell: build",
+      "overlaps the traversal",
+    ),
+  ];
+
+  for (body, expected) in cases {
+    let files_and_cache = if body.starts_with("files:") {
+      String::new()
+    } else {
+      "files:\n      inputs: [Octafile.yml]\n      outputs: [target]\n    cache: {}\n    ".to_owned()
+    };
+    fs::write(
+      &path,
+      format!("version: 1\ntasks:\n  build:\n    {files_and_cache}{body}\n"),
+    )?;
+    let octafile = Octafile::load(Some(path.clone()), false, vec!["shell".to_owned()], "shell")?;
+    let result = TaskGraphBuilder::new(plugin_manager.clone())?
+      .with_working_directory(temp_dir.path().to_path_buf())
+      .build(octafile, "build", false, vec![])
+      .await;
+    assert!(
+      matches!(result, Err(ExecutorError::InvalidCacheConfiguration(message)) if message.contains(expected)),
+      "cache boundary should reject {body}"
+    );
+  }
+
+  let external = TempDir::new().unwrap();
+  let external_path = external.path().join("artifact").to_string_lossy().replace('\\', "/");
+  fs::write(
+    &path,
+    format!(
+      "version: 1\ntasks:\n  build:\n    files: {{ inputs: [Octafile.yml], outputs: [target] }}\n    cache: {{}}\n    artifacts:\n      - {{ name: outside, path: '{external_path}' }}\n    shell: build\n"
+    ),
+  )?;
+  let octafile = Octafile::load(Some(path.clone()), false, vec!["shell".to_owned()], "shell")?;
+  let result = TaskGraphBuilder::new(plugin_manager.clone())?
+    .with_working_directory(temp_dir.path().to_path_buf())
+    .build(octafile, "build", false, vec![])
+    .await;
+  assert!(matches!(
+    result,
+    Err(ExecutorError::InvalidCacheConfiguration(message)) if message.contains("must be relative")
+  ));
+
+  fs::write(
+    &path,
+    format!(
+      "version: 1\ntasks:\n  build:\n    dir: '{}'\n    files: {{ inputs: [Octafile.yml], outputs: [target] }}\n    cache: {{}}\n    artifacts:\n      - {{ name: outside, path: artifact }}\n    shell: build\n",
+      external.path().to_string_lossy().replace('\\', "/")
+    ),
+  )?;
+  let octafile = Octafile::load(Some(path.clone()), false, vec!["shell".to_owned()], "shell")?;
+  let result = TaskGraphBuilder::new(plugin_manager)?
+    .with_working_directory(temp_dir.path().to_path_buf())
+    .build(octafile, "build", false, vec![])
+    .await;
+  assert!(matches!(
+    result,
+    Err(ExecutorError::InvalidCacheConfiguration(message)) if message.contains("outside the cache workspace")
+  ));
+
+  fs::write(
+    &path,
+    r#"
+version: 1
+tasks:
+  build:
+    files: { inputs: [], outputs: [] }
+    cache: {}
+    cmds:
+      - { id: compile, key: build }
+    outputs:
+      token: { step: compile, field: digest, secret: true }
+"#,
+  )?;
+  let octafile = Octafile::load_with_schemas(Some(path), false, structured_plugin_schemas(), "key")?;
+  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+  let result = TaskGraphBuilder::new(Arc::new(PluginManager::new(plugins_dir)))?
+    .with_working_directory(temp_dir.path().to_path_buf())
+    .build(octafile, "build", false, vec![])
+    .await;
+  assert!(matches!(
+    result,
+    Err(ExecutorError::InvalidCacheConfiguration(message)) if message.contains("secret structured output")
+  ));
+  Ok(())
+}
+
+#[test]
+fn every_task_output_mode_maps_to_the_executor_renderer() {
+  for (configured, expected) in [
+    (TaskOutputMode::Interleaved, RenderMode::Interleaved),
+    (TaskOutputMode::Group, RenderMode::Group),
+    (TaskOutputMode::Prefixed, RenderMode::Prefixed),
+    (TaskOutputMode::OnError, RenderMode::OnError),
+    (TaskOutputMode::KeepOrder, RenderMode::KeepOrder),
+    (TaskOutputMode::Replacing, RenderMode::Replacing),
+    (TaskOutputMode::Timed, RenderMode::Timed),
+  ] {
+    assert_eq!(task_output_mode(configured), expected);
+  }
+}
+
+#[tokio::test]
+async fn cached_task_orders_deferred_cleanup_before_resources_and_publication() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let octafile_path = temp_dir.path().join("Octafile.yml");
+  fs::write(
+    &octafile_path,
+    r#"
+version: 1
+tasks:
+  build:
+    files: { inputs: [Octafile.yml], outputs: [target] }
+    cache: {}
+    cmds:
+      - shell: echo build
+        if: exit 0
+      - defer: echo cleanup
+    artifacts:
+      - { name: app, path: target/app }
+"#,
+  )?;
+  let octafile = Octafile::load(Some(octafile_path.clone()), false, vec!["shell".to_owned()], "shell")?;
+  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
+  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+  let plan = TaskGraphBuilder::new(plugin_manager)?
+    .with_working_directory(temp_dir.path().to_path_buf())
+    .build(octafile, "build", false, vec![])
+    .await?;
+
+  let node = |prefix: &str| {
+    plan
+      .nodes()
+      .iter()
+      .find(|node| node.name.starts_with(prefix))
+      .expect("planned node")
+  };
+  let cleanup = node("Deferred command");
+  let resources = node("Register resources");
+  let finalize = node("Finalize cache");
+  assert!(plan.edges()[&cleanup.id].iter().any(|node| node.id == resources.id));
+  assert!(plan.edges()[&resources.id].iter().any(|node| node.id == finalize.id));
+
+  // A task consisting only of cleanup still needs a reachable registration
+  // root, otherwise the executor could finish before running the defer.
+  fs::write(
+    &octafile_path,
+    r#"
+version: 1
+tasks:
+  cleanup-only:
+    cmds:
+      - defer: echo cleanup
+"#,
+  )?;
   let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_owned()], "shell")?;
   let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
   let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
-  let method = SourceMethod::custom("content-addressed");
-  let dag = TaskGraphBuilder::new(plugin_manager)?
-    .with_source_strategy(method, TestSourceStrategy)
-    .build(octafile, "build", false, vec![])
+  let cleanup_only = TaskGraphBuilder::new(plugin_manager)?
+    .with_working_directory(temp_dir.path().to_path_buf())
+    .build(octafile, "cleanup-only", false, vec![])
     .await?;
-  let gate = dag
+  assert!(cleanup_only
     .nodes()
     .iter()
-    .find(|task| task.name == "Check freshness for build")
-    .unwrap();
-
-  assert_eq!(gate.source_method(), Some(SourceMethod::custom("content-addressed")));
-  assert_eq!(gate.source_strategy_key(), Some("test"));
+    .any(|node| node.name == "Register deferred commands"));
   Ok(())
 }
 

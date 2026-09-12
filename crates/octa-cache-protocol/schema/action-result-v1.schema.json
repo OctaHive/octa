@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://octahive.dev/schemas/cache/action-result-v1.schema.json",
+  "title": "Octa cache action result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["result_version", "action"],
+  "properties": {
+    "result_version": { "const": 1 },
+    "action": { "$ref": "#/$defs/blake3Digest" },
+    "output_bundle": { "$ref": "#/$defs/blob" },
+    "stdout": { "type": "string", "maxLength": 4194304, "x-maxUtf8Bytes": 4194304 },
+    "task_outputs": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/boundedNonControlString" },
+      "additionalProperties": { "not": { "type": "null" } }
+    },
+    "artifacts": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/artifact" }
+    },
+    "reports": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/report" }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "not": { "required": ["output_bundle"] } },
+      "then": {
+        "properties": {
+          "artifacts": { "maxItems": 0 },
+          "reports": { "maxItems": 0 }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hash", "size_bytes"],
+      "properties": {
+        "algorithm": { "enum": ["blake3", "sha256"] },
+        "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "blake3Digest": {
+      "allOf": [
+        { "$ref": "#/$defs/digest" },
+        { "properties": { "algorithm": { "const": "blake3" } } }
+      ]
+    },
+    "boundedNonControlString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+      "x-maxUtf8Bytes": 16384
+    },
+    "relativePath": {
+      "allOf": [
+        {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "pattern": "^[^/\\\\:\\u0000-\\u001f\\u007f]+(?:/[^/\\\\:\\u0000-\\u001f\\u007f]+)*$",
+          "x-maxUtf8Bytes": 16384
+        },
+        { "not": { "pattern": "(^|/)\\.{1,2}(/|$)" } }
+      ]
+    },
+    "blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "encoding", "encoded_size_bytes", "expanded_size_bytes", "entry_count"],
+      "properties": {
+        "digest": { "$ref": "#/$defs/blake3Digest" },
+        "encoding": { "enum": ["identity", "zstd_v1"] },
+        "encoded_size_bytes": { "type": "integer", "minimum": 1 },
+        "expanded_size_bytes": { "type": "integer", "minimum": 1 },
+        "entry_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path"],
+      "properties": {
+        "name": { "$ref": "#/$defs/boundedNonControlString" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "content_type": { "$ref": "#/$defs/boundedNonControlString" }
+      }
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "path", "format"],
+      "properties": {
+        "name": { "$ref": "#/$defs/boundedNonControlString" },
+        "path": { "$ref": "#/$defs/relativePath" },
+        "format": { "$ref": "#/$defs/boundedNonControlString" }
+      }
+    }
+  }
+}

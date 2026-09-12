@@ -1,0 +1,49 @@
+{
+  "key_format": 1,
+  "task_definition": {
+    "algorithm": "blake3",
+    "hash": "0101010101010101010101010101010101010101010101010101010101010101",
+    "size_bytes": 101
+  },
+  "input_root": {
+    "algorithm": "blake3",
+    "hash": "0202020202020202020202020202020202020202020202020202020202020202",
+    "size_bytes": 202
+  },
+  "working_directory": "crates/octa-cli",
+  "variables": {
+    "algorithm": "blake3",
+    "hash": "0303030303030303030303030303030303030303030303030303030303030303",
+    "size_bytes": 303
+  },
+  "environment": {
+    "algorithm": "blake3",
+    "hash": "0404040404040404040404040404040404040404040404040404040404040404",
+    "size_bytes": 404
+  },
+  "runtime": {
+    "kind": "oci",
+    "os": "linux",
+    "architecture": "amd64",
+    "image": {
+      "algorithm": "sha256",
+      "hash": "0505050505050505050505050505050505050505050505050505050505050505",
+      "size_bytes": 505
+    }
+  },
+  "plugins": [
+    {
+      "name": "shell",
+      "version": "0.3.0",
+      "protocol_version": 1,
+      "executable": {
+        "algorithm": "sha256",
+        "hash": "0606060606060606060606060606060606060606060606060606060606060606",
+        "size_bytes": 606
+      }
+    }
+  ],
+  "arguments": ["--release", "feature=cache"],
+  "timeout": { "seconds": 120, "nanoseconds": 0 },
+  "salt": "rust-release-v1"
+}

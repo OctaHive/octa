@@ -3,6 +3,12 @@
 //! This crate owns workspace loading, plugin lifecycle, task planning, and
 //! execution. Transport and presentation remain in its callers.
 
+#![warn(missing_docs)]
+
+mod cache;
+
+pub use cache::{CacheMode, ConfiguredCache, RuntimeCacheConfig, RuntimeCacheError};
+
 use std::{collections::HashMap, num::NonZeroUsize, path::PathBuf, sync::Arc};
 
 use octa_executor::{
@@ -24,32 +30,48 @@ use tokio_util::sync::CancellationToken;
 
 const BUILTIN_PLUGINS: [&str; 2] = ["shell", "tpl"];
 
+/// Failure while loading, executing, or shutting down a workspace runtime.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+  /// Filesystem or console I/O failed.
   #[error(transparent)]
   Io(#[from] std::io::Error),
+  /// Octafile discovery, parsing, or validation failed.
   #[error(transparent)]
   Octafile(#[from] OctafileError),
+  /// Monorepo project discovery or composition failed.
   #[error(transparent)]
   Monorepo(#[from] MonorepoError),
-  #[error(transparent)]
-  State(#[from] sled::Error),
+  /// Persistent monorepo discovery state could not be opened or updated.
+  #[error("monorepo discovery state failed: {0}")]
+  MonorepoState(#[source] MonorepoError),
+  /// Task planning or execution failed.
   #[error(transparent)]
   Execution(#[from] octa_executor::ExecutorError),
+  /// Result-cache profile loading or composition failed.
+  #[error(transparent)]
+  Cache(#[from] RuntimeCacheError),
+  /// Plugin digest-lock loading or verification failed.
   #[error(transparent)]
   PluginLock(Box<PluginLockError>),
+  /// Plugin setup is invalid before user code starts.
   #[error("invalid plugin configuration: {0}")]
   PluginManagerConfiguration(#[source] PluginManagerError),
+  /// A configured plugin process failed at runtime.
   #[error("plugin runtime failed: {0}")]
   PluginInfrastructure(#[source] PluginManagerError),
+  /// A plugin name or default capability cannot be resolved.
   #[error("invalid plugin configuration: {0}")]
   PluginConfiguration(String),
+  /// A spawned root execution panicked or was aborted.
   #[error("execution task failed: {0}")]
   Join(#[from] tokio::task::JoinError),
+  /// Cancellation stopped runtime bootstrap or execution.
   #[error("execution cancelled")]
   Cancelled,
 }
 
+/// Result returned by runtime composition and execution operations.
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 impl From<PluginLockError> for RuntimeError {
@@ -63,24 +85,42 @@ impl From<PluginLockError> for RuntimeError {
 /// Paths may be absolute or relative to `workspace`. A runtime starts and owns
 /// its plugin processes and must be shut down after the final execution.
 pub struct RuntimeConfig {
+  /// Workspace from which Octafile and relative paths are resolved.
   pub workspace: PathBuf,
+  /// Optional explicit Octafile path.
   pub octafile: Option<PathBuf>,
+  /// Whether Octafile discovery uses the global location.
   pub global: bool,
+  /// Runtime-owned state directory.
   pub data_dir: PathBuf,
+  /// Directory containing plugin manifests and executables.
   pub plugins_dir: PathBuf,
+  /// Optional digest lock required for plugin execution.
   pub plugin_lock: Option<PathBuf>,
+  /// Optional logical-secret provider profile.
   pub secrets_profile: Option<PathBuf>,
+  /// Validated machine-specific result-cache configuration.
+  pub result_cache: Option<RuntimeCacheConfig>,
+  /// Additional plugins requested by the caller.
   pub plugins: Vec<String>,
+  /// Optional default plugin for bare task definitions.
   pub default_plugin: Option<String>,
+  /// Workspace-wide public variable overrides.
   pub variables: Vec<(String, String)>,
+  /// Optional maximum number of concurrently executing tasks.
   pub concurrency: Option<NonZeroUsize>,
+  /// Optional interactive provider for unresolved required variables.
   pub variable_resolver: Option<Arc<dyn VariableResolver>>,
+  /// Connector used by raw terminal task execution.
   pub raw_terminal: Arc<dyn RawTerminalConnector>,
+  /// Structured event and presentation destination.
   pub console: Arc<Console>,
+  /// Parent cancellation token for the runtime lifecycle.
   pub cancellation: CancellationToken,
 }
 
 impl RuntimeConfig {
+  /// Creates the minimal non-interactive configuration used by a runner.
   pub fn headless(workspace: PathBuf, plugins_dir: PathBuf, data_dir: PathBuf, console: Arc<Console>) -> Self {
     Self {
       workspace,
@@ -90,6 +130,7 @@ impl RuntimeConfig {
       plugins_dir,
       plugin_lock: None,
       secrets_profile: None,
+      result_cache: None,
       plugins: Vec::new(),
       default_plugin: None,
       variables: Vec::new(),
@@ -105,15 +146,26 @@ impl RuntimeConfig {
 #[derive(Clone, Debug, Default)]
 /// Per-invocation execution flags; workspace state lives in [`Runtime`].
 pub struct RunOptions {
+  /// Allow independent graph nodes to run concurrently.
   pub parallel: bool,
+  /// Plan task commands without executing them.
   pub dry: bool,
+  /// Ignore cache hits and task-local reuse decisions.
   pub force: bool,
+  /// Cancel remaining work after the first task failure.
   pub failfast: bool,
+  /// Per-invocation public variable overrides.
   pub variables: Vec<(String, String)>,
+  /// Ordered user arguments forwarded to the selected task.
   pub task_args: Vec<String>,
+  /// Suppress ordinary Octa diagnostics.
   pub quiet: bool,
+  /// Optional task-stream suppression policy.
   pub silence: Option<Silence>,
+  /// Request an exclusive raw terminal session.
   pub raw: bool,
+  /// Inspect cache identity and availability without executing task commands.
+  pub cache_probe: bool,
 }
 
 /// Loaded workspace runtime with one plugin and secret-session lifecycle.
@@ -143,6 +195,7 @@ impl Runtime {
       plugins_dir,
       plugin_lock,
       secrets_profile,
+      result_cache,
       plugins,
       default_plugin,
       variables,
@@ -154,6 +207,13 @@ impl Runtime {
     } = config;
 
     check_cancelled(&cancellation)?;
+    // Opening includes an exact bounded scan and crash recovery. Complete it
+    // before starting plugins so a cache failure cannot leak child processes
+    // from a partially constructed runtime.
+    let result_cache = match result_cache {
+      Some(config) => Some(config.open().await?),
+      None => None,
+    };
     let secret_session = secrets_profile
       .map(|path| if path.is_absolute() { path } else { workspace.join(path) })
       .map(|path| SecretProfile::load(&path).and_then(SecretSession::new))
@@ -163,11 +223,6 @@ impl Runtime {
       .map(|path| if path.is_absolute() { path } else { workspace.join(path) })
       .map(|path| load_plugin_lock(&path).map_err(RuntimeError::from))
       .transpose()?;
-    let runtime_identity = serde_json::json!({
-      "octa": env!("CARGO_PKG_VERSION"),
-      "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-      "plugin_lock": plugin_lock,
-    });
     let locked = plugin_lock.is_some();
     let plugin_manager = Arc::new(match plugin_lock {
       Some(lock) => PluginManager::with_locked_plugins(plugins_dir, &workspace, lock),
@@ -192,10 +247,17 @@ impl Runtime {
     } else {
       workspace.join(data_dir)
     };
-    let fingerprint = Arc::new(sled::open(data_dir.join("fingerprint"))?);
     check_cancelled(&cancellation)?;
     let entry_path = Octafile::resolve_path(octafile.clone(), global, Some(workspace.clone()))?;
-    let monorepo = octa_monorepo::resolve(&entry_path, &workspace, octafile.is_some() || global, &fingerprint)?;
+    // Monorepo discovery owns and lazily opens its incremental state. Task
+    // result caching has a separate store and never reuses this directory.
+    let monorepo = octa_monorepo::resolve(
+      &entry_path,
+      &workspace,
+      octafile.is_some() || global,
+      &data_dir.join("monorepo"),
+    )
+    .map_err(classify_monorepo_error)?;
     check_cancelled(&cancellation)?;
     let synthetic_includes = synthetic_includes(&monorepo);
     let loaded = Octafile::load_with_schemas_vars_and_includes_from(
@@ -210,11 +272,10 @@ impl Runtime {
 
     let summary = Arc::new(Summary::new());
     let effective_concurrency = effective_concurrency(concurrency, loaded.concurrency);
-    let mut engine = ExecutionEngine::new(plugin_manager.clone(), loaded.clone(), fingerprint, console.clone())
+    let mut engine = ExecutionEngine::new(plugin_manager.clone(), loaded.clone(), console.clone())
       .with_summary(summary.clone())
       .with_runtime_coordinator(Arc::new(RuntimeCoordinator::default()))
-      .with_raw_terminal(raw_terminal)
-      .with_runtime_identity(runtime_identity);
+      .with_raw_terminal(raw_terminal);
     if let Some(limit) = effective_concurrency {
       engine = engine.with_concurrency(Arc::new(Semaphore::new(limit.get())));
     }
@@ -223,6 +284,9 @@ impl Runtime {
     }
     if let Some(session) = &secret_session {
       engine = engine.with_secret_session(session.clone());
+    }
+    if let Some(cache) = result_cache {
+      engine = engine.with_result_cache(cache.result_cache());
     }
 
     Ok(Self {
@@ -241,34 +305,42 @@ impl Runtime {
     })
   }
 
+  /// Returns the fully composed workspace Octafile.
   pub fn octafile(&self) -> &Arc<Octafile> {
     &self.octafile
   }
 
+  /// Returns the execution summary shared by all prepared commands.
   pub fn summary(&self) -> &Arc<Summary> {
     &self.summary
   }
 
+  /// Returns the runtime's structured output destination.
   pub fn console(&self) -> &Arc<Console> {
     &self.console
   }
 
+  /// Returns a child-capable clone of the runtime cancellation token.
   pub fn cancellation(&self) -> CancellationToken {
     self.cancellation.clone()
   }
 
+  /// Reports whether monorepo discovery reused its metadata cache.
   pub fn monorepo_cache_hit(&self) -> bool {
     self.monorepo_cache_hit
   }
 
+  /// Returns the number of loaded monorepo projects.
   pub fn monorepo_project_count(&self) -> usize {
     self.monorepo_project_count
   }
 
+  /// Qualifies bare task names with the current monorepo namespace.
   pub fn qualify_commands(&self, commands: Vec<String>) -> Vec<String> {
     qualify_commands(commands, self.current_namespace.as_deref())
   }
 
+  /// Returns whether any selected task explicitly enables watch mode.
   pub fn commands_request_watch(&self, commands: &[String]) -> bool {
     let finder = OctaFinder::new();
     commands.iter().any(|command| {
@@ -279,6 +351,7 @@ impl Runtime {
     })
   }
 
+  /// Builds validated execution plans and their shared watch targets.
   pub async fn prepare(
     &self,
     commands: &[String],
@@ -312,6 +385,7 @@ impl Runtime {
       request.quiet = options.quiet;
       request.silence = options.silence;
       request.raw = options.raw;
+      request.cache_probe = options.cache_probe;
       let execution = self.engine.prepare(request).await?;
 
       plan_is_parallel |= options.parallel || !execution.is_linear();
@@ -326,6 +400,12 @@ impl Runtime {
     Ok((executions, watch_targets))
   }
 
+  /// Returns the hashing service shared by prepared cache actions and watch mode.
+  pub fn input_snapshotter(&self) -> octa_cache::InputSnapshotter {
+    self.engine.input_snapshotter()
+  }
+
+  /// Executes prepared roots serially or concurrently and returns terminal results.
   pub async fn execute(
     &self,
     executions: Vec<PreparedExecution>,
@@ -415,6 +495,13 @@ fn synthetic_includes(monorepo: &MonorepoResolution) -> Vec<SyntheticInclude> {
       path: project.octafile.clone(),
     })
     .collect()
+}
+
+fn classify_monorepo_error(error: MonorepoError) -> RuntimeError {
+  match error {
+    MonorepoError::Cache(_) | MonorepoError::CacheEncoding(_) => RuntimeError::MonorepoState(error),
+    _ => RuntimeError::Monorepo(error),
+  }
 }
 
 fn effective_concurrency(requested: Option<NonZeroUsize>, configured: Option<NonZeroUsize>) -> Option<NonZeroUsize> {
@@ -601,6 +688,19 @@ mod tests {
     assert!(matches!(
       classify_plugin_error(PluginManagerError::ConnectionError("closed".to_owned())),
       RuntimeError::PluginInfrastructure(_)
+    ));
+  }
+
+  #[test]
+  fn separates_monorepo_configuration_from_state_failures() {
+    assert!(matches!(
+      classify_monorepo_error(MonorepoError::InvalidConfiguration("roots".to_owned())),
+      RuntimeError::Monorepo(_)
+    ));
+    let encoding = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+    assert!(matches!(
+      classify_monorepo_error(MonorepoError::CacheEncoding(encoding)),
+      RuntimeError::MonorepoState(_)
     ));
   }
 

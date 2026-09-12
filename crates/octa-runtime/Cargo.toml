@@ -16,14 +16,18 @@ octa-finder = { version = "0.3.0", path = "../octa-finder" }
 octa-monorepo = { version = "0.3.0", path = "../octa-monorepo" }
 octa-octafile = { version = "0.3.0", path = "../octa-octafile" }
 octa-output = { version = "0.3.0", path = "../octa-output" }
+octa-cache = { version = "0.3.0", path = "../octa-cache" }
+octa-cache-protocol = { version = "0.3.0", path = "../octa-cache-protocol" }
 octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
 octa-plugin-manager = { version = "0.3.0", path = "../octa-plugin-manager" }
+blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sled = "0.34"
+toml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+same-file = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

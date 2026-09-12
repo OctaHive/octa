@@ -5,16 +5,17 @@ use std::{
   process::Stdio,
   sync::mpsc,
   thread,
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use assert_cmd::Command;
+use octa_cache_protocol::{Digest, PlatformArchitecture, PlatformOs, RuntimeIdentity};
 use octa_plugin::protocol::PLUGIN_PROTOCOL_VERSION;
 use octa_plugin_manager::plugin_lock::{
   current_platform, sha256_file, write_plugin_lock, PluginLock, PluginManifest, PLUGIN_LOCK_VERSION,
   PLUGIN_MANIFEST_VERSION,
 };
-use octa_runner::{MAX_RUNNER_INPUT_FRAME_BYTES, RUNNER_OUTPUT_SCHEMA_V1};
+use octa_runner::{MAX_RUNNER_INPUT_FRAME_BYTES, RUNNER_OUTPUT_SCHEMA_V2, RUNNER_PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
@@ -23,7 +24,18 @@ fn plugins_dir() -> PathBuf {
   if let Some(path) = env::var_os("OCTA_E2E_PLUGINS_DIR") {
     return PathBuf::from(path);
   }
-  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug")
+
+  let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+  let target = workspace.join("target/debug");
+  #[cfg(windows)]
+  let plugin_names = ["octa_plugin_shell.exe", "octa_plugin_tpl.exe"];
+  #[cfg(not(windows))]
+  let plugin_names = ["octa_plugin_shell", "octa_plugin_tpl"];
+  if plugin_names.iter().all(|name| target.join(name).is_file()) {
+    target
+  } else {
+    workspace.join("plugins")
+  }
 }
 
 fn request(workspace: &TempDir, command: &str) -> String {
@@ -31,13 +43,52 @@ fn request(workspace: &TempDir, command: &str) -> String {
     "{}\n",
     json!({
       "type": "start",
-      "protocol_version": 1,
+      "protocol_version": RUNNER_PROTOCOL_VERSION,
       "request_id": "test-run",
       "request": {
         "workspace": workspace.path(),
         "data_dir": workspace.path().join("cache"),
         "plugins_dir": plugins_dir(),
         "commands": [command]
+      }
+    })
+  )
+}
+
+fn cached_request(workspace: &TempDir, cache_directory: &std::path::Path, command: &str) -> String {
+  let os = match env::consts::OS {
+    "linux" => PlatformOs::Linux,
+    "windows" => PlatformOs::Windows,
+    "macos" => PlatformOs::Macos,
+    value => panic!("unsupported test operating system {value}"),
+  };
+  let architecture = match env::consts::ARCH {
+    "x86_64" => PlatformArchitecture::Amd64,
+    "aarch64" => PlatformArchitecture::Arm64,
+    value => panic!("unsupported test architecture {value}"),
+  };
+  let runtime = RuntimeIdentity::Native {
+    os,
+    architecture,
+    environment: Digest::blake3(b"cli-runner-shared-test-environment"),
+  };
+  format!(
+    "{}\n",
+    json!({
+      "type": "start",
+      "protocol_version": 2,
+      "request_id": "cached-run",
+      "request": {
+        "workspace": workspace.path(),
+        "data_dir": workspace.path().join("state"),
+        "plugins_dir": plugins_dir(),
+        "commands": [command],
+        "cache": {
+          "mode": "read_write",
+          "namespace": "tests/runner",
+          "local_directory": cache_directory,
+          "runtime": runtime
+        }
       }
     })
   )
@@ -101,7 +152,7 @@ fn messages(output: &[u8]) -> Vec<Value> {
 }
 
 fn assert_valid_output(messages: &[Value]) {
-  let schema = serde_json::from_str(RUNNER_OUTPUT_SCHEMA_V1).unwrap();
+  let schema = serde_json::from_str(RUNNER_OUTPUT_SCHEMA_V2).unwrap();
   let validator = jsonschema::validator_for(&schema).unwrap();
   for message in messages {
     let errors = validator
@@ -122,10 +173,78 @@ fn reports_capabilities_without_starting_a_job() {
   assert_eq!(messages.len(), 1);
   assert_valid_output(&messages);
   assert_eq!(messages[0]["type"], "capabilities");
-  assert_eq!(messages[0]["runner_protocols"], json!([1]));
-  assert_eq!(messages[0]["event_schemas"], json!([3]));
+  assert_eq!(messages[0]["runner_protocols"], json!([2]));
+  assert_eq!(messages[0]["event_schemas"], json!([4]));
   assert_eq!(messages[0]["plugin_protocols"], json!([1]));
   assert_eq!(messages[0]["octafile_versions"], json!([1]));
+}
+
+#[test]
+fn protocol_v2_reuses_one_local_result_across_workspaces() {
+  let cache = TempDir::new().unwrap();
+  let first = TempDir::new().unwrap();
+  let second = TempDir::new().unwrap();
+  let octafile = r#"
+version: 1
+tasks:
+  build:
+    files:
+      inputs: [input.txt]
+      outputs: [output.txt]
+    cache: {}
+    shell: echo generated > output.txt && echo run >> runs.txt
+"#;
+  for workspace in [&first, &second] {
+    fs::write(workspace.path().join("Octafile.yml"), octafile).unwrap();
+    fs::write(workspace.path().join("input.txt"), "input").unwrap();
+  }
+
+  let execute = |workspace: &TempDir| {
+    let mut command = Command::cargo_bin("octa-runner").unwrap();
+    command
+      .write_stdin(cached_request(workspace, cache.path(), "build"))
+      .output()
+      .unwrap()
+  };
+  let first_output = execute(&first);
+  assert!(
+    first_output.status.success(),
+    "{}",
+    String::from_utf8_lossy(&first_output.stdout)
+  );
+  let second_output = execute(&second);
+  assert!(
+    second_output.status.success(),
+    "{}",
+    String::from_utf8_lossy(&second_output.stdout)
+  );
+  assert_valid_output(&messages(&first_output.stdout));
+  assert_valid_output(&messages(&second_output.stdout));
+
+  let cache_outcome = |output: &[u8]| {
+    messages(output)
+      .into_iter()
+      .find(|message| message["type"] == "finished")
+      .unwrap()["results"][0]["tasks"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .find_map(|task| task.get("cache").cloned())
+      .unwrap()
+  };
+  let first_cache = cache_outcome(&first_output.stdout);
+  let second_cache = cache_outcome(&second_output.stdout);
+  assert_eq!(first_cache["status"], "miss");
+  assert_eq!(
+    second_cache["status"], "hit",
+    "first={first_cache}, second={second_cache}"
+  );
+  assert_eq!(first_cache["action"], second_cache["action"]);
+  assert_eq!(
+    fs::read_to_string(second.path().join("output.txt")).unwrap(),
+    "generated\n"
+  );
+  assert!(!second.path().join("runs.txt").exists());
 }
 
 #[test]
@@ -141,7 +260,7 @@ fn executes_only_digest_verified_locked_plugins() {
     "{}\n",
     json!({
       "type": "start",
-      "protocol_version": 1,
+      "protocol_version": RUNNER_PROTOCOL_VERSION,
       "request_id": "locked-run",
       "request": {
         "workspace": workspace.path(),
@@ -283,7 +402,7 @@ tasks:
     "{}\n",
     json!({
       "type": "start",
-      "protocol_version": 1,
+      "protocol_version": RUNNER_PROTOCOL_VERSION,
       "request_id": "junit-run",
       "request": {
         "workspace": workspace.path(),
@@ -350,7 +469,7 @@ tasks:
       "{}\n",
       json!({
         "type": "start",
-        "protocol_version": 1,
+        "protocol_version": RUNNER_PROTOCOL_VERSION,
         "request_id": format!("secret-{environment}"),
         "request": {
           "workspace": workspace.path(),
@@ -453,6 +572,26 @@ fn rejects_an_incompatible_protocol_before_loading_the_workspace() {
 }
 
 #[test]
+fn rejects_the_removed_protocol_v1_without_loading_a_job() {
+  let workspace = TempDir::new().unwrap();
+  let cache = TempDir::new().unwrap();
+  let mut input: Value = serde_json::from_str(cached_request(&workspace, cache.path(), "build").trim()).unwrap();
+  input["protocol_version"] = json!(1);
+
+  let mut command = Command::cargo_bin("octa-runner").unwrap();
+  let output = command.write_stdin(input.to_string() + "\n").output().unwrap();
+  assert_eq!(output.status.code(), Some(4));
+
+  let messages = messages(&output.stdout);
+  assert_valid_output(&messages);
+  assert_eq!(messages.last().unwrap()["type"], "error");
+  assert!(messages.last().unwrap()["message"]
+    .as_str()
+    .unwrap()
+    .contains("unsupported runner protocol"));
+}
+
+#[test]
 fn rejects_an_oversized_start_frame() {
   let mut command = Command::cargo_bin("octa-runner").unwrap();
   let output = command
@@ -493,7 +632,7 @@ fn rejects_missing_start_cancel_first_empty_ids_and_invalid_requests() {
     (
       json!({
         "type": "start",
-        "protocol_version": 1,
+        "protocol_version": RUNNER_PROTOCOL_VERSION,
         "request_id": "",
         "request": {"workspace": "/", "commands": ["build"]}
       }),
@@ -502,7 +641,7 @@ fn rejects_missing_start_cancel_first_empty_ids_and_invalid_requests() {
     (
       json!({
         "type": "start",
-        "protocol_version": 1,
+        "protocol_version": RUNNER_PROTOCOL_VERSION,
         "request_id": "invalid",
         "request": {"workspace": "relative", "commands": ["build"]}
       }),
@@ -542,7 +681,7 @@ fn supports_unicode_workspaces_and_partial_output_lines() {
     "{}\n",
     json!({
       "type": "start",
-      "protocol_version": 1,
+      "protocol_version": RUNNER_PROTOCOL_VERSION,
       "request_id": "unicode",
       "request": {
         "workspace": path,
@@ -739,13 +878,20 @@ fn cancel_stops_an_active_command() {
   writeln!(stdin, "{{not-json}}").unwrap();
   stdin.write_all(request(&workspace, "wait").as_bytes()).unwrap();
   stdin.flush().unwrap();
-  for _ in 0..3 {
+  let deadline = Instant::now() + Duration::from_secs(5);
+  let mut errors = 0;
+  while errors < 3 {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    assert!(
+      !remaining.is_zero(),
+      "runner did not report all invalid control commands"
+    );
     let line = line_rx
-      .recv_timeout(Duration::from_secs(5))
+      .recv_timeout(remaining)
       .expect("runner did not report the invalid control command")
       .unwrap();
     let message: Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(message["type"], "error");
+    errors += usize::from(message["type"] == "error");
     observed.push(message);
   }
   assert!(

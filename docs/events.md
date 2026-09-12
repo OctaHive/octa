@@ -5,9 +5,9 @@ parse human output: terminal renderers may change their wording or layout withou
 contract.
 
 Every line is one UTF-8 JSON object described by the checked-in
-[version 3 JSON Schema](../crates/octa-output/schema/events-v3.schema.json). The current schema and
-the frozen version 1 and 2 schemas are embedded in `octa-output` as `EVENT_SCHEMA_V3`,
-`EVENT_SCHEMA_V2`, and `EVENT_SCHEMA_V1`; `EVENT_SCHEMA_VERSION` is written to every new entry.
+[version 4 JSON Schema](../crates/octa-output/schema/events-v4.schema.json). The current schema and
+the frozen version 1–3 schemas are embedded in `octa-output` as `EVENT_SCHEMA_V4` through
+`EVENT_SCHEMA_V1`; `EVENT_SCHEMA_VERSION` is written to every new entry.
 
 ## Envelope and ordering
 
@@ -15,7 +15,7 @@ Every entry contains:
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Event contract version; currently `3` |
+| `schema_version` | Event contract version; currently `4` |
 | `sequence` | Strictly increasing position in this Octa process's output stream |
 | `timestamp` | RFC 3339 emission time |
 | `category` | `execution`, `diagnostic`, or `document` |
@@ -65,9 +65,27 @@ not stable API behavior.
 Paths in these events are relative to the execution workspace. The future agent must still validate
 them immediately before collection because a task may modify the filesystem after registration.
 
+## Cache lifecycle
+
+Cache events belong to a task scope and use the canonical action digest as their correlation key:
+
+| Event | Meaning |
+| --- | --- |
+| `cache_lookup_started` | The complete action identity was computed and lookup began. |
+| `cache_hit` | A reusable action result and its metadata were accepted. |
+| `cache_miss` | No result was selected; `reason` is a stable diagnostic identifier. |
+| `cache_restore_finished` | A hit's filesystem transaction finished; zero bytes means matching outputs were already materialized. |
+| `cache_publish_started` | A successful task passed its final input recheck and began publication. |
+| `cache_published` | Blob-first immutable publication completed or found an identical result. |
+| `cache_error` | Cache work failed and normal task execution continued; `reason` is stable and `action` is absent if identity was not available. |
+
+The stream reports task-level transitions rather than individual blob chunks. Cache failures are
+non-fatal unless cancellation is requested, so consumers must use the task's terminal result—not
+the presence of `cache_error`—to determine build success.
+
 Scope and step declarations are emitted in plan declaration order before scheduling. A scope starts
 when its first DAG node is considered for execution. A step starts only after it has acquired
-scheduler capacity; condition, freshness, and cache evaluation are part of the started step. A
+scheduler capacity; condition and cache evaluation are part of the started step. A
 normally executed step follows
 `step_declared → step_started → step_finished`. Work cancelled before it starts can go directly from
 declared to a terminal `step_finished` event. `scope_finished` is emitted only after all of the
@@ -78,8 +96,8 @@ cleanup boundary.
 
 ## Versioning policy
 
-Versions 1 and 2 are frozen as exact external contracts. Version 2 adds the `progress` execution
-event; version 1 remains available unchanged. Renaming or removing a field, changing a field's type
+Versions 1–3 are frozen as exact external contracts. Version 4 adds task cache lifecycle events;
+version 2 added `progress`, and earlier versions remain available unchanged. Renaming or removing a field, changing a field's type
 or requiredness, adding a field or event variant, or changing an enum value requires a new
 `schema_version` and a new immutable schema file. Corrections that only clarify prose do not.
 

@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+/// One project Octafile selected by a monorepo root configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MonorepoProject {
   /// Colon-separated task namespace represented as individual path components.
@@ -8,6 +9,7 @@ pub struct MonorepoProject {
   pub octafile: PathBuf,
 }
 
+/// Resolved Octafile entry point and projects visible to one invocation.
 #[derive(Clone, Debug)]
 pub struct MonorepoResolution {
   /// Octafile whose monorepo configuration owns this resolution.

@@ -43,6 +43,8 @@ pub struct Vars {
   required_vars: IndexMap<String, RequiredVar>,
   output_refs: IndexMap<String, TaskOutputReference>,
   secret_refs: HashMap<String, SecretRef>,
+  // Values supplied by Octa for templates but excluded from declared action inputs.
+  transient: HashSet<String>,
   secret_session: Option<Arc<SecretSession>>,
   parent: Option<Arc<Vars>>, // Link to parent variables
   dir: Option<PathBuf>,      // Directory used by shell-backed values in this context
@@ -56,6 +58,7 @@ struct VariableLayer {
   required_vars: IndexMap<String, RequiredVar>,
   output_refs: IndexMap<String, TaskOutputReference>,
   secret_refs: HashMap<String, SecretRef>,
+  transient: HashSet<String>,
   dir: Option<PathBuf>,
 }
 
@@ -140,6 +143,7 @@ impl PartialEq for Vars {
       && self.required_vars == other.required_vars
       && self.output_refs == other.output_refs
       && self.secret_refs == other.secret_refs
+      && self.transient == other.transient
   }
 }
 
@@ -153,6 +157,7 @@ impl Vars {
       required_vars: IndexMap::new(),
       output_refs: IndexMap::new(),
       secret_refs: HashMap::new(),
+      transient: HashSet::new(),
       secret_session: None,
       parent: None,
       dir: None,
@@ -167,6 +172,7 @@ impl Vars {
       required_vars: IndexMap::new(),
       output_refs: IndexMap::new(),
       secret_refs: HashMap::new(),
+      transient: HashSet::new(),
       secret_session: None,
       parent: Some(Arc::new(parent)),
       dir: None,
@@ -205,6 +211,7 @@ impl Vars {
     self.required_vars.clear();
     self.output_refs.clear();
     self.secret_refs.clear();
+    self.transient.clear();
     self.expanded = false;
   }
 
@@ -214,6 +221,7 @@ impl Vars {
     self.required_vars.clear();
     self.output_refs.clear();
     self.secret_refs.clear();
+    self.transient.clear();
     self.extend_variables(variables);
   }
 
@@ -238,8 +246,15 @@ impl Vars {
       self.secrets.remove(key);
       self.output_refs.shift_remove(key);
       self.secret_refs.remove(key);
+      self.transient.remove(key);
     }
     self.expanded = false;
+  }
+
+  /// Inserts an Octa-provided template value that is not a declared action input.
+  pub(crate) fn insert_transient<T: Serialize + ?Sized>(&mut self, key: &str, value: &T) {
+    self.insert(key, value);
+    self.transient.insert(key.to_owned());
   }
 
   pub fn get(&self, key: &str) -> Option<&Value> {
@@ -254,6 +269,7 @@ impl Vars {
         self.secrets.remove(key);
         self.output_refs.shift_remove(key);
         self.secret_refs.remove(key);
+        self.transient.remove(key);
       }
     }
     self.expanded = false;
@@ -266,6 +282,7 @@ impl Vars {
       self.secrets.remove(&key);
       self.output_refs.shift_remove(&key);
       self.secret_refs.remove(&key);
+      self.transient.remove(&key);
     }
     self.expanded = false;
   }
@@ -273,6 +290,7 @@ impl Vars {
   pub(crate) fn extend_variables(&mut self, variables: OctafileVars) {
     // Consume the typed parser representation directly so secret metadata is not lost in Serde.
     for (key, variable) in variables {
+      self.transient.remove(&key);
       let secret = variable.is_secret();
       let enum_source = variable.enum_source().cloned();
       let question = variable.question().map(str::to_owned);
@@ -490,6 +508,7 @@ impl Vars {
         required_vars: vars.required_vars.clone(),
         output_refs: vars.output_refs.clone(),
         secret_refs: vars.secret_refs.clone(),
+        transient: vars.transient.clone(),
         dir: vars.dir.clone(),
       });
       current = vars.parent.as_ref().map(|p| p.as_ref());
@@ -542,6 +561,7 @@ impl Vars {
         required_vars: _,
         output_refs: _,
         secret_refs,
+        transient: _,
         dir,
       } = layer;
       let current_dir = match dir {
@@ -701,7 +721,7 @@ impl Vars {
 
   /// Returns persistence-safe inputs: secret variables are removed and any occurrence of
   /// their resolved scalar values inside other strings is replaced with a stable marker.
-  pub(crate) fn freshness_values(&self, tracked: Option<&HashSet<String>>) -> HashMap<String, Value> {
+  pub(crate) fn action_values(&self, tracked: Option<&HashSet<String>>) -> HashMap<String, Value> {
     let secret_values = self
       .values
       .iter()
@@ -716,29 +736,25 @@ impl Vars {
       .collect()
   }
 
-  pub(crate) fn redact_for_persistence(&self, value: Value) -> Value {
-    let secret_values = self
-      .values
-      .iter()
-      .filter(|(name, _)| self.secrets.contains(*name))
-      .map(|(_, value)| value.clone())
-      .collect::<Vec<_>>();
-    redact_persistent_value(value, &secret_values)
-  }
-
   /// Names explicitly declared by Octa configuration or invocation layers.
   pub(crate) fn declared_names(&self) -> HashSet<String> {
-    self
-      .collect_context_chain()
+    let mut declarations = HashMap::<String, bool>::new();
+    for layer in self.collect_context_chain() {
+      for name in layer.values.keys() {
+        declarations.insert(name.clone(), layer.transient.contains(name));
+      }
+      for name in layer
+        .required_vars
+        .keys()
+        .chain(layer.output_refs.keys())
+        .chain(layer.secret_refs.keys())
+      {
+        declarations.insert(name.clone(), false);
+      }
+    }
+    declarations
       .into_iter()
-      .flat_map(|layer| {
-        layer
-          .values
-          .into_keys()
-          .chain(layer.required_vars.into_keys())
-          .chain(layer.output_refs.into_keys())
-          .chain(layer.secret_refs.into_keys())
-      })
+      .filter_map(|(name, transient)| (!transient).then_some(name))
       .collect()
   }
 
@@ -1068,6 +1084,7 @@ impl From<Context> for Vars {
       required_vars: IndexMap::new(),
       output_refs: IndexMap::new(),
       secret_refs: HashMap::new(),
+      transient: HashSet::new(),
       secret_session: None,
       parent: None,
       dir: None,
@@ -1402,11 +1419,25 @@ mod tests {
     }));
     vars.secrets.insert("TOKEN".to_owned());
 
-    let values = vars.freshness_values(None);
+    let values = vars.action_values(None);
     assert!(!values.contains_key("TOKEN"));
     assert_eq!(values["HEADER"], serde_json::json!("Bearer <secret>"));
     assert_eq!(values["PUBLIC"], serde_json::json!("visible"));
     assert!(!serde_json::to_string(&values).unwrap().contains("do-not-persist"));
+  }
+
+  #[test]
+  fn declared_action_inputs_exclude_runtime_values_but_allow_explicit_replacement() {
+    let mut vars = Vars::new();
+    vars.insert_transient("ROOT_DIR", &"/first/workspace");
+    vars.insert("PROFILE", &"release");
+    assert_eq!(vars.declared_names(), HashSet::from(["PROFILE".to_owned()]));
+
+    vars.insert("ROOT_DIR", &"portable-explicit-value");
+    assert_eq!(
+      vars.declared_names(),
+      HashSet::from(["PROFILE".to_owned(), "ROOT_DIR".to_owned()])
+    );
   }
 
   #[tokio::test]

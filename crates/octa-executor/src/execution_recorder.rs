@@ -47,6 +47,7 @@ struct ScopeState {
   outputs: TaskOutputs,
   artifacts: Vec<RegisteredArtifact>,
   reports: Vec<RegisteredReport>,
+  cache: Option<crate::execution_result::CacheOutcome>,
 }
 
 impl Default for ScopeState {
@@ -62,6 +63,7 @@ impl Default for ScopeState {
       outputs: TaskOutputs::default(),
       artifacts: Vec::new(),
       reports: Vec::new(),
+      cache: None,
     }
   }
 }
@@ -435,8 +437,11 @@ impl ExecutionRecorder {
       state.status = state.status.max(status);
       record_timed_failure(&mut state.failure, &mut state.failure_at, failure, failure_at);
       state.outputs.extend(outputs.task());
-      state.artifacts.extend_from_slice(outputs.artifacts());
-      state.reports.extend_from_slice(outputs.reports());
+      extend_unique(&mut state.artifacts, outputs.artifacts());
+      extend_unique(&mut state.reports, outputs.reports());
+      if let Some(cache) = outputs.cache() {
+        state.cache = Some(cache.clone());
+      }
       state.remaining -= 1;
       if state.remaining == 0 {
         state.lifecycle = LifecycleState::PublishingFinish;
@@ -676,6 +681,7 @@ impl ExecutionRecorder {
           redacted_outputs: state.outputs.secret_names(),
           artifacts: state.artifacts.clone(),
           reports: state.reports.clone(),
+          cache: state.cache.clone(),
           steps: steps_by_scope.remove(&scope.id()).unwrap_or_default(),
         })
       })
@@ -718,6 +724,14 @@ impl ExecutionRecorder {
           .map(|(_, failure)| failure)
       })
       .cloned()
+  }
+}
+
+fn extend_unique<T: Clone + PartialEq>(destination: &mut Vec<T>, values: &[T]) {
+  for value in values {
+    if !destination.contains(value) {
+      destination.push(value.clone());
+    }
   }
 }
 

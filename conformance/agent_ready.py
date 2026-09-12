@@ -82,8 +82,8 @@ def main() -> None:
     plugins = args.plugins.resolve()
 
     capabilities = json.loads(subprocess.run([runner, "capabilities"], check=True, text=True, stdout=subprocess.PIPE).stdout)
-    assert capabilities["runner_protocols"] == [1]
-    assert capabilities["event_schemas"] == [3]
+    assert capabilities["runner_protocols"] == [2]
+    assert capabilities["event_schemas"] == [4]
     assert capabilities["plugin_protocols"] == [1]
     assert {"artifacts", "reports", "locked-plugins", "secret-providers"} <= set(capabilities["features"])
 
@@ -121,7 +121,7 @@ tasks:
         lock = write_locked_plugins(plugins, locked_plugins)
         start = {
             "type": "start",
-            "protocol_version": 1,
+            "protocol_version": 2,
             "request_id": "conformance",
             "request": {
                 "workspace": str(root),
