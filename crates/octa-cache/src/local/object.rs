@@ -187,6 +187,24 @@ pub(super) fn open_lock_file(path: &Path) -> CacheResult<File> {
 /// every cache hit.
 pub(super) async fn record_sampled_access(path: &Path, interval: Duration) -> CacheResult<()> {
   let marker = path.with_extension("access");
+  let parent = marker
+    .parent()
+    .ok_or_else(|| CacheError::Configuration("cache action access marker has no parent directory".to_owned()))?;
+  match tokio::fs::symlink_metadata(parent).await {
+    Ok(metadata) if metadata.file_type().is_dir() && !is_link_or_reparse(&metadata) => {},
+    Ok(_) => {
+      return Err(io_error(
+        "inspect cache action access marker parent",
+        parent,
+        io::Error::new(io::ErrorKind::NotADirectory, "parent is not a regular directory"),
+      ));
+    },
+    // An operator may remove the cache while a lookup is finishing. Access
+    // sampling is advisory, so an absent shard must not turn a hit into an
+    // execution failure.
+    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+    Err(error) => return Err(io_error("inspect cache action access marker parent", parent, error)),
+  }
   let recent = match tokio::fs::symlink_metadata(&marker).await {
     Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => metadata
       .modified()
@@ -241,11 +259,15 @@ mod tests {
   }
 
   #[test]
-  fn encoded_blob_verification_rejects_a_physical_size_mismatch() {
+  fn encoded_blob_verification_rejects_limits_and_a_physical_size_mismatch() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("blob");
     fs::write(&path, b"short").unwrap();
     let expected = descriptor(b"longer bytes");
+    assert!(matches!(
+      verify_encoded_blob(&path, &expected, expected.expanded_size_bytes - 1),
+      Err(CacheError::Limit(message)) if message.contains("above the configured limit")
+    ));
     assert!(matches!(
       verify_encoded_blob(&path, &expected, 1024),
       Err(CacheError::InvalidBundle(message)) if message.contains("encoded blob has")
@@ -265,6 +287,11 @@ mod tests {
     let second = acquire_lock(shared_path.clone(), false).await.unwrap();
     assert!(shared_path.is_file());
     drop((first, second));
+
+    assert!(matches!(
+      open_lock_file(&root.path().join("missing/lock")),
+      Err(CacheError::Io { .. })
+    ));
   }
 
   #[cfg(unix)]
@@ -302,6 +329,13 @@ mod tests {
     fs::write(&non_directory, b"not a directory").unwrap();
     assert!(matches!(
       record_sampled_access(&non_directory.join("action.json"), Duration::from_secs(60)).await,
+      Err(CacheError::Io { .. })
+    ));
+
+    let directory_marker_action = root.path().join("directory-marker.json");
+    fs::create_dir(directory_marker_action.with_extension("access")).unwrap();
+    assert!(matches!(
+      record_sampled_access(&directory_marker_action, Duration::from_secs(60)).await,
       Err(CacheError::Io { .. })
     ));
   }

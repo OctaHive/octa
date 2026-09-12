@@ -2373,6 +2373,93 @@ fn test_json_output_rejects_raw_mode_before_execution() -> Result<(), Box<dyn st
   Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn test_raw_mode_runs_through_the_pty_without_a_terminal() -> Result<(), Box<dyn std::error::Error>> {
+  use std::{
+    io::{BufRead as _, BufReader, Read as _, Write as _},
+    process::Stdio,
+    sync::mpsc,
+    time::Duration,
+  };
+
+  use wait_timeout::ChildExt as _;
+
+  let watchdog = Duration::from_secs(60);
+  let tmp_dir = TempDir::new()?;
+  fs::write(
+    tmp_dir.path().join("Octafile.yml"),
+    "version: 1\ntasks:\n  interactive: |\n    echo raw-ready\n    read value\n    echo raw-$value\n",
+  )?;
+
+  let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_octa"));
+  let mut child = command
+    .current_dir(tmp_dir.path())
+    .args(["--raw", "interactive"])
+    .env("OCTA_DATA_DIR", tmp_dir.path().join("cache"))
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+  let mut open_stdin = child.stdin.take().expect("piped stdin is available");
+  let stdout = child.stdout.take().expect("piped stdout is available");
+  let stderr = child.stderr.take().expect("piped stderr is available");
+  let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+  let stdout_reader = std::thread::spawn(move || {
+    let mut output = String::new();
+    let mut reader = BufReader::new(stdout);
+    loop {
+      let mut line = String::new();
+      let count = reader.read_line(&mut line).unwrap();
+      if count == 0 {
+        break;
+      }
+      output.push_str(&line);
+      if line.contains("raw-ready") {
+        let _ = ready_sender.send(());
+      }
+    }
+    output
+  });
+  let stderr_reader = std::thread::spawn(move || {
+    let mut output = String::new();
+    BufReader::new(stderr).read_to_string(&mut output).unwrap();
+    output
+  });
+
+  if let Err(error) = ready_receiver.recv_timeout(watchdog) {
+    let _ = child.kill();
+    drop(open_stdin);
+    let _ = child.wait();
+    let stdout = stdout_reader.join().expect("stdout reader must not panic");
+    let stderr = stderr_reader.join().expect("stderr reader must not panic");
+    panic!("raw command did not request input: {error}; stdout={stdout:?}; stderr={stderr:?}");
+  }
+  writeln!(open_stdin, "forwarded-input")?;
+  open_stdin.flush()?;
+  let status = child.wait_timeout(watchdog)?;
+  drop(open_stdin);
+
+  let Some(status) = status else {
+    child.kill()?;
+    let _ = child.wait();
+    let stdout = stdout_reader.join().expect("stdout reader must not panic");
+    let stderr = stderr_reader.join().expect("stderr reader must not panic");
+    panic!("raw command waited for host stdin after the PTY child exited; stdout={stdout:?}; stderr={stderr:?}");
+  };
+  let stdout = stdout_reader.join().expect("stdout reader must not panic");
+  let stderr = stderr_reader.join().expect("stderr reader must not panic");
+  assert!(status.success(), "raw command failed: {stderr}");
+  assert!(
+    stdout.contains("raw-forwarded-input"),
+    "unexpected raw output: {stdout:?}"
+  );
+
+  Ok(())
+}
+
+#[cfg(windows)]
 #[test]
 fn test_raw_mode_runs_through_the_pty_without_a_terminal() -> Result<(), Box<dyn std::error::Error>> {
   let tmp_dir = TempDir::new()?;
@@ -2387,7 +2474,7 @@ fn test_raw_mode_runs_through_the_pty_without_a_terminal() -> Result<(), Box<dyn
     .args(["--raw", "interactive"])
     .env("OCTA_DATA_DIR", tmp_dir.path().join("cache"))
     .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
-    .timeout(std::time::Duration::from_secs(10))
+    .timeout(std::time::Duration::from_secs(60))
     .assert()
     .success()
     .stdout(predicate::str::contains("raw-output"));

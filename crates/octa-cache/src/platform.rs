@@ -256,8 +256,11 @@ mod tests {
 
   #[test]
   fn timestamps_before_the_epoch_have_a_distinct_stable_key() {
-    assert_eq!(system_time_key(UNIX_EPOCH - Duration::from_nanos(1)), (true, 0, 1));
-    assert_eq!(system_time_key(UNIX_EPOCH + Duration::from_nanos(1)), (false, 0, 1));
+    // Windows filesystem time has a coarser resolution than one nanosecond.
+    // Whole seconds are exact on every supported platform while still testing
+    // that the sign is part of the transient fingerprint.
+    assert_eq!(system_time_key(UNIX_EPOCH - Duration::from_secs(1)), (true, 1, 0));
+    assert_eq!(system_time_key(UNIX_EPOCH + Duration::from_secs(1)), (false, 1, 0));
   }
 
   #[cfg(windows)]

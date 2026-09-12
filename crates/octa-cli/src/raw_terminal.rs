@@ -93,12 +93,12 @@ impl RawTerminalBridge {
 }
 
 #[cfg(unix)]
-async fn forward_input(input: RawTerminalInput, terminal_mode: bool) -> io::Result<()> {
+async fn forward_input(input: RawTerminalInput, _terminal_mode: bool) -> io::Result<()> {
   use std::{fs::File, io::Read};
 
   use nix::fcntl::{fcntl, FcntlArg, OFlag};
   use nix::unistd::dup;
-  use tokio::io::{unix::AsyncFd, AsyncReadExt};
+  use tokio::io::unix::AsyncFd;
 
   struct RestoreStdinFlags(OFlag);
   impl Drop for RestoreStdinFlags {
@@ -107,25 +107,36 @@ async fn forward_input(input: RawTerminalInput, terminal_mode: bool) -> io::Resu
     }
   }
 
-  if !terminal_mode {
-    let mut stdin = tokio::io::stdin();
-    let mut buffer = vec![0; 8192];
-    loop {
-      match stdin.read(&mut buffer).await {
-        Ok(0) => break,
-        Ok(count) => input.write(buffer[..count].to_vec()).await?,
-        Err(error) => return Err(error),
-      }
-    }
-    return input.close().await;
-  }
-
+  // Tokio implements stdin with an uncancellable blocking read. If piped
+  // stdin remains open after a raw child exits, awaiting an aborted forwarding
+  // task can therefore hang process shutdown. A duplicated nonblocking Unix
+  // descriptor remains cancellable for terminals, pipes, and redirected files.
   let stdin = std::io::stdin();
   let flags = OFlag::from_bits_truncate(fcntl(&stdin, FcntlArg::F_GETFL).map_err(io::Error::other)?);
   fcntl(&stdin, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).map_err(io::Error::other)?;
   let _restore_flags = RestoreStdinFlags(flags);
-  let terminal = AsyncFd::new(File::from(dup(&stdin).map_err(io::Error::other)?))?;
+  let mut descriptor = File::from(dup(&stdin).map_err(io::Error::other)?);
   let mut buffer = vec![0; 8192];
+
+  // Regular files and `/dev/null` cannot be registered with epoll on Linux,
+  // but a nonblocking read can drain them without a readiness subscription.
+  if drain_ready_input(&mut descriptor, &input, &mut buffer).await? {
+    return input.close().await;
+  }
+
+  let terminal = match AsyncFd::new(descriptor) {
+    Ok(terminal) => terminal,
+    Err(error) if error.raw_os_error() == Some(nix::libc::EPERM) => {
+      let mut descriptor = File::from(dup(&stdin).map_err(io::Error::other)?);
+      loop {
+        if drain_ready_input(&mut descriptor, &input, &mut buffer).await? {
+          return input.close().await;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+    },
+    Err(error) => return Err(error),
+  };
   loop {
     let mut ready = terminal.readable().await?;
     match ready.try_io(|file| {
@@ -134,11 +145,27 @@ async fn forward_input(input: RawTerminalInput, terminal_mode: bool) -> io::Resu
     }) {
       Ok(Ok(0)) => break,
       Ok(Ok(count)) => input.write(buffer[..count].to_vec()).await?,
+      Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
       Ok(Err(error)) => return Err(error),
       Err(_) => continue,
     }
   }
   input.close().await
+}
+
+#[cfg(unix)]
+async fn drain_ready_input(file: &mut std::fs::File, input: &RawTerminalInput, buffer: &mut [u8]) -> io::Result<bool> {
+  use std::io::Read as _;
+
+  loop {
+    match file.read(buffer) {
+      Ok(0) => return Ok(true),
+      Ok(count) => input.write(buffer[..count].to_vec()).await?,
+      Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+      Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+      Err(error) => return Err(error),
+    }
+  }
 }
 
 #[cfg(not(unix))]
