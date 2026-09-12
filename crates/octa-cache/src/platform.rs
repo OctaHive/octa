@@ -21,7 +21,7 @@ pub(crate) fn is_link_or_reparse(metadata: &Metadata) -> bool {
   {
     use std::os::windows::fs::MetadataExt as _;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
   }
   #[cfg(not(windows))]
   false
@@ -110,7 +110,7 @@ fn platform_change(metadata: &Metadata) -> PlatformChange {
     // Creation time distinguishes a replacement at the same path when a
     // filesystem cannot provide a stable file index. Attributes complement
     // the portable executable bit and catch relevant metadata changes.
-    return PlatformChange(metadata.creation_time() as i64, metadata.file_attributes() as i64);
+    PlatformChange(metadata.creation_time() as i64, metadata.file_attributes() as i64)
   }
   #[cfg(not(windows))]
   {
