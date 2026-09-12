@@ -200,6 +200,20 @@ fn rejects_files_at_cache_directory_boundaries() {
   ));
 }
 
+#[test]
+fn reports_a_missing_cache_directory_parent() {
+  let root = tempfile::tempdir().unwrap();
+  let path = root.path().join("missing/shard");
+
+  assert!(matches!(
+    create_cache_directory(&path),
+    Err(CacheError::Io {
+      operation: "create local cache directory",
+      ..
+    })
+  ));
+}
+
 #[tokio::test]
 async fn recovers_capacity_state_and_rejects_unsafe_replacements() {
   let root = tempfile::tempdir().unwrap();

@@ -589,20 +589,9 @@ fn create_cache_root(path: &Path) -> CacheResult<()> {
 }
 
 fn create_cache_directory(path: &Path) -> CacheResult<()> {
-  match fs::symlink_metadata(path) {
-    Ok(metadata) if metadata.is_dir() && !is_link_or_reparse(&metadata) => return Ok(()),
-    Ok(_) => {
-      return Err(CacheError::Configuration(format!(
-        "local cache directory '{}' must not be a file, symbolic link, junction, or reparse point",
-        path.display()
-      )))
-    },
-    Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-    Err(error) => return Err(io_error("inspect local cache directory", path, error)),
-  }
   // Another writer may create the same digest shard after our initial
-  // inspection. Treat that race as success only after the common validation
-  // below proves the winner created a real directory rather than a link.
+  // attempt. Treat that race as success only after validation proves the
+  // winner created a real directory rather than a link.
   match fs::create_dir(path) {
     Ok(()) => {},
     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
@@ -612,7 +601,7 @@ fn create_cache_directory(path: &Path) -> CacheResult<()> {
     fs::symlink_metadata(path).map_err(|error| io_error("inspect created local cache directory", path, error))?;
   if !metadata.is_dir() || is_link_or_reparse(&metadata) {
     return Err(CacheError::Configuration(format!(
-      "local cache directory '{}' changed while it was being created",
+      "local cache directory '{}' must not be a file, symbolic link, junction, or reparse point",
       path.display()
     )));
   }
