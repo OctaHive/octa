@@ -2616,6 +2616,7 @@ dependencies = [
  "jsonschema",
  "octa-plugin",
  "octa-plugin-lock",
+ "same-file",
  "serde",
  "serde_json",
  "serde_yml",

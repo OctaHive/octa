@@ -589,6 +589,7 @@ fn classify_plugin_error(error: PluginManagerError) -> RuntimeError {
     | PluginManagerError::PluginSelectorAlreadyRegistered(_)
     | PluginManagerError::Lock(_) => RuntimeError::PluginManagerConfiguration(error),
     PluginManagerError::StartError(_)
+    | PluginManagerError::IdentityError(_)
     | PluginManagerError::ShutdownError(_)
     | PluginManagerError::ConnectionError(_)
     | PluginManagerError::Io(_)
@@ -687,6 +688,10 @@ mod tests {
     ));
     assert!(matches!(
       classify_plugin_error(PluginManagerError::ConnectionError("closed".to_owned())),
+      RuntimeError::PluginInfrastructure(_)
+    ));
+    assert!(matches!(
+      classify_plugin_error(PluginManagerError::IdentityError("changed".to_owned())),
       RuntimeError::PluginInfrastructure(_)
     ));
   }

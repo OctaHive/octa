@@ -7,11 +7,12 @@ use std::{
   collections::{HashMap, HashSet, VecDeque},
   path::{Path, PathBuf},
   sync::{Arc, Mutex as StdMutex},
+  time::SystemTime,
 };
 use thiserror::Error;
 use tokio::io::{self, AsyncReadExt};
 use tokio::{
-  sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
+  sync::{Mutex, OnceCell, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock},
   task::JoinHandle,
   time::{timeout, Duration},
 };
@@ -19,7 +20,7 @@ use uuid::Uuid;
 
 use crate::{
   plugin_client::PluginClient,
-  plugin_lock::{locked_plugin, verify_plugin, PluginLock, PluginLockError},
+  plugin_lock::{locked_plugin, verify_plugin_binary, PluginLock, PluginLockError},
   plugin_process::{LocalPluginLauncher, PluginLaunchError, PluginLaunchRequest, PluginLauncher, PluginProcess},
 };
 
@@ -40,6 +41,9 @@ pub enum PluginManagerError {
 
   #[error("Failed to start plugin: {0}")]
   StartError(String),
+
+  #[error("Failed to identify plugin: {0}")]
+  IdentityError(String),
 
   #[error("Failed to shutdown plugin: {0}")]
   ShutdownError(String),
@@ -75,7 +79,86 @@ struct PluginInstance {
   process: PluginProcess,
   socket_path: OsString,
   client: PluginClient,
-  identity: PluginBinaryIdentity,
+  identity: Arc<LazyPluginIdentity>,
+}
+
+/// Cheap evidence that the path still names the executable opened before the
+/// plugin was launched. File identity catches replacements while size and
+/// modification time catch ordinary in-place writes without hashing on every
+/// startup.
+#[derive(Debug)]
+struct PluginFileFingerprint {
+  handle: same_file::Handle,
+  size: u64,
+  modified: Option<SystemTime>,
+}
+
+impl PluginFileFingerprint {
+  fn read(path: &Path) -> std::io::Result<Self> {
+    let file = std::fs::File::open(path)?;
+    Self::from_file(file)
+  }
+
+  fn from_file(file: std::fs::File) -> std::io::Result<Self> {
+    let metadata = file.metadata()?;
+    let handle = same_file::Handle::from_file(file)?;
+    Ok(Self {
+      handle,
+      size: metadata.len(),
+      modified: metadata.modified().ok(),
+    })
+  }
+
+  fn matches(&self, path: &Path) -> std::io::Result<bool> {
+    let current = Self::read(path)?;
+    Ok(self.handle == current.handle && self.size == current.size && self.modified == current.modified)
+  }
+}
+
+/// Resolves the expensive binary digest only when a cache action key needs it.
+/// The lock-file digest is already trustworthy and can be reused directly.
+struct LazyPluginIdentity {
+  name: String,
+  version: String,
+  protocol_version: u16,
+  executable: PathBuf,
+  fingerprint: PluginFileFingerprint,
+  verified_sha256: Option<String>,
+  resolved: OnceCell<PluginBinaryIdentity>,
+}
+
+impl LazyPluginIdentity {
+  async fn resolve(&self) -> Result<PluginBinaryIdentity> {
+    self
+      .resolved
+      .get_or_try_init(|| async {
+        self.ensure_unchanged()?;
+        let sha256 = match &self.verified_sha256 {
+          Some(sha256) => sha256.clone(),
+          None => crate::plugin_lock::sha256_file(&self.executable).await?,
+        };
+        self.ensure_unchanged()?;
+        Ok(PluginBinaryIdentity {
+          name: self.name.clone(),
+          version: self.version.clone(),
+          protocol_version: self.protocol_version,
+          sha256,
+          executable_size: self.fingerprint.size,
+        })
+      })
+      .await
+      .cloned()
+  }
+
+  fn ensure_unchanged(&self) -> Result<()> {
+    if self.fingerprint.matches(&self.executable)? {
+      return Ok(());
+    }
+    Err(PluginManagerError::IdentityError(format!(
+      "plugin '{}' executable changed after it was selected",
+      self.name
+    )))
+  }
 }
 
 /// Exact implementation identity of one running plugin process.
@@ -85,10 +168,15 @@ struct PluginInstance {
 /// prevent reuse across different plugin binaries.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PluginBinaryIdentity {
+  /// Stable plugin name reported by its executable.
   pub name: String,
+  /// Implementation version reported during the plugin handshake.
   pub version: String,
+  /// Version of the plugin protocol used by the running process.
   pub protocol_version: u16,
+  /// SHA-256 digest of the executable selected before process startup.
   pub sha256: String,
+  /// Executable size included in the digest descriptor.
   pub executable_size: u64,
 }
 
@@ -390,6 +478,17 @@ impl PluginManager {
 
   /// Start a plugin and establish connection
   pub async fn start_plugin(&self, plugin_path: &str) -> Result<Schema> {
+    self.start_plugin_with_identity(plugin_path, None).await
+  }
+
+  /// Starts a plugin while carrying forward a digest already established by a
+  /// lock-file verification. Unlocked plugins defer hashing until a cache key
+  /// actually requires their implementation identity.
+  async fn start_plugin_with_identity(
+    &self,
+    plugin_path: &str,
+    verified: Option<(String, PluginFileFingerprint)>,
+  ) -> Result<Schema> {
     let plugin_full_path = self.plugins_dir.join(plugin_path);
     let plugin_name = plugin_full_path
       .file_stem()
@@ -410,8 +509,17 @@ impl PluginManager {
         plugin_full_path.to_string_lossy().to_string(),
       ));
     }
-    let initial_size = tokio::fs::metadata(&plugin_full_path).await?.len();
-    let initial_sha256 = crate::plugin_lock::sha256_file(&plugin_full_path).await?;
+    let (verified_sha256, fingerprint) = match verified {
+      Some((sha256, fingerprint)) => {
+        if !fingerprint.matches(&plugin_full_path)? {
+          return Err(PluginManagerError::StartError(format!(
+            "plugin '{plugin_name}' executable changed after lock verification"
+          )));
+        }
+        (Some(sha256), fingerprint)
+      },
+      None => (None, PluginFileFingerprint::read(&plugin_full_path)?),
+    };
 
     let socket_name =
       interpret_local_socket_name(&socket_path).map_err(|e| PluginManagerError::SocketPath(e.to_string()))?;
@@ -482,22 +590,15 @@ impl PluginManager {
         ));
       },
     };
-    let identity = async {
-      Ok::<_, std::io::Error>((
-        tokio::fs::metadata(&plugin_full_path).await?.len(),
-        crate::plugin_lock::sha256_file(&plugin_full_path).await?,
-      ))
-    }
-    .await;
-    let (executable_size, sha256) = match identity {
-      Ok(identity) => identity,
+    let unchanged = match fingerprint.matches(&plugin_full_path) {
+      Ok(unchanged) => unchanged,
       Err(error) => {
         drop(client);
         let _ = Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
         return Err(error.into());
       },
     };
-    if executable_size != initial_size || sha256 != initial_sha256 {
+    if !unchanged {
       drop(client);
       let _ = Self::cleanup_failed_start(&mut process, &socket_path, stdout_handle, stderr_handle).await;
       return Err(PluginManagerError::StartError(format!(
@@ -516,13 +617,15 @@ impl PluginManager {
         process,
         socket_path,
         client,
-        identity: PluginBinaryIdentity {
+        identity: Arc::new(LazyPluginIdentity {
           name: plugin_name.clone(),
           version: version.version,
           protocol_version: version.protocol_version,
-          sha256,
-          executable_size,
-        },
+          executable: plugin_full_path,
+          fingerprint,
+          verified_sha256,
+          resolved: OnceCell::new(),
+        }),
       },
     );
 
@@ -536,8 +639,11 @@ impl PluginManager {
       .as_ref()
       .ok_or_else(|| PluginManagerError::StartError("plugin lock is not configured".to_owned()))?;
     let mut expected_capabilities = locked_plugin(lock, plugin_name)?.capabilities.clone();
-    let executable = verify_plugin(lock, plugin_name, &self.plugins_dir).await?;
-    let schema = self.start_plugin(&executable.to_string_lossy()).await?;
+    let verified = verify_plugin_binary(lock, plugin_name, &self.plugins_dir).await?;
+    let fingerprint = PluginFileFingerprint::from_file(verified.file)?;
+    let schema = self
+      .start_plugin_with_identity(&verified.path.to_string_lossy(), Some((verified.sha256, fingerprint)))
+      .await?;
     expected_capabilities.sort();
     let mut actual_capabilities = schema.capabilities.clone();
     actual_capabilities.sort();
@@ -572,24 +678,40 @@ impl PluginManager {
   }
 
   /// Returns the exact running binary behind a registered task key.
-  pub async fn identity_for_key(&self, key: &str) -> Option<PluginBinaryIdentity> {
-    let plugin_name = self.resolve_key(key).await?.plugin_name().to_owned();
-    self.identity_for_plugin(&plugin_name).await
+  ///
+  /// An unlocked binary is hashed on the first call and the result is reused.
+  /// The call fails if the executable changed since process startup.
+  pub async fn identity_for_key(&self, key: &str) -> Result<Option<PluginBinaryIdentity>> {
+    let Some(plugin_name) = self.resolve_key(key).await.map(|registration| registration.plugin_name) else {
+      return Ok(None);
+    };
+    self.identity_for_plugin(&plugin_name).await.map(Some)
   }
 
   /// Returns the exact running binary behind a registered capability.
-  pub async fn identity_for_capability(&self, capability: &str) -> Option<PluginBinaryIdentity> {
-    let plugin_name = self.resolve_capability(capability).await?.plugin_name().to_owned();
-    self.identity_for_plugin(&plugin_name).await
+  ///
+  /// An unlocked binary is hashed on the first call and the result is reused.
+  /// The call fails if the executable changed since process startup.
+  pub async fn identity_for_capability(&self, capability: &str) -> Result<Option<PluginBinaryIdentity>> {
+    let Some(plugin_name) = self
+      .resolve_capability(capability)
+      .await
+      .map(|registration| registration.plugin_name)
+    else {
+      return Ok(None);
+    };
+    self.identity_for_plugin(&plugin_name).await.map(Some)
   }
 
-  async fn identity_for_plugin(&self, plugin_name: &str) -> Option<PluginBinaryIdentity> {
-    self
+  async fn identity_for_plugin(&self, plugin_name: &str) -> Result<PluginBinaryIdentity> {
+    let identity = self
       .active_plugins
       .lock()
       .await
       .get(plugin_name)
       .map(|plugin| plugin.identity.clone())
+      .ok_or_else(|| PluginManagerError::PluginNotFound(plugin_name.to_owned()))?;
+    identity.resolve().await
   }
 
   /// Clones a connected client without holding the manager lifecycle lock during execution.
@@ -768,6 +890,73 @@ mod tests {
       .collect::<HashSet<_>>();
 
     assert_eq!(paths.len(), 1_000);
+  }
+
+  #[tokio::test]
+  async fn locked_identity_reuses_the_verified_digest() {
+    let directory = TempDir::new().unwrap();
+    let executable = directory.path().join("plugin");
+    fs::write(&executable, b"plugin bytes").await.unwrap();
+    let verified_sha256 = "a".repeat(64);
+    let identity = LazyPluginIdentity {
+      name: "fixture".to_owned(),
+      version: "1.2.3".to_owned(),
+      protocol_version: 1,
+      fingerprint: PluginFileFingerprint::read(&executable).unwrap(),
+      executable,
+      verified_sha256: Some(verified_sha256.clone()),
+      resolved: OnceCell::new(),
+    };
+
+    let resolved = identity.resolve().await.unwrap();
+
+    assert_eq!(resolved.sha256, verified_sha256);
+    assert_eq!(resolved.executable_size, 12);
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn lazy_identity_rejects_an_executable_replaced_after_startup() {
+    let directory = TempDir::new().unwrap();
+    let executable = directory.path().join("plugin");
+    fs::write(&executable, b"original").await.unwrap();
+    let identity = LazyPluginIdentity {
+      name: "fixture".to_owned(),
+      version: "1.2.3".to_owned(),
+      protocol_version: 1,
+      fingerprint: PluginFileFingerprint::read(&executable).unwrap(),
+      executable: executable.clone(),
+      verified_sha256: None,
+      resolved: OnceCell::new(),
+    };
+    fs::rename(&executable, directory.path().join("old-plugin"))
+      .await
+      .unwrap();
+    fs::write(&executable, b"original").await.unwrap();
+
+    let error = identity.resolve().await.unwrap_err();
+
+    assert!(matches!(error, PluginManagerError::IdentityError(_)));
+    assert!(error.to_string().contains("changed after it was selected"));
+  }
+
+  #[cfg(unix)]
+  #[tokio::test]
+  async fn locked_start_rejects_a_file_replaced_after_verification() {
+    let directory = TempDir::new().unwrap();
+    let locked = directory.path().join("locked-plugin");
+    fs::write(&locked, b"locked").await.unwrap();
+    let verified_fingerprint = PluginFileFingerprint::read(&locked).unwrap();
+    fs::rename(&locked, directory.path().join("old-locked-plugin"))
+      .await
+      .unwrap();
+    fs::write(&locked, b"locked").await.unwrap();
+    let manager = PluginManager::new(directory.path());
+    let error = manager
+      .start_plugin_with_identity("locked-plugin", Some(("a".repeat(64), verified_fingerprint)))
+      .await
+      .unwrap_err();
+    assert!(error.to_string().contains("changed after lock verification"));
   }
 
   #[tokio::test]
@@ -992,7 +1181,19 @@ mod tests {
     assert!(result.unwrap().is_ok());
 
     assert!(setup.plugin_manager.is_plugin_running("test").await);
-    let identity = setup.plugin_manager.identity_for_key("key").await.unwrap();
+    assert!(setup
+      .plugin_manager
+      .identity_for_key("missing")
+      .await
+      .unwrap()
+      .is_none());
+    let identity = setup.plugin_manager.identity_for_key("key").await.unwrap().unwrap();
+    assert!(setup
+      .plugin_manager
+      .identity_for_capability("missing")
+      .await
+      .unwrap()
+      .is_none());
     assert_eq!(identity.name, "test");
     assert_eq!(identity.version, "0.3.0");
     assert_eq!(identity.protocol_version, 1);
@@ -1003,6 +1204,11 @@ mod tests {
     assert_eq!(
       identity.sha256,
       crate::plugin_lock::sha256_file(&setup.plugin_path).await.unwrap()
+    );
+    assert_eq!(
+      setup.plugin_manager.identity_for_key("key").await.unwrap().unwrap(),
+      identity,
+      "the resolved digest should be reused for the running plugin"
     );
   }
 

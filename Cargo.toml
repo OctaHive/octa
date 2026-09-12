@@ -73,3 +73,8 @@ lto = true
 incremental = false
 opt-level = "s"
 strip = true
+
+# Plugin digests are part of cache identity. Keep their computation fast in
+# development and CI builds, where plugin binaries are largest.
+[profile.dev.package.sha2]
+opt-level = 3

@@ -6,6 +6,7 @@
 use std::{
   collections::BTreeMap,
   fmt::Write as _,
+  io::Read,
   path::{Component, Path, PathBuf},
 };
 
@@ -14,7 +15,6 @@ pub use octa_plugin_lock::{LockedPlugin, PluginLock, PLUGIN_LOCK_VERSION};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::{fs::File, io::AsyncReadExt};
 
 pub const PLUGIN_MANIFEST_VERSION: u8 = 1;
 
@@ -151,6 +151,23 @@ pub fn load_plugin_lock(path: &Path) -> Result<PluginLock, PluginLockError> {
 
 /// Verifies one locked plugin and returns its canonical executable path.
 pub async fn verify_plugin(lock: &PluginLock, plugin: &str, plugins_dir: &Path) -> Result<PathBuf, PluginLockError> {
+  Ok(verify_plugin_binary(lock, plugin, plugins_dir).await?.path)
+}
+
+/// Verified executable plus the still-open file that was hashed. Keeping the
+/// handle lets the process manager bind the lock digest to the path it launches
+/// without another full-file read or a verify/open race.
+pub(crate) struct VerifiedPluginBinary {
+  pub(crate) path: PathBuf,
+  pub(crate) file: std::fs::File,
+  pub(crate) sha256: String,
+}
+
+pub(crate) async fn verify_plugin_binary(
+  lock: &PluginLock,
+  plugin: &str,
+  plugins_dir: &Path,
+) -> Result<VerifiedPluginBinary, PluginLockError> {
   let entry = lock
     .plugins
     .get(plugin)
@@ -233,7 +250,11 @@ pub fn write_plugin_lock(lock: &PluginLock, path: &Path) -> Result<(), PluginLoc
   })
 }
 
-async fn verify_locked(locked: &LockedPlugin, plugin: &str, plugins_dir: &Path) -> Result<PathBuf, PluginLockError> {
+async fn verify_locked(
+  locked: &LockedPlugin,
+  plugin: &str,
+  plugins_dir: &Path,
+) -> Result<VerifiedPluginBinary, PluginLockError> {
   if plugin.trim().is_empty() || locked.version.trim().is_empty() || locked.platforms.is_empty() {
     return Err(PluginLockError::InvalidManifest {
       plugin: plugin.to_owned(),
@@ -285,10 +306,12 @@ async fn verify_locked(locked: &LockedPlugin, plugin: &str, plugins_dir: &Path) 
       plugin: plugin.to_owned(),
     });
   }
-  let actual = sha256_file(&executable).await.map_err(|source| PluginLockError::Read {
-    path: executable.clone(),
-    source,
-  })?;
+  let (actual, file) = open_and_sha256(executable.clone())
+    .await
+    .map_err(|source| PluginLockError::Read {
+      path: executable.clone(),
+      source,
+    })?;
   if !actual.eq_ignore_ascii_case(&locked.sha256) {
     return Err(PluginLockError::DigestMismatch {
       plugin: plugin.to_owned(),
@@ -296,19 +319,39 @@ async fn verify_locked(locked: &LockedPlugin, plugin: &str, plugins_dir: &Path) 
       actual,
     });
   }
-  Ok(executable)
+  Ok(VerifiedPluginBinary {
+    path: executable,
+    file,
+    sha256: actual,
+  })
 }
 
 pub fn current_platform() -> String {
   format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
+/// Computes a lowercase SHA-256 digest without occupying an async runtime worker.
 pub async fn sha256_file(path: &Path) -> std::io::Result<String> {
-  let mut file = File::open(path).await?;
+  open_and_sha256(path.to_path_buf()).await.map(|(digest, _)| digest)
+}
+
+async fn open_and_sha256(path: PathBuf) -> std::io::Result<(String, std::fs::File)> {
+  tokio::task::spawn_blocking(move || {
+    let mut file = std::fs::File::open(path)?;
+    let digest = sha256_file_blocking(&mut file)?;
+    Ok((digest, file))
+  })
+  .await
+  .map_err(std::io::Error::other)?
+}
+
+/// Hashes a plugin on a blocking worker so large binaries cannot stall the
+/// Tokio worker that drives plugin handshakes and event streams.
+fn sha256_file_blocking(file: &mut std::fs::File) -> std::io::Result<String> {
   let mut digest = Sha256::new();
-  let mut buffer = [0_u8; 64 * 1024];
+  let mut buffer = vec![0_u8; 1024 * 1024];
   loop {
-    let read = file.read(&mut buffer).await?;
+    let read = file.read(&mut buffer)?;
     if read == 0 {
       break;
     }

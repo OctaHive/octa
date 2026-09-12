@@ -89,6 +89,7 @@ async fn plugin_identities(
       crate::plugin::PluginTarget::Key(key) => manager.identity_for_key(key).await,
       crate::plugin::PluginTarget::Capability(capability) => manager.identity_for_capability(capability).await,
     }
+    .map_err(|error| ExecutorError::ActionIdentityError(error.to_string()))?
     .ok_or_else(|| ExecutorError::PluginUnavailable(selector.name().to_owned()))?;
     let executable = Digest::from_hex(DigestAlgorithm::Sha256, &identity.sha256, identity.executable_size)
       .map_err(ExecutorError::from)?;
