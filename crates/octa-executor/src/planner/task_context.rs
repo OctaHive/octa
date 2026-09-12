@@ -153,7 +153,12 @@ impl TaskGraphBuilder {
   pub(super) fn task_working_dir(&self, cmd: &FindResult) -> PathBuf {
     let task_dir = cmd.task.dir.as_ref().unwrap_or(&cmd.octafile.dir);
     if task_dir.is_absolute() {
-      task_dir.clone()
+      // `std::fs::canonicalize` gives loaded Octafiles a verbatim `\\?\`
+      // prefix on Windows, while the execution workspace is normalized by
+      // `dunce`. Remove only that representational difference so containment
+      // checks compare paths in the same form even when the task directory
+      // does not exist yet and therefore cannot itself be canonicalized.
+      dunce::simplified(task_dir).to_path_buf()
     } else {
       self.dir.join(task_dir)
     }
