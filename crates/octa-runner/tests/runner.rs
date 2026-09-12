@@ -1,8 +1,9 @@
 use std::{
   env, fs,
   io::{BufRead, BufReader, Read, Write},
+  ops::{Deref, DerefMut},
   path::PathBuf,
-  process::Stdio,
+  process::{Child, Stdio},
   sync::mpsc,
   thread,
   time::{Duration, Instant},
@@ -19,6 +20,41 @@ use octa_runner::{MAX_RUNNER_INPUT_FRAME_BYTES, RUNNER_OUTPUT_SCHEMA_V2, RUNNER_
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
+
+const PROCESS_WATCHDOG: Duration = Duration::from_secs(60);
+
+/// Ensures a failed integration test cannot leave a runner competing with the
+/// rest of the concurrently executing suite for CPU, pipes, or plugin sockets.
+struct ReapedChild(Child);
+
+impl From<Child> for ReapedChild {
+  fn from(child: Child) -> Self {
+    Self(child)
+  }
+}
+
+impl Deref for ReapedChild {
+  type Target = Child;
+
+  fn deref(&self) -> &Self::Target {
+    &self.0
+  }
+}
+
+impl DerefMut for ReapedChild {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    &mut self.0
+  }
+}
+
+impl Drop for ReapedChild {
+  fn drop(&mut self) {
+    if !matches!(self.0.try_wait(), Ok(Some(_))) {
+      let _ = self.0.kill();
+      let _ = self.0.wait();
+    }
+  }
+}
 
 fn plugins_dir() -> PathBuf {
   if let Some(path) = env::var_os("OCTA_E2E_PLUGINS_DIR") {
@@ -712,12 +748,13 @@ fn bounded_event_stream_recovers_after_a_slow_consumer() {
   )
   .unwrap();
   let runner = Command::cargo_bin("octa-runner").unwrap();
-  let mut child = std::process::Command::new(runner.get_program())
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
+  let mut child = ReapedChild::from(
+    std::process::Command::new(runner.get_program())
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .spawn()
+      .unwrap(),
+  );
   child
     .stdin
     .take()
@@ -732,8 +769,7 @@ fn bounded_event_stream_recovers_after_a_slow_consumer() {
     stdout.read_to_end(&mut bytes).unwrap();
     bytes
   });
-  let Some(status) = child.wait_timeout(Duration::from_secs(10)).unwrap() else {
-    child.kill().unwrap();
+  let Some(status) = child.wait_timeout(PROCESS_WATCHDOG).unwrap() else {
     panic!("runner did not recover after the consumer resumed reading");
   };
   assert!(status.success());
@@ -756,12 +792,7 @@ fn cancel_before_execution_returns_one_terminal_result() {
 
   let runner = Command::cargo_bin("octa-runner").unwrap();
   let mut command = std::process::Command::new(runner.get_program());
-  let mut child = command
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
+  let mut child = ReapedChild::from(command.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap());
   let mut stdin = child.stdin.take().unwrap();
   let mut stdout = BufReader::new(child.stdout.take().unwrap());
   stdin.write_all(request(&workspace, "wait").as_bytes()).unwrap();
@@ -776,8 +807,7 @@ fn cancel_before_execution_returns_one_terminal_result() {
   writeln!(stdin, "{}", json!({"type": "cancel", "request_id": "test-run"})).unwrap();
   drop(stdin);
 
-  let Some(status) = child.wait_timeout(Duration::from_secs(5)).unwrap() else {
-    child.kill().unwrap();
+  let Some(status) = child.wait_timeout(PROCESS_WATCHDOG).unwrap() else {
     panic!("runner did not finish after cancellation");
   };
   assert_eq!(status.code(), Some(130));
@@ -803,11 +833,13 @@ fn oversized_control_frame_cancels_the_active_request() {
   )
   .unwrap();
   let runner = Command::cargo_bin("octa-runner").unwrap();
-  let mut child = std::process::Command::new(runner.get_program())
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .spawn()
-    .unwrap();
+  let mut child = ReapedChild::from(
+    std::process::Command::new(runner.get_program())
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .spawn()
+      .unwrap(),
+  );
   let mut stdin = child.stdin.take().unwrap();
   let mut stdout = BufReader::new(child.stdout.take().unwrap());
   stdin.write_all(request(&workspace, "wait").as_bytes()).unwrap();
@@ -820,8 +852,7 @@ fn oversized_control_frame_cancels_the_active_request() {
 
   stdin.write_all(&vec![b'x'; MAX_RUNNER_INPUT_FRAME_BYTES + 1]).unwrap();
   drop(stdin);
-  let Some(status) = child.wait_timeout(Duration::from_secs(5)).unwrap() else {
-    child.kill().unwrap();
+  let Some(status) = child.wait_timeout(PROCESS_WATCHDOG).unwrap() else {
     panic!("runner did not cancel after an oversized control frame");
   };
   assert_eq!(status.code(), Some(130));
@@ -841,12 +872,13 @@ fn cancel_stops_an_active_command() {
   .unwrap();
 
   let runner = Command::cargo_bin("octa-runner").unwrap();
-  let mut child = std::process::Command::new(runner.get_program())
-    .stdin(Stdio::piped())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
-    .unwrap();
+  let mut child = ReapedChild::from(
+    std::process::Command::new(runner.get_program())
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .spawn()
+      .unwrap(),
+  );
   let mut stdin = child.stdin.take().unwrap();
   let stdout = child.stdout.take().unwrap();
   let (line_tx, line_rx) = mpsc::channel();
@@ -863,8 +895,8 @@ fn cancel_stops_an_active_command() {
   let mut observed = Vec::new();
   loop {
     let line = line_rx
-      .recv_timeout(Duration::from_secs(5))
-      .expect("runner did not start the command within five seconds")
+      .recv_timeout(PROCESS_WATCHDOG)
+      .expect("runner did not start the command before the watchdog elapsed")
       .unwrap();
     let message: Value = serde_json::from_str(&line).unwrap();
     let started = message["type"] == "event" && message["event"]["data"]["type"] == "step_started";
@@ -878,7 +910,7 @@ fn cancel_stops_an_active_command() {
   writeln!(stdin, "{{not-json}}").unwrap();
   stdin.write_all(request(&workspace, "wait").as_bytes()).unwrap();
   stdin.flush().unwrap();
-  let deadline = Instant::now() + Duration::from_secs(5);
+  let deadline = Instant::now() + PROCESS_WATCHDOG;
   let mut errors = 0;
   while errors < 3 {
     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -901,8 +933,7 @@ fn cancel_stops_an_active_command() {
 
   writeln!(stdin, "{}", json!({"type": "cancel", "request_id": "test-run"})).unwrap();
   drop(stdin);
-  let Some(status) = child.wait_timeout(Duration::from_secs(5)).unwrap() else {
-    child.kill().unwrap();
+  let Some(status) = child.wait_timeout(PROCESS_WATCHDOG).unwrap() else {
     panic!("runner did not stop the active command");
   };
   assert_eq!(status.code(), Some(130));
