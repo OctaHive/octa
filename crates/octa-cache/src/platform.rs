@@ -60,7 +60,7 @@ pub(crate) enum FileIdentity {
   #[cfg(unix)]
   Unix { device: u64, inode: u64 },
   #[cfg(windows)]
-  Windows { volume: u32, index: u64 },
+  Windows { volume: u64, index: u64 },
   #[cfg(not(unix))]
   Path(std::path::PathBuf),
 }
@@ -139,16 +139,21 @@ pub(crate) fn file_identity(_path: &Path, metadata: &Metadata) -> FileIdentity {
 }
 
 #[cfg(windows)]
-pub(crate) fn file_identity(path: &Path, metadata: &Metadata) -> FileIdentity {
-  use std::os::windows::fs::MetadataExt as _;
-  windows_file_identity(path, metadata.volume_serial_number(), metadata.file_index())
+pub(crate) fn file_identity(path: &Path, _metadata: &Metadata) -> FileIdentity {
+  // The equivalent methods on `std::os::windows::fs::MetadataExt` are still
+  // unstable. Query the same stable Win32 handle information through
+  // `winapi-util`, which also knows how to open directories correctly.
+  let identity = winapi_util::Handle::from_path_any(path)
+    .and_then(|handle| winapi_util::file::information(&handle))
+    .map(|information| (information.volume_serial_number(), information.file_index()));
+  windows_file_identity(path, identity.ok())
 }
 
 #[cfg(windows)]
-fn windows_file_identity(path: &Path, volume: Option<u32>, index: Option<u64>) -> FileIdentity {
-  match (volume, index) {
-    (Some(volume), Some(index)) => FileIdentity::Windows { volume, index },
-    // Never coalesce unrelated files under an ambiguous `(None, None)` key.
+fn windows_file_identity(path: &Path, identity: Option<(u64, u64)>) -> FileIdentity {
+  match identity {
+    Some((volume, index)) => FileIdentity::Windows { volume, index },
+    // Never coalesce unrelated files when handle information is unavailable.
     // The path fallback may miss hard-link reuse, but it cannot reuse another
     // directory entry's content digest.
     _ => FileIdentity::Path(path.to_path_buf()),
@@ -258,12 +263,25 @@ mod tests {
   #[cfg(windows)]
   #[test]
   fn unavailable_windows_file_ids_fall_back_to_the_exact_path() {
-    let first = windows_file_identity(Path::new(r"C:\workspace\first"), None, None);
-    let second = windows_file_identity(Path::new(r"C:\workspace\second"), None, None);
+    let first = windows_file_identity(Path::new(r"C:\workspace\first"), None);
+    let second = windows_file_identity(Path::new(r"C:\workspace\second"), None);
     assert_ne!(first, second);
     assert_eq!(
-      windows_file_identity(Path::new(r"C:\workspace\first"), Some(7), Some(11)),
-      windows_file_identity(Path::new(r"D:\other"), Some(7), Some(11))
+      windows_file_identity(Path::new(r"C:\workspace\first"), Some((7, 11))),
+      windows_file_identity(Path::new(r"D:\other"), Some((7, 11)))
     );
+  }
+
+  #[cfg(windows)]
+  #[test]
+  fn reads_windows_file_identity_through_a_stable_handle_api() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("entry");
+    std::fs::write(&path, b"cache input").unwrap();
+
+    assert!(matches!(
+      file_identity(&path, &std::fs::metadata(&path).unwrap()),
+      FileIdentity::Windows { .. }
+    ));
   }
 }

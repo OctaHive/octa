@@ -28,6 +28,9 @@ tokio-util = { workspace = true }
 uuid = { workspace = true }
 zstd = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
+
 [dev-dependencies]
 proptest = "1.9.0"
 tempfile = { workspace = true }

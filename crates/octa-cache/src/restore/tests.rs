@@ -609,7 +609,12 @@ fn recovery_rejects_conflicting_terminal_markers() {
 #[test]
 fn recovery_rejects_a_noncanonical_workspace_path() {
   let workspace = tempfile::tempdir().unwrap();
-  let noncanonical = workspace.path().join(".");
+  fs::create_dir(workspace.path().join("child")).unwrap();
+  // `workspace/.` compares equal to `workspace` on some platforms. An
+  // existing `child/..` resolves to the same directory while retaining a
+  // lexical parent component, so it exercises the canonical-path guard on
+  // Linux, macOS, and Windows alike.
+  let noncanonical = workspace.path().join("child").join("..");
   assert!(matches!(
     recovery_workspace_exists(&noncanonical),
     Err(CacheError::Path { reason, .. }) if reason.contains("canonical journal path")
