@@ -907,6 +907,10 @@ mod tests {
   use tokio_util::sync::CancellationToken;
 
   const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+  #[cfg(windows)]
+  const TEST_PLUGIN: &str = "octa_plugin_test.exe";
+  #[cfg(not(windows))]
+  const TEST_PLUGIN: &str = "octa_plugin_test";
 
   #[derive(Default)]
   struct RecordingLauncher {
@@ -1230,9 +1234,9 @@ mod tests {
 
     let starts = tokio::time::timeout(Duration::from_secs(10), async {
       tokio::join!(
-        managers[0].start_plugin("test.py"),
-        managers[1].start_plugin("test.py"),
-        managers[2].start_plugin("test.py")
+        managers[0].start_plugin(TEST_PLUGIN),
+        managers[1].start_plugin(TEST_PLUGIN),
+        managers[2].start_plugin(TEST_PLUGIN)
       )
     })
     .await
@@ -1250,7 +1254,7 @@ mod tests {
   #[tokio::test]
   async fn test_start_plugin() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_path.file_name().unwrap().to_str().unwrap();
 
     let result = tokio::time::timeout(TEST_TIMEOUT, setup.plugin_manager.start_plugin(plugin_name)).await;
@@ -1295,7 +1299,7 @@ mod tests {
   #[tokio::test]
   async fn cache_planning_resolves_keys_and_preserves_failures() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     setup.plugin_manager.start_plugin(setup.plugin_name()).await.unwrap();
 
     let plan = setup
@@ -1350,7 +1354,7 @@ mod tests {
   #[tokio::test]
   async fn test_plugin_execution() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_path.file_name().unwrap().to_str().unwrap();
 
     // Start plugin
@@ -1416,7 +1420,7 @@ mod tests {
   #[tokio::test]
   async fn test_shutdown_plugin() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_path.file_name().unwrap().to_str().unwrap();
 
     // Start plugin
@@ -1434,7 +1438,7 @@ mod tests {
   #[tokio::test]
   async fn test_start_nonexistent_plugin() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
 
     let result = setup.plugin_manager.start_plugin("nonexistent_plugin").await;
     assert!(matches!(result, Err(PluginManagerError::PluginNotFound(_))));
@@ -1443,7 +1447,7 @@ mod tests {
   #[tokio::test]
   async fn test_start_duplicate_plugin() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_path.file_name().unwrap().to_str().unwrap();
 
     // Start the plugin first time
@@ -1457,7 +1461,7 @@ mod tests {
   #[tokio::test]
   async fn test_shutdown_all() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_path.file_name().unwrap().to_str().unwrap();
 
     // Start plugin
@@ -1474,7 +1478,7 @@ mod tests {
   #[tokio::test]
   async fn test_list_plugins_empty() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
 
     // Initially should be empty
     let plugins = setup.plugin_manager.list_active_plugins().await;
@@ -1484,7 +1488,7 @@ mod tests {
   #[tokio::test]
   async fn test_list_single_plugin() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_path.file_name().unwrap().to_str().unwrap();
 
     // Start plugin
@@ -1499,7 +1503,7 @@ mod tests {
   #[tokio::test]
   async fn test_list_plugins_after_shutdown() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_path.file_name().unwrap().to_str().unwrap();
 
     // Start plugin
@@ -1553,7 +1557,7 @@ mod tests {
   #[tokio::test]
   async fn test_list_plugins_concurrent_access() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_path.file_name().unwrap().to_str().unwrap();
 
     // Create Arc for plugin manager to share across threads
@@ -1581,7 +1585,7 @@ mod tests {
   #[tokio::test]
   async fn test_plugin_restart() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_name();
 
     // Start plugin
@@ -1632,7 +1636,7 @@ time.sleep(10)  # Simulate a hanging plugin
   #[tokio::test]
   async fn test_invalid_plugin_operations() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
 
     // Try to get client for non-existent plugin
     let result = setup.plugin_manager.get_client("nonexistent").await;
@@ -1650,7 +1654,7 @@ time.sleep(10)  # Simulate a hanging plugin
   #[tokio::test]
   async fn test_concurrent_plugin_operations() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_name().to_string();
     let manager = Arc::new(setup.plugin_manager);
 
@@ -1686,7 +1690,7 @@ time.sleep(10)  # Simulate a hanging plugin
   #[tokio::test]
   async fn test_plugin_cleanup() {
     let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
-    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    let setup = TestSetup::new(plugins_dir, TEST_PLUGIN).await;
     let plugin_name = setup.plugin_name();
 
     // Start plugin

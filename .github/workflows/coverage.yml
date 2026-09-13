@@ -33,6 +33,8 @@ jobs:
           cp target/debug/octa_plugin_tpl plugins
           cargo build -p octa_plugin_junit
           cp target/debug/octa_plugin_junit plugins
+          cargo build -p octa-plugin --example octa_plugin_test
+          cp target/debug/examples/octa_plugin_test plugins
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate code coverage

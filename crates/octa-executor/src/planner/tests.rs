@@ -15,6 +15,11 @@ use crate::{
 };
 use octa_output::{Console, ConsoleRecord, ConsoleRenderer, ExecutionEvent};
 
+#[cfg(windows)]
+const PROCESS_FIXTURE: &str = "octa_plugin_test.exe";
+#[cfg(not(windows))]
+const PROCESS_FIXTURE: &str = "octa_plugin_test";
+
 struct TestVariableResolver;
 
 #[async_trait::async_trait]
@@ -58,7 +63,7 @@ async fn started_planning_fixture_manager() -> Arc<PluginManager> {
     .canonicalize()
     .unwrap();
   let manager = Arc::new(PluginManager::new(directory));
-  manager.start_plugin("test.py").await.unwrap();
+  manager.start_plugin(PROCESS_FIXTURE).await.unwrap();
   manager
 }
 
@@ -318,7 +323,7 @@ tasks:
   )?;
   let plugins_dir = PathBuf::from("../../plugins").canonicalize()?;
   let plugin_manager = Arc::new(PluginManager::new(&plugins_dir));
-  let schema = plugin_manager.start_plugin("test.py").await.unwrap();
+  let schema = plugin_manager.start_plugin(PROCESS_FIXTURE).await.unwrap();
   let schemas = octa_octafile::PluginSchemas::from([(
     schema.key,
     octa_octafile::PluginTypeSchema {
