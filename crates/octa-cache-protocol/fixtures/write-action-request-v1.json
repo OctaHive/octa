@@ -1,0 +1,14 @@
+{
+  "protocol_version": 1,
+  "namespace": "project/test",
+  "result": {
+    "result_version": 1,
+    "action": {
+      "algorithm": "blake3",
+      "hash": "1010101010101010101010101010101010101010101010101010101010101010",
+      "size_bytes": 512
+    },
+    "stdout": "cache hit",
+    "task_outputs": { "image": "registry.example/app@sha256:abc" }
+  }
+}

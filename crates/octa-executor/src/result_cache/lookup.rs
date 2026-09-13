@@ -105,6 +105,7 @@ pub(crate) async fn lookup(cache: &ResultCache, request: CacheLookup<'_>) -> Exe
 
   let lookup = match cache.store.get_action(&cache.namespace, &action).await {
     Ok(result) => result,
+    Err(CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache lookup".to_owned())),
     Err(error) => {
       return record_lookup_error(state, output, Some(action), CacheReason::LookupFailed, error, started).await;
     },
@@ -160,6 +161,7 @@ pub(crate) async fn lookup(cache: &ResultCache, request: CacheLookup<'_>) -> Exe
           )
           .await;
         },
+        Err(CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache lookup".to_owned())),
         Err(error) => {
           return record_lookup_error(
             state,
@@ -225,6 +227,7 @@ pub(crate) async fn lookup(cache: &ResultCache, request: CacheLookup<'_>) -> Exe
   if let Some(bundle) = &result.output_bundle {
     let reader = match cache.store.read_blob(bundle).await {
       Ok(reader) => reader,
+      Err(CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache restore".to_owned())),
       Err(error) => {
         return record_lookup_error(state, output, Some(action), CacheReason::BlobReadFailed, error, started).await;
       },
@@ -247,6 +250,17 @@ pub(crate) async fn lookup(cache: &ResultCache, request: CacheLookup<'_>) -> Exe
       started,
     )
     .await;
+  }
+
+  // Only the store knows whether a verified hit needs internal promotion. The
+  // executor deliberately reports the lifecycle point without branching on a
+  // concrete tier or repeating remote publication.
+  match cache.store.commit_verified_hit(&cache.namespace, &result).await {
+    Ok(()) => {},
+    Err(CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache restore".to_owned())),
+    Err(error) => {
+      tracing::warn!(cache.operation = "commit verified hit", error = %error, "cache hit promotion failed")
+    },
   }
 
   let captured = cached_result(result);

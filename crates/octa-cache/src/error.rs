@@ -57,6 +57,14 @@ pub enum CacheError {
   /// Stored metadata could not be serialized or decoded safely.
   #[error("invalid cache metadata: {0}")]
   Metadata(String),
+  /// A remote cache operation failed before producing a trusted result.
+  #[error("remote cache {operation} failed: {message}")]
+  Remote {
+    /// Stable operation name suitable for diagnostics.
+    operation: &'static str,
+    /// Credential-free diagnostic suitable for operator logs.
+    message: String,
+  },
   /// A cache object failed integrity checks and was removed from normal lookup.
   #[error("corrupt cache object '{path}': {reason}")]
   Corrupt {

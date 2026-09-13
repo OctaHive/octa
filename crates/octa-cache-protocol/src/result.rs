@@ -76,7 +76,7 @@ pub const ZSTD_V1_MAX_WINDOW_LOG: u32 = 27;
 /// Encoding is intentionally absent from content identity. Recompressing the
 /// same canonical bundle may change transfer bytes and size without changing
 /// which filesystem result the blob represents.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlobEncoding {
   /// Canonical bytes are stored without compression.
@@ -92,7 +92,7 @@ pub enum BlobEncoding {
 /// The encoding and encoded size describe the physical object fetched from
 /// storage. Keeping both views lets a reader reject truncation and excessive
 /// expansion before accepting any restored files.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlobDescriptor {
   /// Digest of the canonical uncompressed representation.

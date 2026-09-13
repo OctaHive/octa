@@ -7,14 +7,16 @@ use std::{env, path::PathBuf};
 /// CI copies plugin binaries into the workspace `plugins` directory before
 /// running tests. Custom test harnesses may instead provide an explicit
 /// directory or build every binary beside the active Cargo test profile. The
-/// lookup checks those sources by contents and never assumes `target/debug`,
-/// which is incorrect for coverage and custom target directories.
+/// normal Cargo target is a fallback for coverage, which builds test harnesses
+/// in a private target but uses the separately prepared plugin executables.
 pub(crate) fn plugin_directory() -> PathBuf {
   if let Some(directory) = env::var_os("OCTA_TEST_PLUGINS_DIR") {
     return PathBuf::from(directory);
   }
 
-  let workspace_plugins = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../plugins");
+  let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+  let workspace_plugins = workspace.join("plugins");
+  let default_profile = workspace.join("target/debug");
   let executable = env::current_exe().expect("the current test executable must have a path");
   let deps = executable
     .parent()
@@ -23,7 +25,10 @@ pub(crate) fn plugin_directory() -> PathBuf {
     .parent()
     .expect("the Cargo test deps directory must have a profile parent");
 
-  [workspace_plugins, active_profile.to_path_buf()]
+  // Prefer the binary produced by this Cargo invocation. The workspace
+  // directory is a CI packaging fixture and can legitimately contain an
+  // older locally copied plugin from another build.
+  [active_profile.to_path_buf(), default_profile, workspace_plugins]
     .into_iter()
     .find(|directory| required_plugins_exist(directory))
     .expect("shell and template test plugins must be built before executor tests")

@@ -1,0 +1,16 @@
+{
+  "protocol_version": 1,
+  "missing": [
+    {
+      "digest": {
+        "algorithm": "blake3",
+        "hash": "2020202020202020202020202020202020202020202020202020202020202020",
+        "size_bytes": 4096
+      },
+      "encoding": "zstd_v1",
+      "encoded_size_bytes": 1024,
+      "expanded_size_bytes": 4096,
+      "entry_count": 3
+    }
+  ]
+}

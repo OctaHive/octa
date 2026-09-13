@@ -25,13 +25,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-same-file = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
 jsonschema = { workspace = true }
 octa-cache-protocol = { version = "0.3.0", path = "../octa-cache-protocol" }
+octa-cache = { version = "0.3.0", path = "../octa-cache" }
+octa-cache-http = { version = "0.3.0", path = "../octa-cache-http" }
+octa-cache-test-support = { path = "../octa-cache-test-support" }
 octa-plugin-manager = { version = "0.3.0", path = "../octa-plugin-manager" }
 serde_yml = { workspace = true }
+rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
 tempfile = { workspace = true }
 wait-timeout = "0.2"

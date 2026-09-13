@@ -44,6 +44,7 @@ pub fn capabilities() -> RunnerMessage<String, (), ()> {
       "graceful-cancellation",
       "versioned-events",
       "task-result-cache-v1",
+      "task-result-cache-http-v1",
     ]
     .into_iter()
     .map(str::to_owned)

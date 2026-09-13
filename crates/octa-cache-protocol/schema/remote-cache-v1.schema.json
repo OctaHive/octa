@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://octahive.dev/schemas/cache/remote-cache-v1.schema.json",
+  "title": "Octa remote cache metadata v1",
+  "oneOf": [
+    { "$ref": "#/$defs/findMissingRequest" },
+    { "$ref": "#/$defs/findMissingResponse" },
+    { "$ref": "#/$defs/writeActionRequest" }
+  ],
+  "$defs": {
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "hash", "size_bytes"],
+      "properties": {
+        "algorithm": { "const": "blake3" },
+        "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "size_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["digest", "encoding", "encoded_size_bytes", "expanded_size_bytes", "entry_count"],
+      "properties": {
+        "digest": { "$ref": "#/$defs/digest" },
+        "encoding": { "enum": ["identity", "zstd_v1"] },
+        "encoded_size_bytes": { "type": "integer", "minimum": 1 },
+        "expanded_size_bytes": { "type": "integer", "minimum": 1 },
+        "entry_count": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "blobList": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": { "$ref": "#/$defs/blob" }
+    },
+    "findMissingRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "blobs"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "blobs": { "$ref": "#/$defs/blobList" }
+      }
+    },
+    "findMissingResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "missing"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "missing": { "$ref": "#/$defs/blobList" }
+      }
+    },
+    "writeActionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "namespace", "result"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "namespace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$",
+          "x-maxUtf8Bytes": 16384
+        },
+        "result": { "$ref": "https://octahive.dev/schemas/cache/action-result-v1.schema.json" }
+      }
+    }
+  }
+}

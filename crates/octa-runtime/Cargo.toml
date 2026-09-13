@@ -17,6 +17,7 @@ octa-monorepo = { version = "0.3.0", path = "../octa-monorepo" }
 octa-octafile = { version = "0.3.0", path = "../octa-octafile" }
 octa-output = { version = "0.3.0", path = "../octa-output" }
 octa-cache = { version = "0.3.0", path = "../octa-cache" }
+octa-cache-http = { version = "0.3.0", path = "../octa-cache-http" }
 octa-cache-protocol = { version = "0.3.0", path = "../octa-cache-protocol" }
 octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
 octa-plugin-manager = { version = "0.3.0", path = "../octa-plugin-manager" }

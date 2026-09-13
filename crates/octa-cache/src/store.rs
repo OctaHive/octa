@@ -36,7 +36,7 @@ pub struct ActionLookup {
   pub layer: CacheLayer,
 }
 
-/// Validates the namespace shared by local and future remote stores.
+/// Validates the namespace shared by local and remote stores.
 ///
 /// Stores may hash the value for their physical layout, but all implementations
 /// accept the same bounded logical namespace.
@@ -54,7 +54,11 @@ pub trait CacheStore: Send + Sync {
   /// Looks up and validates the result bound to `action` in `namespace`.
   async fn get_action(&self, namespace: &str, action: &Digest) -> CacheResult<Option<ActionLookup>>;
 
-  /// Returns, in request order, the subset whose exact physical representations are absent.
+  /// Returns, in request order, the subset this store cannot currently read.
+  ///
+  /// A concrete CAS reports physical absence. A layered store reports a blob
+  /// only when every readable tier lacks it; tier-specific publication checks
+  /// remain an implementation detail of that layered store.
   async fn find_missing_blobs(&self, blobs: &[BlobDescriptor]) -> CacheResult<Vec<BlobDescriptor>>;
 
   /// Opens an encoded blob stream whose length matches `blob`.
@@ -67,4 +71,15 @@ pub trait CacheStore: Send + Sync {
 
   /// Durably binds an action to a result after all referenced blobs are visible.
   async fn write_action_if_absent(&self, namespace: &str, result: &ActionResultV1) -> CacheResult<WriteOutcome>;
+
+  /// Commits store-internal state after a hit was completely verified.
+  ///
+  /// Concrete stores normally have nothing to do because the hit already came
+  /// from their durable state. A layered store uses this point to publish the
+  /// verified remote action into its local hot tier without repeating remote
+  /// publication. The executor calls this only after output restoration and
+  /// resource validation have succeeded.
+  async fn commit_verified_hit(&self, _namespace: &str, _result: &ActionResultV1) -> CacheResult<()> {
+    Ok(())
+  }
 }

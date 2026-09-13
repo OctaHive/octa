@@ -120,8 +120,9 @@
       "properties": {
         "endpoint": { "type": "string", "pattern": "^https://" },
         "token_file": { "type": "string", "minLength": 1 },
-        "request_timeout_seconds": { "type": "integer", "minimum": 1 },
-        "max_parallel_transfers": { "type": "integer", "minimum": 1 }
+        "ca_certificate_file": { "type": "string", "minLength": 1 },
+        "request_timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 600 },
+        "max_parallel_transfers": { "type": "integer", "minimum": 1, "maximum": 256 }
       },
       "additionalProperties": false
     },

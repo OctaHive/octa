@@ -108,53 +108,35 @@ pub(crate) async fn finalize(
       },
     };
     let descriptor = packed.1;
-    let missing = match cache.store.find_missing_blobs(std::slice::from_ref(&descriptor)).await {
-      Ok(missing) => missing,
-      Err(error) => {
-        return publication_error(&captured, outcome, output, action, CacheReason::BlobLookupFailed, error).await;
-      },
-    };
-    let blob_missing = match missing.as_slice() {
-      [] => false,
-      [missing] if missing == &descriptor => true,
-      _ => {
+    // Publication always crosses the store seam. Concrete stores make this
+    // create-if-absent call cheap when the blob already exists; a layered store
+    // must still ensure its mandatory L1 contains the bytes even when L2 can
+    // already serve the same descriptor.
+    match cache.store.write_blob_if_absent(&descriptor, Box::pin(packed.0)).await {
+      Ok(WriteOutcome::Written | WriteOutcome::AlreadyPresent) => {},
+      Ok(WriteOutcome::Conflict) => {
         return publication_error(
           &captured,
           outcome,
           output,
           action,
-          CacheReason::BlobLookupFailed,
-          "cache store returned an invalid missing-blob response",
+          CacheReason::BlobConflict,
+          "immutable blob publication conflict",
         )
         .await;
       },
-    };
-    if blob_missing {
-      match cache.store.write_blob_if_absent(&descriptor, Box::pin(packed.0)).await {
-        Ok(WriteOutcome::Written | WriteOutcome::AlreadyPresent) => {},
-        Ok(WriteOutcome::Conflict) => {
-          return publication_error(
-            &captured,
-            outcome,
-            output,
-            action,
-            CacheReason::BlobConflict,
-            "immutable blob publication conflict",
-          )
-          .await;
-        },
-        Err(error) => {
-          return publication_error(
-            &captured,
-            outcome,
-            output,
-            action,
-            CacheReason::BlobPublicationFailed,
-            error,
-          )
-          .await;
-        },
-      }
+      Err(CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache publication".to_owned())),
+      Err(error) => {
+        return publication_error(
+          &captured,
+          outcome,
+          output,
+          action,
+          CacheReason::BlobPublicationFailed,
+          error,
+        )
+        .await;
+      },
     }
     Some(descriptor)
   };
@@ -191,6 +173,7 @@ pub(crate) async fn finalize(
       )
       .await;
     },
+    Err(CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache publication".to_owned())),
     Err(error) => {
       return publication_error(
         &captured,

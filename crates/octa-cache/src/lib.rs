@@ -12,6 +12,7 @@ mod error;
 mod fileset;
 mod hash;
 mod input;
+mod layered;
 mod local;
 mod locking;
 mod platform;
@@ -25,6 +26,7 @@ pub use bundle::{
 };
 pub use error::{CacheError, CacheResult};
 pub use input::{InputEntry, InputSnapshot, InputSnapshotter, SnapshotOptions};
+pub use layered::LayeredCacheStore;
 pub use local::{GarbageCollection, LocalCacheConfig, LocalCacheStatus, LocalCacheStore};
 pub use restore::{OutputLockGuard, RestoreManager, RestoreOutcome};
 pub use store::{validate_namespace, ActionLookup, BlobReader, CacheStore, WriteOutcome};

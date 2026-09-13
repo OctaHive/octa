@@ -14,9 +14,10 @@ use std::{
 };
 
 use octa_cache::{
-  BundleEncoding, BundleLimits, GarbageCollection, LocalCacheConfig, LocalCacheStatus, LocalCacheStore, RestoreManager,
-  SnapshotOptions, DEFAULT_BUNDLE_COMPRESSION_LEVEL,
+  BundleEncoding, BundleLimits, CacheStore, GarbageCollection, LayeredCacheStore, LocalCacheConfig, LocalCacheStatus,
+  LocalCacheStore, RestoreManager, SnapshotOptions, DEFAULT_BUNDLE_COMPRESSION_LEVEL,
 };
+use octa_cache_http::{HttpCacheConfig, HttpCacheStore};
 pub use octa_cache_protocol::CacheMode;
 use octa_cache_protocol::{
   Digest, DigestAlgorithm, PlatformArchitecture, PlatformOs, RuntimeIdentity, MAX_CACHE_STRING_BYTES,
@@ -57,6 +58,9 @@ pub enum RuntimeCacheError {
   /// Shared cache protocol identity validation failed.
   #[error(transparent)]
   Protocol(#[from] octa_cache_protocol::CacheProtocolError),
+  /// Remote HTTP adapter configuration or construction failed.
+  #[error(transparent)]
+  Http(#[from] octa_cache_http::HttpCacheError),
   /// The blocking cache initialization worker panicked or was cancelled.
   #[error("cache initialization worker failed: {0}")]
   Worker(#[source] tokio::task::JoinError),
@@ -75,6 +79,7 @@ pub struct RuntimeCacheConfig {
   snapshot: SnapshotOptions,
   bundle_encoding: BundleEncoding,
   bundle_limits: BundleLimits,
+  remote: Option<HttpCacheConfig>,
 }
 
 impl RuntimeCacheConfig {
@@ -102,7 +107,26 @@ impl RuntimeCacheConfig {
       snapshot: SnapshotOptions::default(),
       bundle_encoding: BundleEncoding::default(),
       bundle_limits: BundleLimits::default(),
+      remote: None,
     })
+  }
+
+  /// Adds a remote L2 endpoint while retaining the mandatory local L1 store.
+  pub fn with_remote(
+    mut self,
+    endpoint: &str,
+    token_file: &Path,
+    ca_certificate_file: Option<&Path>,
+    request_timeout: Duration,
+    max_parallel_transfers: usize,
+  ) -> Result<Self, RuntimeCacheError> {
+    let mut remote =
+      HttpCacheConfig::from_token_file(endpoint, token_file)?.with_ca_certificate_file(ca_certificate_file)?;
+    remote.policy.request_timeout = request_timeout;
+    remote.policy.max_parallel_transfers = max_parallel_transfers;
+    remote.validate()?;
+    self.remote = Some(remote);
+    Ok(self)
   }
 
   /// Loads a strict TOML profile resolved from `workspace`.
@@ -150,17 +174,34 @@ impl RuntimeCacheConfig {
 
   /// Builds the concrete local store, restore manager, and executor service.
   pub async fn open(&self) -> Result<ConfiguredCache, RuntimeCacheError> {
+    self
+      .open_with_cancellation(tokio_util::sync::CancellationToken::new())
+      .await
+  }
+
+  /// Builds cache services tied to the surrounding run's cancellation token.
+  pub async fn open_with_cancellation(
+    &self,
+    cancellation: tokio_util::sync::CancellationToken,
+  ) -> Result<ConfiguredCache, RuntimeCacheError> {
     let config = self.clone();
-    tokio::task::spawn_blocking(move || config.open_sync())
+    tokio::task::spawn_blocking(move || config.open_sync(cancellation))
       .await
       .map_err(RuntimeCacheError::Worker)?
   }
 
-  fn open_sync(self) -> Result<ConfiguredCache, RuntimeCacheError> {
+  fn open_sync(self, cancellation: tokio_util::sync::CancellationToken) -> Result<ConfiguredCache, RuntimeCacheError> {
     let local = Arc::new(LocalCacheStore::open(self.local)?);
     let restore = RestoreManager::open(local.layout_root(), self.bundle_limits)?;
     restore.recover()?;
-    let result_cache = ResultCache::new(local.clone(), restore, self.namespace, self.runtime)?
+    let store: Arc<dyn CacheStore> = match self.remote {
+      Some(remote) => {
+        let remote = Arc::new(HttpCacheStore::new(remote, cancellation)?);
+        Arc::new(LayeredCacheStore::new(local.clone(), remote))
+      },
+      None => local.clone(),
+    };
+    let result_cache = ResultCache::new(store, restore, self.namespace, self.runtime)?
       .with_access(self.mode)
       .with_snapshot_options(self.snapshot)?
       .with_bundle_options(self.bundle_encoding, self.bundle_limits)?;
@@ -206,6 +247,8 @@ struct CacheProfile {
   snapshot: SnapshotProfile,
   #[serde(default)]
   bundle: BundleProfile,
+  #[serde(default)]
+  remote: Option<RemoteProfile>,
 }
 
 impl CacheProfile {
@@ -240,8 +283,44 @@ impl CacheProfile {
     config.snapshot = snapshot;
     config.bundle_encoding = encoding;
     config.bundle_limits = limits;
+    if let Some(remote) = self.remote {
+      if !remote.token_file.is_absolute() {
+        return Err(RuntimeCacheError::Invalid(
+          "remote cache token_file must be an absolute operator-owned path".to_owned(),
+        ));
+      }
+      if remote
+        .ca_certificate_file
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+      {
+        return Err(RuntimeCacheError::Invalid(
+          "remote cache ca_certificate_file must be an absolute operator-owned path".to_owned(),
+        ));
+      }
+      let mut http = HttpCacheConfig::from_token_file(&remote.endpoint, &remote.token_file)?
+        .with_ca_certificate_file(remote.ca_certificate_file.as_deref())?;
+      apply_remote_profile(&mut http, remote);
+      http.validate()?;
+      config.remote = Some(http);
+    }
     Ok(config)
   }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteProfile {
+  endpoint: String,
+  token_file: PathBuf,
+  ca_certificate_file: Option<PathBuf>,
+  request_timeout_seconds: Option<u64>,
+  max_parallel_transfers: Option<usize>,
+  max_retries: Option<u8>,
+  retry_base_delay_milliseconds: Option<u64>,
+  retry_max_delay_milliseconds: Option<u64>,
+  circuit_failure_threshold: Option<u32>,
+  circuit_open_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -372,6 +451,30 @@ fn apply_bundle_profile(limits: &mut BundleLimits, profile: &BundleProfile) {
   }
 }
 
+fn apply_remote_profile(config: &mut HttpCacheConfig, profile: RemoteProfile) {
+  if let Some(value) = profile.request_timeout_seconds {
+    config.policy.request_timeout = Duration::from_secs(value);
+  }
+  if let Some(value) = profile.max_parallel_transfers {
+    config.policy.max_parallel_transfers = value;
+  }
+  if let Some(value) = profile.max_retries {
+    config.policy.max_retries = value;
+  }
+  if let Some(value) = profile.retry_base_delay_milliseconds {
+    config.policy.retry_base_delay = Duration::from_millis(value);
+  }
+  if let Some(value) = profile.retry_max_delay_milliseconds {
+    config.policy.retry_max_delay = Duration::from_millis(value);
+  }
+  if let Some(value) = profile.circuit_failure_threshold {
+    config.policy.circuit_failure_threshold = value;
+  }
+  if let Some(value) = profile.circuit_open_seconds {
+    config.policy.circuit_open_duration = Duration::from_secs(value);
+  }
+}
+
 fn resolve_path(workspace: &Path, path: PathBuf) -> PathBuf {
   if path.is_absolute() {
     path
@@ -470,6 +573,131 @@ identity = "rust-1.98-toolchain-v1"
       RuntimeIdentity::Native { environment, .. }
         if environment == Digest::blake3(b"rust-1.98-toolchain-v1")
     ));
+  }
+
+  #[test]
+  fn loads_and_validates_remote_transport_policy_without_exposing_its_token() {
+    let workspace = TempDir::new().unwrap();
+    let cache = workspace.path().join("cache");
+    let token = workspace.path().join("token");
+    fs::write(&token, "runtime-secret\n").unwrap();
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt as _;
+      fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let path = workspace.path().join("cache.toml");
+    fs::write(
+      &path,
+      format!(
+        r#"
+mode = "read_write"
+namespace = "project/remote"
+
+[local]
+directory = "{}"
+
+[environment]
+identity = "remote-environment"
+
+[remote]
+endpoint = "https://cache.example/tenant"
+token_file = "{}"
+request_timeout_seconds = 12
+max_parallel_transfers = 3
+max_retries = 4
+retry_base_delay_milliseconds = 25
+retry_max_delay_milliseconds = 500
+circuit_failure_threshold = 2
+circuit_open_seconds = 7
+"#,
+        cache.to_string_lossy().replace('\\', "/"),
+        token.to_string_lossy().replace('\\', "/")
+      ),
+    )
+    .unwrap();
+
+    let config = RuntimeCacheConfig::load_profile(&path, workspace.path()).unwrap();
+    let remote = config.remote.unwrap();
+    assert_eq!(remote.policy.request_timeout, Duration::from_secs(12));
+    assert_eq!(remote.policy.max_parallel_transfers, 3);
+    assert_eq!(remote.policy.max_retries, 4);
+    assert_eq!(remote.policy.retry_base_delay, Duration::from_millis(25));
+    assert_eq!(remote.policy.retry_max_delay, Duration::from_millis(500));
+    assert_eq!(remote.policy.circuit_failure_threshold, 2);
+    assert_eq!(remote.policy.circuit_open_duration, Duration::from_secs(7));
+    assert!(!format!("{remote:?}").contains("runtime-secret"));
+  }
+
+  #[tokio::test]
+  async fn programmatic_remote_session_composes_the_layered_store() {
+    let workspace = TempDir::new().unwrap();
+    let token = workspace.path().join("token");
+    fs::write(&token, "runner-secret").unwrap();
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt as _;
+      fs::set_permissions(&token, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let config = RuntimeCacheConfig::local(
+      CacheMode::ReadWrite,
+      "runner/test",
+      workspace.path().join("cache"),
+      native_runtime_identity("runner-environment").unwrap(),
+    )
+    .unwrap()
+    .with_remote("https://cache.example/tenant", &token, None, Duration::from_secs(5), 2)
+    .unwrap();
+    assert!(config.remote.is_some());
+    let cache = config
+      .open_with_cancellation(tokio_util::sync::CancellationToken::new())
+      .await
+      .unwrap();
+    assert!(cache.local.layout_root().is_dir());
+
+    assert!(matches!(
+      RuntimeCacheConfig::local(
+        CacheMode::ReadWrite,
+        "runner/test",
+        workspace.path().join("other"),
+        native_runtime_identity("runner-environment").unwrap(),
+      )
+      .unwrap()
+      .with_remote("http://cache.example", &token, None, Duration::from_secs(5), 2)
+      .unwrap_err(),
+      RuntimeCacheError::Http(_)
+    ));
+  }
+
+  #[test]
+  fn profile_rejects_a_relative_remote_token_path() {
+    let workspace = TempDir::new().unwrap();
+    let path = workspace.path().join("cache.toml");
+    fs::write(
+      &path,
+      format!(
+        r#"
+mode = "read_write"
+namespace = "project/remote"
+
+[local]
+directory = "{}"
+
+[environment]
+identity = "remote-environment"
+
+[remote]
+endpoint = "https://cache.example"
+token_file = "token"
+"#,
+        workspace.path().join("cache").to_string_lossy().replace('\\', "/")
+      ),
+    )
+    .unwrap();
+    assert!(RuntimeCacheConfig::load_profile(&path, workspace.path())
+      .unwrap_err()
+      .to_string()
+      .contains("absolute"));
   }
 
   #[test]
@@ -665,6 +893,7 @@ read_buffer_bytes = 4096
       snapshot: SnapshotOptions::default(),
       bundle_encoding: BundleEncoding::Identity,
       bundle_limits: BundleLimits::default(),
+      remote: None,
     };
     let cache = config.open().await.unwrap();
     assert_eq!(cache.status().await.unwrap().max_bytes, config.local.max_bytes);

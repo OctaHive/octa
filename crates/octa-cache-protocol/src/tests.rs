@@ -10,6 +10,86 @@ fn digest(byte: u8, size: u64) -> Digest {
   Digest::new(DigestAlgorithm::Blake3, [byte; 32], size)
 }
 
+#[test]
+fn remote_envelopes_validate_versions_batches_and_action_binding_data() {
+  assert_eq!(
+    REMOTE_CACHE_PROTOCOL_HEADER_VALUE_V1.parse::<u16>().unwrap(),
+    REMOTE_CACHE_PROTOCOL_V1
+  );
+  let result = action_result();
+  let blob = result.output_bundle.clone().unwrap();
+  let missing = FindMissingBlobsRequestV1 {
+    protocol_version: REMOTE_CACHE_PROTOCOL_V1,
+    blobs: vec![blob.clone()],
+  };
+  missing.validate().unwrap();
+  serde_json::from_value::<FindMissingBlobsRequestV1>(serde_json::to_value(&missing).unwrap()).unwrap();
+
+  let response = FindMissingBlobsResponseV1 {
+    protocol_version: REMOTE_CACHE_PROTOCOL_V1,
+    missing: vec![blob],
+  };
+  response.validate().unwrap();
+
+  let publication = WriteActionRequestV1 {
+    protocol_version: REMOTE_CACHE_PROTOCOL_V1,
+    namespace: "project/test".to_owned(),
+    result,
+  };
+  publication.validate().unwrap();
+
+  let mut invalid = missing;
+  invalid.protocol_version = 2;
+  assert!(invalid.validate().unwrap_err().to_string().contains("unsupported"));
+  invalid.protocol_version = REMOTE_CACHE_PROTOCOL_V1;
+  invalid.blobs = vec![response.missing[0].clone(); MAX_CACHE_LIST_ITEMS + 1];
+  assert!(invalid.validate().unwrap_err().to_string().contains("limited"));
+
+  let mut invalid = publication;
+  invalid.namespace.clear();
+  assert!(invalid.validate().unwrap_err().to_string().contains("namespace"));
+}
+
+#[test]
+fn remote_golden_documents_match_the_shared_schema_and_wire_types() {
+  let remote_schema: serde_json::Value = serde_json::from_str(REMOTE_CACHE_SCHEMA_V1).unwrap();
+  let result_schema: serde_json::Value = serde_json::from_str(ACTION_RESULT_SCHEMA_V1).unwrap();
+  let registry = jsonschema::Registry::new()
+    .add(
+      "https://octahive.dev/schemas/cache/action-result-v1.schema.json",
+      result_schema,
+    )
+    .unwrap()
+    .prepare()
+    .unwrap();
+  let validator = jsonschema::options()
+    .with_registry(&registry)
+    .build(&remote_schema)
+    .unwrap();
+
+  let request: serde_json::Value =
+    serde_json::from_str(include_str!("../fixtures/find-missing-blobs-request-v1.json")).unwrap();
+  let response: serde_json::Value =
+    serde_json::from_str(include_str!("../fixtures/find-missing-blobs-response-v1.json")).unwrap();
+  let publication: serde_json::Value =
+    serde_json::from_str(include_str!("../fixtures/write-action-request-v1.json")).unwrap();
+  for document in [&request, &response, &publication] {
+    assert!(validator.is_valid(document));
+  }
+  serde_json::from_value::<FindMissingBlobsRequestV1>(request)
+    .unwrap()
+    .validate()
+    .unwrap();
+  serde_json::from_value::<FindMissingBlobsResponseV1>(response)
+    .unwrap()
+    .validate()
+    .unwrap();
+  serde_json::from_value::<WriteActionRequestV1>(publication)
+    .unwrap()
+    .validate()
+    .unwrap();
+}
+
 fn sha256(byte: u8, size: u64) -> Digest {
   Digest::new(DigestAlgorithm::Sha256, [byte; 32], size)
 }

@@ -211,7 +211,7 @@ impl Runtime {
     // before starting plugins so a cache failure cannot leak child processes
     // from a partially constructed runtime.
     let result_cache = match result_cache {
-      Some(config) => Some(config.open().await?),
+      Some(config) => Some(config.open_with_cancellation(cancellation.clone()).await?),
       None => None,
     };
     let secret_session = secrets_profile

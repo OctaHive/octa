@@ -1,7 +1,7 @@
 //! Stable cache identities and serialization-only result types.
 //!
 //! This crate is the lowest cache boundary shared by the CLI, runner, local
-//! store, and future OctaCity HTTP client. It deliberately has no executor,
+//! store, and HTTP cache clients. It deliberately has no executor,
 //! filesystem, async-runtime, compression, or transport dependency. Action
 //! digests are produced by an explicit binary encoding rather than a serde
 //! representation, so harmless JSON formatting changes cannot invalidate the
@@ -14,6 +14,7 @@ mod digest;
 mod layer;
 mod path;
 mod policy;
+mod remote;
 mod result;
 
 pub use action::{
@@ -23,6 +24,11 @@ pub use digest::{Digest, DigestAlgorithm};
 pub use layer::CacheLayer;
 pub use path::RelativePath;
 pub use policy::CacheMode;
+pub use remote::{
+  FindMissingBlobsRequestV1, FindMissingBlobsResponseV1, WriteActionRequestV1, REMOTE_CACHE_BLOB_CONTENT_TYPE,
+  REMOTE_CACHE_JSON_CONTENT_TYPE, REMOTE_CACHE_PROTOCOL_HEADER, REMOTE_CACHE_PROTOCOL_HEADER_VALUE_V1,
+  REMOTE_CACHE_PROTOCOL_V1,
+};
 pub use result::{
   ActionResultV1, BlobDescriptor, BlobEncoding, CachedArtifact, CachedReport, ACTION_RESULT_VERSION_V1,
   ZSTD_V1_MAX_WINDOW_LOG,
@@ -32,6 +38,8 @@ pub use result::{
 pub const ACTION_DESCRIPTOR_SCHEMA_V1: &str = include_str!("../schema/action-descriptor-v1.schema.json");
 /// JSON schema for serialized version-one action results.
 pub const ACTION_RESULT_SCHEMA_V1: &str = include_str!("../schema/action-result-v1.schema.json");
+/// JSON schema for every version-one remote metadata request and response.
+pub const REMOTE_CACHE_SCHEMA_V1: &str = include_str!("../schema/remote-cache-v1.schema.json");
 
 /// Maximum UTF-8 bytes in one identity or resource string.
 pub const MAX_CACHE_STRING_BYTES: usize = 16 * 1024;
@@ -41,6 +49,14 @@ pub const MAX_CACHE_LIST_ITEMS: usize = 4096;
 pub const MAX_ACTION_RESULT_METADATA_BYTES: usize = 4 * 1024 * 1024;
 /// Maximum complete JSON representation accepted for one action result.
 pub const MAX_ACTION_RESULT_WIRE_BYTES: usize = MAX_ACTION_RESULT_METADATA_BYTES + 64 * 1024;
+/// Maximum JSON response accepted for one remote cache metadata operation.
+pub const MAX_REMOTE_CACHE_METADATA_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum bearer-token file size accepted by cache composition roots.
+pub const MAX_CACHE_TOKEN_FILE_BYTES: u64 = 64 * 1024;
+/// Largest whole-operation deadline agents may grant an HTTP cache call.
+pub const MAX_REMOTE_CACHE_REQUEST_TIMEOUT_SECONDS: u64 = 10 * 60;
+/// Largest blob-transfer concurrency accepted for one runner job.
+pub const MAX_REMOTE_CACHE_PARALLEL_TRANSFERS: usize = 256;
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 /// Invalid cache identity or result metadata.

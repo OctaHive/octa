@@ -16,6 +16,15 @@ low_watermark_bytes = 17179869184
 
 [environment]
 identity = "linux-amd64-rust-1.98-toolchain-v1"
+
+# Optional shared L2. The local cache above remains the verified L1.
+[remote]
+endpoint = "https://cache.example.com/tenant-a/"
+token_file = "/run/secrets/octa-cache-token"
+# Optional PEM root for a private certificate authority.
+# ca_certificate_file = "/etc/octa/cache-ca.pem"
+request_timeout_seconds = 30
+max_parallel_transfers = 8
 ```
 
 Run a cacheable task with:
@@ -70,9 +79,27 @@ max_compression_ratio = 1000
 read_buffer_bytes = 1048576
 ```
 
-Omitted optional values use the centralized defaults in `octa-cache`. Unknown
+Omitted optional values use the centralized defaults in the cache crates. Unknown
 fields, zero resource bounds, inconsistent watermarks, and unsupported
 compression settings fail before task execution.
+
+`[remote]` enables the version-one HTTP action cache and CAS described in
+[`cache-http-v1.md`](cache-http-v1.md). `endpoint` and `token_file` are
+required; `ca_certificate_file` optionally adds one PEM root for a private PKI.
+The endpoint must use HTTPS and contain no credentials, query, or fragment.
+Credential and certificate paths must be absolute. On Unix the regular, non-symlink token
+file must be owned by the effective process user and must not grant group or
+other permissions. On Windows the service installer is responsible for
+restricting the file ACL to the agent account. Its value is never serialized or
+logged.
+
+In addition to the timeout and transfer limit shown above, operators may set
+`max_retries`, `retry_base_delay_milliseconds`,
+`retry_max_delay_milliseconds`, `circuit_failure_threshold`, and
+`circuit_open_seconds`. Remote failures fall back to task execution or
+local-only publication; cancellation still cancels the task. A remote action
+is fetched without its blob, checked against job limits, then populated into
+the local CAS only as part of a verified restore.
 
 ## Inspection and maintenance
 
@@ -91,6 +118,6 @@ plugin-backed template values may therefore perform their documented reads or
 external calls. `prune` performs an exclusive bounded
 mark-and-sweep pass and reports removed action, blob, and maintenance objects.
 
-Remote endpoints are intentionally absent from the CLI profile in this phase.
-They will be implemented by the versioned HTTP cache client; Octa will not put
-an S3 SDK or server storage details into this profile.
+`status` and `prune` remain local maintenance operations. The remote service
+owns its own quota, retention, and backing storage; Octa does not expose S3
+details or use an S3 SDK.

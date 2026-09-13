@@ -276,6 +276,11 @@ impl LocalCacheStore {
   async fn quarantine(&self, source: PathBuf, reason: String) -> CacheResult<()> {
     let _gc = acquire_lock(self.gc_lock_path(), false).await?;
     let _object = acquire_lock(self.object_lock_path(&source.to_string_lossy()), true).await?;
+    self.quarantine_locked(source, reason)
+  }
+
+  /// Moves an object while the caller holds the shared GC and exclusive object locks.
+  fn quarantine_locked(&self, source: PathBuf, reason: String) -> CacheResult<()> {
     if !validate_cache_parent(&self.layout, &source, false)? {
       return Ok(());
     }
@@ -299,6 +304,44 @@ impl LocalCacheStore {
     }
     sync_directory(destination.parent().expect("quarantine object has a parent"))?;
     Ok(())
+  }
+
+  /// Removes a conflicting local action only if it still differs from the
+  /// verified remote result observed by the caller.
+  ///
+  /// Rechecking under both cache locks prevents a delayed promotion from
+  /// quarantining an equal action that another process published meanwhile.
+  pub(crate) async fn quarantine_conflicting_action(
+    &self,
+    namespace: &str,
+    verified: &ActionResultV1,
+  ) -> CacheResult<bool> {
+    let path = self.action_path(namespace, &verified.action)?;
+    let expected = serde_json::to_vec(verified).expect("validated action-result metadata must serialize to JSON");
+    let _gc = acquire_lock(self.gc_lock_path(), false).await?;
+    let _object = acquire_lock(self.object_lock_path(&path.to_string_lossy()), true).await?;
+    if !validate_cache_parent(&self.layout, &path, false)? {
+      return Ok(false);
+    }
+    let metadata = match fs::symlink_metadata(&path) {
+      Ok(metadata) => metadata,
+      Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+      Err(error) => return Err(io_error("inspect conflicting local action", &path, error)),
+    };
+    let equal = metadata.file_type().is_file()
+      && !is_link_or_reparse(&metadata)
+      && metadata.len() <= MAX_ACTION_RESULT_WIRE_BYTES as u64
+      && fs::read(&path)
+        .map(|bytes| bytes == expected)
+        .map_err(|error| io_error("read conflicting local action", &path, error))?;
+    if equal {
+      return Ok(false);
+    }
+    self.quarantine_locked(
+      path,
+      "local action conflicts with a completely verified remote result".to_owned(),
+    )?;
+    Ok(true)
   }
 
   async fn quarantine_action(&self, path: PathBuf, reason: String) -> CacheError {

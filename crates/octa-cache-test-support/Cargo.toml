@@ -1,0 +1,15 @@
+[package]
+name = "octa-cache-test-support"
+description = "Shared reference HTTP cache used by Octa integration tests"
+version = "0.0.0"
+publish = false
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+octa-cache-protocol = { version = "0.3.0", path = "../octa-cache-protocol" }
+serde_json = { workspace = true }

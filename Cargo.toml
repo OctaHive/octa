@@ -13,6 +13,8 @@ members = [
   "crates/octa-runner-protocol",
   "crates/octa-cache-protocol",
   "crates/octa-cache",
+  "crates/octa-cache-http",
+  "crates/octa-cache-test-support",
   "crates/octa-plugin",
   "crates/octa-plugin-lock",
   "crates/octa-plugin-manager",
@@ -37,6 +39,7 @@ blake3 = "1.8.2"
 crossterm = "0.29.0"
 console = "0.16.4"
 lazy_static = "1.5.0"
+libc = "0.2.189"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yml = "0.0.13"
@@ -64,6 +67,11 @@ tempfile = "3.27"
 same-file = "1.0.6"
 zstd = "0.13.3"
 toml = "0.9"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "stream"] }
+fastrand = "2.3.0"
+zeroize = "1.8.2"
+url = "2.5.8"
+axum = "0.8.9"
 
 # default to small, optimized workspace release binaries
 [profile.release]

@@ -95,14 +95,15 @@ and server transport settings intentionally do not belong to this protocol.
 Protocol v1 is intentionally not accepted: Octa does not maintain a partial
 compatibility adapter for the pre-cache runner contract. `local_directory` is agent-selected and absolute;
 `runtime` is the exact Native environment or immutable OCI image identity used
-by the job. The optional `remote` member reserves the Phase 6 HTTPS transport
-contract, but the current runner rejects it and does not advertise a remote-cache
-feature. Its token value is never serialized. Agents
+by the job. The optional `remote` member enables the HTTPS L2 transport when
+the runner advertises `task-result-cache-http-v1`; the local CAS remains the L1
+tier and is used together with it. The token value is never serialized. Agents
 must provide a regular, non-symlink token file containing 1 to 64 KiB; on Unix
-it must not grant group or other permissions. Agents must inspect
-`capabilities.features` before requesting a transport: the current
-`task-result-cache-v1` feature advertises the shared cache engine and local CAS,
-not the later HTTP transport.
+it must not grant group or other permissions. The optional CA file adds a
+private root without disabling TLS verification. `request_timeout_seconds`
+covers the complete remote operation, including transfer-slot waits, staging,
+retries, and response consumption. Agents must inspect
+`capabilities.features` before sending a remote session.
 
 Rust consumers should use the separately versioned
 [`octa-runner-protocol`](../crates/octa-runner-protocol) crate. It owns the

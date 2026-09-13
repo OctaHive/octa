@@ -32,12 +32,21 @@ use replay::{
 
 /// Deterministic store used to exercise executor fallback policy without
 /// depending on filesystem corruption in the local CAS implementation.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CancelledStoreOperation {
+  GetAction,
+  FindMissing,
+  ReadBlob,
+  WriteBlob,
+  WriteAction,
+  CommitHit,
+}
+
 struct ControlledStore {
   action: Mutex<Option<ActionResultV1>>,
   blob: Option<Vec<u8>>,
   blob_missing: bool,
   blob_lookup_fails: bool,
-  invalid_missing_response: bool,
   blob_read_fails: bool,
   blob_write: Result<WriteOutcome, &'static str>,
   action_write: Result<WriteOutcome, &'static str>,
@@ -46,6 +55,7 @@ struct ControlledStore {
   cancel_on_lookup: Option<CancellationToken>,
   cancel_on_blob_read: Option<CancellationToken>,
   action_read_fails: bool,
+  cancelled_operation: Option<CancelledStoreOperation>,
   lookups: AtomicUsize,
   blob_writes: AtomicUsize,
   action_writes: AtomicUsize,
@@ -58,7 +68,6 @@ impl Default for ControlledStore {
       blob: None,
       blob_missing: true,
       blob_lookup_fails: false,
-      invalid_missing_response: false,
       blob_read_fails: false,
       blob_write: Ok(WriteOutcome::Written),
       action_write: Ok(WriteOutcome::Written),
@@ -67,6 +76,7 @@ impl Default for ControlledStore {
       cancel_on_lookup: None,
       cancel_on_blob_read: None,
       action_read_fails: false,
+      cancelled_operation: None,
       lookups: AtomicUsize::new(0),
       blob_writes: AtomicUsize::new(0),
       action_writes: AtomicUsize::new(0),
@@ -78,6 +88,9 @@ impl Default for ControlledStore {
 impl CacheStore for ControlledStore {
   async fn get_action(&self, _namespace: &str, _action: &Digest) -> Result<Option<ActionLookup>, CacheError> {
     self.lookups.fetch_add(1, Ordering::Relaxed);
+    if self.cancelled_operation == Some(CancelledStoreOperation::GetAction) {
+      return Err(CacheError::Cancelled);
+    }
     if self.action_read_fails {
       return Err(CacheError::Configuration("offline".to_owned()));
     }
@@ -97,18 +110,19 @@ impl CacheStore for ControlledStore {
   }
 
   async fn find_missing_blobs(&self, blobs: &[BlobDescriptor]) -> Result<Vec<BlobDescriptor>, CacheError> {
+    if self.cancelled_operation == Some(CancelledStoreOperation::FindMissing) {
+      return Err(CacheError::Cancelled);
+    }
     if self.blob_lookup_fails {
       return Err(CacheError::Configuration("blob lookup unavailable".to_owned()));
-    }
-    if self.invalid_missing_response {
-      let mut invalid = blobs.to_vec();
-      invalid.extend_from_slice(blobs);
-      return Ok(invalid);
     }
     Ok(if self.blob_missing { blobs.to_vec() } else { Vec::new() })
   }
 
   async fn read_blob(&self, _blob: &BlobDescriptor) -> Result<BlobReader, CacheError> {
+    if self.cancelled_operation == Some(CancelledStoreOperation::ReadBlob) {
+      return Err(CacheError::Cancelled);
+    }
     if self.blob_read_fails {
       return Err(CacheError::Configuration("blob unavailable".to_owned()));
     }
@@ -121,6 +135,9 @@ impl CacheStore for ControlledStore {
 
   async fn write_blob_if_absent(&self, _blob: &BlobDescriptor, _body: BlobReader) -> Result<WriteOutcome, CacheError> {
     self.blob_writes.fetch_add(1, Ordering::Relaxed);
+    if self.cancelled_operation == Some(CancelledStoreOperation::WriteBlob) {
+      return Err(CacheError::Cancelled);
+    }
     self
       .blob_write
       .map_err(|message| CacheError::Configuration(message.to_owned()))
@@ -132,9 +149,20 @@ impl CacheStore for ControlledStore {
     _result: &ActionResultV1,
   ) -> Result<WriteOutcome, CacheError> {
     self.action_writes.fetch_add(1, Ordering::Relaxed);
+    if self.cancelled_operation == Some(CancelledStoreOperation::WriteAction) {
+      return Err(CacheError::Cancelled);
+    }
     self
       .action_write
       .map_err(|message| CacheError::Configuration(message.to_owned()))
+  }
+
+  async fn commit_verified_hit(&self, _namespace: &str, _result: &ActionResultV1) -> Result<(), CacheError> {
+    if self.cancelled_operation == Some(CancelledStoreOperation::CommitHit) {
+      Err(CacheError::Cancelled)
+    } else {
+      Ok(())
+    }
   }
 }
 
@@ -214,6 +242,53 @@ async fn action_for(
     .unwrap()
     .root;
   action_digest(cache, plan, manager, context, root).await.unwrap()
+}
+
+async fn lookup_cancelled_by_store(
+  operation: CancelledStoreOperation,
+  probe: bool,
+  output_bundle: Option<BlobDescriptor>,
+) -> Result<(), ExecutorError> {
+  let directory = TempDir::new().unwrap();
+  let manager = octa_plugin_manager::plugin_manager::PluginManager::new(directory.path());
+  let context = runtime_context(directory.path());
+  let output = runtime_output();
+  let cancel = CancellationToken::new();
+  let plan = plan(directory.path(), Vec::new(), Vec::new());
+  let store = Arc::new(ControlledStore {
+    blob: Some(b"blob".to_vec()),
+    cancelled_operation: Some(operation),
+    ..ControlledStore::default()
+  });
+  let cache = runtime_cache(directory.path(), store.clone());
+  if operation != CancelledStoreOperation::GetAction {
+    let action = action_for(&cache, &plan, &manager, &context).await;
+    *store.action.lock().await = Some(ActionResultV1 {
+      result_version: ACTION_RESULT_VERSION_V1,
+      action,
+      output_bundle,
+      stdout: None,
+      task_outputs: BTreeMap::new(),
+      artifacts: Vec::new(),
+      reports: Vec::new(),
+    });
+  }
+  let state = TaskCacheState::default();
+  state.set_probe(probe).await;
+  lookup(
+    &cache,
+    CacheLookup {
+      plan: &plan,
+      state: &state,
+      plugin_manager: &manager,
+      context: &context,
+      output: &output,
+      cancel: &cancel,
+      dry: false,
+      force: false,
+    },
+  )
+  .await
 }
 
 #[test]
@@ -316,6 +391,64 @@ fn cache_configuration_identity_and_result_metadata_are_stable() {
     outputs: CompletionOutputs::default(),
   };
   assert!(action_result(Digest::blake3(b"action"), None, &oversized).is_err());
+}
+
+#[tokio::test]
+async fn store_cancellation_is_never_converted_to_a_cache_miss_or_soft_failure() {
+  let blob = BlobDescriptor {
+    digest: Digest::blake3(b"blob"),
+    encoding: BlobEncoding::Identity,
+    encoded_size_bytes: 4,
+    expanded_size_bytes: 4,
+    entry_count: 1,
+  };
+  for (operation, probe, bundle) in [
+    (CancelledStoreOperation::GetAction, false, None),
+    (CancelledStoreOperation::FindMissing, true, Some(blob.clone())),
+    (CancelledStoreOperation::ReadBlob, false, Some(blob)),
+    (CancelledStoreOperation::CommitHit, false, None),
+  ] {
+    assert!(matches!(
+      lookup_cancelled_by_store(operation, probe, bundle).await,
+      Err(ExecutorError::TaskCancelled(_))
+    ));
+  }
+
+  for operation in [CancelledStoreOperation::WriteBlob, CancelledStoreOperation::WriteAction] {
+    let directory = TempDir::new().unwrap();
+    fs::write(directory.path().join("output"), "content").unwrap();
+    let manager = octa_plugin_manager::plugin_manager::PluginManager::new(directory.path());
+    let context = runtime_context(directory.path());
+    let output = runtime_output();
+    let cancel = CancellationToken::new();
+    let plan = plan(directory.path(), Vec::new(), vec![RelativePath::new("output").unwrap()]);
+    let store = Arc::new(ControlledStore {
+      cancelled_operation: Some(operation),
+      ..ControlledStore::default()
+    });
+    let cache = runtime_cache(directory.path(), store);
+    let state = TaskCacheState::default();
+    lookup(
+      &cache,
+      CacheLookup {
+        plan: &plan,
+        state: &state,
+        plugin_manager: &manager,
+        context: &context,
+        output: &output,
+        cancel: &cancel,
+        dry: false,
+        force: true,
+      },
+    )
+    .await
+    .unwrap();
+    state.record_command(0, "executed", &CompletionOutputs::default()).await;
+    assert!(matches!(
+      finalize(&cache, &plan, &state, &output, &cancel, false).await,
+      Err(ExecutorError::TaskCancelled(_))
+    ));
+  }
 }
 
 #[test]
@@ -1387,41 +1520,6 @@ async fn publication_failures_remain_soft_and_never_bind_an_action() {
     assert_eq!(outcome.reason, Some(expected));
   }
 
-  for store in [
-    Arc::new(ControlledStore {
-      blob_lookup_fails: true,
-      ..ControlledStore::default()
-    }),
-    Arc::new(ControlledStore {
-      invalid_missing_response: true,
-      ..ControlledStore::default()
-    }),
-  ] {
-    let state = TaskCacheState::default();
-    state
-      .set_lookup(
-        Some(PublicationIdentity { action, input_root }),
-        None,
-        CacheOutcome::miss(
-          action.to_string(),
-          CacheReason::ActionNotFound,
-          std::time::Duration::ZERO,
-        ),
-      )
-      .await;
-    let (_, _, outcome) = finalize(
-      &runtime_cache(directory.path(), store),
-      &output_plan,
-      &state,
-      &output,
-      &cancel,
-      false,
-    )
-    .await
-    .unwrap();
-    assert_eq!(outcome.reason, Some(CacheReason::BlobLookupFailed));
-  }
-
   let invalid_resource = TaskCacheState::default();
   invalid_resource
     .set_lookup(
@@ -1451,7 +1549,7 @@ async fn publication_failures_remain_soft_and_never_bind_an_action() {
 
   let present_store = Arc::new(ControlledStore {
     blob_missing: false,
-    blob_write: Err("an existing blob must not be uploaded"),
+    blob_write: Ok(WriteOutcome::AlreadyPresent),
     ..ControlledStore::default()
   });
   let state = TaskCacheState::default();
@@ -1477,7 +1575,9 @@ async fn publication_failures_remain_soft_and_never_bind_an_action() {
   .await
   .unwrap();
   assert_ne!(outcome.status, CacheStatus::Error);
-  assert_eq!(present_store.blob_writes.load(Ordering::Relaxed), 0);
+  // Publication always offers the verified bytes to the store. A layered
+  // store must populate L1 even when the same blob is already readable in L2.
+  assert_eq!(present_store.blob_writes.load(Ordering::Relaxed), 1);
 
   let cancelled = CancellationToken::new();
   cancelled.cancel();

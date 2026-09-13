@@ -12,7 +12,7 @@ use std::{collections::BTreeMap, num::NonZeroUsize, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use octa_cache_protocol::CacheMode;
+pub use octa_cache_protocol::{CacheMode, MAX_CACHE_TOKEN_FILE_BYTES};
 
 /// Current incompatible version of the runner command envelope.
 pub const RUNNER_PROTOCOL_VERSION: u16 = 2;
@@ -20,8 +20,6 @@ pub const RUNNER_PROTOCOL_VERSION: u16 = 2;
 pub const RUNNER_EVENT_SCHEMA_VERSION: u16 = 4;
 /// Maximum bytes accepted for one newline-delimited input command.
 pub const MAX_RUNNER_INPUT_FRAME_BYTES: usize = 1024 * 1024;
-/// Maximum accepted size of a job-scoped remote-cache bearer token file.
-pub const MAX_CACHE_TOKEN_FILE_BYTES: u64 = 64 * 1024;
 /// Published JSON Schema for protocol-v2 input commands.
 pub const RUNNER_INPUT_SCHEMA_V2: &str = include_str!("../schema/input-v2.schema.json");
 /// Published JSON Schema for protocol-v2 output messages.
@@ -72,12 +70,12 @@ pub enum Silence {
   Stderr,
 }
 
-/// Optional remote endpoint negotiated for a future HTTP-backed layer.
+/// Optional remote endpoint negotiated for the HTTP-backed L2 cache.
 ///
 /// Version two carries the security-sensitive shape so agents never need to
 /// inject bearer values into the process environment or command line. The
-/// runner validates the token file before execution; transport is activated by
-/// a runner capability only when the HTTP cache implementation is available.
+/// runner validates and reads the token file before execution, and advertises
+/// `task-result-cache-http-v1` only while this transport is compiled in.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteCacheSession {
@@ -85,7 +83,10 @@ pub struct RemoteCacheSession {
   pub endpoint: String,
   /// Absolute path to a bounded bearer token file; its value is never serialized.
   pub token_file: PathBuf,
-  /// Per-request deadline selected by the agent.
+  /// Optional absolute PEM root certificate for private HTTPS deployments.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub ca_certificate_file: Option<PathBuf>,
+  /// Whole-operation deadline selected by the agent.
   pub request_timeout_seconds: u64,
   /// Upper bound on this job's concurrent blob transfers.
   pub max_parallel_transfers: NonZeroUsize,
@@ -127,8 +128,20 @@ impl CacheSessionSpec {
       if !remote.token_file.is_absolute() {
         return Err("remote cache token_file must be an absolute path".to_owned());
       }
-      if remote.request_timeout_seconds == 0 {
-        return Err("remote cache request timeout must be greater than zero".to_owned());
+      if remote
+        .ca_certificate_file
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+      {
+        return Err("remote cache ca_certificate_file must be an absolute path".to_owned());
+      }
+      if remote.request_timeout_seconds == 0
+        || remote.request_timeout_seconds > octa_cache_protocol::MAX_REMOTE_CACHE_REQUEST_TIMEOUT_SECONDS
+      {
+        return Err("remote cache request timeout is outside supported bounds".to_owned());
+      }
+      if remote.max_parallel_transfers.get() > octa_cache_protocol::MAX_REMOTE_CACHE_PARALLEL_TRANSFERS {
+        return Err("remote cache transfer concurrency exceeds the supported bound".to_owned());
       }
     }
     Ok(())
@@ -491,6 +504,7 @@ mod tests {
     let remote = RemoteCacheSession {
       endpoint: "http://cache.example".to_owned(),
       token_file: std::env::current_dir().unwrap().join("token"),
+      ca_certificate_file: None,
       request_timeout_seconds: 30,
       max_parallel_transfers: NonZeroUsize::new(4).unwrap(),
     };
@@ -503,9 +517,16 @@ mod tests {
     invalid.remote.as_mut().unwrap().token_file = PathBuf::from("token");
     assert!(invalid.validate().unwrap_err().contains("token_file"));
     invalid.remote.as_mut().unwrap().token_file = std::env::current_dir().unwrap().join("token");
+    invalid.remote.as_mut().unwrap().ca_certificate_file = Some(PathBuf::from("ca.pem"));
+    assert!(invalid.validate().unwrap_err().contains("ca_certificate_file"));
+    invalid.remote.as_mut().unwrap().ca_certificate_file = None;
     invalid.remote.as_mut().unwrap().request_timeout_seconds = 0;
     assert!(invalid.validate().unwrap_err().contains("timeout"));
     invalid.remote.as_mut().unwrap().request_timeout_seconds = 30;
+    invalid.remote.as_mut().unwrap().max_parallel_transfers =
+      NonZeroUsize::new(octa_cache_protocol::MAX_REMOTE_CACHE_PARALLEL_TRANSFERS + 1).unwrap();
+    assert!(invalid.validate().unwrap_err().contains("concurrency"));
+    invalid.remote.as_mut().unwrap().max_parallel_transfers = NonZeroUsize::new(4).unwrap();
     assert!(invalid.validate().is_ok());
   }
 
@@ -571,14 +592,15 @@ mod tests {
   #[test]
   fn schemas_validate_public_examples() {
     let input_schema: Value = serde_json::from_str(RUNNER_INPUT_SCHEMA_V2).unwrap();
+    let input_validator = jsonschema::validator_for(&input_schema).unwrap();
     let input = json!({
       "type": "start",
       "protocol_version": RUNNER_PROTOCOL_VERSION,
       "request_id": "job-1",
       "request": { "workspace": "/workspace", "commands": ["ci"] }
     });
-    assert!(jsonschema::validator_for(&input_schema).unwrap().is_valid(&input));
-    let cache_input = json!({
+    assert!(input_validator.is_valid(&input));
+    let mut cache_input = json!({
       "type": "start",
       "protocol_version": 2,
       "request_id": "cached-job",
@@ -598,11 +620,27 @@ mod tests {
               "hash": "0101010101010101010101010101010101010101010101010101010101010101",
               "size_bytes": 9
             }
+          },
+          "remote": {
+            "endpoint": "https://cache.example",
+            "token_file": "/credentials/cache-token",
+            "request_timeout_seconds": 600,
+            "max_parallel_transfers": 256
           }
         }
       }
     });
-    assert!(jsonschema::validator_for(&input_schema).unwrap().is_valid(&cache_input));
+    assert!(input_validator.is_valid(&cache_input));
+    // JSON Schema cannot import Rust constants. These boundary assertions keep
+    // its literal limits synchronized with the wire-type validation.
+    cache_input["request"]["cache"]["remote"]["request_timeout_seconds"] =
+      json!(octa_cache_protocol::MAX_REMOTE_CACHE_REQUEST_TIMEOUT_SECONDS + 1);
+    assert!(!input_validator.is_valid(&cache_input));
+    cache_input["request"]["cache"]["remote"]["request_timeout_seconds"] =
+      json!(octa_cache_protocol::MAX_REMOTE_CACHE_REQUEST_TIMEOUT_SECONDS);
+    cache_input["request"]["cache"]["remote"]["max_parallel_transfers"] =
+      json!(octa_cache_protocol::MAX_REMOTE_CACHE_PARALLEL_TRANSFERS + 1);
+    assert!(!input_validator.is_valid(&cache_input));
 
     let output_schema: Value = serde_json::from_str(RUNNER_OUTPUT_SCHEMA_V2).unwrap();
     let validator = jsonschema::validator_for(&output_schema).unwrap();
