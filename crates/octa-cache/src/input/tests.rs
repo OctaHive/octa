@@ -1,6 +1,9 @@
 //! Input snapshot integration and filesystem-safety tests.
 
-use std::{fs, sync::Arc};
+use std::fs;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::sync::Arc;
 
 use tempfile::TempDir;
 

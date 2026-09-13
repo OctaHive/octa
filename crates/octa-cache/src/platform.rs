@@ -286,7 +286,7 @@ fn platform_identity(_path: &Path, metadata: &Metadata) -> (FileIdentity, Platfo
 
 #[cfg(windows)]
 fn platform_identity(path: &Path, metadata: &Metadata) -> (FileIdentity, PlatformChange, bool) {
-  use std::{mem::size_of, os::windows::fs::MetadataExt as _};
+  use std::mem::size_of;
   use winapi_util::AsHandleRef as _;
   use windows_sys::Win32::{
     Foundation::HANDLE,
@@ -440,8 +440,6 @@ pub(crate) fn create_symlink(target: &Path, destination: &Path, directory: bool)
 
 #[cfg(test)]
 mod tests {
-  #[cfg(windows)]
-  use std::path::Path;
   use std::time::Duration;
 
   use super::*;

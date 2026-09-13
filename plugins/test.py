@@ -180,8 +180,9 @@ class WindowsServer:
         win32file.CloseHandle(pipe)
 
     async def start(self):
+        import winerror
         import win32pipe
-        import win32file
+        import pywintypes
 
         log_message(self.log_file, f"Starting Windows named pipe server on: {self.path}")
 
@@ -199,8 +200,14 @@ class WindowsServer:
         try:
             await asyncio.get_running_loop().run_in_executor(None, win32pipe.ConnectNamedPipe, self.pipe, None)
             print("Client connected")
-        except Exception as e:
-            win32file.CloseHandle(self.pipe)
+        except pywintypes.error as e:
+            # A client may open the pipe after CreateNamedPipe returned but
+            # before ConnectNamedPipe starts waiting. Windows reports that
+            # successful connection as ERROR_PIPE_CONNECTED instead of a
+            # normal return value.
+            if e.winerror == winerror.ERROR_PIPE_CONNECTED:
+                print("Client connected")
+                return
             log_message(self.log_file, f"Error connect pipe: {str(e)}")
             raise
 
@@ -306,6 +313,8 @@ async def main():
         log_message(log_file, "Server was cancelled")
     except Exception as e:
         log_message(log_file, f"Server error: {e}")
+        print(f"Server error: {e}", file=sys.stderr)
+        raise
     finally:
         log_message(log_file, "Shutting down server...")
         await server.close()
