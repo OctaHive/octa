@@ -135,11 +135,10 @@ pub struct ReportDeclaration {
 
 /// Filesystem inputs that define a task and exact roots it may materialize.
 ///
-/// `inputs` remains optional in the parser model so a non-cached task may use
-/// `files.outputs` solely to constrain artifacts. Caching and watch mode both
-/// require it to be present, including when the intended set is explicitly
-/// empty. This distinction prevents a missing declaration from silently
-/// becoming a reusable action with no filesystem inputs.
+/// `inputs` remains optional because cacheable plugin steps may provide a
+/// complete contract during planning. An explicit list augments every plugin
+/// contract and is still required for opaque steps such as shell commands.
+/// Watch mode cannot consult plugins and therefore always requires it.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskFiles {
@@ -690,11 +689,6 @@ impl Context {
   }
 
   fn validate_task_contract(&self, task: &Task) -> Result<(), String> {
-    if task.cache.is_some() && task.files.as_ref().and_then(|files| files.inputs.as_ref()).is_none() {
-      return Err(
-        "a cached task must declare 'files.inputs'; use an explicit empty list when it has no file inputs".to_owned(),
-      );
-    }
     if task.watch == Some(true) && task.files.as_ref().and_then(|files| files.inputs.as_ref()).is_none() {
       return Err("a watched task must declare 'files.inputs'".to_owned());
     }
@@ -1178,6 +1172,7 @@ outputs:
 
   #[test]
   fn validates_cache_and_watch_file_contracts() {
+    parse_task(&context(), "cache: {}\nshell: build").unwrap();
     let task = parse_task(
       &context(),
       "files:\n  inputs: [src/**, '!src/generated/**']\n  outputs: [target/app]\ncache:\n  environment: [RUSTFLAGS]\n  salt: v1\nwatch: true\nshell: build",
@@ -1187,7 +1182,6 @@ outputs:
     assert_eq!(task.cache.unwrap().environment, ["RUSTFLAGS"]);
 
     for (yaml, expected) in [
-      ("cache: {}\nshell: build", "must declare 'files.inputs'"),
       ("watch: true\nshell: build", "watched task must declare"),
       (
         "files: { inputs: [''], outputs: [] }\ncache: {}\nshell: build",

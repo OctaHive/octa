@@ -115,7 +115,7 @@ pub(super) fn relative_directory(workspace: &Path, directory: &Path) -> Executor
   if relative.as_os_str().is_empty() {
     return Ok(RelativePath::root());
   }
-  RelativePath::new(relative.to_string_lossy().replace('\\', "/")).map_err(ExecutorError::from)
+  RelativePath::from_path(relative).map_err(ExecutorError::from)
 }
 
 pub(super) fn digest_json(value: &impl serde::Serialize) -> ExecutorResult<Digest> {

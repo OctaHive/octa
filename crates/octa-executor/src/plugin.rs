@@ -130,14 +130,10 @@ impl PluginInvoker {
       .await
       .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error.to_string()))?;
 
-    let command = match request.value {
-      Value::String(command) => command,
-      value => value.to_string(),
-    };
     let execution = client
       .start_execution(
         PluginExecutionRequest {
-          params: command,
+          params: request.value,
           dry,
           args: request.args,
           dir,

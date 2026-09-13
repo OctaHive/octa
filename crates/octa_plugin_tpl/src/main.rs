@@ -1,7 +1,13 @@
+//! Built-in text/template plugin.
+//!
+//! Inline templates have no filesystem inputs. File-backed templates expose
+//! their exact source file through protocol-v2 cache planning, then retain the
+//! existing execution behavior for cached and uncached tasks alike.
+
 use std::{
   borrow::Cow,
   env,
-  path::{Path, PathBuf},
+  path::{Component, Path, PathBuf},
   sync::Arc,
 };
 
@@ -10,7 +16,11 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value;
 
-use octa_plugin::{logger::Logger, protocol::PluginResponse, serve_plugin, Plugin, PluginCommand, PluginSchema};
+use octa_plugin::{
+  logger::Logger,
+  protocol::{PluginCachePlan, PluginCachePlanRequest, PluginResponse},
+  serve_plugin, Plugin, PluginCommand, PluginSchema,
+};
 use tera::{Context as TeraContext, Tera};
 use tokio::{
   io::{AsyncWrite, AsyncWriteExt},
@@ -50,9 +60,12 @@ fn plugin_schema() -> PluginSchema {
   }
 }
 
-async fn load_template(command: String, dir: &Path) -> anyhow::Result<String> {
-  let Ok(Value::Object(params)) = serde_json::from_str::<Value>(&command) else {
-    return Ok(command);
+async fn load_template(value: Value, dir: &Path) -> anyhow::Result<String> {
+  let Value::Object(params) = value else {
+    return value
+      .as_str()
+      .map(str::to_owned)
+      .context("template plugin value must be a string or file object");
   };
 
   let template_file = serde_json::from_value::<TemplateFile>(Value::Object(params))
@@ -64,11 +77,61 @@ async fn load_template(command: String, dir: &Path) -> anyhow::Result<String> {
     .with_context(|| format!("Failed to read template file '{}'", path.display()))
 }
 
+/// Converts a plugin parameter with the same component semantics as execution.
+///
+/// Windows separators are recognized by `Path::components` on Windows. On
+/// Unix a literal backslash remains inside a component and is rejected, so a
+/// cache contract never aliases it to a different `/` path.
+fn portable_relative_path(path: &Path) -> Option<String> {
+  let mut result = Vec::new();
+  for component in path.components() {
+    match component {
+      Component::Normal(value) => {
+        let value = value.to_str()?;
+        if value.contains(['\\', ':']) || value.chars().any(char::is_control) {
+          return None;
+        }
+        result.push(value);
+      },
+      Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+    }
+  }
+  (!result.is_empty()).then(|| result.join("/"))
+}
+
 #[async_trait]
 impl Plugin for TemplatePlugin {
   /// Return plugin version
   fn version(&self) -> String {
     env!("CARGO_PKG_VERSION").to_owned()
+  }
+
+  fn cache_plan(&self, request: &PluginCachePlanRequest) -> anyhow::Result<Option<PluginCachePlan>> {
+    let Value::Object(params) = &request.params else {
+      // An inline template reads no workspace files. Its variables and
+      // environment are already included by the action descriptor.
+      return Ok(Some(PluginCachePlan::default()));
+    };
+    let template = serde_json::from_value::<TemplateFile>(Value::Object(params.clone()))
+      .context("Failed to parse template file parameters")?;
+    let Some(file) = portable_relative_path(&template.file) else {
+      // Execution retains native Path behavior for uncached tasks. Cache
+      // planning must fail closed when that path has no portable identity.
+      return Ok(None);
+    };
+    let portable = if request.working_directory.is_empty() {
+      file
+    } else {
+      format!("{}/{file}", request.working_directory)
+    };
+    let mut pattern = glob::Pattern::escape(&portable);
+    if pattern.starts_with('!') {
+      pattern.insert(0, '\\');
+    }
+    Ok(Some(PluginCachePlan {
+      inputs: vec![pattern],
+      outputs: Vec::new(),
+    }))
   }
 
   async fn execute_command(
@@ -80,7 +143,7 @@ impl Plugin for TemplatePlugin {
   ) -> anyhow::Result<()> {
     let PluginCommand {
       id,
-      command,
+      value,
       dir,
       vars,
       envs,
@@ -90,7 +153,7 @@ impl Plugin for TemplatePlugin {
 
     let mut tera = Tera::default();
     let template_name = format!("template_{}", id);
-    let template = load_template(command, &dir).await?;
+    let template = load_template(value, &dir).await?;
 
     let get_env = |name: &str| match envs.get(name) {
       Some(val) => Some(Cow::Borrowed(val.as_str())),
@@ -214,6 +277,98 @@ mod tests {
     assert_eq!(schema.input_schema.unwrap()["oneOf"].as_array().unwrap().len(), 2);
   }
 
+  #[test]
+  fn plans_inline_and_file_template_inputs_without_accessing_the_workspace() {
+    let plugin = TemplatePlugin {};
+    let target = octa_plugin::protocol::TargetPlatform {
+      os: "linux".to_owned(),
+      architecture: "x86_64".to_owned(),
+    };
+    let inline = plugin
+      .cache_plan(&PluginCachePlanRequest {
+        params: Value::String("Hello {{ name }}".to_owned()),
+        working_directory: String::new(),
+        target: target.clone(),
+      })
+      .unwrap()
+      .unwrap();
+    assert_eq!(inline, PluginCachePlan::default());
+
+    // A string remains an inline template even when its contents happen to be
+    // valid JSON. Planning must use the schema-selected value type rather than
+    // reparsing the legacy execution string.
+    let json_shaped_inline = plugin
+      .cache_plan(&PluginCachePlanRequest {
+        params: Value::String(r#"{"file":"not-an-input"}"#.to_owned()),
+        working_directory: String::new(),
+        target: target.clone(),
+      })
+      .unwrap()
+      .unwrap();
+    assert_eq!(json_shaped_inline, PluginCachePlan::default());
+
+    let file = plugin
+      .cache_plan(&PluginCachePlanRequest {
+        params: serde_json::json!({ "file": "templates/[name].txt" }),
+        working_directory: "project".to_owned(),
+        target: target.clone(),
+      })
+      .unwrap()
+      .unwrap();
+    assert_eq!(file.inputs, ["project/templates/[[]name[]].txt"]);
+    assert!(file.outputs.is_empty());
+
+    let leading_bang = plugin
+      .cache_plan(&PluginCachePlanRequest {
+        params: serde_json::json!({ "file": "!template.txt" }),
+        working_directory: String::new(),
+        target,
+      })
+      .unwrap()
+      .unwrap();
+    assert_eq!(leading_bang.inputs, [r"\!template.txt"]);
+
+    for file in ["../outside", "/absolute", "bad\nname"] {
+      let plan = plugin
+        .cache_plan(&PluginCachePlanRequest {
+          params: serde_json::json!({ "file": file }),
+          working_directory: String::new(),
+          target: octa_plugin::protocol::TargetPlatform {
+            os: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+          },
+        })
+        .unwrap();
+      assert!(plan.is_none(), "{file}");
+    }
+
+    #[cfg(unix)]
+    assert!(plugin
+      .cache_plan(&PluginCachePlanRequest {
+        params: serde_json::json!({ "file": r"a\b" }),
+        working_directory: String::new(),
+        target: octa_plugin::protocol::TargetPlatform {
+          os: "linux".to_owned(),
+          architecture: "x86_64".to_owned(),
+        },
+      })
+      .unwrap()
+      .is_none());
+  }
+
+  #[tokio::test]
+  async fn json_shaped_string_remains_an_inline_template_during_execution() {
+    let directory = tempfile::tempdir().unwrap();
+    let inline = r#"{"file":"not-a-file"}"#;
+
+    assert_eq!(
+      load_template(Value::String(inline.to_owned()), directory.path())
+        .await
+        .unwrap(),
+      inline
+    );
+  }
+
   #[tokio::test]
   async fn test_echo_command() {
     let (writer, logger, dir) = setup_test().await;
@@ -226,7 +381,7 @@ mod tests {
         PluginCommand {
           id: "test-id".to_string(),
           dry: false,
-          command: "{{ name }}".to_owned(),
+          value: Value::String("{{ name }}".to_owned()),
           args: vec![],
           dir,
           vars: HashMap::from([("name".to_owned(), Value::String("Hello, World!".to_owned()))]),
@@ -282,7 +437,7 @@ mod tests {
         PluginCommand {
           id: "test-id".to_string(),
           dry: false,
-          command: serde_json::json!({ "file": "greeting.tpl" }).to_string(),
+          value: serde_json::json!({ "file": "greeting.tpl" }),
           args: vec![],
           dir,
           vars: HashMap::from([("name".to_owned(), Value::String("World".to_owned()))]),
@@ -319,7 +474,7 @@ mod tests {
         PluginCommand {
           id: "test-id".to_string(),
           dry: false,
-          command: serde_json::json!({ "file": "missing.tpl" }).to_string(),
+          value: serde_json::json!({ "file": "missing.tpl" }),
           args: vec![],
           dir,
           vars: HashMap::new(),

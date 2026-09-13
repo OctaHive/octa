@@ -19,7 +19,7 @@ class CommandHandler:
         response = {
             "type": "Hello",
             "payload": {
-              "protocol_version": 1,
+              "protocol_version": 2,
               "version": "0.3.0",
               "features": []
             }
@@ -62,11 +62,42 @@ class CommandHandler:
 
         return False, response
 
+    def handle_plan_cache(self, cmd):
+        payload = cmd["payload"]
+        params = payload["request"]["params"]
+        if params == "plan-error":
+            response = {
+                "type": "Error",
+                "payload": {
+                    "id": payload["id"],
+                    "message": "fixture planning failure"
+                }
+            }
+        elif params == "planned":
+            target_os = payload["request"]["target"]["os"]
+            response = {
+                "type": "CachePlan",
+                "payload": {
+                    "id": payload["id"],
+                    "plan": {
+                        "inputs": [f"platform/{target_os}.input"],
+                        "outputs": []
+                    }
+                }
+            }
+        else:
+            response = {
+                "type": "CachePlanUnavailable",
+                "payload": {"id": payload["id"]}
+            }
+        return False, [response]
+
     def handle_schema(self, cmd):
       response = {
           "type": "Schema",
           "payload": {
             "key": "key",
+            "capabilities": [],
             "output_schema": {
               "type": "object",
               "properties": {
@@ -92,6 +123,7 @@ class CommandHandler:
         handlers = {
             "Hello": self.handle_hello,
             "Schema": self.handle_schema,
+            "PlanCache": self.handle_plan_cache,
             "Execute": self.handle_execute,
             "Shutdown": self.handle_shutdown
         }

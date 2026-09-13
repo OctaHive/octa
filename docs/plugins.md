@@ -14,9 +14,15 @@ are the source of truth. Plugin authors should normally use the `octa-plugin` SD
 Release manifests and lock-file verification are documented in
 [Reproducible plugins](plugin-distribution.md).
 
-`Hello` carries `protocol_version: 1` independently from the Octa and plugin
+`Hello` carries `protocol_version: 2` independently from the Octa and plugin
 package versions. Compatibility is decided from this protocol version; product
 semver is informational and may differ between Octa and a plugin.
+
+Protocol version 2 adds cache planning and preserves the JSON type of plugin
+parameters through execution. It is intentionally incompatible with version
+1: before cache lookup, Octa must be able to distinguish a plugin that
+explicitly reports an opaque filesystem contract from an older plugin that
+does not understand the request.
 
 This private engine-to-plugin transport is distinct from Octa's public
 [runtime event stream](events.md). Plugin command IDs are translated into stable plan-level step IDs
@@ -38,7 +44,8 @@ A plugin connection has three phases:
 
 1. `Hello` negotiates the plugin protocol version.
 2. `Schema` registers the task key and capabilities.
-3. Zero or more `Execute` requests run concurrently until `Shutdown`.
+3. Zero or more side-effect-free `PlanCache` requests and concurrent `Execute`
+   requests are served until `Shutdown`.
 
 Octa may also send command-scoped `Cancel`, `Stdin`, `Resize`, and `CloseStdin` messages during the
 execution phase.
@@ -48,18 +55,18 @@ execution phase.
 Octa sends the protocol version, its product version, and enabled features:
 
 ```json
-{"type":"Hello","payload":{"protocol_version":1,"version":"0.3.0","features":[]}}
+{"type":"Hello","payload":{"protocol_version":2,"version":"0.3.0","features":[]}}
 ```
 
 The plugin responds with the same protocol version and its own product version:
 
 ```json
-{"type":"Hello","payload":{"protocol_version":1,"version":"0.3.0","features":[]}}
+{"type":"Hello","payload":{"protocol_version":2,"version":"0.3.0","features":[]}}
 ```
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `protocol_version` | integer | Wire protocol version; must equal `1` on both sides |
+| `protocol_version` | integer | Wire protocol version; must equal `2` on both sides |
 | `version` | string | Informational Octa or plugin package version |
 | `features` | string array | Negotiated feature names; currently empty |
 
@@ -129,8 +136,76 @@ tasks:
     command: ./deploy
 ```
 
-Structured plugin values are validated as structured JSON, then encoded into the current
-`Execute.params` string as compact JSON.
+Plugin values are validated against `input_schema` and retain their JSON type in both
+`PlanCache.params` and `Execute.params`. A string that contains JSON-looking text therefore remains
+a string; plugins do not need to parse it again to distinguish scalar and structured task forms.
+
+## Planning a cache contract
+
+Before looking up a cached task, Octa sends `PlanCache` for every executable
+plugin step that can observe the workspace. The request uses parameters already
+validated against `input_schema`, but deliberately omits runtime variables,
+secrets, and process environment so planning remains deterministic and cannot
+become a second execution path:
+
+```json
+{
+  "type": "PlanCache",
+  "payload": {
+    "id": "plan-identity",
+    "request": {
+      "params": {"file":"templates/app.txt"},
+      "working_directory": "project",
+      "target": {"os": "linux", "architecture": "x86_64"}
+    }
+  }
+}
+```
+
+`working_directory` is portable and relative to the workspace; an empty string
+means the workspace root. The target labels use Octa's normalized platform
+names. A plugin that can describe the invocation completely responds with
+workspace-relative input patterns and exact output roots:
+
+```json
+{
+  "type": "CachePlan",
+  "payload": {
+    "id": "plan-identity",
+    "plan": {
+      "inputs": ["project/templates/app.txt"],
+      "outputs": ["project/generated"]
+    }
+  }
+}
+```
+
+Input patterns are an ordered include/exclude set with the same grammar as
+`files.inputs`. Octa keeps each plugin's set independent when it forms their
+union, so an exclusion from one source cannot remove a file required by
+another. Output roots from the task and all plugins are also unioned, then
+checked by the normal cache path, overlap, ownership, and restore rules.
+
+Returning `CachePlan` asserts that the contract is complete; empty arrays mean
+the invocation reads and writes no workspace files. If completeness is not
+possible—for example, for an arbitrary shell command or a path selected by a
+runtime template—the plugin must respond:
+
+```json
+{"type":"CachePlanUnavailable","payload":{"id":"plan-identity"}}
+```
+
+A cached task may omit `files.inputs` only when every executable step returns a
+complete plan. User-declared inputs are additive: they allow opaque steps but
+never remove plugin requirements. Artifact and report registration remains a
+separate result concern and does not implicitly change the filesystem
+contract.
+
+Planning must only inspect the validated parameters, working directory, target
+platform, and the plugin's own immutable implementation. It must not read or
+write the workspace, start tools, use the network, or resolve secrets. The Rust
+SDK exposes this operation as `Plugin::cache_plan`; its default returns
+`CachePlanUnavailable`.
 
 ## Starting a command
 
@@ -157,7 +232,7 @@ Octa sends an `Execute` request:
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `id` | string | required | Host-assigned command identity; copy it unchanged into every response |
-| `params` | string | required | Plugin value; structured values arrive as compact JSON text |
+| `params` | JSON value | required | Validated plugin value with its original JSON type |
 | `args` | string array | required | Arguments passed to the selected Octa task |
 | `dir` | path string | required | Effective task working directory |
 | `envs` | string map | required | Effective process environment |
@@ -387,7 +462,8 @@ does not exit normally.
 ## Minimal Rust plugin
 
 The SDK owns handshake, schema discovery, command registration, routing, cancellation, and shutdown.
-A plugin only implements `Plugin::version` and `Plugin::execute_command`:
+A plugin implements `Plugin::version` and `Plugin::execute_command`; it may also override
+`Plugin::cache_plan` when it can provide a complete filesystem contract:
 
 ```rust
 use std::sync::Arc;
@@ -415,9 +491,14 @@ impl Plugin for EchoPlugin {
     _logger: Arc<impl Logger>,
     _cancel_token: CancellationToken,
   ) -> Result<()> {
+    let line = command
+      .value
+      .as_str()
+      .ok_or_else(|| anyhow::anyhow!("echo value must be a string"))?
+      .to_owned();
     let output = PluginResponse::Stdout {
       id: command.id.clone(),
-      line: command.command,
+      line,
     };
     let done = PluginResponse::Completed {
       id: command.id,

@@ -19,7 +19,7 @@ fn plugin_manager() -> (PluginManager, String) {
 
 fn request(command: &str) -> PluginExecutionRequest {
   PluginExecutionRequest {
-    params: command.to_owned(),
+    params: serde_json::Value::String(command.to_owned()),
     dry: false,
     args: Vec::new(),
     dir: std::env::current_dir().unwrap(),

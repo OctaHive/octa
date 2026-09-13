@@ -34,6 +34,14 @@ them would prevent equivalent work from sharing results. Executor behavior that
 affects task semantics is instead represented by an explicit semantic epoch in
 the task-definition digest. That epoch is independent of the Octa release
 version and is incremented only for an incompatible execution-semantics change.
+The task-definition digest also contains the canonical effective filesystem
+contract: independent ordered input-pattern sets and the sorted union of exact
+output roots supplied by the user and plugin planning. Pattern sets are sorted
+as units because producer order is irrelevant, while order inside each set is
+retained because later exclusions or inclusions change its meaning. Empty and
+duplicate sets and duplicate output roots are removed. This binds a cache entry
+to what was actually snapshotted and restored, rather than only to the
+user-authored portion of the Octafile.
 Changing the descriptor fields, their normalization, tags, or byte encoding
 requires a new action-key format and domain.
 

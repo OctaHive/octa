@@ -1,9 +1,22 @@
+//! Private versioned wire messages exchanged by Octa and execution plugins.
+
 use std::{collections::HashMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PLUGIN_PROTOCOL_VERSION: u16 = 1;
+/// Current engine-to-plugin wire protocol.
+///
+/// Version two adds side-effect-free filesystem contract planning and keeps
+/// plugin parameters as typed JSON values. Octa does not negotiate version-one
+/// compatibility because a host must know whether a missing plan means
+/// "opaque" rather than "old plugin" before cache lookup.
+pub const PLUGIN_PROTOCOL_VERSION: u16 = 2;
+
+/// Maximum total number of input patterns and output roots in one plugin plan.
+pub const MAX_PLUGIN_CACHE_PLAN_ITEMS: usize = 1_024;
+/// Maximum UTF-8 length of one target label, input pattern, or output root.
+pub const MAX_PLUGIN_CACHE_PLAN_STRING_BYTES: usize = 4_096;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Version {
@@ -21,11 +34,79 @@ pub struct Schema {
   #[serde(default, skip_serializing_if = "Vec::is_empty")]
   pub capabilities: Vec<String>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
-  /// JSON Schema for values accepted in `Execute.params`.
+  /// JSON Schema for values accepted in `Execute.params` and `PlanCache.params`.
   pub input_schema: Option<Map<String, Value>>,
   #[serde(default, skip_serializing_if = "Option::is_none")]
   /// JSON Schema for the object returned in a successful `Completed.outputs`.
   pub output_schema: Option<Map<String, Value>>,
+}
+
+/// Execution platform for which a plugin computes a filesystem contract.
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TargetPlatform {
+  /// Normalized operating-system name such as `linux`, `macos`, or `windows`.
+  pub os: String,
+  /// Normalized architecture name such as `x86_64` or `arm64`.
+  pub architecture: String,
+}
+
+/// Immutable inputs supplied to a plugin's side-effect-free planning method.
+#[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginCachePlanRequest {
+  /// Validated plugin task value without the legacy string encoding used by execution.
+  pub params: Value,
+  /// Portable task working directory relative to the workspace; empty is root.
+  pub working_directory: String,
+  /// Platform on which the later command will execute.
+  pub target: TargetPlatform,
+}
+
+/// Complete filesystem contract required by one plugin invocation.
+///
+/// Both path classes are workspace-relative. Input patterns retain their
+/// ordered include/exclude semantics within this plan. Outputs are exact file
+/// or directory roots. Returning this value asserts completeness; returning
+/// `CachePlanUnavailable` declares the invocation opaque.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginCachePlan {
+  /// Ordered workspace-relative input patterns required by the invocation.
+  #[serde(default)]
+  pub inputs: Vec<String>,
+  /// Exact workspace-relative output roots owned by the invocation.
+  #[serde(default)]
+  pub outputs: Vec<String>,
+}
+
+impl PluginCachePlan {
+  /// Enforces transport bounds before the plan reaches cache path validation.
+  pub fn validate(&self) -> Result<(), String> {
+    let items = self
+      .inputs
+      .len()
+      .checked_add(self.outputs.len())
+      .ok_or_else(|| "plugin cache plan item count overflowed".to_owned())?;
+    if items > MAX_PLUGIN_CACHE_PLAN_ITEMS {
+      return Err(format!(
+        "plugin cache plan is limited to {MAX_PLUGIN_CACHE_PLAN_ITEMS} input and output items"
+      ));
+    }
+    for (kind, values) in [("input pattern", &self.inputs), ("output root", &self.outputs)] {
+      for value in values {
+        if value.is_empty() || value.len() > MAX_PLUGIN_CACHE_PLAN_STRING_BYTES {
+          return Err(format!(
+            "plugin cache plan {kind} must contain 1..={MAX_PLUGIN_CACHE_PLAN_STRING_BYTES} UTF-8 bytes"
+          ));
+        }
+        if value.chars().any(char::is_control) {
+          return Err(format!("plugin cache plan {kind} must not contain control characters"));
+        }
+      }
+    }
+    Ok(())
+  }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
@@ -86,10 +167,18 @@ pub struct ReportDeclaration {
 pub enum OctaCommand {
   Hello(Version),
   Schema,
+  /// Requests a complete filesystem contract without executing the command.
+  PlanCache {
+    /// Host-assigned identity echoed by the planning response.
+    id: String,
+    /// Validated command parameters and immutable planning context.
+    request: PluginCachePlanRequest,
+  },
   Execute {
     /// Host-assigned identity echoed by every response for this command.
     id: String,
-    params: String,
+    /// Validated plugin task value in its original JSON type.
+    params: Value,
     args: Vec<String>,
     dir: PathBuf,
     envs: HashMap<String, String>,
@@ -130,6 +219,18 @@ pub enum OctaCommand {
 pub enum PluginResponse {
   Hello(Version),
   Schema(Schema),
+  /// Complete filesystem contract for one planned plugin invocation.
+  CachePlan {
+    /// Identity copied from `PlanCache`.
+    id: String,
+    /// Required inputs and owned outputs for the later execution.
+    plan: PluginCachePlan,
+  },
+  /// The plugin cannot completely describe this invocation's filesystem use.
+  CachePlanUnavailable {
+    /// Identity copied from `PlanCache`.
+    id: String,
+  },
   Started {
     id: String,
   },
@@ -210,7 +311,73 @@ mod base64_bytes {
 
 #[cfg(test)]
 mod tests {
-  use super::{OctaCommand, PluginResponse, ProgressUpdate, ReportDeclaration, Schema};
+  use super::*;
+
+  fn request() -> PluginCachePlanRequest {
+    PluginCachePlanRequest {
+      params: serde_json::json!({ "file": "templates/app.txt" }),
+      working_directory: "project".to_owned(),
+      target: TargetPlatform {
+        os: "linux".to_owned(),
+        architecture: "x86_64".to_owned(),
+      },
+    }
+  }
+
+  #[test]
+  fn cache_planning_messages_round_trip_with_the_request_identity() {
+    let command = OctaCommand::PlanCache {
+      id: "plan-1".to_owned(),
+      request: request(),
+    };
+    let encoded = serde_json::to_value(command).unwrap();
+    let decoded = serde_json::from_value::<OctaCommand>(encoded).unwrap();
+    assert!(matches!(
+      decoded,
+      OctaCommand::PlanCache { id, request: value }
+        if id == "plan-1" && value == request()
+    ));
+
+    let response = PluginResponse::CachePlan {
+      id: "plan-1".to_owned(),
+      plan: PluginCachePlan {
+        inputs: vec!["project/src/**".to_owned()],
+        outputs: vec!["project/target".to_owned()],
+      },
+    };
+    let encoded = serde_json::to_value(response).unwrap();
+    let decoded = serde_json::from_value::<PluginResponse>(encoded).unwrap();
+    assert!(matches!(
+      decoded,
+      PluginResponse::CachePlan { id, plan }
+        if id == "plan-1" && plan.inputs == ["project/src/**"] && plan.outputs == ["project/target"]
+    ));
+  }
+
+  #[test]
+  fn cache_plan_request_rejects_unknown_fields_and_plan_limits_are_bounded() {
+    let mut encoded = serde_json::to_value(request()).unwrap();
+    encoded["unknown"] = Value::Bool(true);
+    assert!(serde_json::from_value::<PluginCachePlanRequest>(encoded).is_err());
+
+    let oversized = PluginCachePlan {
+      inputs: vec!["input".to_owned(); MAX_PLUGIN_CACHE_PLAN_ITEMS + 1],
+      outputs: Vec::new(),
+    };
+    assert!(oversized.validate().unwrap_err().contains("limited"));
+    let invalid = PluginCachePlan {
+      inputs: vec!["bad\npattern".to_owned()],
+      outputs: Vec::new(),
+    };
+    assert!(invalid.validate().unwrap_err().contains("control"));
+    for invalid in [String::new(), "x".repeat(MAX_PLUGIN_CACHE_PLAN_STRING_BYTES + 1)] {
+      let invalid = PluginCachePlan {
+        inputs: Vec::new(),
+        outputs: vec![invalid],
+      };
+      assert!(invalid.validate().unwrap_err().contains("UTF-8 bytes"));
+    }
+  }
 
   #[test]
   fn schema_without_optional_schemas_uses_no_validation() {
@@ -336,6 +503,27 @@ mod tests {
     assert!(secret_vars.is_empty());
     assert!(!redact_params);
     assert!(!raw);
+  }
+
+  #[test]
+  fn execute_preserves_structured_parameters_without_string_encoding() {
+    let command = OctaCommand::Execute {
+      id: "structured".to_owned(),
+      params: serde_json::json!({ "file": "report.xml" }),
+      args: Vec::new(),
+      dir: PathBuf::from("."),
+      envs: HashMap::new(),
+      vars: HashMap::new(),
+      secret_vars: Vec::new(),
+      redact_params: false,
+      raw: false,
+      dry: false,
+    };
+    let encoded = serde_json::to_value(command).unwrap();
+    assert_eq!(
+      encoded["payload"]["params"],
+      serde_json::json!({ "file": "report.xml" })
+    );
   }
 
   #[test]

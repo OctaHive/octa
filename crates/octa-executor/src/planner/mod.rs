@@ -1,6 +1,7 @@
 //! Compiles Octafile task declarations into executable plans.
 
 mod cache;
+mod cache_contract;
 mod graph;
 mod nodes;
 mod platform;

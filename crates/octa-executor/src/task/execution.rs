@@ -33,6 +33,15 @@ impl TaskNode {
     }
   }
 
+  #[cfg(test)]
+  /// Exposes the compiled cache contract only to planner tests.
+  pub(crate) fn compiled_cache_plan(&self) -> Option<&crate::result_cache::TaskCachePlan> {
+    match &self.action {
+      NodeAction::CacheLookup { plan, .. } => Some(plan),
+      _ => None,
+    }
+  }
+
   /// Ensures a deferred status is present on the node-owned context snapshot.
   ///
   /// Deferred plans own their invocation runtime and use one exit code for all

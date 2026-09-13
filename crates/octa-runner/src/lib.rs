@@ -9,10 +9,11 @@ use std::{
 };
 
 use octa_output::{ConsoleEntry, ConsoleRenderer};
+use octa_plugin::protocol::PLUGIN_PROTOCOL_VERSION;
 pub use octa_runner_protocol::{
   CacheMode, CacheSessionSpec, RemoteCacheSession, RunRequest, RunStatus, RunnerCommand, RunnerMessage, Silence,
   MAX_CACHE_TOKEN_FILE_BYTES, MAX_RUNNER_INPUT_FRAME_BYTES, RUNNER_EVENT_SCHEMA_VERSION, RUNNER_INPUT_SCHEMA_V2,
-  RUNNER_OUTPUT_SCHEMA_V2, RUNNER_PLUGIN_PROTOCOL_VERSION, RUNNER_PROTOCOL_VERSION,
+  RUNNER_OUTPUT_SCHEMA_V2, RUNNER_PROTOCOL_VERSION,
 };
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
@@ -22,7 +23,7 @@ pub fn hello() -> RunnerMessage<String, (), ()> {
     protocol_version: RUNNER_PROTOCOL_VERSION,
     octa_version: env!("CARGO_PKG_VERSION").to_owned(),
     event_schema_version: RUNNER_EVENT_SCHEMA_VERSION,
-    plugin_protocol_version: RUNNER_PLUGIN_PROTOCOL_VERSION,
+    plugin_protocol_version: PLUGIN_PROTOCOL_VERSION,
   }
 }
 
@@ -31,7 +32,7 @@ pub fn capabilities() -> RunnerMessage<String, (), ()> {
     octa_version: env!("CARGO_PKG_VERSION").to_owned(),
     runner_protocols: vec![RUNNER_PROTOCOL_VERSION],
     event_schemas: vec![RUNNER_EVENT_SCHEMA_VERSION],
-    plugin_protocols: vec![RUNNER_PLUGIN_PROTOCOL_VERSION],
+    plugin_protocols: vec![PLUGIN_PROTOCOL_VERSION],
     octafile_versions: vec![1],
     platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
     features: [

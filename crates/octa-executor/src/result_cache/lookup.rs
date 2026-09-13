@@ -59,7 +59,11 @@ pub(crate) async fn lookup(cache: &ResultCache, request: CacheLookup<'_>) -> Exe
   }
 
   let started = Instant::now();
-  let snapshot = match cache.snapshotter.snapshot(&plan.workspace, &plan.inputs, cancel).await {
+  let snapshot = match cache
+    .snapshotter
+    .snapshot_pattern_sets(&plan.workspace, &plan.input_pattern_sets, cancel)
+    .await
+  {
     Ok(snapshot) => snapshot,
     Err(octa_cache::CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache lookup".to_owned())),
     Err(error) => {
@@ -178,7 +182,11 @@ pub(crate) async fn lookup(cache: &ResultCache, request: CacheLookup<'_>) -> Exe
 
   // Recheck immediately before replacing outputs. A concurrent source change
   // turns the lookup into a miss rather than restoring a result for stale input.
-  let verified = match cache.snapshotter.snapshot(&plan.workspace, &plan.inputs, cancel).await {
+  let verified = match cache
+    .snapshotter
+    .snapshot_pattern_sets(&plan.workspace, &plan.input_pattern_sets, cancel)
+    .await
+  {
     Ok(snapshot) => snapshot,
     Err(octa_cache::CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache lookup".to_owned())),
     Err(error) => {

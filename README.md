@@ -1488,13 +1488,18 @@ tasks:
     shell: cargo build --release
 ```
 
-Every cacheable task must declare `files.inputs`; use `inputs: []` when it intentionally has no
-filesystem inputs. `files.outputs` may be empty for tasks that only return stdout or public
-structured outputs. Inputs are identified by path, entry kind, executable bit, symlink target, and
-BLAKE3 content digest—timestamps are never a correctness strategy. Configured public variables and
-task environment values are included automatically. `cache.environment` selects ambient process
-variables that also affect the result; missing and empty values are distinct. `salt` is an optional
-manual invalidation value, not a substitute for declaring real inputs.
+A specialized plugin may supply a complete filesystem contract during its side-effect-free planning
+step. In that case `files` can be omitted. User declarations are additive to all plugin plans and
+cannot remove a plugin-required input or output. Every executable step must be completely described;
+opaque commands such as `shell` still require explicit `files.inputs` (use `inputs: []` only when
+they intentionally have no filesystem inputs). `files.outputs` may be empty for tasks that only
+return stdout or public structured outputs. Inputs are identified by path, entry kind, executable
+bit, symlink target, and BLAKE3 content digest—timestamps are never a correctness strategy.
+Configured public variables and task environment values are included automatically.
+`cache.environment` selects ambient process variables that also affect the result; missing and empty
+values are distinct. `salt` is an optional manual invalidation value, not a substitute for declaring
+real inputs. The planning protocol and plugin obligations are documented in
+[Plugin protocol](docs/plugins.md#planning-a-cache-contract).
 
 Storage and native toolchain identity are configured outside the Octafile:
 

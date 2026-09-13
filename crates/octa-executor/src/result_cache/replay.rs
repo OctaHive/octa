@@ -205,7 +205,7 @@ fn validate_materialized_resource(
       "cached {kind} '{name}' at '{path}' resolves outside the materialization"
     ))
   })?;
-  let resolved_path = RelativePath::new(relative.to_string_lossy().replace('\\', "/"))?;
+  let resolved_path = RelativePath::from_path(relative)?;
   if &resolved_path != path {
     return Err(CacheError::Metadata(format!(
       "cached {kind} '{name}' at '{path}' resolves through a different path"

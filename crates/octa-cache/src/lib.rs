@@ -35,10 +35,37 @@ pub fn validate_file_contract(
   inputs: &[String],
   outputs: &[octa_cache_protocol::RelativePath],
 ) -> CacheResult<()> {
+  validate_file_contract_pattern_sets(workspace, &[inputs.to_vec()], outputs)
+}
+
+/// Validates the union of independent user/plugin input contracts.
+///
+/// Each pattern set retains its own ordered include/exclude semantics, so one
+/// producer cannot subtract files required by another producer.
+pub fn validate_file_contract_pattern_sets(
+  workspace: &std::path::Path,
+  input_pattern_sets: &[Vec<String>],
+  outputs: &[octa_cache_protocol::RelativePath],
+) -> CacheResult<()> {
   if outputs.is_empty() {
-    fileset::validate_contract(inputs, workspace, outputs)
+    fileset::validate_contract_groups(input_pattern_sets, workspace, outputs)
   } else {
     let outputs = bundle::validate_output_roots(outputs)?;
-    fileset::validate_contract(inputs, workspace, &outputs)
+    fileset::validate_contract_groups(input_pattern_sets, workspace, &outputs)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use tempfile::TempDir;
+
+  #[test]
+  fn single_contract_validation_uses_the_same_rules_as_grouped_contracts() {
+    let workspace = TempDir::new().unwrap();
+    let output = octa_cache_protocol::RelativePath::new("target").unwrap();
+
+    let error = validate_file_contract(workspace.path(), &["target/**".to_owned()], &[output]).unwrap_err();
+    assert!(error.to_string().contains("overlaps"));
   }
 }

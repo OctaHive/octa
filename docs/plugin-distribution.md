@@ -9,7 +9,7 @@ Each distributed plugin binary has a sidecar `*.plugin.yml` manifest:
 manifest_version: 1
 name: shell
 version: "0.3.0"
-protocol: 1
+protocol: 2
 platforms: [linux-x86_64]
 entrypoint: octa_plugin_shell
 sha256: 4f5c...

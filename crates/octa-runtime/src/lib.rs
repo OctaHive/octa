@@ -590,6 +590,7 @@ fn classify_plugin_error(error: PluginManagerError) -> RuntimeError {
     | PluginManagerError::Lock(_) => RuntimeError::PluginManagerConfiguration(error),
     PluginManagerError::StartError(_)
     | PluginManagerError::IdentityError(_)
+    | PluginManagerError::CachePlanningError(_)
     | PluginManagerError::ShutdownError(_)
     | PluginManagerError::ConnectionError(_)
     | PluginManagerError::Io(_)

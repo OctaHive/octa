@@ -16,11 +16,7 @@ pub(crate) fn portable_relative(workspace: &Path, path: &Path) -> CacheResult<Re
     path: path.to_path_buf(),
     reason: "path escaped the workspace".to_owned(),
   })?;
-  let value = relative.to_str().ok_or_else(|| CacheError::Path {
-    path: relative.to_path_buf(),
-    reason: "portable cache paths must be UTF-8".to_owned(),
-  })?;
-  RelativePath::new(value.replace('\\', "/")).map_err(CacheError::from)
+  RelativePath::from_path(relative).map_err(CacheError::from)
 }
 
 /// Joins a validated `/`-separated path without host-dependent parsing.
@@ -99,5 +95,18 @@ mod tests {
     for invalid in ["", "/absolute", "C:/drive", "..\\target", "../../escape", "bad\nname"] {
       assert!(validate_symlink_text(&link, invalid).is_err(), "{invalid}");
     }
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn portable_paths_reject_a_literal_backslash_instead_of_aliasing_it() {
+    let workspace = Path::new("/workspace");
+    assert!(portable_relative(workspace, Path::new(r"/workspace/a\b")).is_err());
+    assert_eq!(
+      portable_relative(workspace, Path::new("/workspace/a/b"))
+        .unwrap()
+        .as_str(),
+      "a/b"
+    );
   }
 }

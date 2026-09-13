@@ -34,6 +34,34 @@ fn create_test_task() -> Task {
   }
 }
 
+async fn started_shell_manager() -> Arc<PluginManager> {
+  let manager = Arc::new(PluginManager::new(crate::test_support::plugin_directory()));
+  #[cfg(windows)]
+  let executable = "octa_plugin_shell.exe";
+  #[cfg(not(windows))]
+  let executable = "octa_plugin_shell";
+  manager.start_plugin(executable).await.unwrap();
+  manager
+}
+
+async fn start_template_plugin(manager: &PluginManager) {
+  #[cfg(windows)]
+  let executable = "octa_plugin_tpl.exe";
+  #[cfg(not(windows))]
+  let executable = "octa_plugin_tpl";
+  manager.start_plugin(executable).await.unwrap();
+}
+
+async fn started_planning_fixture_manager() -> Arc<PluginManager> {
+  let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("../../plugins")
+    .canonicalize()
+    .unwrap();
+  let manager = Arc::new(PluginManager::new(directory));
+  manager.start_plugin("test.py").await.unwrap();
+  manager
+}
+
 #[test]
 fn repeated_dependencies_receive_distinct_invocation_names() {
   let dependencies = vec![Deps::from("build".to_owned()), Deps::from("build".to_owned())];
@@ -899,9 +927,9 @@ tasks:
   )?;
 
   let octafile = Octafile::load(Some(octafile_path.clone()), false, vec!["shell".to_owned()], "shell")?;
-  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
-  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+  let plugin_manager = started_shell_manager().await;
   let dag = TaskGraphBuilder::new(plugin_manager)?
+    .with_working_directory(temp_dir.path().to_path_buf())
     .build(octafile, "build", false, vec![])
     .await?;
   assert_eq!(
@@ -947,12 +975,12 @@ tasks:
       ),
     )
   };
-  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
-  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+  let plugin_manager = started_shell_manager().await;
 
   write_octafile("")?;
   let octafile = Octafile::load(Some(octafile_path.clone()), false, vec!["shell".to_owned()], "shell")?;
   let result = TaskGraphBuilder::new(plugin_manager.clone())?
+    .with_working_directory(temp_dir.path().to_path_buf())
     .build(octafile, "**", true, vec![])
     .await;
   assert!(matches!(
@@ -964,8 +992,203 @@ tasks:
   write_octafile("deps: [package]")?;
   let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_owned()], "shell")?;
   TaskGraphBuilder::new(plugin_manager)?
+    .with_working_directory(temp_dir.path().to_path_buf())
     .build(octafile, "metadata", false, vec![])
     .await?;
+  Ok(())
+}
+
+#[tokio::test]
+async fn plugin_plans_allow_implicit_inputs_but_opaque_steps_require_user_inputs() -> ExecutorResult<()> {
+  let directory = TempDir::new().unwrap();
+  let path = directory.path().join("Octafile.yml");
+  let manager = started_shell_manager().await;
+  start_template_plugin(&manager).await;
+
+  fs::write(
+    &path,
+    "version: 1\ntasks:\n  render:\n    cache: {}\n    preconditions: ['true']\n    tpl: hello\n",
+  )?;
+  let octafile = Octafile::load(
+    Some(path.clone()),
+    false,
+    vec!["shell".to_owned(), "tpl".to_owned()],
+    "shell",
+  )?;
+  TaskGraphBuilder::new(manager.clone())?
+    .with_working_directory(directory.path().to_path_buf())
+    .build(octafile, "render", false, Vec::new())
+    .await?;
+
+  fs::write(
+    &path,
+    "version: 1\ntasks:\n  render:\n    cache: {}\n    tpl: { file: ../outside }\n",
+  )?;
+  let octafile = Octafile::load(
+    Some(path.clone()),
+    false,
+    vec!["shell".to_owned(), "tpl".to_owned()],
+    "shell",
+  )?;
+  assert!(matches!(
+    TaskGraphBuilder::new(manager.clone())?
+      .with_working_directory(directory.path().to_path_buf())
+      .build(octafile, "render", false, Vec::new())
+      .await,
+    Err(ExecutorError::InvalidCacheConfiguration(_))
+  ));
+
+  fs::write(
+    &path,
+    "version: 1\ntasks:\n  build:\n    cache: {}\n    shell: echo build\n",
+  )?;
+  let octafile = Octafile::load(
+    Some(path.clone()),
+    false,
+    vec!["shell".to_owned(), "tpl".to_owned()],
+    "shell",
+  )?;
+  let opaque = TaskGraphBuilder::new(manager.clone())?
+    .with_working_directory(directory.path().to_path_buf())
+    .build(octafile, "build", false, Vec::new())
+    .await;
+  assert!(matches!(
+    opaque,
+    Err(ExecutorError::InvalidCacheConfiguration(message))
+      if message.contains("omits files.inputs") && message.contains("shell")
+  ));
+
+  fs::write(
+    &path,
+    "version: 1\ntasks:\n  render:\n    dir: '{{ OUTPUT_DIR }}'\n    cache: {}\n    tpl: hello\n",
+  )?;
+  let octafile = Octafile::load(
+    Some(path.clone()),
+    false,
+    vec!["shell".to_owned(), "tpl".to_owned()],
+    "shell",
+  )?;
+  assert!(matches!(
+    TaskGraphBuilder::new(manager.clone())?
+      .with_working_directory(directory.path().to_path_buf())
+      .build(octafile, "render", false, Vec::new())
+      .await,
+    Err(ExecutorError::InvalidCacheConfiguration(message))
+      if message.contains("working directory must be concrete")
+  ));
+
+  fs::write(
+    &path,
+    r#"version: 1
+tasks:
+  mixed:
+    files: { inputs: [Octafile.yml] }
+    cache: {}
+    cmds:
+      - tpl: { file: template.txt }
+      - shell: echo build
+"#,
+  )?;
+  fs::write(directory.path().join("template.txt"), "hello").unwrap();
+  let octafile = Octafile::load(Some(path), false, vec!["shell".to_owned(), "tpl".to_owned()], "shell")?;
+  let plan = TaskGraphBuilder::new(manager)?
+    .with_working_directory(directory.path().to_path_buf())
+    .build(octafile, "mixed", false, Vec::new())
+    .await?;
+  let cache = plan
+    .nodes()
+    .iter()
+    .find_map(|node| node.compiled_cache_plan())
+    .expect("cache lookup plan");
+  assert!(cache.input_pattern_sets.contains(&vec!["Octafile.yml".to_owned()]));
+  assert!(cache.input_pattern_sets.contains(&vec!["template.txt".to_owned()]));
+  Ok(())
+}
+
+#[tokio::test]
+async fn effective_plugin_contract_participates_in_task_definition_identity() -> ExecutorResult<()> {
+  let directory = TempDir::new().unwrap();
+  let path = directory.path().join("Octafile.yml");
+  fs::write(&path, "version: 1\ntasks:\n  build:\n    cache: {}\n    key: planned\n")?;
+  let manager = started_planning_fixture_manager().await;
+  let build = |path: PathBuf| Octafile::load(Some(path), false, vec!["key".to_owned()], "key");
+
+  let mut linux_builder =
+    TaskGraphBuilder::new(manager.clone())?.with_working_directory(directory.path().to_path_buf());
+  linux_builder.os_type = "linux".to_owned();
+  let linux = linux_builder
+    .build(build(path.clone())?, "build", false, Vec::new())
+    .await?;
+  let linux_plan = linux
+    .nodes()
+    .iter()
+    .find_map(|node| node.compiled_cache_plan())
+    .expect("Linux cache plan");
+  assert_eq!(linux_plan.input_pattern_sets, [["platform/linux.input".to_owned()]]);
+
+  let mut windows_builder = TaskGraphBuilder::new(manager)?.with_working_directory(directory.path().to_path_buf());
+  windows_builder.os_type = "windows".to_owned();
+  let windows = windows_builder.build(build(path)?, "build", false, Vec::new()).await?;
+  let windows_plan = windows
+    .nodes()
+    .iter()
+    .find_map(|node| node.compiled_cache_plan())
+    .expect("Windows cache plan");
+  assert_eq!(windows_plan.input_pattern_sets, [["platform/windows.input".to_owned()]]);
+  assert_ne!(linux_plan.task_definition, windows_plan.task_definition);
+  Ok(())
+}
+
+#[tokio::test]
+async fn cache_planning_uses_relative_directories_and_contextual_errors() -> ExecutorResult<()> {
+  let directory = TempDir::new().unwrap();
+  let path = directory.path().join("Octafile.yml");
+  fs::create_dir(directory.path().join("nested"))?;
+  fs::write(
+    &path,
+    r#"version: 1
+tasks:
+  render:
+    dir: nested
+    files: { inputs: [Octafile.yml] }
+    cache: {}
+    preconditions: [echo ready]
+    cmds:
+      - tpl: hello
+      - shell: echo inactive
+        platforms: [linux]
+"#,
+  )?;
+  let manager = started_shell_manager().await;
+  start_template_plugin(&manager).await;
+  let octafile = Octafile::load(
+    Some(path.clone()),
+    false,
+    vec!["shell".to_owned(), "tpl".to_owned()],
+    "shell",
+  )?;
+  let mut builder = TaskGraphBuilder::new(manager.clone())?.with_working_directory(directory.path().to_path_buf());
+  builder.os_type = "planning-test".to_owned();
+  builder.build(octafile, "render", false, Vec::new()).await?;
+
+  fs::write(
+    &path,
+    "version: 1\ntasks:\n  build:\n    files: { inputs: [Octafile.yml] }\n    cache: {}\n    missing: build\n",
+  )?;
+  let octafile = Octafile::load(
+    Some(path),
+    false,
+    vec!["shell".to_owned(), "tpl".to_owned(), "missing".to_owned()],
+    "shell",
+  )?;
+  assert!(matches!(
+    TaskGraphBuilder::new(manager)?
+      .with_working_directory(directory.path().to_path_buf())
+      .build(octafile, "build", false, Vec::new())
+      .await,
+    Err(ExecutorError::InvalidCacheConfiguration(message))
+      if message.contains("could not plan") && message.contains("Plugin not found")
+  ));
   Ok(())
 }
 
@@ -973,8 +1196,7 @@ tasks:
 async fn rejects_cache_boundaries_that_cannot_be_replayed_completely() -> ExecutorResult<()> {
   let temp_dir = TempDir::new().unwrap();
   let path = temp_dir.path().join("Octafile.yml");
-  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
-  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+  let plugin_manager = started_shell_manager().await;
   let cases = [
     ("raw: true\n    shell: build", "raw, interactive, or ignores failures"),
     (
@@ -1110,8 +1332,7 @@ tasks:
 "#,
   )?;
   let octafile = Octafile::load(Some(octafile_path.clone()), false, vec!["shell".to_owned()], "shell")?;
-  let plugins_dir = PathBuf::from("../../plugins/test.py").canonicalize().unwrap();
-  let plugin_manager = Arc::new(PluginManager::new(plugins_dir));
+  let plugin_manager = started_shell_manager().await;
   let plan = TaskGraphBuilder::new(plugin_manager)?
     .with_working_directory(temp_dir.path().to_path_buf())
     .build(octafile, "build", false, vec![])

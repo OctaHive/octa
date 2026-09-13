@@ -5,6 +5,7 @@
 //! crate. The module owns only planning decisions; lookup, restoration, and
 //! publication remain in `result_cache`.
 
+use super::cache_contract::EffectiveFileContract;
 use super::*;
 
 impl TaskGraphBuilder {
@@ -19,37 +20,29 @@ impl TaskGraphBuilder {
       return Ok((context, parents, None));
     };
 
-    let files = command
-      .task
-      .files
-      .as_ref()
-      .ok_or_else(|| ExecutorError::InvalidCacheConfiguration("cached task has no files contract".to_owned()))?;
-    let inputs = files
-      .inputs
-      .clone()
-      .ok_or_else(|| ExecutorError::InvalidCacheConfiguration("cached task has no files.inputs contract".to_owned()))?;
-    self.validate_cacheable_task(command, &inputs, &files.outputs)?;
-    let outputs = files
-      .outputs
-      .iter()
-      .map(|path| RelativePath::new(path.clone()))
-      .collect::<Result<Vec<_>, _>>()
-      .map_err(|error| ExecutorError::InvalidCacheConfiguration(error.to_string()))?;
+    self.validate_cacheable_task_shape(command)?;
+    let files = self.effective_file_contract(command).await?;
+    self.validate_cacheable_task_contract(command, &files)?;
     let state = Arc::new(TaskCacheState::default());
     let runtime = context
       .runtime
       .clone()
       .ok_or(ExecutorError::TaskConfigFieldMissing("invocation_runtime"))?;
-    let definition = self.execution_definition(command)?;
+    let definition = self.execution_definition(command, &files)?;
+    let EffectiveFileContract {
+      input_pattern_sets,
+      outputs,
+      plugin_keys,
+    } = files;
     let plan = Arc::new(TaskCachePlan {
       workspace: self.dir.clone(),
-      inputs,
+      input_pattern_sets,
       outputs,
       task_definition: TaskCachePlan::definition_digest(&definition)?,
       environment: cache_config.environment.clone(),
-      // Values, conditions, and preconditions are tracked at runtime. Command
-      // plugins have not executed at lookup time and are collected statically.
-      plugin_keys: task_plugin_keys(&command.task),
+      // Helpers used while resolving values and preconditions are tracked at
+      // runtime. Declared commands and conditions are collected statically.
+      plugin_keys,
       arguments: self.command_args.clone(),
       timeout: command.task.timeout.map(|timeout| timeout.duration()),
       salt: cache_config.salt.clone(),
@@ -133,12 +126,7 @@ impl TaskGraphBuilder {
 
   /// Rejects task shapes that cannot be replayed completely and validates the
   /// filesystem contract with the same grammar used by snapshots and watch.
-  fn validate_cacheable_task(
-    &self,
-    command: &FindResult,
-    inputs: &[String],
-    output_values: &[String],
-  ) -> ExecutorResult<()> {
+  fn validate_cacheable_task_shape(&self, command: &FindResult) -> ExecutorResult<()> {
     if command.task.raw == Some(true)
       || command.task.interactive == Some(true)
       || command.task.ignore_error == Some(true)
@@ -172,12 +160,15 @@ impl TaskGraphBuilder {
         command.name
       )));
     }
-    let outputs = output_values
-      .iter()
-      .map(|path| RelativePath::new(path.clone()))
-      .collect::<Result<Vec<_>, _>>()
-      .map_err(|error| ExecutorError::InvalidCacheConfiguration(error.to_string()))?;
-    octa_cache::validate_file_contract(&self.dir, inputs, &outputs)
+    Ok(())
+  }
+
+  fn validate_cacheable_task_contract(
+    &self,
+    command: &FindResult,
+    files: &EffectiveFileContract,
+  ) -> ExecutorResult<()> {
+    octa_cache::validate_file_contract_pattern_sets(&self.dir, &files.input_pattern_sets, &files.outputs)
       .map_err(|error| ExecutorError::InvalidCacheConfiguration(error.to_string()))?;
 
     for resource in command
@@ -210,9 +201,9 @@ impl TaskGraphBuilder {
           resource.display()
         ))
       })?;
-      let relative = RelativePath::new(relative.to_string_lossy().replace('\\', "/"))
+      let relative = RelativePath::from_path(relative)
         .map_err(|error| ExecutorError::InvalidCacheConfiguration(error.to_string()))?;
-      if !outputs.iter().any(|root| relative.is_within(root)) {
+      if !files.outputs.iter().any(|root| relative.is_within(root)) {
         return Err(ExecutorError::InvalidCacheConfiguration(format!(
           "resource '{}' is not contained by files.outputs",
           resource.display()
@@ -223,9 +214,17 @@ impl TaskGraphBuilder {
   }
 
   /// Captures parser-independent task semantics for the action descriptor.
-  fn execution_definition(&self, command: &FindResult) -> ExecutorResult<serde_json::Value> {
+  fn execution_definition(
+    &self,
+    command: &FindResult,
+    files: &EffectiveFileContract,
+  ) -> ExecutorResult<serde_json::Value> {
     Ok(serde_json::json!({
       "task": task_identity::task_definition(&command.task)?,
+      "effective_files": {
+        "input_pattern_sets": &files.input_pattern_sets,
+        "outputs": &files.outputs,
+      },
       // A dedicated semantic version avoids invalidating every cache entry for
       // executor releases that cannot affect task behavior.
       "executor_semantics": crate::result_cache::EXECUTOR_CACHE_SEMANTICS_V1,
@@ -293,29 +292,4 @@ fn overlapping_roots<'a>(
       .find(|right| left.is_within(right) || right.is_within(left))
       .map(|right| (left, right))
   })
-}
-
-fn task_plugin_keys(task: &Task) -> Vec<String> {
-  let mut keys = task.plugin.iter().map(|plugin| plugin.key.clone()).collect::<Vec<_>>();
-  if let Some(conditions) = &task.condition {
-    keys.extend(
-      conditions
-        .before_deps
-        .iter()
-        .chain(conditions.after_deps.iter())
-        .map(|condition| condition.command.key.clone()),
-    );
-  }
-  keys.extend(task.cmds.as_deref().unwrap_or_default().iter().flat_map(|command| {
-    let plugin = match &command.payload {
-      CommandPayload::Plugin(plugin) => Some(plugin.key.clone()),
-      CommandPayload::Task(_) => None,
-    };
-    plugin
-      .into_iter()
-      .chain(command.options.condition.iter().map(|condition| condition.key.clone()))
-  }));
-  keys.sort();
-  keys.dedup();
-  keys
 }

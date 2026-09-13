@@ -161,6 +161,72 @@ identity = "cli-runner-shared-test-environment"
 }
 
 #[test]
+fn test_plugin_contract_caches_a_task_without_user_declared_files() {
+  let workspace = TempDir::new().unwrap();
+  let cache = TempDir::new().unwrap();
+  fs::write(workspace.path().join("template.txt"), "hello {{ name }}").unwrap();
+  fs::write(
+    workspace.path().join("Octafile.yml"),
+    r#"
+version: 1
+vars:
+  name: octa
+tasks:
+  render:
+    cache: {}
+    tpl: { file: template.txt }
+"#,
+  )
+  .unwrap();
+  fs::write(
+    workspace.path().join("cache.toml"),
+    format!(
+      r#"
+mode = "read_write"
+namespace = "tests/plugin-contract"
+
+[local]
+directory = "{}"
+
+[environment]
+identity = "plugin-contract-test-environment"
+"#,
+      cache.path().to_string_lossy().replace('\\', "/")
+    ),
+  )
+  .unwrap();
+
+  let run = || {
+    let mut command = Command::cargo_bin("octa").unwrap();
+    command
+      .current_dir(workspace.path())
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .args(["--cache-profile", "cache.toml", "render"])
+      .output()
+      .unwrap()
+  };
+  let first = run();
+  assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+  assert!(String::from_utf8_lossy(&first.stdout).contains("hello octa"));
+
+  let second = run();
+  assert!(second.status.success(), "{}", String::from_utf8_lossy(&second.stderr));
+  let mut explain = Command::cargo_bin("octa").unwrap();
+  explain
+    .current_dir(workspace.path())
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+    .args(["--cache-profile", "cache.toml", "cache", "explain", "render"])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("status=hit"));
+
+  fs::write(workspace.path().join("template.txt"), "changed {{ name }}").unwrap();
+  let changed = run();
+  assert!(changed.status.success(), "{}", String::from_utf8_lossy(&changed.stderr));
+  assert!(String::from_utf8_lossy(&changed.stdout).contains("changed octa"));
+}
+
+#[test]
 fn test_cache_management_requires_a_profile_and_explain_requires_a_cacheable_task() {
   let workspace = TempDir::new().unwrap();
   let cache = TempDir::new().unwrap();

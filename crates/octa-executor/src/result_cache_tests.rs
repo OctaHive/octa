@@ -157,7 +157,7 @@ fn report() -> RegisteredReport {
 fn plan(workspace: &Path, inputs: Vec<String>, outputs: Vec<RelativePath>) -> TaskCachePlan {
   TaskCachePlan {
     workspace: workspace.to_path_buf(),
-    inputs,
+    input_pattern_sets: vec![inputs],
     outputs,
     task_definition: Digest::blake3(b"task"),
     environment: Vec::new(),
@@ -209,7 +209,7 @@ async fn action_for(
 ) -> Digest {
   let root = cache
     .snapshotter
-    .snapshot(&plan.workspace, &plan.inputs, &CancellationToken::new())
+    .snapshot_pattern_sets(&plan.workspace, &plan.input_pattern_sets, &CancellationToken::new())
     .await
     .unwrap()
     .root;
@@ -478,7 +478,7 @@ async fn invalid_publication_metadata_does_not_fail_a_successful_task() {
     .await;
   let plan = TaskCachePlan {
     workspace: directory.path().to_path_buf(),
-    inputs: Vec::new(),
+    input_pattern_sets: Vec::new(),
     outputs: Vec::new(),
     task_definition: Digest::blake3(b"task"),
     environment: Vec::new(),
@@ -523,7 +523,7 @@ async fn lookup_failures_fall_back_while_dry_and_secret_tasks_bypass_storage() {
   .unwrap();
   let plan = TaskCachePlan {
     workspace: directory.path().to_path_buf(),
-    inputs: Vec::new(),
+    input_pattern_sets: Vec::new(),
     outputs: Vec::new(),
     task_definition: Digest::blake3(b"task"),
     environment: Vec::new(),
@@ -1258,7 +1258,7 @@ async fn publication_failures_remain_soft_and_never_bind_an_action() {
   let input_plan = plan(directory.path(), vec!["input".to_owned()], Vec::new());
   let state = TaskCacheState::default();
   let before = InputSnapshotter::default()
-    .snapshot(directory.path(), &input_plan.inputs, &cancel)
+    .snapshot_pattern_sets(directory.path(), &input_plan.input_pattern_sets, &cancel)
     .await
     .unwrap()
     .root;

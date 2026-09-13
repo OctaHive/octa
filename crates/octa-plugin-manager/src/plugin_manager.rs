@@ -1,5 +1,11 @@
+//! Plugin discovery, validated registration, process ownership, and lookup.
+//!
+//! This module resolves task keys or capabilities to a concrete plugin and
+//! delegates wire traffic to `PluginClient`; it does not interpret cache file
+//! contracts or task semantics.
+
 use futures_util::future::join_all;
-use octa_plugin::protocol::Schema;
+use octa_plugin::protocol::{PluginCachePlan, PluginCachePlanRequest, Schema, TargetPlatform};
 use octa_plugin::socket::{interpret_local_socket_name, make_local_socket_name};
 use serde_json::{Map, Value};
 use std::ffi::OsString;
@@ -44,6 +50,9 @@ pub enum PluginManagerError {
 
   #[error("Failed to identify plugin: {0}")]
   IdentityError(String),
+
+  #[error("Failed to plan plugin cache contract: {0}")]
+  CachePlanningError(String),
 
   #[error("Failed to shutdown plugin: {0}")]
   ShutdownError(String),
@@ -178,6 +187,16 @@ pub struct PluginBinaryIdentity {
   pub sha256: String,
   /// Executable size included in the digest descriptor.
   pub executable_size: u64,
+}
+
+/// Host context used to request a plugin-provided filesystem contract.
+pub struct PluginCachePlanningRequest {
+  /// Validated structured task value.
+  pub value: Value,
+  /// Portable task working directory relative to the workspace.
+  pub working_directory: String,
+  /// Platform on which the command will later execute.
+  pub target: TargetPlatform,
 }
 
 struct StartupReservation {
@@ -677,6 +696,43 @@ impl PluginManager {
     self.plugin_registry.lock().await.capabilities.get(capability).cloned()
   }
 
+  /// Plans one task-key invocation without executing it.
+  pub async fn plan_cache_for_key(
+    &self,
+    key: &str,
+    request: PluginCachePlanningRequest,
+  ) -> Result<Option<PluginCachePlan>> {
+    let registration = self
+      .resolve_key(key)
+      .await
+      .ok_or_else(|| PluginManagerError::PluginNotFound(key.to_owned()))?;
+    self.plan_cache(registration, request).await
+  }
+
+  async fn plan_cache(
+    &self,
+    registration: PluginRegistration,
+    request: PluginCachePlanningRequest,
+  ) -> Result<Option<PluginCachePlan>> {
+    registration.validate_input(&request.value).map_err(|error| {
+      PluginManagerError::CachePlanningError(format!(
+        "plugin '{}' rejected its parameters: {error}",
+        registration.plugin_name()
+      ))
+    })?;
+    let client = self.get_client(registration.plugin_name()).await?;
+    client
+      .plan_cache(PluginCachePlanRequest {
+        params: request.value,
+        working_directory: request.working_directory,
+        target: request.target,
+      })
+      .await
+      .map_err(|error| {
+        PluginManagerError::CachePlanningError(format!("plugin '{}' failed: {error}", registration.plugin_name()))
+      })
+  }
+
   /// Returns the exact running binary behind a registered task key.
   ///
   /// An unlocked binary is hashed on the first call and the result is reused.
@@ -879,6 +935,17 @@ mod tests {
 
     fn plugin_name(&self) -> &str {
       self.plugin_path.file_name().unwrap().to_str().unwrap()
+    }
+  }
+
+  fn cache_planning_request(value: Value) -> PluginCachePlanningRequest {
+    PluginCachePlanningRequest {
+      value,
+      working_directory: String::new(),
+      target: TargetPlatform {
+        os: "linux".to_owned(),
+        architecture: "x86_64".to_owned(),
+      },
     }
   }
 
@@ -1196,7 +1263,10 @@ mod tests {
       .is_none());
     assert_eq!(identity.name, "test");
     assert_eq!(identity.version, "0.3.0");
-    assert_eq!(identity.protocol_version, 1);
+    assert_eq!(
+      identity.protocol_version,
+      octa_plugin::protocol::PLUGIN_PROTOCOL_VERSION
+    );
     assert_eq!(
       identity.executable_size,
       std::fs::metadata(&setup.plugin_path).unwrap().len()
@@ -1210,6 +1280,61 @@ mod tests {
       identity,
       "the resolved digest should be reused for the running plugin"
     );
+  }
+
+  #[tokio::test]
+  async fn cache_planning_resolves_keys_and_preserves_failures() {
+    let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
+    let setup = TestSetup::new(plugins_dir, "test.py").await;
+    setup.plugin_manager.start_plugin(setup.plugin_name()).await.unwrap();
+
+    let plan = setup
+      .plugin_manager
+      .plan_cache_for_key("key", cache_planning_request(Value::String("planned".to_owned())))
+      .await
+      .unwrap()
+      .unwrap();
+    assert_eq!(plan.inputs, ["platform/linux.input"]);
+
+    assert!(matches!(
+      setup
+        .plugin_manager
+        .plan_cache_for_key(
+          "missing",
+          cache_planning_request(Value::String("planned".to_owned()))
+        )
+        .await,
+      Err(PluginManagerError::PluginNotFound(name)) if name == "missing"
+    ));
+    assert!(matches!(
+      setup
+        .plugin_manager
+        .plan_cache_for_key(
+          "key",
+          cache_planning_request(Value::String("plan-error".to_owned()))
+        )
+        .await,
+      Err(PluginManagerError::CachePlanningError(message)) if message.contains("fixture planning failure")
+    ));
+
+    let registration = PluginRegistration::new(
+      "test".to_owned(),
+      Schema {
+        key: "validated".to_owned(),
+        supports_raw: false,
+        capabilities: Vec::new(),
+        input_schema: serde_json::json!({ "type": "string" }).as_object().cloned(),
+        output_schema: None,
+      },
+    )
+    .unwrap();
+    assert!(matches!(
+      setup
+        .plugin_manager
+        .plan_cache(registration, cache_planning_request(Value::Bool(true)))
+        .await,
+      Err(PluginManagerError::CachePlanningError(message)) if message.contains("rejected its parameters")
+    ));
   }
 
   #[tokio::test]
@@ -1234,7 +1359,7 @@ mod tests {
     let mut execution = client
       .start_execution(
         PluginExecutionRequest {
-          params: "test".to_owned(),
+          params: Value::String("test".to_owned()),
           dry: false,
           args: Vec::new(),
           dir: PathBuf::from("."),

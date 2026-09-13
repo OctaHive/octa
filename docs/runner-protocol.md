@@ -132,7 +132,7 @@ The initial handshake reports protocol compatibility:
   "protocol_version": 2,
   "octa_version": "0.3.0",
   "event_schema_version": 4,
-  "plugin_protocol_version": 1
+  "plugin_protocol_version": 2
 }
 ```
 

@@ -1,6 +1,10 @@
 //! Portable workspace-relative paths carried by cache metadata.
 
-use std::{fmt, str::FromStr};
+use std::{
+  fmt,
+  path::{Component, Path},
+  str::FromStr,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -20,6 +24,34 @@ impl RelativePath {
     let value = value.into();
     validate(&value)?;
     Ok(Self(value))
+  }
+
+  /// Converts a host-relative path without changing the meaning of its components.
+  ///
+  /// `Path::components` recognizes Windows separators only on Windows. A
+  /// backslash contained in a Unix filename therefore reaches [`Self::new`]
+  /// unchanged and is rejected as non-portable instead of aliasing a `/` path.
+  pub fn from_path(path: &Path) -> Result<Self, CacheProtocolError> {
+    let mut components = Vec::new();
+    for component in path.components() {
+      match component {
+        Component::Normal(value) => components.push(
+          value
+            .to_str()
+            .ok_or_else(|| CacheProtocolError::Path("portable cache paths must be UTF-8".to_owned()))?,
+        ),
+        Component::CurDir if components.is_empty() => {},
+        Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+          return Err(CacheProtocolError::Path(
+            "host path must be normalized and relative".to_owned(),
+          ));
+        },
+      }
+    }
+    if components.is_empty() {
+      return Ok(Self::root());
+    }
+    Self::new(components.join("/"))
   }
 
   /// Constructs the distinguished path representing the workspace root.
@@ -117,4 +149,22 @@ fn validate(value: &str) -> Result<(), CacheProtocolError> {
     ));
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn converts_host_components_without_aliasing_distinct_unix_names() {
+    assert_eq!(
+      RelativePath::from_path(Path::new("nested/file")).unwrap().as_str(),
+      "nested/file"
+    );
+    assert_eq!(RelativePath::from_path(Path::new("")).unwrap(), RelativePath::root());
+    assert!(RelativePath::from_path(Path::new("../escape")).is_err());
+
+    #[cfg(unix)]
+    assert!(RelativePath::from_path(Path::new(r"nested\file")).is_err());
+  }
 }

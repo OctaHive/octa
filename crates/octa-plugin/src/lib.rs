@@ -1,3 +1,9 @@
+//! Rust SDK and process host for Octa execution plugins.
+//!
+//! Implementations provide schema, optional side-effect-free cache planning,
+//! and command execution. The host owns framing, correlation, cancellation,
+//! and response serialization.
+
 use std::{collections::HashMap, ffi::OsStr, io, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
@@ -7,7 +13,7 @@ use interprocess::local_socket::{
   ListenerOptions,
 };
 use logger::{collect_value_redactions, redact, Logger, LoggerSystem, RedactingLogger};
-use protocol::{OctaCommand, PluginResponse, Schema, Version};
+use protocol::{OctaCommand, PluginCachePlan, PluginCachePlanRequest, PluginResponse, Schema, Version};
 use serde_json::{Map, Value};
 use socket::interpret_local_socket_name;
 use tokio::io::{AsyncReadExt, AsyncWrite, ReadHalf};
@@ -51,7 +57,8 @@ pub enum PluginInput {
 pub struct PluginCommand {
   pub id: String,
   pub dry: bool,
-  pub command: String,
+  /// Validated task value with the same JSON type received during cache planning.
+  pub value: Value,
   pub args: Vec<String>,
   pub dir: PathBuf,
   pub vars: HashMap<String, Value>,
@@ -75,6 +82,16 @@ struct Args {
 #[async_trait]
 pub trait Plugin: Send + Sync + 'static {
   fn version(&self) -> String;
+
+  /// Describes every filesystem input and output used by one invocation.
+  ///
+  /// Planning runs before cache lookup and must not execute tools, access the
+  /// network, resolve runtime templates, or mutate the workspace. Return
+  /// `None` whenever those unavailable values can change a path; it explicitly
+  /// marks the invocation opaque so a cached task must provide its own inputs.
+  fn cache_plan(&self, _request: &PluginCachePlanRequest) -> anyhow::Result<Option<PluginCachePlan>> {
+    Ok(None)
+  }
 
   async fn execute_command(
     &self,
@@ -146,6 +163,21 @@ where
   W: AsyncWrite + Send + Unpin + 'static,
 {
   match command {
+    OctaCommand::PlanCache { id, request } => {
+      let response = match plugin.cache_plan(&request) {
+        Ok(Some(plan)) => match plan.validate() {
+          Ok(()) => PluginResponse::CachePlan { id, plan },
+          Err(message) => PluginResponse::Error { id, message },
+        },
+        Ok(None) => PluginResponse::CachePlanUnavailable { id },
+        Err(error) => PluginResponse::Error {
+          id,
+          message: format!("Cache planning failed: {error}"),
+        },
+      };
+      let response_json = serde_json::to_string(&response)? + "\n";
+      writer.lock().await.write_all(response_json.as_bytes()).await?;
+    },
     OctaCommand::Execute {
       id,
       params,
@@ -164,7 +196,7 @@ where
         collect_value_redactions(value, &mut redactions);
       }
       if redact_params {
-        redactions.push(params.clone());
+        collect_value_redactions(&params, &mut redactions);
       }
       let command_logger = Arc::new(RedactingLogger::new(logger.clone(), redactions.clone()));
 
@@ -199,7 +231,7 @@ where
             PluginCommand {
               id: command_id.clone(),
               dry,
-              command: params,
+              value: params,
               args,
               dir,
               vars,
@@ -683,6 +715,21 @@ mod tests {
       self.version.clone()
     }
 
+    fn cache_plan(&self, request: &PluginCachePlanRequest) -> anyhow::Result<Option<PluginCachePlan>> {
+      match request.params.as_str() {
+        Some("opaque") => Ok(None),
+        Some("invalid") => Ok(Some(PluginCachePlan {
+          inputs: vec![String::new()],
+          outputs: Vec::new(),
+        })),
+        Some("error") => Err(anyhow::anyhow!("fixture planning failure")),
+        _ => Ok(Some(PluginCachePlan {
+          inputs: vec![format!("{}/input", request.working_directory)],
+          outputs: vec![format!("{}/output", request.working_directory)],
+        })),
+      }
+    }
+
     async fn execute_command(
       &self,
       request: PluginCommand,
@@ -690,8 +737,8 @@ mod tests {
       logger: Arc<impl Logger>,
       cancel_token: CancellationToken,
     ) -> anyhow::Result<()> {
-      let PluginCommand { id, command, args, .. } = request;
-      logger.log(&format!("Executing command: {} {:?}", command, args))?;
+      let PluginCommand { id, value, args, .. } = request;
+      logger.log(&format!("Executing command: {} {:?}", value, args))?;
 
       for line in &self.output_lines {
         if cancel_token.is_cancelled() {
@@ -739,6 +786,64 @@ mod tests {
       responses.push(serde_json::from_str(&line).unwrap());
     }
     responses
+  }
+
+  async fn planned_response(params: &str) -> PluginResponse {
+    let (reader, writer) = tokio::io::duplex(1024);
+    let writer = Arc::new(Mutex::new(writer));
+    handle_command(
+      OctaCommand::PlanCache {
+        id: "plan-1".to_owned(),
+        request: PluginCachePlanRequest {
+          params: Value::String(params.to_owned()),
+          working_directory: "project".to_owned(),
+          target: protocol::TargetPlatform {
+            os: "linux".to_owned(),
+            architecture: "x86_64".to_owned(),
+          },
+        },
+      },
+      writer,
+      Arc::new(Mutex::new(HashMap::new())),
+      Arc::new(MockPlugin {
+        version: "1.0.0".to_owned(),
+        execution_delay: None,
+        should_fail: false,
+        output_lines: Vec::new(),
+      }),
+      Arc::new(MockLogger::new()),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    let mut line = String::new();
+    BufReader::new(reader).read_line(&mut line).await.unwrap();
+    serde_json::from_str::<PluginResponse>(&line).unwrap()
+  }
+
+  #[tokio::test]
+  async fn handle_command_returns_every_cache_planning_outcome_without_starting_execution() {
+    let response = planned_response("value").await;
+    assert!(matches!(
+      response,
+      PluginResponse::CachePlan { id, plan }
+        if id == "plan-1"
+          && plan.inputs == ["project/input"]
+          && plan.outputs == ["project/output"]
+    ));
+    assert!(matches!(
+      planned_response("opaque").await,
+      PluginResponse::CachePlanUnavailable { id } if id == "plan-1"
+    ));
+    assert!(matches!(
+      planned_response("invalid").await,
+      PluginResponse::Error { id, message } if id == "plan-1" && message.contains("UTF-8 bytes")
+    ));
+    assert!(matches!(
+      planned_response("error").await,
+      PluginResponse::Error { id, message } if id == "plan-1" && message.contains("fixture planning failure")
+    ));
   }
 
   async fn exchange_plugin_frames(socket_path: &Path, frames: &[String]) -> Vec<PluginResponse> {
@@ -858,7 +963,7 @@ mod tests {
 
     let command = OctaCommand::Execute {
       id: "command".to_owned(),
-      params: "test".to_string(),
+      params: Value::String("test".to_owned()),
       args: vec!["arg1".to_string(), "arg2".to_string()],
       dir: PathBuf::from("/test/dir"),
       envs: {
@@ -920,7 +1025,7 @@ mod tests {
     let secret = "secret-producing-payload";
     let command = OctaCommand::Execute {
       id: "command".to_owned(),
-      params: secret.to_owned(),
+      params: Value::String(secret.to_owned()),
       args: Vec::new(),
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -1007,7 +1112,7 @@ mod tests {
     handle_command(
       OctaCommand::Execute {
         id: "command".to_owned(),
-        params: "test".to_string(),
+        params: Value::String("test".to_owned()),
         args: vec![],
         dir: PathBuf::from("."),
         envs: HashMap::new(),
@@ -1116,7 +1221,7 @@ mod tests {
 
     let command = OctaCommand::Execute {
       id: "command".to_owned(),
-      params: "failing_command".to_string(),
+      params: Value::String("failing_command".to_owned()),
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -1170,7 +1275,7 @@ mod tests {
 
     let command = OctaCommand::Execute {
       id: "command".to_owned(),
-      params: "long_running".to_string(),
+      params: Value::String("long_running".to_owned()),
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -1228,7 +1333,7 @@ mod tests {
 
     let command = OctaCommand::Execute {
       id: "command".to_owned(),
-      params: "to_be_cancelled".to_string(),
+      params: Value::String("to_be_cancelled".to_owned()),
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -1366,7 +1471,7 @@ mod tests {
 
     let command = OctaCommand::Execute {
       id: "command".to_owned(),
-      params: "empty_output".to_string(),
+      params: Value::String("empty_output".to_owned()),
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -1423,7 +1528,7 @@ mod tests {
 
     let command = OctaCommand::Execute {
       id: "command".to_owned(),
-      params: "env_test".to_string(),
+      params: Value::String("env_test".to_owned()),
       args: vec![],
       dir: PathBuf::from("."),
       envs,
@@ -1476,7 +1581,7 @@ mod tests {
 
     let command = OctaCommand::Execute {
       id: "command".to_owned(),
-      params: "test".to_string(),
+      params: Value::String("test".to_owned()),
       args: vec![],
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -1544,7 +1649,7 @@ mod tests {
     for i in 0..3 {
       let command = OctaCommand::Execute {
         id: format!("command-{i}"),
-        params: format!("cmd{}", i),
+        params: Value::String(format!("cmd{}", i)),
         args: vec![],
         dir: PathBuf::from("."),
         envs: HashMap::new(),
@@ -1683,7 +1788,7 @@ mod tests {
 
     let cmd_command = OctaCommand::Execute {
       id: "command".to_owned(),
-      params: "".to_owned(),
+      params: Value::String(String::new()),
       args: vec!["arg1".to_string(), "arg2".to_string()],
       dir: PathBuf::from("/test/dir"),
       envs: HashMap::new(),

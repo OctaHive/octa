@@ -32,7 +32,7 @@ def digest(path: Path) -> str:
     return value.hexdigest()
 
 
-def write_locked_plugins(source: Path, destination: Path) -> Path:
+def write_locked_plugins(source: Path, destination: Path, protocol: int) -> Path:
     destination.mkdir()
     entries = []
     for name, capabilities in [("shell", ["shell"]), ("tpl", [])]:
@@ -43,7 +43,7 @@ def write_locked_plugins(source: Path, destination: Path) -> Path:
             "manifest_version: 1",
             f"name: {name}",
             'version: "conformance"',
-            "protocol: 1",
+            f"protocol: {protocol}",
             f"platforms: [{runtime_platform()}]",
             f"entrypoint: {entrypoint}",
             f"sha256: {sha256}",
@@ -55,7 +55,7 @@ def write_locked_plugins(source: Path, destination: Path) -> Path:
             [
                 f"  {name}:",
                 '    version: "conformance"',
-                "    protocol: 1",
+                f"    protocol: {protocol}",
                 f"    platforms: [{runtime_platform()}]",
                 f"    entrypoint: {entrypoint}",
                 f"    sha256: {sha256}",
@@ -84,7 +84,8 @@ def main() -> None:
     capabilities = json.loads(subprocess.run([runner, "capabilities"], check=True, text=True, stdout=subprocess.PIPE).stdout)
     assert capabilities["runner_protocols"] == [2]
     assert capabilities["event_schemas"] == [4]
-    assert capabilities["plugin_protocols"] == [1]
+    assert len(capabilities["plugin_protocols"]) == 1
+    plugin_protocol = capabilities["plugin_protocols"][0]
     assert {"artifacts", "reports", "locked-plugins", "secret-providers"} <= set(capabilities["features"])
 
     with tempfile.TemporaryDirectory(prefix="octa-agent-conformance-") as temporary:
@@ -118,7 +119,7 @@ tasks:
             encoding="utf-8",
         )
         locked_plugins = root / "locked-plugins"
-        lock = write_locked_plugins(plugins, locked_plugins)
+        lock = write_locked_plugins(plugins, locked_plugins, plugin_protocol)
         start = {
             "type": "start",
             "protocol_version": 2,

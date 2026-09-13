@@ -46,7 +46,11 @@ pub(crate) async fn finalize(
   };
 
   output.cache_publish_started(action.to_string()).await?;
-  let current = match cache.snapshotter.snapshot(&plan.workspace, &plan.inputs, cancel).await {
+  let current = match cache
+    .snapshotter
+    .snapshot_pattern_sets(&plan.workspace, &plan.input_pattern_sets, cancel)
+    .await
+  {
     Ok(snapshot) => snapshot,
     Err(CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache publication".to_owned())),
     Err(error) => {

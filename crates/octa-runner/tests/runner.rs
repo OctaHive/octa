@@ -211,7 +211,7 @@ fn reports_capabilities_without_starting_a_job() {
   assert_eq!(messages[0]["type"], "capabilities");
   assert_eq!(messages[0]["runner_protocols"], json!([2]));
   assert_eq!(messages[0]["event_schemas"], json!([4]));
-  assert_eq!(messages[0]["plugin_protocols"], json!([1]));
+  assert_eq!(messages[0]["plugin_protocols"], json!([2]));
   assert_eq!(messages[0]["octafile_versions"], json!([1]));
 }
 
@@ -281,6 +281,64 @@ tasks:
     "generated\n"
   );
   assert!(!second.path().join("runs.txt").exists());
+}
+
+#[test]
+fn plugin_contract_is_identical_in_the_runner_without_a_files_block() {
+  let cache = TempDir::new().unwrap();
+  let first = TempDir::new().unwrap();
+  let second = TempDir::new().unwrap();
+  let octafile = r#"
+version: 1
+tasks:
+  render:
+    cache: {}
+    tpl: { file: template.txt }
+"#;
+  for workspace in [&first, &second] {
+    fs::write(workspace.path().join("Octafile.yml"), octafile).unwrap();
+    fs::write(workspace.path().join("template.txt"), "runner-template").unwrap();
+  }
+
+  let execute = |workspace: &TempDir| {
+    let mut command = Command::cargo_bin("octa-runner").unwrap();
+    command
+      .write_stdin(cached_request(workspace, cache.path(), "render"))
+      .output()
+      .unwrap()
+  };
+  let first_output = execute(&first);
+  let second_output = execute(&second);
+  assert!(
+    first_output.status.success(),
+    "{}",
+    String::from_utf8_lossy(&first_output.stdout)
+  );
+  assert!(
+    second_output.status.success(),
+    "{}",
+    String::from_utf8_lossy(&second_output.stdout)
+  );
+  let outcome = |output: &[u8]| {
+    messages(output)
+      .into_iter()
+      .find(|message| message["type"] == "finished")
+      .unwrap()["results"][0]["tasks"]
+      .as_array()
+      .unwrap()
+      .iter()
+      .find_map(|task| task.get("cache").cloned())
+      .unwrap()
+  };
+  let first_cache = outcome(&first_output.stdout);
+  let second_cache = outcome(&second_output.stdout);
+  assert_eq!(first_cache["status"], "miss");
+  assert_eq!(second_cache["status"], "hit");
+  assert_eq!(first_cache["action"], second_cache["action"]);
+  assert_eq!(
+    messages(&second_output.stdout).last().unwrap()["results"][0]["stdout"],
+    json!(["runner-template"])
+  );
 }
 
 #[test]

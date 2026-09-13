@@ -120,7 +120,8 @@ impl std::fmt::Debug for ResultCache {
 #[derive(Clone, Debug)]
 pub(crate) struct TaskCachePlan {
   pub(crate) workspace: PathBuf,
-  pub(crate) inputs: Vec<String>,
+  /// Independent ordered pattern sets whose selected files form one union.
+  pub(crate) input_pattern_sets: Vec<Vec<String>>,
   pub(crate) outputs: Vec<RelativePath>,
   pub(crate) task_definition: Digest,
   pub(crate) environment: Vec<String>,

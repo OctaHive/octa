@@ -2728,6 +2728,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "glob",
  "octa-plugin",
  "serde",
  "serde_json",

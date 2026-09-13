@@ -85,6 +85,13 @@ jobs:
       - name: Package as archive
         shell: bash
         run: |
+          # Some release targets are cross-compiled and cannot be executed on
+          # the packaging host, so read the single protocol source of truth.
+          PLUGIN_PROTOCOL=$(sed -n 's/^pub const PLUGIN_PROTOCOL_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' crates/octa-plugin/src/protocol.rs)
+          if [[ ! "${PLUGIN_PROTOCOL}" =~ ^[0-9]+$ ]]; then
+            echo "Could not read PLUGIN_PROTOCOL_VERSION from the protocol crate" >&2
+            exit 1
+          fi
           cd target/${{ matrix.platform.target }}/release
           mkdir ./release
           mkdir ./release/plugins
@@ -115,10 +122,14 @@ jobs:
           JUNIT_DIGEST=$(shasum -a 256 "./release/plugins/${JUNIT_ENTRY}" | cut -d ' ' -f 1)
           (cd ./release && shasum -a 256 "${{ matrix.platform.bin }}" "octa-runner${{ contains(matrix.platform.os, 'windows') && '.exe' || '' }}" > SHA256SUMS)
           VERSION="${GITHUB_REF_NAME#v}"
-          printf 'manifest_version: 1\nname: shell\nversion: "%s"\nprotocol: 1\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\ncapabilities:\n  - shell\n' "$VERSION" "${{ matrix.platform.runtime_platform }}" "$SHELL_ENTRY" "$SHELL_DIGEST" > ./release/plugins/shell.plugin.yml
-          printf 'manifest_version: 1\nname: tpl\nversion: "%s"\nprotocol: 1\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "${{ matrix.platform.runtime_platform }}" "$TPL_ENTRY" "$TPL_DIGEST" > ./release/plugins/tpl.plugin.yml
-          printf 'manifest_version: 1\nname: junit\nversion: "%s"\nprotocol: 1\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "${{ matrix.platform.runtime_platform }}" "$JUNIT_ENTRY" "$JUNIT_DIGEST" > ./release/plugins/junit.plugin.yml
-          printf 'version: 1\nplugins:\n  junit:\n    version: "%s"\n    protocol: 1\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    source: junit.plugin.yml\n  shell:\n    version: "%s"\n    protocol: 1\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    capabilities: [shell]\n    source: shell.plugin.yml\n  tpl:\n    version: "%s"\n    protocol: 1\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    source: tpl.plugin.yml\n' "$VERSION" "${{ matrix.platform.runtime_platform }}" "$JUNIT_ENTRY" "$JUNIT_DIGEST" "$VERSION" "${{ matrix.platform.runtime_platform }}" "$SHELL_ENTRY" "$SHELL_DIGEST" "$VERSION" "${{ matrix.platform.runtime_platform }}" "$TPL_ENTRY" "$TPL_DIGEST" > ./release/Octa.lock
+          printf 'manifest_version: 1\nname: shell\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\ncapabilities:\n  - shell\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$SHELL_ENTRY" "$SHELL_DIGEST" > ./release/plugins/shell.plugin.yml
+          printf 'manifest_version: 1\nname: tpl\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$TPL_ENTRY" "$TPL_DIGEST" > ./release/plugins/tpl.plugin.yml
+          printf 'manifest_version: 1\nname: junit\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$JUNIT_ENTRY" "$JUNIT_DIGEST" > ./release/plugins/junit.plugin.yml
+          printf 'version: 1\nplugins:\n  junit:\n    version: "%s"\n    protocol: %s\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    source: junit.plugin.yml\n  shell:\n    version: "%s"\n    protocol: %s\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    capabilities: [shell]\n    source: shell.plugin.yml\n  tpl:\n    version: "%s"\n    protocol: %s\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    source: tpl.plugin.yml\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$JUNIT_ENTRY" "$JUNIT_DIGEST" "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$SHELL_ENTRY" "$SHELL_DIGEST" "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$TPL_ENTRY" "$TPL_DIGEST" > ./release/Octa.lock
+
+          # Exercise the packaged binary against the exact generated lock so a
+          # protocol or digest drift fails before an unusable archive is built.
+          OCTA_PLUGINS_DIR=./release/plugins "./release/${{ matrix.platform.bin }}" plugin verify --lock ./release/Octa.lock
 
           if [[ "${{ matrix.platform.os }}" == "windows-latest" ]]; then
             7z a ../../../${{ matrix.platform.name }} ./release/*

@@ -1,8 +1,14 @@
+//! Multiplexed transport for one long-lived plugin process.
+//!
+//! Lifecycle commands and cache-planning requests share the socket but use
+//! independent correlation tables, so out-of-order planning responses cannot
+//! consume lifecycle control or command output.
+
 use std::{
   collections::HashMap,
   io,
   path::PathBuf,
-  sync::{Arc, Weak},
+  sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak},
   time::Duration,
 };
 
@@ -16,15 +22,22 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use octa_plugin::protocol::{OctaCommand, PluginResponse, ProgressUpdate, Schema, Version, PLUGIN_PROTOCOL_VERSION};
+use octa_plugin::protocol::{
+  OctaCommand, PluginCachePlan, PluginCachePlanRequest, PluginResponse, ProgressUpdate, Schema, Version,
+  PLUGIN_PROTOCOL_VERSION,
+};
 
 const CONTROL_RESPONSE_CAPACITY: usize = 16;
 const COMMAND_RESPONSE_CAPACITY: usize = 32;
 const MAX_PLUGIN_FRAME_BYTES: usize = 1024 * 1024;
 const CANCELLED_ROUTE_TTL: Duration = Duration::from_secs(5);
 const PLUGIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const PLUGIN_CACHE_PLAN_TIMEOUT: Duration = Duration::from_secs(5);
 const INITIAL_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(1);
 const MAX_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(25);
+
+type CachePlanResponse = Result<Option<PluginCachePlan>, PluginClientError>;
+type CachePlanRoute = oneshot::Sender<CachePlanResponse>;
 
 #[derive(Debug)]
 pub enum PluginClientError {
@@ -99,9 +112,35 @@ pub struct PluginClient {
 struct PluginClientInner {
   writer: Mutex<Option<WriteHalf<TokioStream>>>,
   control_rx: Mutex<mpsc::Receiver<PluginResponse>>,
+  /// Serializes request/response exchanges that do not use command routes.
+  control_exchange: Mutex<()>,
+  /// Correlates cache-plan responses independently from lifecycle control.
+  plans: StdMutex<HashMap<String, CachePlanRoute>>,
   commands: Mutex<HashMap<String, CommandRoute>>,
   shutdown_signal: CancellationToken,
   connection_closed: CancellationToken,
+}
+
+/// Removes a pending route even when its caller future is externally dropped.
+struct PendingCachePlanRoute {
+  inner: Weak<PluginClientInner>,
+  id: String,
+}
+
+impl Drop for PendingCachePlanRoute {
+  fn drop(&mut self) {
+    let Some(inner) = self.inner.upgrade() else {
+      return;
+    };
+    plan_routes(&inner).remove(&self.id);
+  }
+}
+
+fn plan_routes(inner: &PluginClientInner) -> StdMutexGuard<'_, HashMap<String, CachePlanRoute>> {
+  // No plugin or user code runs while this small routing map is locked. If a
+  // test or allocator panic poisoned it, retaining stale senders is less safe
+  // than recovering the still structurally valid map.
+  inner.plans.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Debug)]
@@ -235,7 +274,7 @@ impl PluginExecution {
 
 /// Complete payload required to start one plugin command.
 pub struct PluginExecutionRequest {
-  pub params: String,
+  pub params: Value,
   pub dry: bool,
   pub args: Vec<String>,
   pub dir: PathBuf,
@@ -275,6 +314,8 @@ impl PluginClient {
     let inner = Arc::new(PluginClientInner {
       writer: Mutex::new(Some(writer)),
       control_rx: Mutex::new(control_rx),
+      control_exchange: Mutex::new(()),
+      plans: StdMutex::new(HashMap::new()),
       commands: Mutex::new(HashMap::new()),
       shutdown_signal: CancellationToken::new(),
       connection_closed: CancellationToken::new(),
@@ -317,6 +358,7 @@ impl PluginClient {
 
   /// Negotiates the process protocol and returns the plugin's own version.
   pub async fn handshake_version(&self) -> Result<Version, PluginClientError> {
+    let _exchange = self.inner.control_exchange.lock().await;
     let hello = OctaCommand::Hello(Version {
       protocol_version: PLUGIN_PROTOCOL_VERSION,
       version: env!("CARGO_PKG_VERSION").to_string(),
@@ -343,6 +385,7 @@ impl PluginClient {
   }
 
   pub async fn get_schema(&self) -> Result<Schema, PluginClientError> {
+    let _exchange = self.inner.control_exchange.lock().await;
     self.send(&OctaCommand::Schema).await?;
 
     match self.receive_control().await? {
@@ -350,6 +393,41 @@ impl PluginClient {
       PluginResponse::Error { message, .. } => Err(PluginClientError::Protocol(message)),
       _ => Err(PluginClientError::Protocol("Unexpected response to Schema".into())),
     }
+  }
+
+  /// Requests a side-effect-free filesystem contract for one invocation.
+  pub async fn plan_cache(
+    &self,
+    request: PluginCachePlanRequest,
+  ) -> Result<Option<PluginCachePlan>, PluginClientError> {
+    let id = Uuid::new_v4().to_string();
+    let (response_tx, response_rx) = oneshot::channel();
+    plan_routes(&self.inner).insert(id.clone(), response_tx);
+    let pending = PendingCachePlanRoute {
+      inner: Arc::downgrade(&self.inner),
+      id: id.clone(),
+    };
+    self
+      .send(&OctaCommand::PlanCache {
+        id: id.clone(),
+        request,
+      })
+      .await?;
+
+    let result = match tokio::time::timeout(PLUGIN_CACHE_PLAN_TIMEOUT, response_rx).await {
+      Ok(Ok(result)) => result,
+      Ok(Err(_)) => Err(PluginClientError::ConnectionClosed),
+      Err(_) => {
+        drop(pending);
+        self.cleanup().await;
+        return Err(PluginClientError::Protocol(format!(
+          "Plugin did not return cache plan '{id}' within {} seconds",
+          PLUGIN_CACHE_PLAN_TIMEOUT.as_secs()
+        )));
+      },
+    };
+    drop(pending);
+    result
   }
 
   fn start_response_handler(
@@ -396,6 +474,9 @@ impl PluginClient {
 
       if let Some(inner) = inner.upgrade() {
         inner.connection_closed.cancel();
+        for (_, response) in plan_routes(&inner).drain() {
+          let _ = response.send(Err(PluginClientError::ConnectionClosed));
+        }
         for (_, route) in inner.commands.lock().await.drain() {
           route.completed.cancel();
           if let CommandRouteState::AwaitingStart(pending) = route.state {
@@ -407,6 +488,36 @@ impl PluginClient {
   }
 
   async fn dispatch_response(
+    inner: &Arc<PluginClientInner>,
+    control_tx: &mpsc::Sender<PluginResponse>,
+    response: PluginResponse,
+  ) -> bool {
+    match response {
+      PluginResponse::CachePlan { id, plan } => {
+        let route = plan_routes(inner).remove(&id);
+        let Some(route) = route else {
+          return Self::fail_protocol(inner, format!("Plugin returned an unknown cache plan '{id}'")).await;
+        };
+        let result = plan
+          .validate()
+          .map(|()| Some(plan))
+          .map_err(PluginClientError::Protocol);
+        let _ = route.send(result);
+        true
+      },
+      PluginResponse::CachePlanUnavailable { id } => {
+        let route = plan_routes(inner).remove(&id);
+        let Some(route) = route else {
+          return Self::fail_protocol(inner, format!("Plugin returned an unknown cache plan '{id}'")).await;
+        };
+        let _ = route.send(Ok(None));
+        true
+      },
+      response => Self::dispatch_execution_response(inner, control_tx, response).await,
+    }
+  }
+
+  async fn dispatch_execution_response(
     inner: &Arc<PluginClientInner>,
     control_tx: &mpsc::Sender<PluginResponse>,
     response: PluginResponse,
@@ -524,8 +635,12 @@ impl PluginClient {
       }
       drop(commands);
 
-      if matches!(response, PluginResponse::Error { .. }) {
-        return control_tx.try_send(response).is_ok();
+      if let PluginResponse::Error { id, message } = response {
+        if let Some(route) = plan_routes(inner).remove(&id) {
+          let _ = route.send(Err(PluginClientError::Protocol(message)));
+          return true;
+        }
+        return control_tx.try_send(PluginResponse::Error { id, message }).is_ok();
       }
       // Output for an unknown or already completed command cannot be routed and
       // must not pollute the bounded control channel.
@@ -537,6 +652,9 @@ impl PluginClient {
 
   async fn fail_protocol(inner: &Arc<PluginClientInner>, message: String) -> bool {
     inner.connection_closed.cancel();
+    for (_, response) in plan_routes(inner).drain() {
+      let _ = response.send(Err(PluginClientError::Protocol(message.clone())));
+    }
     for (id, mut route) in inner.commands.lock().await.drain() {
       route.completed.cancel();
       match route.state {
@@ -654,6 +772,7 @@ impl PluginClient {
   }
 
   pub async fn shutdown(&self) -> Result<(), PluginClientError> {
+    let _exchange = self.inner.control_exchange.lock().await;
     let connection_closed = self.inner.control_rx.lock().await.is_closed();
     if connection_closed {
       self.cleanup().await;
@@ -766,7 +885,7 @@ mod tests {
 
   const TIMEOUT: Duration = Duration::from_secs(5);
 
-  fn execution_request(params: impl Into<String>) -> PluginExecutionRequest {
+  fn execution_request(params: impl Into<Value>) -> PluginExecutionRequest {
     PluginExecutionRequest {
       params: params.into(),
       dry: false,
@@ -838,7 +957,7 @@ mod tests {
   fn rejects_oversized_outbound_protocol_frames() {
     let command = OctaCommand::Execute {
       id: "command".to_owned(),
-      params: "x".repeat(MAX_PLUGIN_FRAME_BYTES),
+      params: Value::String("x".repeat(MAX_PLUGIN_FRAME_BYTES)),
       args: Vec::new(),
       dir: PathBuf::from("."),
       envs: HashMap::new(),
@@ -978,6 +1097,7 @@ mod tests {
       let (reader, mut writer) = tokio::io::split(stream);
       let mut reader = BufReader::new(reader);
       let mut buffer = String::new();
+      let mut deferred_plan = None;
 
       while let Ok(n) = reader.read_line(&mut buffer).await {
         if n == 0 || stop_signal.load(Ordering::SeqCst) {
@@ -1005,6 +1125,57 @@ mod tests {
             input_schema: None,
             output_schema: None,
           }))
+        } else if buffer.contains("PlanCache") && handle_type == "ignore-plan" {
+          None
+        } else if buffer.contains("PlanCache") {
+          let OctaCommand::PlanCache { mut id, request } = serde_json::from_str::<OctaCommand>(&buffer).unwrap() else {
+            unreachable!()
+          };
+          if handle_type == "close-plan" {
+            break;
+          }
+          if matches!(handle_type, "wrong-plan-id" | "wrong-unavailable-id") {
+            id = "wrong-plan".to_owned();
+          }
+          if matches!(handle_type, "plan-unavailable" | "wrong-unavailable-id") {
+            Some(PluginResponse::CachePlanUnavailable { id })
+          } else if handle_type == "plan-error" {
+            Some(PluginResponse::Error {
+              id,
+              message: "fixture planning failure".to_owned(),
+            })
+          } else {
+            let response = PluginResponse::CachePlan {
+              id,
+              plan: PluginCachePlan {
+                inputs: if handle_type == "invalid-plan" {
+                  vec![String::new()]
+                } else if handle_type == "reverse-plans" {
+                  vec![request.params.as_str().unwrap().to_owned()]
+                } else {
+                  vec!["src/**".to_owned()]
+                },
+                outputs: vec!["target".to_owned()],
+              },
+            };
+            if handle_type == "reverse-plans" {
+              match deferred_plan.take() {
+                None => {
+                  deferred_plan = Some(response);
+                  None
+                },
+                Some(first) => {
+                  let response_json = serde_json::to_string(&response).unwrap() + "\n";
+                  writer.write_all(response_json.as_bytes()).await.unwrap();
+                  writer.flush().await.unwrap();
+                  received_messages.push(response_json);
+                  Some(first)
+                },
+              }
+            } else {
+              Some(response)
+            }
+          }
         } else if buffer.contains("Execute") {
           let mut id = match serde_json::from_str::<OctaCommand>(&buffer).unwrap() {
             OctaCommand::Execute { id, .. } => id,
@@ -1111,6 +1282,144 @@ mod tests {
       client.handshake().await,
       Err(PluginClientError::VersionMismatch)
     ));
+    let _ = server.stop().await;
+  }
+
+  fn cache_plan_request() -> PluginCachePlanRequest {
+    PluginCachePlanRequest {
+      params: serde_json::json!("build"),
+      working_directory: String::new(),
+      target: octa_plugin::protocol::TargetPlatform {
+        os: "linux".to_owned(),
+        architecture: "x86_64".to_owned(),
+      },
+    }
+  }
+
+  #[tokio::test]
+  async fn cache_plans_are_correlated_and_distinguish_an_opaque_invocation() {
+    let mut server = TestServer::new().await;
+    server.start("plan".to_owned()).await;
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let plan = client.plan_cache(cache_plan_request()).await.unwrap().unwrap();
+    assert_eq!(plan.inputs, ["src/**"]);
+    assert_eq!(plan.outputs, ["target"]);
+    client.shutdown().await.unwrap();
+    let messages = server.stop().await;
+    assert!(messages.iter().any(|message| message.contains("PlanCache")));
+    assert!(matches!(
+      client.plan_cache(cache_plan_request()).await,
+      Err(PluginClientError::WriterClosed)
+    ));
+
+    let mut server = TestServer::new().await;
+    server.start("plan-unavailable".to_owned()).await;
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    assert!(client.plan_cache(cache_plan_request()).await.unwrap().is_none());
+    client.shutdown().await.unwrap();
+    let _ = server.stop().await;
+
+    for (mode, expected) in [
+      ("invalid-plan", "UTF-8 bytes"),
+      ("plan-error", "fixture planning failure"),
+      ("wrong-unavailable-id", "unknown cache plan"),
+    ] {
+      let mut server = TestServer::new().await;
+      server.start(mode.to_owned()).await;
+      let client = PluginClient::connect(server.socket_name()).await.unwrap();
+      client.handshake().await.unwrap();
+      assert!(matches!(
+        client.plan_cache(cache_plan_request()).await,
+        Err(PluginClientError::Protocol(message)) if message.contains(expected)
+      ));
+      client.shutdown().await.unwrap();
+      let _ = server.stop().await;
+    }
+
+    let mut server = TestServer::new().await;
+    server.start("close-plan".to_owned()).await;
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    assert!(matches!(
+      client.plan_cache(cache_plan_request()).await,
+      Err(PluginClientError::ConnectionClosed)
+    ));
+    client.shutdown().await.unwrap();
+    let _ = server.stop().await;
+
+    let mut server = TestServer::new().await;
+    server.start("wrong-plan-id".to_owned()).await;
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    assert!(matches!(
+      client.plan_cache(cache_plan_request()).await,
+      Err(PluginClientError::Protocol(message)) if message.contains("unknown cache plan")
+    ));
+    client.shutdown().await.unwrap();
+    let _ = server.stop().await;
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn cache_planning_timeout_closes_the_unresponsive_connection() {
+    let mut server = TestServer::new().await;
+    server.start("ignore-plan".to_owned()).await;
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+
+    assert!(matches!(
+      client.plan_cache(cache_plan_request()).await,
+      Err(PluginClientError::Protocol(message)) if message.contains("did not return cache plan")
+    ));
+    assert!(matches!(
+      client.get_schema().await,
+      Err(PluginClientError::WriterClosed)
+    ));
+    let messages = server.stop().await;
+    assert!(messages.iter().any(|message| message.contains("PlanCache")));
+  }
+
+  #[tokio::test]
+  async fn concurrent_cache_plans_are_correlated_when_responses_arrive_out_of_order() {
+    let mut server = TestServer::new().await;
+    server.start("reverse-plans".to_owned()).await;
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+
+    let mut first = cache_plan_request();
+    first.params = serde_json::json!("first");
+    let mut second = cache_plan_request();
+    second.params = serde_json::json!("second");
+    let (first, second) = tokio::join!(client.plan_cache(first), client.plan_cache(second));
+    assert_eq!(first.unwrap().unwrap().inputs, ["first"]);
+    assert_eq!(second.unwrap().unwrap().inputs, ["second"]);
+
+    client.shutdown().await.unwrap();
+    let _ = server.stop().await;
+  }
+
+  #[tokio::test]
+  async fn dropping_cache_plan_future_removes_its_pending_route() {
+    let mut server = TestServer::new().await;
+    server.start("ignore-plan".to_owned()).await;
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+
+    let request_client = client.clone();
+    let request = tokio::spawn(async move { request_client.plan_cache(cache_plan_request()).await });
+    tokio::time::timeout(TIMEOUT, async {
+      while plan_routes(&client.inner).is_empty() {
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("cache plan route was not registered");
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    assert!(plan_routes(&client.inner).is_empty());
+
+    client.shutdown().await.unwrap();
     let _ = server.stop().await;
   }
 
@@ -1254,7 +1563,7 @@ mod tests {
         let OctaCommand::Execute { id, params, .. } = serde_json::from_str(line.trim()).unwrap() else {
           panic!("expected execute request");
         };
-        requests.insert(params, id);
+        requests.insert(params.as_str().unwrap().to_owned(), id);
       }
       for params in ["second", "first"] {
         let response = PluginResponse::Started {
@@ -1716,6 +2025,7 @@ mod tests {
           },
           OctaCommand::Execute { id, params, .. } => {
             write_response(&writer, PluginResponse::Started { id: id.clone() }).await;
+            let params = params.as_str().unwrap().to_owned();
             let writer = writer.clone();
             tokio::spawn(async move {
               let delay = if params == "first" { 80 } else { 10 };

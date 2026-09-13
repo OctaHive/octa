@@ -329,7 +329,7 @@ impl Plugin for ShellPlugin {
     let PluginCommand {
       id,
       dry,
-      command,
+      value,
       args: _,
       dir,
       vars,
@@ -337,6 +337,10 @@ impl Plugin for ShellPlugin {
       raw,
       input,
     } = request;
+    let command = value
+      .as_str()
+      .context("shell plugin command must be a string")?
+      .to_owned();
     let mut tera = Tera::default();
     let template_name = format!("template_{}", id);
 
@@ -578,7 +582,7 @@ mod tests {
         PluginCommand {
           id: "test-id".to_string(),
           dry: true,
-          command: "echo Hello, World!".to_owned(),
+          value: Value::String("echo Hello, World!".to_owned()),
           args: vec![],
           dir,
           vars: HashMap::new(),

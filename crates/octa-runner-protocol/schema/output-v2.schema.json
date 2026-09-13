@@ -19,7 +19,7 @@
         "protocol_version": { "const": 2 },
         "octa_version": { "type": "string", "minLength": 1 },
         "event_schema_version": { "type": "integer", "minimum": 1 },
-        "plugin_protocol_version": { "const": 1 }
+        "plugin_protocol_version": { "const": 2 }
       },
       "additionalProperties": false
     },

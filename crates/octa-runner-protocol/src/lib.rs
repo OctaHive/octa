@@ -18,8 +18,6 @@ pub use octa_cache_protocol::CacheMode;
 pub const RUNNER_PROTOCOL_VERSION: u16 = 2;
 /// Event schema version carried inside runner event messages.
 pub const RUNNER_EVENT_SCHEMA_VERSION: u16 = 4;
-/// Plugin protocol version required by this runner contract.
-pub const RUNNER_PLUGIN_PROTOCOL_VERSION: u16 = 1;
 /// Maximum bytes accepted for one newline-delimited input command.
 pub const MAX_RUNNER_INPUT_FRAME_BYTES: usize = 1024 * 1024;
 /// Maximum accepted size of a job-scoped remote-cache bearer token file.
@@ -530,14 +528,14 @@ mod tests {
         "protocol_version": 2,
         "octa_version": "0.3.0",
         "event_schema_version": 4,
-        "plugin_protocol_version": 1
+        "plugin_protocol_version": 2
       }),
       json!({
         "type": "capabilities",
         "octa_version": "0.3.0",
         "runner_protocols": [2],
         "event_schemas": [4],
-        "plugin_protocols": [1],
+        "plugin_protocols": [2],
         "octafile_versions": [1],
         "platform": "linux-x86_64",
         "features": [],
@@ -614,14 +612,14 @@ mod tests {
         "protocol_version": 2,
         "octa_version": "0.3.0",
         "event_schema_version": 4,
-        "plugin_protocol_version": 1
+        "plugin_protocol_version": 2
       }),
       json!({
         "type": "capabilities",
         "octa_version": "0.3.0",
         "runner_protocols": [2],
         "event_schemas": [4],
-        "plugin_protocols": [1],
+        "plugin_protocols": [2],
         "octafile_versions": [1],
         "platform": "linux-x86_64",
         "features": []

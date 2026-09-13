@@ -68,13 +68,14 @@ impl Plugin for JunitPlugin {
     logger: Arc<impl Logger>,
     cancel_token: CancellationToken,
   ) -> anyhow::Result<()> {
-    let params: JunitParams = serde_json::from_str(&request.command).context("invalid JUnit parameters")?;
+    let PluginCommand { id, dry, value, .. } = request;
+    let params: JunitParams = serde_json::from_value(value).context("invalid JUnit parameters")?;
 
     if cancel_token.is_cancelled() {
       return send(
         &writer,
         &PluginResponse::Completed {
-          id: request.id,
+          id,
           code: -1,
           outputs: Default::default(),
         },
@@ -82,9 +83,9 @@ impl Plugin for JunitPlugin {
       .await;
     }
 
-    if !request.dry {
+    if !dry {
       let response = PluginResponse::RegisterReport {
-        id: request.id.clone(),
+        id: id.clone(),
         report: ReportDeclaration {
           name: params.name,
           path: params.path,
@@ -98,7 +99,7 @@ impl Plugin for JunitPlugin {
     send(
       &writer,
       &PluginResponse::Completed {
-        id: request.id,
+        id,
         code: 0,
         outputs: Default::default(),
       },
@@ -125,7 +126,7 @@ mod tests {
     PluginCommand {
       id: "command-id".to_owned(),
       dry,
-      command: command.to_owned(),
+      value: serde_json::from_str(command).unwrap(),
       args: Vec::new(),
       dir: PathBuf::from("workspace"),
       vars: HashMap::new(),

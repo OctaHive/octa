@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
   error::{check_cancelled, io_error},
-  fileset::collect,
+  fileset::collect_sets,
   hash::{HashScheduler, HashedFile},
   platform::EntryKey,
   workspace::{portable_relative, safe_symlink_target},
@@ -103,15 +103,30 @@ impl InputSnapshotter {
     patterns: &[String],
     cancel: &CancellationToken,
   ) -> CacheResult<InputSnapshot> {
+    self
+      .snapshot_pattern_sets(workspace, &[patterns.to_vec()], cancel)
+      .await
+  }
+
+  /// Hashes the union of independent ordered input pattern sets.
+  ///
+  /// Exclusions apply only within their own set. This lets a user and several
+  /// plugins add requirements without one contract removing another's files.
+  pub async fn snapshot_pattern_sets(
+    &self,
+    workspace: &Path,
+    pattern_sets: &[Vec<String>],
+    cancel: &CancellationToken,
+  ) -> CacheResult<InputSnapshot> {
     check_cancelled(cancel)?;
     let workspace =
       dunce::canonicalize(workspace).map_err(|error| io_error("canonicalize workspace", workspace, error))?;
     let discovery_root = workspace.clone();
-    let discovery_patterns = patterns.to_vec();
+    let discovery_patterns = pattern_sets.to_vec();
     let discovery_cancel = cancel.clone();
     let max_entries = self.scheduler.options().max_entries;
     let paths = tokio::task::spawn_blocking(move || {
-      collect(&discovery_patterns, &discovery_root, max_entries, &discovery_cancel)
+      collect_sets(&discovery_patterns, &discovery_root, max_entries, &discovery_cancel)
     })
     .await
     .map_err(CacheError::Worker)??;

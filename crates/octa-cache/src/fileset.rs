@@ -33,17 +33,40 @@ use crate::{
 const OCTAIGNORE_FILE: &str = ".octaignore";
 const MAX_OCTAIGNORE_BYTES: u64 = 1024 * 1024;
 
+#[cfg(test)]
 pub(crate) fn collect(
   patterns: &[String],
   root: &Path,
   max_entries: usize,
   cancel: &CancellationToken,
 ) -> CacheResult<Vec<PathBuf>> {
+  collect_pattern_sets(std::iter::once(patterns), root, max_entries, cancel)
+}
+
+/// Expands independent ordered pattern sets and returns their filesystem union.
+///
+/// Keeping sets independent is important: an exclusion in one plugin's plan
+/// must not remove an input required by the user or another plugin.
+pub(crate) fn collect_sets(
+  pattern_sets: &[Vec<String>],
+  root: &Path,
+  max_entries: usize,
+  cancel: &CancellationToken,
+) -> CacheResult<Vec<PathBuf>> {
+  collect_pattern_sets(pattern_sets.iter().map(Vec::as_slice), root, max_entries, cancel)
+}
+
+fn collect_pattern_sets<'a>(
+  pattern_sets: impl IntoIterator<Item = &'a [String]>,
+  root: &Path,
+  max_entries: usize,
+  cancel: &CancellationToken,
+) -> CacheResult<Vec<PathBuf>> {
   check_cancelled(cancel)?;
-  if max_entries == 0 || patterns.len() > MAX_CACHE_LIST_ITEMS {
-    return Err(CacheError::Configuration(format!(
-      "cache input max_entries must be nonzero and patterns are limited to {MAX_CACHE_LIST_ITEMS} items"
-    )));
+  if max_entries == 0 {
+    return Err(CacheError::Configuration(
+      "cache input max_entries must be nonzero".to_owned(),
+    ));
   }
   let root = dunce::canonicalize(root).map_err(|error| io_error("canonicalize workspace", root, error))?;
   if !root.is_dir() {
@@ -54,21 +77,39 @@ pub(crate) fn collect(
   }
 
   let mut filter = IgnoreFilter::new(root.clone());
-  let patterns = patterns
-    .iter()
-    .map(|value| InputPattern::parse(value, &root))
-    .collect::<CacheResult<Vec<_>>>()?;
-  let scan_roots = minimal_scan_roots(&patterns);
   let mut paths = BTreeSet::<PathBuf>::new();
-  // All disjoint scan roots belong to one snapshot and therefore consume one
-  // shared traversal budget. Resetting the counter per root would let a wide
-  // pattern set multiply the configured resource limit.
   let mut visited = 0;
-  for scan_root in scan_roots {
+  let mut pattern_count = 0_usize;
+  let mut patterns = Vec::new();
+  let mut groups = Vec::new();
+  for pattern_set in pattern_sets {
+    pattern_count = pattern_count
+      .checked_add(pattern_set.len())
+      .ok_or_else(|| CacheError::Limit("cache input pattern count overflowed".to_owned()))?;
+    if pattern_count > MAX_CACHE_LIST_ITEMS {
+      return Err(CacheError::Configuration(format!(
+        "cache input patterns are limited to {MAX_CACHE_LIST_ITEMS} items"
+      )));
+    }
+    let start = patterns.len();
+    patterns.extend(
+      pattern_set
+        .iter()
+        .map(|value| InputPattern::parse(value, &root))
+        .collect::<CacheResult<Vec<_>>>()?,
+    );
+    groups.push((start, patterns.len()));
+  }
+
+  // All producers share one traversal. Group ranges affect only the final
+  // include/exclude decision, so overlapping user and plugin roots do not
+  // multiply filesystem work.
+  for scan_root in minimal_scan_roots(&patterns) {
     check_cancelled(cancel)?;
     let mut allow = |path: &Path| filter.is_ignored(path).map(|ignored| !ignored);
     let mut walker = Walker {
       patterns: &patterns,
+      groups: &groups,
       cancel,
       allow: &mut allow,
       paths: &mut paths,
@@ -94,25 +135,49 @@ pub(crate) fn collect(
 /// snapshots. The conservative overlap check may require users of a workspace-
 /// wide include to move generated outputs outside that include, which is safer
 /// than publishing an action whose own outputs become future inputs.
+#[cfg(test)]
 pub(crate) fn validate_contract(patterns: &[String], root: &Path, outputs: &[RelativePath]) -> CacheResult<()> {
-  if patterns.len() > MAX_CACHE_LIST_ITEMS {
-    return Err(CacheError::Configuration(format!(
-      "cache input patterns are limited to {MAX_CACHE_LIST_ITEMS} items"
-    )));
-  }
+  validate_contract_sets(std::iter::once(patterns), root, outputs)
+}
+
+pub(crate) fn validate_contract_groups(
+  pattern_sets: &[Vec<String>],
+  root: &Path,
+  outputs: &[RelativePath],
+) -> CacheResult<()> {
+  validate_contract_sets(pattern_sets.iter().map(Vec::as_slice), root, outputs)
+}
+
+fn validate_contract_sets<'a>(
+  pattern_sets: impl IntoIterator<Item = &'a [String]>,
+  root: &Path,
+  outputs: &[RelativePath],
+) -> CacheResult<()> {
   let root = dunce::canonicalize(root).map_err(|error| io_error("canonicalize workspace", root, error))?;
-  let patterns = patterns
-    .iter()
-    .map(|value| InputPattern::parse(value, &root))
-    .collect::<CacheResult<Vec<_>>>()?;
-  for output in outputs {
-    let output_path = root.join(output.as_str());
-    if patterns.iter().any(|pattern| {
-      !pattern.excluded && (output_path.starts_with(&pattern.scan_root) || pattern.scan_root.starts_with(&output_path))
-    }) {
+  let mut pattern_count = 0_usize;
+  for pattern_set in pattern_sets {
+    pattern_count = pattern_count
+      .checked_add(pattern_set.len())
+      .ok_or_else(|| CacheError::Limit("cache input pattern count overflowed".to_owned()))?;
+    if pattern_count > MAX_CACHE_LIST_ITEMS {
       return Err(CacheError::Configuration(format!(
-        "cache output '{output}' overlaps the traversal of a positive input pattern"
+        "cache input patterns are limited to {MAX_CACHE_LIST_ITEMS} items"
       )));
+    }
+    let patterns = pattern_set
+      .iter()
+      .map(|value| InputPattern::parse(value, &root))
+      .collect::<CacheResult<Vec<_>>>()?;
+    for output in outputs {
+      let output_path = root.join(output.as_str());
+      if patterns.iter().any(|pattern| {
+        !pattern.excluded
+          && (output_path.starts_with(&pattern.scan_root) || pattern.scan_root.starts_with(&output_path))
+      }) {
+        return Err(CacheError::Configuration(format!(
+          "cache output '{output}' overlaps the traversal of a positive input pattern"
+        )));
+      }
     }
   }
   Ok(())
@@ -270,6 +335,8 @@ fn scan_depth(value: &Path) -> Option<usize> {
 /// Depth-first traversal carrying ordered-rule matches inherited from parents.
 struct Walker<'a, F> {
   patterns: &'a [InputPattern],
+  /// Half-open pattern ranges that preserve each producer's ordered rules.
+  groups: &'a [(usize, usize)],
   cancel: &'a CancellationToken,
   allow: &'a mut F,
   paths: &'a mut BTreeSet<PathBuf>,
@@ -311,14 +378,15 @@ where
             .map(|current| current || *inherited)
         })
         .collect::<CacheResult<Arc<[bool]>>>()?;
-      let selected = self
-        .patterns
-        .iter()
-        .zip(matches.iter())
-        .filter(|(_, matched)| **matched)
-        .map(|(pattern, _)| !pattern.excluded)
-        .next_back()
-        .unwrap_or(false);
+      let selected = self.groups.iter().any(|(start, end)| {
+        self.patterns[*start..*end]
+          .iter()
+          .zip(matches[*start..*end].iter())
+          .filter(|(_, matched)| **matched)
+          .map(|(pattern, _)| !pattern.excluded)
+          .next_back()
+          .unwrap_or(false)
+      });
       // The last matching rule wins, while a directory match remains active
       // for descendants through the shared `matches` slice.
       if selected {
@@ -500,13 +568,24 @@ fn read_ignore_file(path: &Path) -> CacheResult<Option<String>> {
 }
 
 fn normalize(path: &Path) -> CacheResult<String> {
-  path
-    .to_str()
-    .map(|value| value.replace('\\', "/"))
-    .ok_or_else(|| CacheError::Path {
-      path: path.to_path_buf(),
-      reason: "portable cache paths must be UTF-8".to_owned(),
-    })
+  let value = path.to_str().ok_or_else(|| CacheError::Path {
+    path: path.to_path_buf(),
+    reason: "portable cache paths must be UTF-8".to_owned(),
+  })?;
+  #[cfg(windows)]
+  {
+    Ok(value.replace('\\', "/"))
+  }
+  #[cfg(not(windows))]
+  {
+    if value.contains('\\') {
+      return Err(CacheError::Path {
+        path: path.to_path_buf(),
+        reason: "portable cache paths must not contain backslashes".to_owned(),
+      });
+    }
+    Ok(value.to_owned())
+  }
 }
 
 #[cfg(test)]
@@ -564,6 +643,11 @@ mod tests {
     let cancel = CancellationToken::new();
 
     assert!(matches!(
+      collect(&["first".to_owned()], root.path(), 0, &cancel),
+      Err(CacheError::Configuration(message)) if message.contains("max_entries")
+    ));
+
+    assert!(matches!(
       collect(&["first".to_owned(), "second".to_owned()], root.path(), 1, &cancel,),
       Err(CacheError::Limit(_))
     ));
@@ -575,6 +659,17 @@ mod tests {
       collect(&["wide/**".to_owned()], root.path(), 2, &cancel),
       Err(CacheError::Limit(_))
     ));
+  }
+
+  #[test]
+  fn overlapping_contract_groups_share_one_filesystem_traversal() {
+    let root = TempDir::new().unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/input"), "data").unwrap();
+    let groups = vec![vec!["src/**".to_owned()], vec!["src/input".to_owned()]];
+
+    let paths = collect_sets(&groups, root.path(), 2, &CancellationToken::new()).unwrap();
+    assert_eq!(paths, [dunce::canonicalize(root.path()).unwrap().join("src/input")]);
   }
 
   #[test]
@@ -639,6 +734,16 @@ mod tests {
   }
 
   #[test]
+  fn validation_keeps_independent_input_contracts_separate() {
+    let root = TempDir::new().unwrap();
+    let output = RelativePath::new("generated").unwrap();
+    let groups = vec![vec!["!generated/**".to_owned()], vec!["generated/schema".to_owned()]];
+
+    let error = validate_contract_groups(&groups, root.path(), &[output]).unwrap_err();
+    assert!(error.to_string().contains("overlaps"));
+  }
+
+  #[test]
   fn rejects_non_directory_roots_and_paths_outside_the_filter() {
     let root = TempDir::new().unwrap();
     let file = root.path().join("file");
@@ -680,6 +785,18 @@ mod tests {
     assert!(matches!(
       validate_contract(&vec!["file".to_owned(); MAX_CACHE_LIST_ITEMS + 1], root.path(), &[]),
       Err(CacheError::Configuration(_))
+    ));
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn discovery_rejects_a_literal_backslash_filename() {
+    let root = TempDir::new().unwrap();
+    fs::write(root.path().join(r"a\b"), "distinct Unix file").unwrap();
+
+    assert!(matches!(
+      collect(&["**".to_owned()], root.path(), usize::MAX, &CancellationToken::new()),
+      Err(CacheError::Path { .. })
     ));
   }
 

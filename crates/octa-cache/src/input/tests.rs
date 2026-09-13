@@ -90,6 +90,31 @@ async fn preserves_ordered_patterns_and_nested_ignore_semantics() {
 }
 
 #[tokio::test]
+async fn independent_contracts_cannot_exclude_each_others_required_inputs() {
+  let root = TempDir::new().unwrap();
+  fs::create_dir_all(root.path().join("src/generated")).unwrap();
+  fs::write(root.path().join("src/main.rs"), "main").unwrap();
+  fs::write(root.path().join("src/generated/schema.rs"), "schema").unwrap();
+  let pattern_sets = vec![
+    patterns(&["src/**", "!src/generated/**"]),
+    patterns(&["src/generated/schema.rs"]),
+  ];
+
+  let snapshot = InputSnapshotter::default()
+    .snapshot_pattern_sets(root.path(), &pattern_sets, &CancellationToken::new())
+    .await
+    .unwrap();
+  let paths = snapshot
+    .entries
+    .iter()
+    .map(|entry| entry.path().as_str())
+    .collect::<Vec<_>>();
+
+  assert!(paths.contains(&"src/main.rs"));
+  assert!(paths.contains(&"src/generated/schema.rs"));
+}
+
+#[tokio::test]
 async fn content_path_mode_and_link_target_affect_the_root() {
   let root = TempDir::new().unwrap();
   fs::create_dir(root.path().join("src")).unwrap();
