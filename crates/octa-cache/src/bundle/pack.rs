@@ -640,7 +640,7 @@ mod tests {
   }
 
   #[test]
-  fn stable_tree_validation_rejects_directory_mutation() {
+  fn stable_tree_validation_rejects_directory_replacement() {
     let root = TempDir::new().unwrap();
     let output = root.path().join("out");
     fs::create_dir(&output).unwrap();
@@ -653,7 +653,12 @@ mod tests {
       kind: OutputKind::Directory,
     };
 
-    fs::write(output.join("second"), "second").unwrap();
+    // Adding a child is not required to update directory metadata on every
+    // Windows filesystem. Directory listings are therefore checked
+    // separately by `visit_output_tree`; this lower-level check is responsible
+    // for detecting replacement of the entry itself.
+    fs::rename(&output, root.path().join("replaced")).unwrap();
+    fs::create_dir(&output).unwrap();
     assert!(matches!(
       validate_stable_entry(&entry),
       Err(CacheError::UnstableFile { .. })
