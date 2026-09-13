@@ -441,7 +441,14 @@ impl PluginManager {
 
   fn resolve_plugin_command(plugin_path: &Path) -> (PathBuf, Vec<OsString>) {
     if plugin_path.extension().and_then(|extension| extension.to_str()) == Some("py") {
-      (PathBuf::from("python3"), vec![plugin_path.as_os_str().to_owned()])
+      // `python3.exe` may resolve to the Microsoft Store execution alias on
+      // Windows. Spawning that alias succeeds but never creates the plugin's
+      // named pipe, which obscures the real problem as a connection timeout.
+      #[cfg(windows)]
+      let interpreter = "python";
+      #[cfg(not(windows))]
+      let interpreter = "python3";
+      (PathBuf::from(interpreter), vec![plugin_path.as_os_str().to_owned()])
     } else {
       (plugin_path.to_owned(), Vec::new())
     }
@@ -1055,6 +1062,9 @@ mod tests {
   fn resolves_script_interpreters_before_launch() {
     let python = PathBuf::from("plugin.py");
     let (executable, arguments) = PluginManager::resolve_plugin_command(&python);
+    #[cfg(windows)]
+    assert_eq!(executable, PathBuf::from("python"));
+    #[cfg(not(windows))]
     assert_eq!(executable, PathBuf::from("python3"));
     assert_eq!(arguments, [python.into_os_string()]);
 
