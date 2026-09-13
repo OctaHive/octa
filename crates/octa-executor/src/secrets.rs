@@ -356,11 +356,15 @@ impl SecretSession {
     if !status.success() {
       return Err(provider_error(alias, "command returned a non-zero status"));
     }
-    send_result.map_err(|error| provider_error(alias, format!("failed to send request: {error}")))?;
     if bytes.len() > MAX_SECRET_BYTES {
       return Err(provider_error(alias, "value exceeds the 1 MiB limit"));
     }
     let value = String::from_utf8(bytes).map_err(|_| provider_error(alias, "command output is not UTF-8"))?;
+    // A helper can close stdin while the host is writing and still emit an
+    // invalid response. Report its status and bounded response violation
+    // deterministically; a successful valid response still requires the full
+    // request to have been delivered.
+    send_result.map_err(|error| provider_error(alias, format!("failed to send request: {error}")))?;
     select_field(
       alias,
       &reference.key,
@@ -1056,11 +1060,20 @@ providers:
   #[cfg(unix)]
   #[tokio::test]
   async fn exec_provider_reports_process_failures_and_enforces_limits() {
-    for (script, timeout_seconds, expected) in [
-      ("exit 7", 2, "non-zero"),
-      ("printf '\\377'", 2, "not UTF-8"),
-      ("head -c 1048577 /dev/zero", 2, "1 MiB limit"),
-      ("sleep 2", 1, "timed out"),
+    // Filling the request pipe makes the closed-stdin race deterministic,
+    // including under the different scheduling introduced by llvm-cov.
+    let pipe_filling_key = "x".repeat(128 * 1024);
+    for (script, timeout_seconds, expected, key) in [
+      ("exit 7", 2, "non-zero", "token"),
+      ("cat >/dev/null; printf '\\377'", 2, "not UTF-8", "token"),
+      ("cat >/dev/null; head -c 1048577 /dev/zero", 2, "1 MiB limit", "token"),
+      ("sleep 2", 1, "timed out", "token"),
+      (
+        "exec 0<&-; sleep 0.05; printf '\\377'",
+        2,
+        "not UTF-8",
+        pipe_filling_key.as_str(),
+      ),
     ] {
       let session = SecretSession::new(SecretProfile {
         version: 1,
@@ -1078,7 +1091,7 @@ providers:
         .resolve(
           &SecretRef {
             provider: "helper".to_owned(),
-            key: "token".to_owned(),
+            key: key.to_owned(),
             field: None,
           },
           &CancellationToken::new(),
