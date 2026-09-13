@@ -171,12 +171,17 @@ fn rejects_patterns_outside_the_monorepo_root() {
     resolve(&root, workspace.path(), false, &state),
     Err(MonorepoError::InvalidPattern { .. })
   ));
+  assert!(!state.exists(), "invalid patterns must be rejected before cache access");
 
+  // Hold the database lock to make the original CI race deterministic: the
+  // next malformed pattern must still win over an unavailable cache.
+  let cache = sled::open(&state).unwrap();
   fs::write(&root, "version: 1\nmonorepo:\n  roots: ['packages/[']\n").unwrap();
   assert!(matches!(
     resolve(&root, workspace.path(), false, &state),
     Err(MonorepoError::InvalidPattern { .. })
   ));
+  drop(cache);
 }
 
 #[test]

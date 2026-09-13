@@ -11,37 +11,69 @@ use crate::{model::DiscoveryResult, MonorepoError, MonorepoProject};
 
 const ALWAYS_EXCLUDED_DIRECTORIES: [&str; 2] = [".git", ".octa"];
 
+/// Validated and compiled patterns for one monorepo discovery pass.
+///
+/// Preparing this value is deliberately separate from filesystem discovery so
+/// callers can reject invalid configuration before opening persistent state.
+pub(crate) struct DiscoveryPlan {
+  excludes: Excludes,
+  roots: Vec<RootPattern>,
+}
+
+struct RootPattern {
+  matcher: GlobMatcher,
+  search_prefix: PathBuf,
+  depth: usize,
+}
+
 #[derive(Clone)]
 struct Excludes {
   names: HashSet<String>,
   patterns: Vec<GlobMatcher>,
 }
 
+/// Validates and compiles every configured pattern without touching the cache
+/// or walking the workspace.
+pub(crate) fn prepare(config: &MonorepoConfig) -> Result<DiscoveryPlan, MonorepoError> {
+  let excludes = Excludes::new(&config.exclude)?;
+  let roots = config
+    .roots
+    .iter()
+    .map(|pattern| {
+      let normalized = normalize_pattern(pattern)?;
+      let matcher = compile_pattern(&normalized)?;
+      let (search_prefix, depth) = pattern_walk(&normalized, config.max_depth);
+      Ok(RootPattern {
+        matcher,
+        search_prefix,
+        depth,
+      })
+    })
+    .collect::<Result<Vec<_>, MonorepoError>>()?;
+  Ok(DiscoveryPlan { excludes, roots })
+}
+
 pub(crate) fn discover(
   root: &Path,
   root_octafile: &Path,
-  config: &MonorepoConfig,
+  plan: &DiscoveryPlan,
 ) -> Result<DiscoveryResult, MonorepoError> {
-  let excludes = Excludes::new(&config.exclude)?;
   let mut directories = BTreeMap::new();
   let mut projects = BTreeMap::new();
   record_nearest_directory(root, root, &mut directories);
 
-  for pattern in &config.roots {
-    let normalized = normalize_pattern(pattern)?;
-    let matcher = compile_pattern(&normalized)?;
-    let (prefix, depth) = pattern_walk(&normalized, config.max_depth);
-    let search_root = root.join(prefix);
+  for root_pattern in &plan.roots {
+    let search_root = root.join(&root_pattern.search_prefix);
     if !search_root.is_dir() {
       record_nearest_directory(root, &search_root, &mut directories);
       continue;
     }
 
     let filter_root = root.to_path_buf();
-    let filter_excludes = excludes.clone();
+    let filter_excludes = plan.excludes.clone();
     let mut builder = WalkBuilder::new(&search_root);
     builder
-      .max_depth(Some(depth))
+      .max_depth(Some(root_pattern.depth))
       .follow_links(false)
       .hidden(false)
       .git_ignore(false)
@@ -64,12 +96,12 @@ pub(crate) fn discover(
         .path()
         .strip_prefix(root)
         .expect("walked paths stay below the monorepo root");
-      if excludes.matches(relative) {
+      if plan.excludes.matches(relative) {
         continue;
       }
       record_directory(root, entry.path(), &mut directories);
 
-      if !matcher.is_match(path_text(relative)) {
+      if !root_pattern.matcher.is_match(path_text(relative)) {
         continue;
       }
       let Some(octafile) = Octafile::find_in_directory(entry.path()) else {

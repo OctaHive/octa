@@ -36,13 +36,17 @@ pub fn resolve(
     return Ok(standalone(entry_octafile));
   };
   config.validate().map_err(MonorepoError::InvalidConfiguration)?;
+  // Pattern errors are configuration errors, so resolve them before opening
+  // sled. Besides avoiding needless state, this keeps a previous failed
+  // resolution from racing the next caller for the database file lock.
+  let discovery_plan = discovery::prepare(&config)?;
 
   let root_dir = root_octafile.parent().expect("a canonical Octafile has a parent");
   let cache = cache::open(state_directory)?;
   let (projects, cache_hit) = match cache::load(&cache, &root_octafile, root_dir, &config)? {
     Some(projects) => (projects, true),
     None => {
-      let result = discovery::discover(root_dir, &root_octafile, &config)?;
+      let result = discovery::discover(root_dir, &root_octafile, &discovery_plan)?;
       cache::store(&cache, &root_octafile, root_dir, &config, &result)?;
       (result.projects, false)
     },
