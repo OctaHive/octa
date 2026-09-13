@@ -65,6 +65,24 @@ struct RestoreCallbacks<V, O> {
   durable_stage: O,
 }
 
+/// Named durable transition used by crash-boundary tests.
+///
+/// Keeping this typed prevents tests from silently drifting away from the
+/// state machine when a transition is renamed or added.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestoreStage {
+  RestoreIntentRecorded,
+  JournalPrepared,
+  OriginalBackedUp,
+  StagedOutputInstalled,
+  InstalledOutputReverted,
+  OriginalRestored,
+  NewOutputReverted,
+  CreatedParentRemoved,
+  RollbackMarked,
+  TransactionCommitted,
+}
+
 impl RestoreManager {
   /// Opens restore state below an initialized versioned local-cache directory.
   pub fn open(cache_layout_root: impl Into<PathBuf>, limits: BundleLimits) -> CacheResult<Self> {
@@ -165,7 +183,7 @@ impl RestoreManager {
     workspace: &Path,
     output_roots: &[RelativePath],
     cancel: &CancellationToken,
-    durable_stage: impl FnMut(&'static str),
+    durable_stage: impl FnMut(RestoreStage),
   ) -> CacheResult<RestoreOutcome> {
     let _active_restore = self.lock_recovery(false)?;
     self.restore_with_callbacks(
@@ -188,7 +206,7 @@ impl RestoreManager {
     workspace: &Path,
     output_roots: &[RelativePath],
     cancel: &CancellationToken,
-    callbacks: RestoreCallbacks<impl Fn(&Path) -> CacheResult<()>, impl FnMut(&'static str)>,
+    callbacks: RestoreCallbacks<impl Fn(&Path) -> CacheResult<()>, impl FnMut(RestoreStage)>,
   ) -> CacheResult<RestoreOutcome> {
     let RestoreCallbacks {
       validate,
@@ -216,7 +234,7 @@ impl RestoreManager {
     let journal = RestoreJournal::new(id, workspace.clone(), transaction.clone(), entries, created_parents);
     let journal_path = self.journal_root().join(format!("{}.json", journal.id));
     write_journal(&journal_path, &journal)?;
-    durable_stage("restore_intent_recorded");
+    durable_stage(RestoreStage::RestoreIntentRecorded);
 
     let staging = transaction.join("staging");
     let backup = transaction.join("backup");
@@ -240,7 +258,7 @@ impl RestoreManager {
       remove_transaction_state(&journal_path, &transaction)?;
       return Err(error);
     }
-    durable_stage("journal_prepared");
+    durable_stage(RestoreStage::JournalPrepared);
 
     let mutation = (|| -> CacheResult<()> {
       create_live_parents(&workspace, &journal.created_parents)?;
@@ -253,20 +271,20 @@ impl RestoreManager {
           create_parent(&saved)?;
           fs::rename(&live, &saved).map_err(|error| io_error("move live output to restore backup", &live, error))?;
           sync_rename_parents(&live, &saved)?;
-          durable_stage("original_backed_up");
+          durable_stage(RestoreStage::OriginalBackedUp);
         }
         create_parent(&live)?;
         fs::rename(&staged, &live).map_err(|error| io_error("install staged cache output", &live, error))?;
         sync_rename_parents(&staged, &live)?;
-        durable_stage("staged_output_installed");
+        durable_stage(RestoreStage::StagedOutputInstalled);
       }
       write_commit_marker(&journal_path)?;
-      durable_stage("transaction_committed");
+      durable_stage(RestoreStage::TransactionCommitted);
       Ok(())
     })();
 
     if let Err(error) = mutation {
-      self.rollback(&journal_path, &journal)?;
+      self.rollback_with_observer(&journal_path, &journal, &mut durable_stage)?;
       return Err(error);
     }
     self.cleanup_committed(&journal_path, &journal)?;
@@ -298,6 +316,15 @@ impl RestoreManager {
   }
 
   fn rollback(&self, journal_path: &Path, journal: &RestoreJournal) -> CacheResult<()> {
+    self.rollback_with_observer(journal_path, journal, &mut |_| {})
+  }
+
+  fn rollback_with_observer(
+    &self,
+    journal_path: &Path,
+    journal: &RestoreJournal,
+    durable_stage: &mut impl FnMut(RestoreStage),
+  ) -> CacheResult<()> {
     let staging = journal.transaction.join("staging");
     let backup = journal.transaction.join("backup");
     for entry in journal.roots.iter().rev() {
@@ -320,10 +347,12 @@ impl RestoreManager {
             fs::rename(&live, &staged)
               .map_err(|error| io_error("return installed output to restore staging", &live, error))?;
             sync_rename_parents(&live, &staged)?;
+            durable_stage(RestoreStage::InstalledOutputReverted);
           }
           create_parent(&live)?;
           fs::rename(&saved, &live).map_err(|error| io_error("restore backed-up output", &saved, error))?;
           sync_rename_parents(&saved, &live)?;
+          durable_stage(RestoreStage::OriginalRestored);
         } else if !path_exists(&staged)? {
           return Err(CacheError::Metadata(format!(
             "restore transaction '{}' lost both staged and backup state for '{}'",
@@ -340,6 +369,7 @@ impl RestoreManager {
         create_parent(&staged)?;
         fs::rename(&live, &staged).map_err(|error| io_error("return new output to restore staging", &live, error))?;
         sync_rename_parents(&live, &staged)?;
+        durable_stage(RestoreStage::NewOutputReverted);
       } else if path_exists(&live)? {
         return Err(CacheError::Metadata(format!(
           "restore transaction '{}' found an unexpected live output '{}'",
@@ -350,12 +380,16 @@ impl RestoreManager {
     for parent in journal.created_parents.iter().rev() {
       let path = join_relative(&journal.workspace, parent);
       match fs::remove_dir(&path) {
-        Ok(()) => sync_parent(&path)?,
+        Ok(()) => {
+          sync_parent(&path)?;
+          durable_stage(RestoreStage::CreatedParentRemoved);
+        },
         Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty) => {},
         Err(error) => return Err(io_error("remove restore-created parent", path, error)),
       }
     }
     write_rolled_back_marker(journal_path)?;
+    durable_stage(RestoreStage::RollbackMarked);
     remove_transaction_state(journal_path, &journal.transaction)
   }
 

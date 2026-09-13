@@ -46,6 +46,30 @@ const DEFAULT_MAX_BLOB_COMPRESSION_RATIO: u64 = 1_000;
 const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 const DEFAULT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
+/// Durable boundaries at which an abrupt process exit has a defined outcome.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationStage {
+  TemporaryCreated,
+  BodyWritten,
+  TemporarySynced,
+  ContentVerified,
+  DestinationRenamed,
+  ParentSynced,
+}
+
+#[cfg(test)]
+macro_rules! publication_checkpoint {
+  ($stage:ident) => {
+    test_publication_checkpoint(PublicationStage::$stage)
+  };
+}
+
+#[cfg(not(test))]
+macro_rules! publication_checkpoint {
+  ($stage:ident) => {};
+}
+
 /// Capacity and maintenance policy for one local cache directory.
 #[derive(Clone, Debug)]
 pub struct LocalCacheConfig {
@@ -359,8 +383,10 @@ impl LocalCacheStore {
       .open(&temporary)
       .await
       .map_err(|error| io_error("create temporary cache metadata", &temporary, error))?;
+    publication_checkpoint!(TemporaryCreated);
     if let Err(error) = async {
       file.write_all(bytes).await?;
+      publication_checkpoint!(BodyWritten);
       file.sync_all().await
     }
     .await
@@ -368,6 +394,7 @@ impl LocalCacheStore {
       let _ = tokio::fs::remove_file(&temporary).await;
       return Err(io_error("write temporary cache metadata", &temporary, error));
     }
+    publication_checkpoint!(TemporarySynced);
     let outcome = match self.publish_temporary(&temporary, destination).await {
       Ok(outcome) => outcome,
       Err(error) => {
@@ -410,7 +437,9 @@ impl LocalCacheStore {
     tokio::fs::rename(temporary, destination)
       .await
       .map_err(|error| io_error("publish immutable cache object", destination, error))?;
+    publication_checkpoint!(DestinationRenamed);
     sync_directory(parent)?;
+    publication_checkpoint!(ParentSynced);
     Ok(WriteOutcome::Written)
   }
 
@@ -474,6 +503,7 @@ impl LocalCacheStore {
       .open(&temporary)
       .await
       .map_err(|error| io_error("create temporary cache blob", &temporary, error))?;
+    publication_checkpoint!(TemporaryCreated);
     // Read one byte beyond the declared size so both truncation and surplus
     // producer data are rejected before the object becomes visible.
     let copied = match tokio::io::copy(
@@ -497,16 +527,19 @@ impl LocalCacheStore {
         blob.encoded_size_bytes
       )));
     }
+    publication_checkpoint!(BodyWritten);
     if let Err(error) = file.sync_all().await {
       drop(file);
       let _ = tokio::fs::remove_file(&temporary).await;
       return Err(io_error("synchronize temporary cache blob", &temporary, error));
     }
     drop(file);
+    publication_checkpoint!(TemporarySynced);
     if let Err(error) = verify_blob_file(temporary.clone(), blob.clone(), self.config.max_expanded_blob_bytes).await {
       let _ = tokio::fs::remove_file(&temporary).await;
       return Err(error);
     }
+    publication_checkpoint!(ContentVerified);
     let outcome = match self.publish_temporary(&temporary, &destination).await {
       Ok(outcome) => outcome,
       Err(error) => {
@@ -828,6 +861,15 @@ impl CacheStore for LocalCacheStore {
     Ok(Box::pin(LockedBlobReader::new(file, gc_lock)))
   }
 
+  async fn recover_corrupt_blob(&self, blob: &BlobDescriptor) -> CacheResult<Option<BlobReader>> {
+    // Revalidate after the failed reader is dropped: another process may have
+    // repaired this immutable path before we acquired its object lock.
+    if self.existing_blob_is_valid(blob).await? {
+      return Ok(Some(self.read_blob(blob).await?));
+    }
+    Ok(None)
+  }
+
   async fn write_blob_if_absent(&self, blob: &BlobDescriptor, body: BlobReader) -> CacheResult<WriteOutcome> {
     blob.validate()?;
     self.validate_blob_resources(blob)?;
@@ -870,6 +912,37 @@ fn validate_action_digest(action: &Digest) -> CacheResult<()> {
 fn namespace_directory(namespace: &str) -> CacheResult<String> {
   validate_namespace(namespace)?;
   Ok(blake3::hash(namespace.as_bytes()).to_hex().to_string())
+}
+
+#[cfg(test)]
+const TEST_PUBLICATION_CRASH_EXIT_CODE: i32 = 86;
+#[cfg(test)]
+const TEST_PUBLICATION_CRASH_STAGE_ENV: &str = "OCTA_CACHE_TEST_CRASH_AFTER_PUBLICATION_STAGE";
+
+#[cfg(test)]
+impl PublicationStage {
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::TemporaryCreated => "temporary-created",
+      Self::BodyWritten => "body-written",
+      Self::TemporarySynced => "temporary-synced",
+      Self::ContentVerified => "content-verified",
+      Self::DestinationRenamed => "destination-renamed",
+      Self::ParentSynced => "parent-synced",
+    }
+  }
+}
+
+/// Test binaries terminate child processes at named durable boundaries to
+/// prove that reopening a cache never exposes a partial object. `exit` avoids
+/// Rust unwinding and destructor cleanup while still flushing coverage data.
+/// Production builds compile this hook to a no-op and do not read process
+/// environment during publication.
+#[cfg(test)]
+fn test_publication_checkpoint(stage: PublicationStage) {
+  if std::env::var(TEST_PUBLICATION_CRASH_STAGE_ENV).is_ok_and(|selected| selected == stage.as_str()) {
+    std::process::exit(TEST_PUBLICATION_CRASH_EXIT_CODE);
+  }
 }
 
 #[cfg(test)]

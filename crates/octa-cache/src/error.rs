@@ -45,7 +45,14 @@ pub enum CacheError {
   /// An operation exceeded a configured resource or size bound.
   #[error("cache limit exceeded: {0}")]
   Limit(String),
-  /// Reading or writing the caller-provided bundle stream failed.
+  /// Reading the untrusted encoded or canonical bundle source failed.
+  ///
+  /// This provenance is intentionally distinct from destination I/O: a
+  /// layered cache may retry this error from an independent tier, while a
+  /// staging or workspace failure cannot be repaired by downloading again.
+  #[error("cache bundle source failed: {0}")]
+  BundleSource(#[source] io::Error),
+  /// Writing the caller-provided bundle sink failed while packing or extracting.
   #[error("cache bundle stream failed: {0}")]
   Stream(#[from] io::Error),
   /// Creating, reopening, or synchronizing private staging storage failed.

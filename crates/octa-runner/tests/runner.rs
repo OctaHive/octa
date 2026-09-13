@@ -91,7 +91,7 @@ fn request(workspace: &TempDir, command: &str) -> String {
   )
 }
 
-fn cached_request(workspace: &TempDir, cache_directory: &std::path::Path, command: &str) -> String {
+fn native_runtime_identity() -> RuntimeIdentity {
   let os = match env::consts::OS {
     "linux" => PlatformOs::Linux,
     "windows" => PlatformOs::Windows,
@@ -103,16 +103,19 @@ fn cached_request(workspace: &TempDir, cache_directory: &std::path::Path, comman
     "aarch64" => PlatformArchitecture::Arm64,
     value => panic!("unsupported test architecture {value}"),
   };
-  let runtime = RuntimeIdentity::Native {
+  RuntimeIdentity::Native {
     os,
     architecture,
     environment: Digest::blake3(b"cli-runner-shared-test-environment"),
-  };
+  }
+}
+
+fn cached_request(workspace: &TempDir, cache_directory: &std::path::Path, command: &str) -> String {
   format!(
     "{}\n",
     json!({
       "type": "start",
-      "protocol_version": 2,
+      "protocol_version": RUNNER_PROTOCOL_VERSION,
       "request_id": "cached-run",
       "request": {
         "workspace": workspace.path(),
@@ -123,7 +126,7 @@ fn cached_request(workspace: &TempDir, cache_directory: &std::path::Path, comman
           "mode": "read_write",
           "namespace": "tests/runner",
           "local_directory": cache_directory,
-          "runtime": runtime
+          "runtime": native_runtime_identity()
         }
       }
     })
@@ -554,11 +557,15 @@ vars:
       key: token
 tasks:
   show:
-    shell: printf '%s' "{{ TOKEN }}" > observed.txt && echo "{{ TOKEN }}"
+    files:
+      inputs: []
+    cache: {}
+    shell: printf '%s' "{{ TOKEN }}" > observed.txt && echo run >> runs.txt && echo "{{ TOKEN }}"
 "#,
   )
   .unwrap();
   for (environment, value) in [("local", "local-secret-value"), ("agent", "agent-secret-value")] {
+    let cache = workspace.path().join(format!("result-cache-{environment}"));
     let input = format!(
       "{}\n",
       json!({
@@ -570,23 +577,68 @@ tasks:
           "data_dir": workspace.path().join(format!("cache-{environment}")),
           "plugins_dir": plugins_dir(),
           "secrets_profile": format!("secrets-{environment}.yml"),
-          "commands": ["show"]
+          "commands": ["show"],
+          "cache": {
+            "mode": "read_write",
+            "namespace": format!("tests/secret-{environment}"),
+            "local_directory": &cache,
+            "runtime": native_runtime_identity()
+          }
         }
       })
     );
 
-    let mut command = Command::cargo_bin("octa-runner").unwrap();
-    let output = command.write_stdin(input).output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    let encoded = String::from_utf8(output.stdout).unwrap();
-    assert!(!encoded.contains(value), "runner leaked a secret: {encoded}");
+    for _ in 0..2 {
+      let mut command = Command::cargo_bin("octa-runner").unwrap();
+      let output = command.write_stdin(input.clone()).output().unwrap();
+      assert!(
+        output.status.success(),
+        "stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+      );
+      let encoded = String::from_utf8(output.stdout).unwrap();
+      assert!(!encoded.contains(value), "runner leaked a secret: {encoded}");
+      assert!(!String::from_utf8_lossy(&output.stderr).contains(value));
+      let messages = messages(encoded.as_bytes());
+      assert_valid_output(&messages);
+      assert_eq!(messages.last().unwrap()["results"][0]["stdout"], json!(["*****"]));
+      let cache = messages.last().unwrap()["results"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|task| task.get("cache"))
+        .unwrap();
+      assert_eq!(cache["status"], "bypassed");
+      assert_eq!(cache["reason"], "secret_variables");
+    }
     assert_eq!(
       fs::read_to_string(workspace.path().join("observed.txt")).unwrap(),
       value
     );
-    let messages = messages(encoded.as_bytes());
-    assert_valid_output(&messages);
-    assert_eq!(messages.last().unwrap()["results"][0]["stdout"], json!(["*****"]));
+    assert_eq!(
+      fs::read_to_string(workspace.path().join("runs.txt")).unwrap(),
+      "run\nrun\n"
+    );
+    let mut pending = vec![cache];
+    while let Some(path) = pending.pop() {
+      for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+          pending.push(entry.path());
+        } else if entry.file_type().unwrap().is_file() {
+          assert!(
+            !fs::read(entry.path())
+              .unwrap()
+              .windows(value.len())
+              .any(|bytes| bytes == value.as_bytes()),
+            "cache persisted a secret in '{}'",
+            entry.path().display()
+          );
+        }
+      }
+    }
+    fs::remove_file(workspace.path().join("runs.txt")).unwrap();
   }
 }
 

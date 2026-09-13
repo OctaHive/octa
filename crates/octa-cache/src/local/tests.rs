@@ -18,6 +18,22 @@ use super::*;
 use crate::{BundleLimits, RestoreManager};
 
 const CHILD_ROOT: &str = "OCTA_CACHE_PROCESS_WRITER_ROOT";
+const CHILD_OPERATION: &str = "OCTA_CACHE_PROCESS_WRITER_OPERATION";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationFixture {
+  Action,
+  Blob,
+}
+
+impl PublicationFixture {
+  const fn as_str(self) -> &'static str {
+    match self {
+      Self::Action => "action",
+      Self::Blob => "blob",
+    }
+  }
+}
 
 fn process_blob_bytes() -> Vec<u8> {
   (0..1024 * 1024).map(|index| (index % 251) as u8).collect()
@@ -802,6 +818,33 @@ async fn replaces_a_corrupt_resident_blob_with_the_verified_publication() {
   assert_eq!(actual, expected);
 }
 
+#[tokio::test]
+async fn recovery_revalidates_a_concurrently_repaired_blob_and_quarantines_corruption() {
+  let root = tempfile::tempdir().unwrap();
+  let store = LocalCacheStore::open(LocalCacheConfig::new(root.path())).unwrap();
+  let expected = b"complete";
+  let descriptor = blob(expected);
+  store.write_blob_if_absent(&descriptor, reader(expected)).await.unwrap();
+
+  let mut recovered = store.recover_corrupt_blob(&descriptor).await.unwrap().unwrap();
+  let mut actual = Vec::new();
+  recovered.read_to_end(&mut actual).await.unwrap();
+  assert_eq!(actual, expected);
+  drop(recovered);
+
+  // Keep the encoded size unchanged so only full digest validation can detect
+  // the damage; metadata-only reads intentionally stay on the hot path.
+  fs::write(store.blob_path(&descriptor), b"damaged!").unwrap();
+  assert!(store.recover_corrupt_blob(&descriptor).await.unwrap().is_none());
+  assert_eq!(
+    store
+      .find_missing_blobs(std::slice::from_ref(&descriptor))
+      .await
+      .unwrap(),
+    std::slice::from_ref(&descriptor)
+  );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writers_publish_one_complete_blob() {
   let root = tempfile::tempdir().unwrap();
@@ -842,9 +885,79 @@ fn process_writer_child() {
     .unwrap();
   runtime.block_on(async {
     let store = LocalCacheStore::open(LocalCacheConfig::new(root)).unwrap();
-    let bytes = process_blob_bytes();
-    store.write_blob_if_absent(&blob(&bytes), reader(&bytes)).await.unwrap();
+    match std::env::var(CHILD_OPERATION).as_deref() {
+      Ok("action") => {
+        store
+          .write_action_if_absent("crash-test", &result(action(9), None, "complete"))
+          .await
+          .unwrap();
+      },
+      _ => {
+        let bytes = process_blob_bytes();
+        store.write_blob_if_absent(&blob(&bytes), reader(&bytes)).await.unwrap();
+      },
+    }
   });
+}
+
+#[tokio::test]
+async fn every_local_publication_stage_reopens_as_absent_or_complete() {
+  let executable = std::env::current_exe().unwrap();
+  let cases = [
+    (PublicationFixture::Blob, PublicationStage::TemporaryCreated, false),
+    (PublicationFixture::Blob, PublicationStage::BodyWritten, false),
+    (PublicationFixture::Blob, PublicationStage::TemporarySynced, false),
+    (PublicationFixture::Blob, PublicationStage::ContentVerified, false),
+    (PublicationFixture::Blob, PublicationStage::DestinationRenamed, true),
+    (PublicationFixture::Blob, PublicationStage::ParentSynced, true),
+    (PublicationFixture::Action, PublicationStage::TemporaryCreated, false),
+    (PublicationFixture::Action, PublicationStage::BodyWritten, false),
+    (PublicationFixture::Action, PublicationStage::TemporarySynced, false),
+    (PublicationFixture::Action, PublicationStage::DestinationRenamed, true),
+    (PublicationFixture::Action, PublicationStage::ParentSynced, true),
+  ];
+
+  for (operation, stage, visible) in cases {
+    let operation_name = operation.as_str();
+    let stage_name = stage.as_str();
+    let root = tempfile::tempdir().unwrap();
+    let status = Command::new(&executable)
+      .args(["--exact", "local::tests::process_writer_child"])
+      .env(CHILD_ROOT, root.path())
+      .env(CHILD_OPERATION, operation_name)
+      .env(TEST_PUBLICATION_CRASH_STAGE_ENV, stage_name)
+      .status()
+      .unwrap();
+    assert_eq!(
+      status.code(),
+      Some(TEST_PUBLICATION_CRASH_EXIT_CODE),
+      "fixture did not terminate at {operation_name}.{stage_name}"
+    );
+
+    let store = LocalCacheStore::open(LocalCacheConfig::new(root.path())).unwrap();
+    if operation == PublicationFixture::Blob {
+      let bytes = process_blob_bytes();
+      let descriptor = blob(&bytes);
+      if visible {
+        let mut reader = store.read_blob(&descriptor).await.unwrap();
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(actual, bytes, "partial blob survived {operation_name}.{stage_name}");
+      } else {
+        assert_eq!(store.find_missing_blobs(&[descriptor]).await.unwrap().len(), 1);
+      }
+    } else {
+      let lookup = store.get_action("crash-test", &action(9)).await.unwrap();
+      assert_eq!(
+        lookup.is_some(),
+        visible,
+        "unexpected action state after {operation_name}.{stage_name}"
+      );
+      if let Some(lookup) = lookup {
+        assert_eq!(lookup.result, result(action(9), None, "complete"));
+      }
+    }
+  }
 }
 
 #[tokio::test]

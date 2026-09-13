@@ -41,6 +41,16 @@ pub(crate) async fn finalize(
   if !cache.access.can_write() {
     return Ok(completed_result(&captured, outcome));
   }
+  // A future plugin may produce a secret output even when the static planner
+  // could not declare it in advance. Preserve the successful task result, but
+  // never let its stdout, structured outputs, or filesystem bundle cross the
+  // persistent cache boundary.
+  if !captured.outputs.task().secret_names().is_empty() {
+    return Ok(completed_result(
+      &captured,
+      CacheOutcome::bypassed(CacheReason::SecretOutputs),
+    ));
+  }
   let Some(PublicationIdentity { action, input_root }) = publication else {
     return Ok(completed_result(&captured, outcome));
   };

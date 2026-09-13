@@ -16,11 +16,12 @@ use axum::{
   response::{IntoResponse, Response},
   Router,
 };
+use futures::StreamExt as _;
 use octa_cache::{CacheStore, LayeredCacheStore, LocalCacheConfig, LocalCacheStore, WriteOutcome};
 use octa_cache_protocol::{
-  ActionResultV1, BlobDescriptor, BlobEncoding, Digest, FindMissingBlobsResponseV1, ACTION_RESULT_VERSION_V1,
-  REMOTE_CACHE_BLOB_CONTENT_TYPE, REMOTE_CACHE_JSON_CONTENT_TYPE, REMOTE_CACHE_PROTOCOL_HEADER,
-  REMOTE_CACHE_PROTOCOL_HEADER_VALUE_V1, REMOTE_CACHE_PROTOCOL_V1,
+  ActionResultV1, BlobDescriptor, BlobEncoding, CacheLayer, Digest, FindMissingBlobsResponseV1,
+  ACTION_RESULT_VERSION_V1, REMOTE_CACHE_BLOB_CONTENT_TYPE, REMOTE_CACHE_JSON_CONTENT_TYPE,
+  REMOTE_CACHE_PROTOCOL_HEADER, REMOTE_CACHE_PROTOCOL_HEADER_VALUE_V1, REMOTE_CACHE_PROTOCOL_V1,
 };
 use octa_cache_test_support::ReferenceCache;
 use tempfile::TempDir;
@@ -28,6 +29,9 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
 
 use crate::{HttpCacheConfig, HttpCacheStore};
+
+mod hardening;
+mod store_contract;
 
 struct ReferenceServer {
   address: SocketAddr,
@@ -121,6 +125,45 @@ impl TestServer {
       response
     });
     Self::start(app).await
+  }
+
+  async fn counting_status(status: StatusCode) -> (Self, Arc<AtomicUsize>) {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let app = Router::new().fallback(move || {
+      let observed = observed.clone();
+      async move {
+        observed.fetch_add(1, Ordering::Relaxed);
+        protocol_response(status, Bytes::new())
+      }
+    });
+    (Self::start(app).await, requests)
+  }
+
+  async fn hanging_blob() -> (Self, Arc<AtomicUsize>) {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let app = Router::new().fallback(move || {
+      let observed = observed.clone();
+      async move {
+        observed.fetch_add(1, Ordering::Relaxed);
+        let stream = futures::stream::once(std::future::ready(Ok::<_, std::convert::Infallible>(
+          Bytes::from_static(b"p"),
+        )))
+        .chain(futures::stream::pending());
+        let mut response = axum::body::Body::from_stream(stream).into_response();
+        response.headers_mut().insert(
+          REMOTE_CACHE_PROTOCOL_HEADER,
+          HeaderValue::from_static(REMOTE_CACHE_PROTOCOL_HEADER_VALUE_V1),
+        );
+        response.headers_mut().insert(
+          header::CONTENT_TYPE,
+          HeaderValue::from_static(REMOTE_CACHE_BLOB_CONTENT_TYPE),
+        );
+        response
+      }
+    });
+    (Self::start(app).await, requests)
   }
 
   async fn start(app: Router) -> Self {

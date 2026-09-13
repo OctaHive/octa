@@ -27,10 +27,10 @@ pub enum WriteOutcome {
   Conflict,
 }
 
-/// Verified action result together with the tier that supplied it.
+/// Validated action-result metadata together with the tier that supplied it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ActionLookup {
-  /// Immutable action metadata selected by the store.
+  /// Immutable action metadata selected and structurally validated by the store.
   pub result: ActionResultV1,
   /// Tier that supplied `result`.
   pub layer: CacheLayer,
@@ -65,6 +65,17 @@ pub trait CacheStore: Send + Sync {
   ///
   /// Bundle decoding performs the final expanded digest and entry validation.
   async fn read_blob(&self, blob: &BlobDescriptor) -> CacheResult<BlobReader>;
+
+  /// Revalidates a suspect blob and may return an independently readable copy.
+  ///
+  /// A single-tier store returns a copy only when another writer repaired the
+  /// object concurrently; otherwise it quarantines corruption and returns
+  /// `None`. Layered stores can then fetch another tier without exposing their
+  /// topology to the executor. Every returned stream remains untrusted and is
+  /// validated through the same path as the original.
+  async fn recover_corrupt_blob(&self, _blob: &BlobDescriptor) -> CacheResult<Option<BlobReader>> {
+    Ok(None)
+  }
 
   /// Durably publishes an encoded blob without replacing an existing object.
   async fn write_blob_if_absent(&self, blob: &BlobDescriptor, body: BlobReader) -> CacheResult<WriteOutcome>;

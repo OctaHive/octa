@@ -40,6 +40,7 @@
       "enum": [
         "dry_run",
         "secret_variables",
+        "secret_outputs",
         "force",
         "read_disabled",
         "action_not_found",

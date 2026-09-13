@@ -87,6 +87,8 @@ pub enum CacheReason {
   DryRun,
   /// Secret task variables make replay unsafe in protocol version one.
   SecretVariables,
+  /// Secret task outputs cannot be persisted in replayable result metadata.
+  SecretOutputs,
   /// Forced execution skipped an otherwise valid lookup.
   Force,
   /// The active cache profile permits publication but not lookup.
@@ -135,6 +137,7 @@ impl CacheReason {
     match self {
       Self::DryRun => "dry_run",
       Self::SecretVariables => "secret_variables",
+      Self::SecretOutputs => "secret_outputs",
       Self::Force => "force",
       Self::ReadDisabled => "read_disabled",
       Self::ActionNotFound => "action_not_found",
@@ -559,6 +562,7 @@ mod tests {
     for reason in [
       CacheReason::DryRun,
       CacheReason::SecretVariables,
+      CacheReason::SecretOutputs,
       CacheReason::Force,
       CacheReason::ReadDisabled,
       CacheReason::ActionNotFound,

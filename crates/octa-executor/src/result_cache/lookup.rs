@@ -6,7 +6,7 @@ use octa_cache::{BlobReader, CacheError, RestoreOutcome};
 use octa_cache_protocol::{CachedArtifact, CachedReport, Digest};
 use octa_output::CacheReason;
 use tempfile::NamedTempFile;
-use tokio::io::AsyncReadExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -232,14 +232,15 @@ pub(crate) async fn lookup(cache: &ResultCache, request: CacheLookup<'_>) -> Exe
         return record_lookup_error(state, output, Some(action), CacheReason::BlobReadFailed, error, started).await;
       },
     };
-    restored_bytes = match restore_bundle(cache, plan, bundle, reader, cancel, &result.artifacts, &result.reports).await
-    {
-      Ok(bytes) => bytes,
-      Err(CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache restore".to_owned())),
-      Err(error) => {
-        return record_lookup_error(state, output, Some(action), CacheReason::RestoreFailed, error, started).await;
-      },
-    };
+    let restored =
+      match restore_cached_bundle(cache, plan, bundle, reader, cancel, &result.artifacts, &result.reports).await {
+        Ok(restored) => restored,
+        Err(CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache restore".to_owned())),
+        Err(error) => {
+          return record_lookup_error(state, output, Some(action), CacheReason::RestoreFailed, error, started).await;
+        },
+      };
+    restored_bytes = restored;
   } else if !plan.outputs.is_empty() {
     return record_lookup_error(
       state,
@@ -273,6 +274,30 @@ pub(crate) async fn lookup(cache: &ResultCache, request: CacheLookup<'_>) -> Exe
   Ok(())
 }
 
+/// Retries only content-originated validation failures. Workspace I/O and path
+/// failures describe the restore destination, so replacing the source blob
+/// cannot fix them and must not quarantine a valid cache object.
+async fn restore_cached_bundle(
+  cache: &ResultCache,
+  plan: &TaskCachePlan,
+  descriptor: &octa_cache_protocol::BlobDescriptor,
+  reader: BlobReader,
+  cancel: &CancellationToken,
+  artifacts: &[CachedArtifact],
+  reports: &[CachedReport],
+) -> Result<u64, CacheError> {
+  match restore_bundle(cache, plan, descriptor, reader, cancel, artifacts, reports).await {
+    Ok(bytes) => Ok(bytes),
+    Err(error) if matches!(error, CacheError::InvalidBundle(_) | CacheError::BundleSource(_)) => {
+      let Some(reader) = cache.store.recover_corrupt_blob(descriptor).await? else {
+        return Err(error);
+      };
+      restore_bundle(cache, plan, descriptor, reader, cancel, artifacts, reports).await
+    },
+    Err(error) => Err(error),
+  }
+}
+
 async fn record_lookup_error(
   state: &TaskCacheState,
   output: &RuntimeOutput,
@@ -299,15 +324,18 @@ async fn restore_bundle(
 ) -> Result<u64, CacheError> {
   let temporary = NamedTempFile::new().map_err(CacheError::TemporaryFile)?;
   let mut sink = tokio::fs::File::from_std(temporary.reopen().map_err(CacheError::TemporaryFile)?);
-  let copied = tokio::io::copy(
-    &mut reader.take(descriptor.encoded_size_bytes.saturating_add(1)),
+  let copied = stage_encoded_blob(
+    reader,
     &mut sink,
+    descriptor.encoded_size_bytes,
+    cache.bundle_limits.read_buffer_bytes,
+    cancel,
   )
   .await?;
   if copied != descriptor.encoded_size_bytes {
-    return Err(CacheError::Stream(std::io::Error::new(
-      std::io::ErrorKind::UnexpectedEof,
-      "cache blob transfer length mismatch",
+    return Err(CacheError::InvalidBundle(format!(
+      "cache blob transfer length is {copied}, expected {}",
+      descriptor.encoded_size_bytes
     )));
   }
   sink.sync_all().await.map_err(CacheError::TemporaryFile)?;
@@ -335,4 +363,39 @@ async fn restore_bundle(
   } else {
     0
   })
+}
+
+/// Copies one encoded representation into private staging while retaining I/O
+/// provenance. Source failures may be retried from another cache tier;
+/// temporary-file failures must be reported without quarantining good data.
+async fn stage_encoded_blob(
+  mut reader: BlobReader,
+  sink: &mut tokio::fs::File,
+  expected: u64,
+  buffer_bytes: usize,
+  cancel: &CancellationToken,
+) -> Result<u64, CacheError> {
+  let maximum = expected.saturating_add(1);
+  let mut copied = 0_u64;
+  let mut buffer = vec![0_u8; buffer_bytes];
+  while copied < maximum {
+    if cancel.is_cancelled() {
+      return Err(CacheError::Cancelled);
+    }
+    let remaining = maximum - copied;
+    let length = remaining.min(buffer.len() as u64) as usize;
+    let read = reader
+      .read(&mut buffer[..length])
+      .await
+      .map_err(CacheError::BundleSource)?;
+    if read == 0 {
+      break;
+    }
+    sink
+      .write_all(&buffer[..read])
+      .await
+      .map_err(CacheError::TemporaryFile)?;
+    copied += read as u64;
+  }
+  Ok(copied)
 }

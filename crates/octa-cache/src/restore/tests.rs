@@ -123,7 +123,16 @@ fn validation_failure_never_replaces_live_outputs() {
 #[test]
 fn every_durable_restore_stage_recovers_to_a_complete_generation() {
   // Two existing roots produce: intent, prepared, backup/install per root, commit.
-  for fail_at in 0..7 {
+  let stages = [
+    RestoreStage::RestoreIntentRecorded,
+    RestoreStage::JournalPrepared,
+    RestoreStage::OriginalBackedUp,
+    RestoreStage::StagedOutputInstalled,
+    RestoreStage::OriginalBackedUp,
+    RestoreStage::StagedOutputInstalled,
+    RestoreStage::TransactionCommitted,
+  ];
+  for (fail_at, target) in stages.into_iter().enumerate() {
     let state = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
     write_tree(workspace.path(), "old");
@@ -137,9 +146,10 @@ fn every_durable_restore_stage_recovers_to_a_complete_generation() {
         workspace.path(),
         &roots(),
         &CancellationToken::new(),
-        |_| {
+        |observed| {
           if stage == fail_at {
-            panic!("injected crash after durable stage {fail_at}");
+            assert_eq!(observed, target);
+            panic!("injected crash after durable stage {target:?}");
           }
           stage += 1;
         },
@@ -149,7 +159,7 @@ fn every_durable_restore_stage_recovers_to_a_complete_generation() {
 
     let restarted = restore_manager(state.path());
     assert_eq!(restarted.recover().unwrap(), 1);
-    if fail_at == 6 {
+    if target == RestoreStage::TransactionCommitted {
       assert_tree(workspace.path(), "new");
     } else {
       assert_tree(workspace.path(), "old");
@@ -167,13 +177,99 @@ fn cancellation_during_replacement_rolls_back_before_returning() {
   let cancel = CancellationToken::new();
   let manager = restore_manager(state.path());
   let result = manager.restore_with_observer(&bytes[..], &descriptor, workspace.path(), &roots(), &cancel, |stage| {
-    if stage == "staged_output_installed" {
+    if stage == RestoreStage::StagedOutputInstalled {
       cancel.cancel();
     }
   });
   assert!(matches!(result, Err(CacheError::Cancelled)));
   assert_tree(workspace.path(), "old");
   assert!(journal_files(&manager.journal_root()).unwrap().is_empty());
+}
+
+#[test]
+fn every_existing_output_rollback_stage_is_recoverable() {
+  for target in [
+    RestoreStage::InstalledOutputReverted,
+    RestoreStage::OriginalRestored,
+    RestoreStage::RollbackMarked,
+  ] {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    write_tree(workspace.path(), "old");
+    let (bytes, descriptor) = packed_tree();
+    let cancel = CancellationToken::new();
+    let manager = restore_manager(state.path());
+    let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+      let _ = manager.restore_with_observer(&bytes[..], &descriptor, workspace.path(), &roots(), &cancel, |stage| {
+        if stage == RestoreStage::StagedOutputInstalled {
+          cancel.cancel();
+        }
+        if stage == target {
+          panic!("injected crash after rollback stage {target:?}");
+        }
+      });
+    }));
+    assert!(crashed.is_err(), "fixture did not reach {target:?}");
+
+    assert_eq!(restore_manager(state.path()).recover().unwrap(), 1);
+    assert_tree(workspace.path(), "old");
+    assert!(journal_files(&manager.journal_root()).unwrap().is_empty());
+  }
+}
+
+#[test]
+fn every_new_output_rollback_stage_is_recoverable() {
+  let new_roots = vec![
+    RelativePath::new("generated/api").unwrap(),
+    RelativePath::new("sentinel").unwrap(),
+  ];
+  for target in [
+    RestoreStage::NewOutputReverted,
+    RestoreStage::CreatedParentRemoved,
+    RestoreStage::RollbackMarked,
+  ] {
+    let producer = tempfile::tempdir().unwrap();
+    fs::create_dir_all(producer.path().join("generated/api")).unwrap();
+    fs::write(producer.path().join("generated/api/client.rs"), "new").unwrap();
+    fs::write(producer.path().join("sentinel"), "new").unwrap();
+    let packed = pack_bundle(
+      Vec::new(),
+      producer.path(),
+      &new_roots,
+      BundleEncoding::Identity,
+      BundleLimits::default(),
+      &CancellationToken::new(),
+    )
+    .unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(workspace.path().join("sentinel"), "old").unwrap();
+    let cancel = CancellationToken::new();
+    let manager = restore_manager(state.path());
+    let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+      let _ = manager.restore_with_observer(
+        &packed.writer[..],
+        &packed.descriptor,
+        workspace.path(),
+        &new_roots,
+        &cancel,
+        |stage| {
+          if stage == RestoreStage::StagedOutputInstalled {
+            cancel.cancel();
+          }
+          if stage == target {
+            panic!("injected crash after rollback stage {target:?}");
+          }
+        },
+      );
+    }));
+    assert!(crashed.is_err(), "fixture did not reach {target:?}");
+
+    assert_eq!(restore_manager(state.path()).recover().unwrap(), 1);
+    assert!(!workspace.path().join("generated").exists());
+    assert_eq!(fs::read_to_string(workspace.path().join("sentinel")).unwrap(), "old");
+    assert!(journal_files(&manager.journal_root()).unwrap().is_empty());
+  }
 }
 
 #[test]
@@ -218,7 +314,7 @@ fn recovery_removes_new_outputs_and_parents_when_no_original_existed() {
       &nested_roots,
       &CancellationToken::new(),
       |stage| {
-        if stage == "staged_output_installed" {
+        if stage == RestoreStage::StagedOutputInstalled {
           installed = true;
           panic!("injected crash after installing a previously absent output");
         }
@@ -328,7 +424,7 @@ fn recovery_discards_a_transaction_for_a_deleted_workspace() {
       &roots(),
       &CancellationToken::new(),
       |stage| {
-        if stage == "journal_prepared" {
+        if stage == RestoreStage::JournalPrepared {
           panic!("leave a prepared journal");
         }
       },
@@ -393,7 +489,7 @@ fn committed_recovery_refuses_to_hide_a_missing_live_output() {
       &roots(),
       &CancellationToken::new(),
       |stage| {
-        if stage == "transaction_committed" {
+        if stage == RestoreStage::TransactionCommitted {
           panic!("leave a committed journal");
         }
       },

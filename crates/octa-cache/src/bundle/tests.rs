@@ -702,6 +702,73 @@ fn cancellation_never_reports_a_complete_bundle() {
     ),
     Err(CacheError::Cancelled)
   ));
+
+  struct CancellingWriter {
+    cancellation: CancellationToken,
+  }
+
+  impl std::io::Write for CancellingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+      self.cancellation.cancel();
+      Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  let cancellation = CancellationToken::new();
+  assert!(matches!(
+    pack_bundle(
+      CancellingWriter {
+        cancellation: cancellation.clone(),
+      },
+      workspace.path(),
+      &[root("out")],
+      BundleEncoding::Identity,
+      BundleLimits::default(),
+      &cancellation,
+    ),
+    Err(CacheError::Cancelled)
+  ));
+
+  struct CancellingReader<R> {
+    inner: R,
+    cancellation: CancellationToken,
+    first: bool,
+  }
+
+  impl<R: std::io::Read> std::io::Read for CancellingReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+      let read = self.inner.read(bytes)?;
+      if self.first && read > 0 {
+        self.first = false;
+        self.cancellation.cancel();
+      }
+      Ok(read)
+    }
+  }
+
+  let packed = pack(workspace.path(), &[root("out")], BundleEncoding::Identity);
+  let staging = TempDir::new().unwrap();
+  let cancellation = CancellationToken::new();
+  assert!(matches!(
+    extract_bundle(
+      CancellingReader {
+        inner: Cursor::new(packed.writer),
+        cancellation: cancellation.clone(),
+        first: true,
+      },
+      &packed.descriptor,
+      staging.path(),
+      &[root("out")],
+      BundleLimits::default(),
+      &cancellation,
+    ),
+    Err(CacheError::Cancelled)
+  ));
+  assert_eq!(fs::read_dir(staging.path()).unwrap().count(), 0);
 }
 
 fn one_directory_bundle(path: &str) -> Vec<u8> {

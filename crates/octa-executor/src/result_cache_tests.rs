@@ -8,7 +8,9 @@ use std::{
   },
 };
 
-use octa_cache::{ActionLookup, BlobReader, CacheError, CacheStore, LocalCacheConfig, LocalCacheStore, WriteOutcome};
+use octa_cache::{
+  pack_bundle, ActionLookup, BlobReader, CacheError, CacheStore, LocalCacheConfig, LocalCacheStore, WriteOutcome,
+};
 use octa_cache_protocol::{
   ActionResultV1, BlobDescriptor, BlobEncoding, CacheLayer, CachedArtifact, CachedReport, Digest, DigestAlgorithm,
   PlatformArchitecture, PlatformOs, ACTION_RESULT_VERSION_V1, MAX_ACTION_RESULT_METADATA_BYTES,
@@ -59,6 +61,7 @@ struct ControlledStore {
   lookups: AtomicUsize,
   blob_writes: AtomicUsize,
   action_writes: AtomicUsize,
+  recoveries: AtomicUsize,
 }
 
 impl Default for ControlledStore {
@@ -80,6 +83,7 @@ impl Default for ControlledStore {
       lookups: AtomicUsize::new(0),
       blob_writes: AtomicUsize::new(0),
       action_writes: AtomicUsize::new(0),
+      recoveries: AtomicUsize::new(0),
     }
   }
 }
@@ -131,6 +135,11 @@ impl CacheStore for ControlledStore {
     }
     let bytes = self.blob.clone().unwrap_or_default();
     Ok(Box::pin(std::io::Cursor::new(bytes)))
+  }
+
+  async fn recover_corrupt_blob(&self, _blob: &BlobDescriptor) -> Result<Option<BlobReader>, CacheError> {
+    self.recoveries.fetch_add(1, Ordering::Relaxed);
+    Ok(None)
   }
 
   async fn write_blob_if_absent(&self, _blob: &BlobDescriptor, _body: BlobReader) -> Result<WriteOutcome, CacheError> {
@@ -1330,6 +1339,78 @@ async fn lookup_handles_force_hits_mutation_and_unusable_results() {
 }
 
 #[tokio::test]
+async fn restore_policy_limits_do_not_quarantine_or_refetch_valid_cache_content() {
+  let directory = TempDir::new().unwrap();
+  fs::write(directory.path().join("output"), b"five!").unwrap();
+  let root = RelativePath::new("output").unwrap();
+  let packed = pack_bundle(
+    Vec::new(),
+    directory.path(),
+    std::slice::from_ref(&root),
+    BundleEncoding::Identity,
+    BundleLimits::default(),
+    &CancellationToken::new(),
+  )
+  .unwrap();
+  fs::remove_file(directory.path().join("output")).unwrap();
+
+  let limits = BundleLimits {
+    max_file_bytes: 4,
+    ..BundleLimits::default()
+  };
+  let store = Arc::new(ControlledStore {
+    blob: Some(packed.writer),
+    ..ControlledStore::default()
+  });
+  let restore = RestoreManager::open(directory.path().join("limited-cache-state"), limits).unwrap();
+  let cache = ResultCache::new(
+    store.clone(),
+    restore,
+    "test",
+    RuntimeIdentity::Native {
+      os: PlatformOs::Macos,
+      architecture: PlatformArchitecture::Arm64,
+      environment: Digest::blake3(b"toolchain"),
+    },
+  )
+  .unwrap()
+  .with_bundle_options(BundleEncoding::Identity, limits)
+  .unwrap();
+  let plan = plan(directory.path(), Vec::new(), vec![root]);
+  let manager = octa_plugin_manager::plugin_manager::PluginManager::new(directory.path());
+  let context = runtime_context(directory.path());
+  let action = action_for(&cache, &plan, &manager, &context).await;
+  *store.action.lock().await = Some(ActionResultV1 {
+    result_version: ACTION_RESULT_VERSION_V1,
+    action,
+    output_bundle: Some(packed.descriptor),
+    stdout: None,
+    task_outputs: BTreeMap::new(),
+    artifacts: Vec::new(),
+    reports: Vec::new(),
+  });
+  let state = TaskCacheState::default();
+  lookup(
+    &cache,
+    CacheLookup {
+      plan: &plan,
+      state: &state,
+      plugin_manager: &manager,
+      context: &context,
+      output: &runtime_output(),
+      cancel: &CancellationToken::new(),
+      dry: false,
+      force: false,
+    },
+  )
+  .await
+  .unwrap();
+
+  assert_eq!(state.miss().await.unwrap().2.reason, Some(CacheReason::RestoreFailed));
+  assert_eq!(store.recoveries.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn publication_failures_remain_soft_and_never_bind_an_action() {
   let directory = TempDir::new().unwrap();
   let output = runtime_output();
@@ -1341,6 +1422,38 @@ async fn publication_failures_remain_soft_and_never_bind_an_action() {
     .await
     .unwrap()
     .root;
+
+  let secret_store = Arc::new(ControlledStore::default());
+  let secret_cache = runtime_cache(directory.path(), secret_store.clone());
+  let secret_state = TaskCacheState::default();
+  secret_state
+    .set_lookup(
+      Some(PublicationIdentity { action, input_root }),
+      None,
+      CacheOutcome::miss(
+        action.to_string(),
+        CacheReason::ActionNotFound,
+        std::time::Duration::ZERO,
+      ),
+    )
+    .await;
+  let mut secret_outputs = TaskOutputs::default();
+  secret_outputs.insert("token".to_owned(), json!("generated-secret"), true);
+  secret_state
+    .record_command(
+      0,
+      "successful secret producer",
+      &CompletionOutputs::new(Map::new(), secret_outputs),
+    )
+    .await;
+  let (_, outputs, outcome) = finalize(&secret_cache, &empty_plan, &secret_state, &output, &cancel, false)
+    .await
+    .unwrap();
+  assert_eq!(outcome.status, CacheStatus::Bypassed);
+  assert_eq!(outcome.reason, Some(CacheReason::SecretOutputs));
+  assert!(outputs.task().is_secret("token"));
+  assert_eq!(secret_store.blob_writes.load(Ordering::Relaxed), 0);
+  assert_eq!(secret_store.action_writes.load(Ordering::Relaxed), 0);
 
   let unset = TaskCacheState::default();
   assert!(matches!(

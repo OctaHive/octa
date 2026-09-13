@@ -49,6 +49,16 @@ impl LayeredCacheStore {
   fn remote_success(&self) {
     self.remote_warning_emitted.store(false, Ordering::Relaxed);
   }
+
+  /// Downloads through the remote adapter and lets L1 perform the definitive
+  /// digest/encoding verification before returning a readable local object.
+  async fn read_remote_into_local(&self, blob: &BlobDescriptor) -> CacheResult<BlobReader> {
+    let reader = self.remote.read_blob(blob).await?;
+    // LocalCacheStore verifies content and can only publish or reuse this exact
+    // descriptor; blob conflicts are a remote-store wire concern.
+    self.local.write_blob_if_absent(blob, reader).await?;
+    self.local.read_blob(blob).await
+  }
 }
 
 #[async_trait]
@@ -127,15 +137,10 @@ impl CacheStore for LayeredCacheStore {
     match self.local.read_blob(blob).await {
       Ok(reader) => Ok(reader),
       Err(CacheError::Cancelled) => Err(CacheError::Cancelled),
-      Err(local_error) => match self.remote.read_blob(blob).await {
+      Err(local_error) => match self.read_remote_into_local(blob).await {
         Ok(reader) => {
           self.remote_success();
-          match self.local.write_blob_if_absent(blob, reader).await? {
-            WriteOutcome::Written | WriteOutcome::AlreadyPresent => self.local.read_blob(blob).await,
-            WriteOutcome::Conflict => Err(CacheError::Metadata(
-              "local CAS rejected a remote blob with the same immutable identity".to_owned(),
-            )),
-          }
+          Ok(reader)
         },
         Err(CacheError::Cancelled) => Err(CacheError::Cancelled),
         Err(remote_error) => {
@@ -143,6 +148,23 @@ impl CacheStore for LayeredCacheStore {
           tracing::debug!(cache.layer = "local", cache.operation = "read blob", error = %local_error, "local blob was unavailable before remote fallback");
           Err(remote_error)
         },
+      },
+    }
+  }
+
+  async fn recover_corrupt_blob(&self, blob: &BlobDescriptor) -> CacheResult<Option<BlobReader>> {
+    if let Some(recovered) = self.local.recover_corrupt_blob(blob).await? {
+      return Ok(Some(recovered));
+    }
+    match self.read_remote_into_local(blob).await {
+      Ok(reader) => {
+        self.remote_success();
+        Ok(Some(reader))
+      },
+      Err(CacheError::Cancelled) => Err(CacheError::Cancelled),
+      Err(error) => {
+        self.remote_warning("recover corrupt blob", &error);
+        Err(error)
       },
     }
   }
@@ -447,6 +469,10 @@ mod tests {
       Err(CacheError::Cancelled)
     ));
     assert!(matches!(cancelled.read_blob(&blob).await, Err(CacheError::Cancelled)));
+    assert!(matches!(
+      cancelled.recover_corrupt_blob(&blob).await,
+      Err(CacheError::Cancelled)
+    ));
 
     let conflict_root = TempDir::new().unwrap();
     let conflict = layered(&conflict_root, Behavior::BlobConflict, bytes.clone());
@@ -517,6 +543,12 @@ mod tests {
     cache.commit_verified_hit("test", &result).await.unwrap();
     assert!(local.get_action("test", &result.action).await.unwrap().is_some());
     assert_eq!(remote.action_writes.load(Ordering::Relaxed), 0);
+
+    let mut concurrently_repaired = cache.recover_corrupt_blob(&blob).await.unwrap().unwrap();
+    let mut recovered_bytes = Vec::new();
+    concurrently_repaired.read_to_end(&mut recovered_bytes).await.unwrap();
+    assert_eq!(recovered_bytes, bytes);
+    assert_eq!(remote.reads.load(Ordering::Relaxed), 1);
 
     // Exercise the rest of the tier boundary after the L1 population: the
     // shared store still reports global readability and idempotent writes.

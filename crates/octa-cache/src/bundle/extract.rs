@@ -50,10 +50,10 @@ pub fn extract_bundle<R: Read>(
   match descriptor.encoding {
     BlobEncoding::Identity => extract_canonical(&mut encoded, descriptor, staging, &roots, limits, cancel)?,
     BlobEncoding::ZstdV1 => {
-      let mut decoder = zstd::stream::read::Decoder::new(&mut encoded).map_err(CacheError::Stream)?;
+      let mut decoder = zstd::stream::read::Decoder::new(&mut encoded).map_err(CacheError::BundleSource)?;
       decoder
         .window_log_max(ZSTD_V1_MAX_WINDOW_LOG)
-        .map_err(CacheError::Stream)?;
+        .map_err(CacheError::BundleSource)?;
       extract_canonical(decoder, descriptor, staging, &roots, limits, cancel)?;
     },
   }
@@ -195,7 +195,7 @@ impl<R: Read> CanonicalReader<R> {
     if next > self.maximum {
       return Err(CacheError::Limit("expanded bundle exceeds configured limit".to_owned()));
     }
-    self.inner.read_exact(buffer).map_err(CacheError::Stream)?;
+    self.inner.read_exact(buffer).map_err(CacheError::BundleSource)?;
     self.hasher.update(buffer);
     self.bytes = next;
     Ok(())
@@ -283,7 +283,7 @@ impl<R: Read> CanonicalReader<R> {
         self.bytes += 1;
         Ok(Some(byte[0]))
       },
-      Err(source) => Err(CacheError::Stream(source)),
+      Err(source) => Err(CacheError::BundleSource(source)),
     }
   }
 
@@ -357,7 +357,7 @@ mod tests {
     assert!(matches!(bounded.read_array::<2>(), Err(CacheError::Limit(_))));
 
     let mut failing = CanonicalReader::new(ErrorReader, 1);
-    assert!(matches!(failing.read_optional_byte(), Err(CacheError::Stream(_))));
+    assert!(matches!(failing.read_optional_byte(), Err(CacheError::BundleSource(_))));
   }
 
   #[test]
