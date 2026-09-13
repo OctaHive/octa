@@ -94,6 +94,90 @@ fn restores_outputs_and_skips_an_already_materialized_tree() {
 }
 
 #[test]
+fn single_absent_root_recovers_on_both_sides_of_its_atomic_install() {
+  let producer = tempfile::tempdir().unwrap();
+  fs::create_dir(producer.path().join("output")).unwrap();
+  fs::write(producer.path().join("output/value"), "new").unwrap();
+  let root = RelativePath::new("output").unwrap();
+  let packed = pack_bundle(
+    Vec::new(),
+    producer.path(),
+    std::slice::from_ref(&root),
+    BundleEncoding::Identity,
+    BundleLimits::default(),
+    &CancellationToken::new(),
+  )
+  .unwrap();
+
+  for target in [RestoreStage::RestoreIntentRecorded, RestoreStage::StagedOutputInstalled] {
+    let state = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let manager = restore_manager(state.path());
+    let crashed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+      let _ = manager.restore_with_observer(
+        &packed.writer[..],
+        &packed.descriptor,
+        workspace.path(),
+        std::slice::from_ref(&root),
+        &CancellationToken::new(),
+        |stage| {
+          if stage == target {
+            panic!("injected crash after single-root stage {target:?}");
+          }
+        },
+      );
+    }));
+    assert!(crashed.is_err());
+    assert_eq!(restore_manager(state.path()).recover().unwrap(), 1);
+    assert_eq!(
+      workspace.path().join("output").exists(),
+      target == RestoreStage::StagedOutputInstalled
+    );
+    if target == RestoreStage::StagedOutputInstalled {
+      assert_eq!(
+        fs::read_to_string(workspace.path().join("output/value")).unwrap(),
+        "new"
+      );
+    }
+    assert!(journal_files(&manager.journal_root()).unwrap().is_empty());
+  }
+}
+
+#[test]
+fn single_absent_root_validation_failure_leaves_no_live_or_recovery_state() {
+  let producer = tempfile::tempdir().unwrap();
+  fs::write(producer.path().join("output"), "new").unwrap();
+  let root = RelativePath::new("output").unwrap();
+  let packed = pack_bundle(
+    Vec::new(),
+    producer.path(),
+    std::slice::from_ref(&root),
+    BundleEncoding::Identity,
+    BundleLimits::default(),
+    &CancellationToken::new(),
+  )
+  .unwrap();
+  let state = tempfile::tempdir().unwrap();
+  let workspace = tempfile::tempdir().unwrap();
+  let manager = restore_manager(state.path());
+
+  let error = manager
+    .restore_validated(
+      &packed.writer[..],
+      &packed.descriptor,
+      workspace.path(),
+      std::slice::from_ref(&root),
+      &CancellationToken::new(),
+      |_| Err(CacheError::Metadata("reject fast-path staging".to_owned())),
+    )
+    .unwrap_err();
+
+  assert!(matches!(error, CacheError::Metadata(message) if message == "reject fast-path staging"));
+  assert!(!workspace.path().join("output").exists());
+  assert!(journal_files(&manager.journal_root()).unwrap().is_empty());
+}
+
+#[test]
 fn validation_failure_never_replaces_live_outputs() {
   let state = tempfile::tempdir().unwrap();
   let workspace = tempfile::tempdir().unwrap();

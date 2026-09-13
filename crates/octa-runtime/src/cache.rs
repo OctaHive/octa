@@ -204,6 +204,7 @@ impl RuntimeCacheConfig {
     let result_cache = ResultCache::new(store, restore, self.namespace, self.runtime)?
       .with_access(self.mode)
       .with_snapshot_options(self.snapshot)?
+      .with_snapshot_digest_memo(local.clone())
       .with_bundle_options(self.bundle_encoding, self.bundle_limits)?;
     Ok(ConfiguredCache {
       local,
@@ -350,6 +351,7 @@ struct SnapshotProfile {
   max_entries: Option<usize>,
   read_buffer_bytes: Option<usize>,
   mutation_retries: Option<u8>,
+  max_memo_bytes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize)]
@@ -424,6 +426,9 @@ fn apply_snapshot_profile(options: &mut SnapshotOptions, profile: SnapshotProfil
   }
   if let Some(value) = profile.mutation_retries {
     options.mutation_retries = value;
+  }
+  if let Some(value) = profile.max_memo_bytes {
+    options.max_memo_bytes = value;
   }
 }
 
@@ -754,6 +759,7 @@ max_parallel_hashes = 2
 max_entries = 90
 read_buffer_bytes = 4096
 mutation_retries = 4
+max_memo_bytes = 7000
 
 [bundle]
 compression = "identity"
@@ -786,6 +792,7 @@ read_buffer_bytes = 4096
     assert_eq!(config.snapshot.max_entries, 90);
     assert_eq!(config.snapshot.read_buffer_bytes, 4096);
     assert_eq!(config.snapshot.mutation_retries, 4);
+    assert_eq!(config.snapshot.max_memo_bytes, 7_000);
     assert_eq!(config.bundle_encoding, BundleEncoding::Identity);
     assert_eq!(config.bundle_limits.max_encoded_bytes, 5_000);
     assert_eq!(config.bundle_limits.max_expanded_bytes, 6_000);

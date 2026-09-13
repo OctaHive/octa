@@ -383,6 +383,14 @@ pub(crate) struct TaskNode {
   plugin: Option<PluginInvocation>,
 }
 
+#[cfg(test)]
+impl TaskNode {
+  /// Exposes the lowered node kind to planner boundary tests.
+  pub(crate) fn action(&self) -> &NodeAction {
+    &self.action
+  }
+}
+
 // Implement equality based on task ID
 impl Eq for TaskNode {}
 

@@ -331,6 +331,7 @@ dependencies = [
  "cfg-if",
  "constant_time_eq",
  "cpufeatures",
+ "rayon-core",
 ]
 
 [[package]]
@@ -2531,8 +2532,10 @@ dependencies = [
  "futures",
  "glob",
  "ignore",
+ "libc",
  "octa-cache-protocol",
  "proptest",
+ "rayon",
  "same-file",
  "serde",
  "serde_json",
@@ -2543,6 +2546,7 @@ dependencies = [
  "tracing",
  "uuid",
  "winapi-util",
+ "windows-sys 0.61.2",
  "zstd",
 ]
 
@@ -3474,6 +3478,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core 0.9.5",
+]
+
+[[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
 ]
 
 [[package]]

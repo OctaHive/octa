@@ -132,11 +132,15 @@ fn extract_canonical<R: Read>(
         let mut file =
           File::create(&destination).map_err(|error| io_error("create staged output file", &destination, error))?;
         reader.copy_exact(&mut file, length, &mut buffer, cancel)?;
-        file
-          .sync_all()
-          .map_err(|error| io_error("synchronize staged output file", &destination, error))?;
         set_executable(&destination, executable)
           .map_err(|error| io_error("set staged output permissions", &destination, error))?;
+        // Restored bytes need process-crash safety, not independent power-loss
+        // durability. Journal and directory synchronization preserve an atomic
+        // generation; after a machine restart the canonical output digest is
+        // checked again before a hit is accepted, and the durable CAS can
+        // restore any bytes the filesystem did not persist. Flushing every
+        // small file here would turn a 10,000-file hit into 10,000 serialized
+        // storage barriers without improving cache correctness.
       },
       SYMLINK_TAG => {
         let directory = reader.read_bool()?;

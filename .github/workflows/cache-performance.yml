@@ -1,0 +1,67 @@
+name: Cache performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Exact pre-cache commit used for the non-cache and freshness baselines
+        required: true
+        default: 56ddfd3ac7114fa108099d6c831a5dd75a98ebd0
+
+jobs:
+  stable-linux:
+    # Performance evidence is meaningful only on the dedicated, otherwise idle
+    # machine represented by this label. GitHub-hosted runners are deliberately
+    # not accepted as substitutes because their CPU and storage vary per job.
+    runs-on: [self-hosted, linux, x64, octa-performance]
+    timeout-minutes: 240
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Install go-task
+        run: go install github.com/go-task/task/v3/cmd/task@v3.53.1
+      - name: Verify filesystem tracer
+        run: command -v strace
+      - name: Test benchmark harness
+        run: python3 -m unittest discover -s benchmarks/cache/tests -v
+      - name: Build current release tools
+        run: |
+          cargo build --locked --release \
+            -p octa-cli -p octa-runner \
+            -p octa_plugin_shell -p octa_plugin_tpl
+          cargo build --locked --release -p octa-cache --example cache_kernel_bench
+      - name: Build exact baseline release tools
+        env:
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+        run: |
+          git worktree add --detach "${RUNNER_TEMP}/octa-cache-baseline" "${BASELINE_REF}"
+          cargo build --locked --release \
+            --manifest-path "${RUNNER_TEMP}/octa-cache-baseline/Cargo.toml" \
+            -p octa-cli -p octa_plugin_shell -p octa_plugin_tpl
+      - name: Run release cache matrix
+        run: |
+          python3 benchmarks/cache/run.py \
+            --octa target/release/octa \
+            --runner target/release/octa-runner \
+            --kernel target/release/examples/cache_kernel_bench \
+            --plugins target/release \
+            --baseline-octa "${RUNNER_TEMP}/octa-cache-baseline/target/release/octa" \
+            --baseline-plugins "${RUNNER_TEMP}/octa-cache-baseline/target/release" \
+            --output "${RUNNER_TEMP}/cache-performance-results"
+      - name: Evaluate fixed thresholds
+        run: python3 benchmarks/cache/report.py "${RUNNER_TEMP}/cache-performance-results" --strict
+      - name: Upload raw evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cache-performance-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/cache-performance-results
+          if-no-files-found: error
+          retention-days: 90

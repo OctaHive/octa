@@ -62,7 +62,28 @@ part of the identity, so equivalent workspaces can reuse one result.
 above.
 
 `[snapshot]` accepts `max_parallel_hashes`, `max_entries`,
-`read_buffer_bytes`, and `mutation_retries`.
+`read_buffer_bytes`, `mutation_retries`, and `max_memo_bytes`. The last value
+bounds the serialized local memo that Octa will load into memory; the default
+is 512 MiB.
+
+Successful input snapshots also populate an internal memo in the local CAS.
+On a later invocation within the same operating-system boot and mounted
+filesystem instance, Octa first walks the selected paths and compares stable
+file identity, size, modification time, change time, entry kind, executable
+state, and symlink target. If they all match, it reuses the previously verified
+BLAKE3 file digests; otherwise it hashes file contents normally. Filesystems
+that cannot expose a stable identity and change time simply bypass this
+optimization. Octa enables persistent memo reuse only on a conservative list
+of local filesystems; network, unknown, and unsupported filesystems always hash
+content. Memo records are local only, count toward the normal local cache
+capacity, and are collected by the same GC; they never enter the distributed
+action identity or replace content verification for new inputs.
+
+Output replacement is atomic across process failure. Octa does not issue a
+separate data flush for every restored file: after a machine restart it verifies
+the canonical output tree and repairs an incomplete materialization from the
+durable CAS. The cache store itself retains its stronger synchronized
+publication rules.
 
 `[bundle]` accepts:
 

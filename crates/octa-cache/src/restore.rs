@@ -30,8 +30,9 @@ use crate::{
 };
 use journal::{
   cleanup_temporary_journals, commit_marker, journal_files, marker_exists, prepared_marker, read_journal,
-  remove_transaction_state, rolled_back_marker, transaction_path, validate_journal, write_commit_marker, write_journal,
-  write_prepared_marker, write_rolled_back_marker, JournalRoot, RestoreJournal,
+  remove_transaction_state, remove_unprepared_transaction_state, rolled_back_marker, transaction_path,
+  validate_journal, write_commit_marker, write_journal, write_prepared_marker, write_rolled_back_marker, JournalRoot,
+  RestoreJournal,
 };
 
 /// Result of a verified output restore request.
@@ -236,6 +237,15 @@ impl RestoreManager {
     write_journal(&journal_path, &journal)?;
     durable_stage(RestoreStage::RestoreIntentRecorded);
 
+    // A single root that did not exist before restoration needs no backup or
+    // multi-root commit marker. Its final same-filesystem rename is atomic, so
+    // recovery can safely observe either no root or the complete verified root.
+    // Nested missing parents are excluded because creating them would add live
+    // mutations outside that one atomic rename.
+    if journal.roots.len() == 1 && !journal.roots[0].had_original && journal.created_parents.is_empty() {
+      return self.restore_new_root(reader, descriptor, cancel, &validate, &mut durable_stage, &journal);
+    }
+
     let staging = transaction.join("staging");
     let backup = transaction.join("backup");
     let preparation = (|| -> CacheResult<()> {
@@ -291,6 +301,67 @@ impl RestoreManager {
     Ok(RestoreOutcome::Restored)
   }
 
+  /// Installs one previously absent root without constructing rollback state.
+  ///
+  /// The journal still makes abandoned staging discoverable. Before the final
+  /// rename there is no live mutation to undo; after it, the complete staged
+  /// root is already the valid committed generation. Consequently a markerless
+  /// recovery can clean transaction state without guessing which generation to
+  /// retain.
+  fn restore_new_root<R: Read>(
+    &self,
+    reader: R,
+    descriptor: &BlobDescriptor,
+    cancel: &CancellationToken,
+    validate: &impl Fn(&Path) -> CacheResult<()>,
+    durable_stage: &mut impl FnMut(RestoreStage),
+    journal: &RestoreJournal,
+  ) -> CacheResult<RestoreOutcome> {
+    let journal_path = self.journal_root().join(format!("{}.json", journal.id));
+    let staging = journal.transaction.join("staging");
+    let preparation = (|| -> CacheResult<()> {
+      fs::create_dir(&journal.transaction)
+        .map_err(|error| io_error("create restore transaction", &journal.transaction, error))?;
+      fs::create_dir(&staging).map_err(|error| io_error("create restore staging directory", &staging, error))?;
+      extract_bundle(
+        reader,
+        descriptor,
+        &staging,
+        std::slice::from_ref(&journal.roots[0].path),
+        self.limits,
+        cancel,
+      )?;
+      validate(&staging)?;
+      sync_tree_directories(&journal.transaction)
+    })();
+    if let Err(error) = preparation {
+      remove_unprepared_transaction_state(&journal_path, &journal.transaction)?;
+      return Err(error);
+    }
+    if let Err(error) = check_cancelled(cancel) {
+      remove_unprepared_transaction_state(&journal_path, &journal.transaction)?;
+      return Err(error);
+    }
+    let staged = join_relative(&staging, &journal.roots[0].path);
+    let live = join_relative(&journal.workspace, &journal.roots[0].path);
+    if let Err(error) =
+      fs::rename(&staged, &live).map_err(|error| io_error("install staged cache output", &live, error))
+    {
+      remove_unprepared_transaction_state(&journal_path, &journal.transaction)?;
+      return Err(error);
+    }
+    if let Err(error) = sync_rename_parents(&staged, &live) {
+      // The rename itself is atomic and installed only verified bytes. A
+      // failed durability flush cannot require rollback when no prior value
+      // existed; retain the live root and leave any failed cleanup discoverable.
+      let _ = remove_unprepared_transaction_state(&journal_path, &journal.transaction);
+      return Err(error);
+    }
+    durable_stage(RestoreStage::StagedOutputInstalled);
+    remove_unprepared_transaction_state(&journal_path, &journal.transaction)?;
+    Ok(RestoreOutcome::Restored)
+  }
+
   fn recover_one(&self, path: &Path, journal: &RestoreJournal) -> CacheResult<()> {
     validate_journal(journal)?;
     let committed = marker_exists(&commit_marker(path))?;
@@ -310,8 +381,10 @@ impl RestoreManager {
       self.rollback(path, journal)
     } else {
       // Without the prepared marker no live output was touched; only staging
-      // and the intent journal can exist.
-      remove_transaction_state(path, &journal.transaction)
+      // and the intent journal can exist. The single-new-root path is the sole
+      // exception: its atomic rename may have installed a complete root, which
+      // markerless recovery intentionally retains.
+      remove_unprepared_transaction_state(path, &journal.transaction)
     }
   }
 

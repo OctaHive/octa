@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "non_cache_max_median_ratio": 1.05,
+  "non_cache_geomean_ratio": 1.03,
+  "large_input_min_mib_per_second": 300.0,
+  "bundle_min_mib_per_second": 100.0,
+  "streaming_max_rss_overhead_bytes": 268435456,
+  "many_entries_max_rss_bytes_per_entry": 1024,
+  "many_output_hit_max_p95_median_ratio": 1.25,
+  "warm_hit_max_reference_ratio": 1.5,
+  "materialized_max_go_task_ratio": 1.0,
+  "remote_hit_max_requests": 2,
+  "automatic_plugin_plan_max_median_ratio": 1.25,
+  "overlapping_max_cpu_ratio": 1.25
+}

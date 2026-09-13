@@ -8,6 +8,7 @@
 #![warn(missing_docs)]
 
 mod bundle;
+mod digest_memo;
 mod error;
 mod fileset;
 mod hash;

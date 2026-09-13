@@ -182,14 +182,16 @@ pub(crate) async fn lookup(cache: &ResultCache, request: CacheLookup<'_>) -> Exe
     return Ok(());
   }
 
-  // Recheck immediately before replacing outputs. A concurrent source change
-  // turns the lookup into a miss rather than restoring a result for stale input.
-  let verified = match cache
+  // Recheck immediately before replacing outputs. The original snapshot keeps
+  // transient file identity and change metadata, so this TOCTOU guard does not
+  // read and hash every input a second time. Canonical action identity still
+  // comes exclusively from the BLAKE3 content snapshot above.
+  let unchanged = match cache
     .snapshotter
-    .snapshot_pattern_sets(&plan.workspace, &plan.input_pattern_sets, cancel)
+    .revalidate(&plan.workspace, &plan.input_pattern_sets, &snapshot, cancel)
     .await
   {
-    Ok(snapshot) => snapshot,
+    Ok(unchanged) => unchanged,
     Err(octa_cache::CacheError::Cancelled) => return Err(ExecutorError::TaskCancelled("cache lookup".to_owned())),
     Err(error) => {
       return record_lookup_error(
@@ -203,7 +205,7 @@ pub(crate) async fn lookup(cache: &ResultCache, request: CacheLookup<'_>) -> Exe
       .await;
     },
   };
-  if verified.root != snapshot.root {
+  if !unchanged {
     output
       .cache_miss(action.to_string(), CacheReason::InputsChangedDuringLookup)
       .await?;

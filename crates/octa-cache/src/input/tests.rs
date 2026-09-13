@@ -1,6 +1,6 @@
 //! Input snapshot integration and filesystem-safety tests.
 
-use std::fs;
+use std::{fs, sync::Arc};
 
 use tempfile::TempDir;
 
@@ -189,6 +189,11 @@ async fn rejects_unsafe_inputs_and_honours_cancellation() {
     ..SnapshotOptions::default()
   })
   .is_err());
+  assert!(InputSnapshotter::new(SnapshotOptions {
+    max_memo_bytes: 0,
+    ..SnapshotOptions::default()
+  })
+  .is_err());
 
   assert!(InputSnapshotter::default()
     .snapshot(root.path(), &patterns(&["["]), &CancellationToken::new())
@@ -267,49 +272,180 @@ async fn empty_inputs_have_a_stable_digest_across_snapshotter_clones() {
     .unwrap();
   assert!(first.entries.is_empty());
   assert_eq!(first.root, second.root);
+  assert_eq!(format!("{first:?}"), format!("{second:?}"));
 }
 
 #[tokio::test]
-async fn sequential_hardlinks_reuse_the_snapshot_digest() {
-  use std::time::Duration;
-
+async fn hardlinks_share_one_content_identity_in_a_snapshot() {
   let root = TempDir::new().unwrap();
   let first = root.path().join("first");
   let second = root.path().join("second");
   fs::write(&first, "shared data").unwrap();
   fs::hard_link(&first, &second).unwrap();
+  let snapshot = InputSnapshotter::default()
+    .snapshot(root.path(), &patterns(&["first", "second"]), &CancellationToken::new())
+    .await
+    .unwrap();
+  let digests = snapshot
+    .entries
+    .iter()
+    .map(|entry| match entry {
+      InputEntry::File { content, .. } => *content,
+      _ => panic!("hardlink inputs must be files"),
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(digests, [Digest::blake3(b"shared data"); 2]);
+
+  let workspace = dunce::canonicalize(root.path()).unwrap();
+  let files = [workspace.join("first"), workspace.join("second")]
+    .into_iter()
+    .enumerate()
+    .map(|(validation_index, path)| {
+      let key = EntryKey::new(&path, &fs::symlink_metadata(&path).unwrap()).unwrap();
+      FileInput {
+        validation_index,
+        path,
+        key,
+      }
+    })
+    .collect::<Vec<_>>();
+  let (requests, indices, counts) = unique_hash_requests(&files);
+  assert_eq!(requests.len(), 1, "one hardlinked inode must produce one content read");
+  assert_eq!(indices, [0, 0]);
+  assert_eq!(counts, [2]);
+}
+
+#[tokio::test]
+async fn unchanged_snapshot_revalidation_accepts_the_captured_metadata() {
+  let root = TempDir::new().unwrap();
+  fs::create_dir(root.path().join("src")).unwrap();
+  fs::write(root.path().join("src/input"), "stable content").unwrap();
+  let inputs = patterns(&["src/**"]);
   let snapshotter = InputSnapshotter::new(SnapshotOptions {
     max_parallel_hashes: 1,
     ..SnapshotOptions::default()
   })
   .unwrap();
-  let memo = Mutex::new(HashMap::new());
+  let snapshot = snapshotter
+    .snapshot(root.path(), &inputs, &CancellationToken::new())
+    .await
+    .unwrap();
 
-  let first_hash = snapshotter
-    .hash_file(
-      &first,
-      fs::symlink_metadata(&first).unwrap(),
-      &memo,
+  let unchanged = snapshotter
+    .revalidate(root.path(), &[inputs], &snapshot, &CancellationToken::new())
+    .await
+    .unwrap();
+
+  assert!(unchanged);
+}
+
+#[tokio::test]
+async fn snapshot_revalidation_detects_content_and_membership_changes() {
+  let root = TempDir::new().unwrap();
+  fs::create_dir(root.path().join("src")).unwrap();
+  let input = root.path().join("src/input");
+  fs::write(&input, "before").unwrap();
+  let inputs = patterns(&["src/**"]);
+  let snapshotter = InputSnapshotter::default();
+
+  let before_content = snapshotter
+    .snapshot(root.path(), &inputs, &CancellationToken::new())
+    .await
+    .unwrap();
+  fs::write(&input, "after!").unwrap();
+  assert!(!snapshotter
+    .revalidate(
+      root.path(),
+      std::slice::from_ref(&inputs),
+      &before_content,
       &CancellationToken::new(),
     )
     .await
-    .unwrap();
-  let held = snapshotter.scheduler.hold_permit().await;
-  let second_hash = tokio::time::timeout(
-    Duration::from_secs(1),
-    snapshotter.hash_file(
-      &second,
-      fs::symlink_metadata(&second).unwrap(),
-      &memo,
-      &CancellationToken::new(),
-    ),
-  )
-  .await
-  .expect("a memoized hardlink must not wait for hashing capacity")
-  .unwrap();
-  drop(held);
+    .unwrap());
 
-  assert_eq!(first_hash.content, second_hash.content);
+  let before_membership = snapshotter
+    .snapshot(root.path(), &inputs, &CancellationToken::new())
+    .await
+    .unwrap();
+  fs::write(root.path().join("src/added"), "new").unwrap();
+  assert!(!snapshotter
+    .revalidate(
+      root.path(),
+      std::slice::from_ref(&inputs),
+      &before_membership,
+      &CancellationToken::new(),
+    )
+    .await
+    .unwrap());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn persistent_digest_memo_reuses_only_unchanged_input_identity() {
+  let workspace = TempDir::new().unwrap();
+  let cache = TempDir::new().unwrap();
+  let input = workspace.path().join("input");
+  fs::write(&input, "before").unwrap();
+  let store = Arc::new(crate::LocalCacheStore::open(crate::LocalCacheConfig::new(cache.path())).unwrap());
+  let inputs = patterns(&["input"]);
+
+  let first = InputSnapshotter::default()
+    .with_digest_memo(store.clone())
+    .snapshot(workspace.path(), &inputs, &CancellationToken::new())
+    .await
+    .unwrap();
+  // A separate snapshotter models the next Octa invocation and proves that
+  // reuse comes from the durable local CAS rather than process-local state.
+  let unchanged = InputSnapshotter::default()
+    .with_digest_memo(store.clone())
+    .snapshot(workspace.path(), &inputs, &CancellationToken::new())
+    .await
+    .unwrap();
+  assert_eq!(unchanged, first);
+
+  // Keep the byte length constant: size alone must never validate a memo.
+  fs::write(&input, "after!").unwrap();
+  let changed = InputSnapshotter::default()
+    .with_digest_memo(store)
+    .snapshot(workspace.path(), &inputs, &CancellationToken::new())
+    .await
+    .unwrap();
+  assert_ne!(changed.root, first.root);
+}
+
+#[test]
+fn memo_validation_rejects_non_blake3_file_identities() {
+  let workspace = TempDir::new().unwrap();
+  fs::write(workspace.path().join("input"), "contents").unwrap();
+  let workspace = dunce::canonicalize(workspace.path()).unwrap();
+  let path = workspace.join("input");
+  let validation = vec![validation_entry(&workspace, &path, fs::symlink_metadata(&path).unwrap()).unwrap()];
+  let invalid_entries = vec![InputEntry::File {
+    path: RelativePath::new("input").unwrap(),
+    content: Digest::new(DigestAlgorithm::Sha256, [7; 32], 8),
+    executable: false,
+  }];
+  let invalid = crate::digest_memo::MemoSnapshot {
+    root: input_root_digest(&invalid_entries),
+    entries: invalid_entries,
+  };
+
+  assert!(!memo_matches(&invalid, &validation));
+}
+
+#[test]
+fn persistent_memo_identity_is_bound_to_its_boot_and_filesystem_scope() {
+  let workspace = TempDir::new().unwrap();
+  fs::write(workspace.path().join("input"), "contents").unwrap();
+  let workspace = dunce::canonicalize(workspace.path()).unwrap();
+  let path = workspace.join("input");
+  let validation = vec![validation_entry(&workspace, &path, fs::symlink_metadata(&path).unwrap()).unwrap()];
+
+  assert!(input_metadata_digest(&validation, None).is_none());
+  assert_ne!(
+    input_metadata_digest(&validation, Some(b"boot-and-filesystem-a")),
+    input_metadata_digest(&validation, Some(b"boot-and-filesystem-b"))
+  );
 }
 
 #[test]

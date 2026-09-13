@@ -127,6 +127,14 @@ pub(crate) struct ExecutionPlan<T: Eq + Hash + Identifiable> {
   scopes: Vec<ConsoleScope>,
 }
 
+#[cfg(test)]
+impl<T: Eq + Hash + Identifiable> ExecutionPlan<T> {
+  /// Exposes planned nodes without widening the production API.
+  pub(crate) fn nodes(&self) -> &std::collections::HashSet<Arc<T>> {
+    self.dag.nodes()
+  }
+}
+
 /// A cleanup action attached to an internal barrier in the main task graph.
 #[derive(Clone)]
 pub(crate) struct DeferredAction<T: Eq + Hash + Identifiable> {

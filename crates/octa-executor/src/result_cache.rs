@@ -87,6 +87,12 @@ impl ResultCache {
     Ok(self)
   }
 
+  /// Enables the local, metadata-validated file-digest accelerator.
+  pub fn with_snapshot_digest_memo(mut self, store: Arc<octa_cache::LocalCacheStore>) -> Self {
+    self.snapshotter = self.snapshotter.with_digest_memo(store);
+    self
+  }
+
   /// Replaces output encoding and safety limits for capture and restore.
   pub fn with_bundle_options(
     mut self,

@@ -8,7 +8,7 @@
 //! semantics.
 
 use std::{
-  collections::{BTreeSet, HashMap},
+  collections::{BTreeMap, HashMap},
   fs::{self, File},
   io::Read,
   path::{Component, Path, PathBuf},
@@ -41,6 +41,17 @@ pub(crate) fn collect(
   cancel: &CancellationToken,
 ) -> CacheResult<Vec<PathBuf>> {
   collect_pattern_sets(std::iter::once(patterns), root, max_entries, cancel)
+    .map(|entries| entries.into_iter().map(|entry| entry.path).collect())
+}
+
+/// One selected path together with metadata captured by the shared traversal.
+///
+/// Consumers must still validate the opened handle around content reads. The
+/// retained metadata only avoids repeating the same path lookup immediately
+/// after discovery.
+pub(crate) struct DiscoveredEntry {
+  pub(crate) path: PathBuf,
+  pub(crate) metadata: fs::Metadata,
 }
 
 /// Expands independent ordered pattern sets and returns their filesystem union.
@@ -52,7 +63,7 @@ pub(crate) fn collect_sets(
   root: &Path,
   max_entries: usize,
   cancel: &CancellationToken,
-) -> CacheResult<Vec<PathBuf>> {
+) -> CacheResult<Vec<DiscoveredEntry>> {
   collect_pattern_sets(pattern_sets.iter().map(Vec::as_slice), root, max_entries, cancel)
 }
 
@@ -61,7 +72,7 @@ fn collect_pattern_sets<'a>(
   root: &Path,
   max_entries: usize,
   cancel: &CancellationToken,
-) -> CacheResult<Vec<PathBuf>> {
+) -> CacheResult<Vec<DiscoveredEntry>> {
   check_cancelled(cancel)?;
   if max_entries == 0 {
     return Err(CacheError::Configuration(
@@ -77,7 +88,7 @@ fn collect_pattern_sets<'a>(
   }
 
   let mut filter = IgnoreFilter::new(root.clone());
-  let mut paths = BTreeSet::<PathBuf>::new();
+  let mut paths = BTreeMap::<PathBuf, fs::Metadata>::new();
   let mut visited = 0;
   let mut pattern_count = 0_usize;
   let mut patterns = Vec::new();
@@ -106,7 +117,7 @@ fn collect_pattern_sets<'a>(
   // multiply filesystem work.
   for scan_root in minimal_scan_roots(&patterns) {
     check_cancelled(cancel)?;
-    let mut allow = |path: &Path| filter.is_ignored(path).map(|ignored| !ignored);
+    let mut allow = |path: &Path, is_directory: bool| filter.is_ignored(path, is_directory).map(|ignored| !ignored);
     let mut walker = Walker {
       patterns: &patterns,
       groups: &groups,
@@ -116,16 +127,15 @@ fn collect_pattern_sets<'a>(
       max_entries,
       visited: &mut visited,
     };
-    match fs::symlink_metadata(&scan_root) {
-      Ok(_) => {
-        let inherited = ancestor_matches(&patterns, &scan_root)?;
-        walker.walk(&scan_root, &inherited)?;
-      },
-      Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-      Err(error) => return Err(io_error("inspect cache input", scan_root, error)),
-    }
+    let inherited = ancestor_matches(&patterns, &scan_root)?;
+    walker.walk(&scan_root, &inherited)?;
   }
-  Ok(paths.into_iter().collect())
+  Ok(
+    paths
+      .into_iter()
+      .map(|(path, metadata)| DiscoveredEntry { path, metadata })
+      .collect(),
+  )
 }
 
 /// Validates input syntax and rejects output roots that a positive input scan
@@ -339,14 +349,14 @@ struct Walker<'a, F> {
   groups: &'a [(usize, usize)],
   cancel: &'a CancellationToken,
   allow: &'a mut F,
-  paths: &'a mut BTreeSet<PathBuf>,
+  paths: &'a mut BTreeMap<PathBuf, fs::Metadata>,
   max_entries: usize,
   visited: &'a mut usize,
 }
 
 impl<F> Walker<'_, F>
 where
-  F: FnMut(&Path) -> CacheResult<bool>,
+  F: FnMut(&Path, bool) -> CacheResult<bool>,
 {
   fn walk(&mut self, path: &Path, inherited_matches: &[bool]) -> CacheResult<()> {
     let mut pending = vec![(path.to_path_buf(), Arc::<[bool]>::from(inherited_matches))];
@@ -359,15 +369,15 @@ where
         )));
       }
       *self.visited += 1;
-      if !(self.allow)(&path)? {
-        continue;
-      }
       let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
         Err(error) => return Err(io_error("inspect cache input", path, error)),
       };
       let is_directory = metadata.is_dir() && !metadata.file_type().is_symlink();
+      if !(self.allow)(&path, is_directory)? {
+        continue;
+      }
       let matches = self
         .patterns
         .iter()
@@ -390,7 +400,7 @@ where
       // The last matching rule wins, while a directory match remains active
       // for descendants through the shared `matches` slice.
       if selected {
-        self.paths.insert(path.clone());
+        self.paths.entry(path.clone()).or_insert_with(|| metadata.clone());
       }
       let selected_by_include = self
         .patterns
@@ -440,7 +450,7 @@ impl IgnoreFilter {
     }
   }
 
-  fn is_ignored(&mut self, path: &Path) -> CacheResult<bool> {
+  fn is_ignored(&mut self, path: &Path, is_directory: bool) -> CacheResult<bool> {
     let relative = path.strip_prefix(&self.root).map_err(|_| CacheError::Path {
       path: path.to_path_buf(),
       reason: "input escaped the workspace".to_owned(),
@@ -462,9 +472,6 @@ impl IgnoreFilter {
         active.push(directory.clone());
       }
     }
-    let is_directory = fs::symlink_metadata(path)
-      .map_err(|error| io_error("inspect cache input", path, error))?
-      .is_dir();
     Ok(self.matches(&active, path, is_directory))
   }
 
@@ -668,7 +675,11 @@ mod tests {
     fs::write(root.path().join("src/input"), "data").unwrap();
     let groups = vec![vec!["src/**".to_owned()], vec!["src/input".to_owned()]];
 
-    let paths = collect_sets(&groups, root.path(), 2, &CancellationToken::new()).unwrap();
+    let paths = collect_sets(&groups, root.path(), 2, &CancellationToken::new())
+      .unwrap()
+      .into_iter()
+      .map(|entry| entry.path)
+      .collect::<Vec<_>>();
     assert_eq!(paths, [dunce::canonicalize(root.path()).unwrap().join("src/input")]);
   }
 
@@ -755,7 +766,7 @@ mod tests {
 
     let mut filter = IgnoreFilter::new(root.path().to_path_buf());
     assert!(matches!(
-      filter.is_ignored(Path::new("/outside")),
+      filter.is_ignored(Path::new("/outside"), false),
       Err(CacheError::Path { .. })
     ));
   }

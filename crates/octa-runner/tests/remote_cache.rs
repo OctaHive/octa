@@ -98,7 +98,7 @@ fn plugins_dir() -> PathBuf {
   }
 }
 
-fn only_regular_file(root: &Path) -> PathBuf {
+fn only_result_blob(root: &Path) -> PathBuf {
   let mut directories = vec![root.to_owned()];
   let mut files = Vec::new();
   while let Some(directory) = directories.pop() {
@@ -107,12 +107,19 @@ fn only_regular_file(root: &Path) -> PathBuf {
       let file_type = entry.file_type().unwrap();
       if file_type.is_dir() {
         directories.push(entry.path());
-      } else if file_type.is_file() {
+      } else if file_type.is_file()
+        && entry
+          .file_name()
+          .to_str()
+          .is_some_and(|name| name.contains("-zstd-v1-"))
+      {
         files.push(entry.path());
       }
     }
   }
-  assert_eq!(files.len(), 1, "fixture must publish exactly one physical blob");
+  // The local CAS may also contain identity-encoded input-digest memo data.
+  // This fixture publishes exactly one compressed task-result bundle.
+  assert_eq!(files.len(), 1, "fixture must publish exactly one result blob");
   files.pop().unwrap()
 }
 
@@ -247,7 +254,7 @@ fn two_runner_processes_share_a_result_over_https() {
   // A same-sized L1 corruption is invisible to metadata-only lookup. The
   // expanded bundle verifier must quarantine it and retry the independent L2
   // copy before allowing the task body to execute.
-  let local_blob = only_regular_file(&second_cache.path().join("v1/blobs"));
+  let local_blob = only_result_blob(&second_cache.path().join("v1/blobs"));
   let size = fs::metadata(&local_blob).unwrap().len() as usize;
   fs::write(&local_blob, vec![b'x'; size]).unwrap();
   fs::remove_file(second.path().join("output.txt")).unwrap();

@@ -62,6 +62,33 @@ async fn started_planning_fixture_manager() -> Arc<PluginManager> {
   manager
 }
 
+#[tokio::test]
+async fn task_without_cache_contract_has_no_cache_graph_boundaries() -> ExecutorResult<()> {
+  let directory = TempDir::new().unwrap();
+  let path = directory.path().join("Octafile.yml");
+  fs::write(
+    &path,
+    r#"
+version: 1
+tasks:
+  build:
+    shell: echo build
+"#,
+  )?;
+  let octafile = Octafile::load(Some(path), false, vec!["shell".to_owned()], "shell")?;
+  let plan = TaskGraphBuilder::new(started_shell_manager().await)?
+    .build(octafile, "build", false, Vec::new())
+    .await?;
+
+  assert!(plan.nodes().iter().all(|node| {
+    !matches!(
+      node.action(),
+      NodeAction::CacheLookup { .. } | NodeAction::CacheFinalize { .. }
+    )
+  }));
+  Ok(())
+}
+
 #[test]
 fn repeated_dependencies_receive_distinct_invocation_names() {
   let dependencies = vec![Deps::from("build".to_owned()), Deps::from("build".to_owned())];

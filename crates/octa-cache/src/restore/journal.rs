@@ -222,6 +222,34 @@ pub(super) fn remove_transaction_state(journal: &Path, transaction: &Path) -> Ca
   sync_directory(journal.parent().expect("journal has a parent"))
 }
 
+/// Removes a transaction that never needed rollback markers.
+///
+/// An unprepared transaction cannot have replaced an existing output. The
+/// single-new-root restore path may already have atomically installed its
+/// verified root, but recovery deliberately leaves that complete live value in
+/// place and only removes the now-unreachable staging directory and intent.
+/// Keeping this lifecycle separate avoids synchronizing absent marker files on
+/// the common first-materialization path.
+pub(super) fn remove_unprepared_transaction_state(journal: &Path, transaction: &Path) -> CacheResult<()> {
+  let removed_transaction = match fs::remove_dir_all(transaction) {
+    Ok(()) => true,
+    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+    Err(error) => return Err(io_error("remove unprepared restore transaction", transaction, error)),
+  };
+  if removed_transaction {
+    sync_directory(transaction.parent().expect("a restore transaction has a parent"))?;
+  }
+  let removed_journal = match fs::remove_file(journal) {
+    Ok(()) => true,
+    Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+    Err(error) => return Err(io_error("remove unprepared restore journal", journal, error)),
+  };
+  if removed_journal {
+    sync_directory(journal.parent().expect("journal has a parent"))?;
+  }
+  Ok(())
+}
+
 pub(super) fn journal_files(root: &Path) -> CacheResult<Vec<PathBuf>> {
   let mut paths = Vec::new();
   for entry in fs::read_dir(root).map_err(|error| io_error("scan restore journals", root, error))? {
