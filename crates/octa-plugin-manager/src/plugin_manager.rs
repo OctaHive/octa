@@ -928,6 +928,18 @@ mod tests {
     }
   }
 
+  struct CrashingLauncher;
+
+  #[async_trait]
+  impl PluginLauncher for CrashingLauncher {
+    async fn launch(&self, mut request: PluginLaunchRequest) -> std::result::Result<PluginProcess, PluginLaunchError> {
+      request
+        .environment
+        .insert("OCTA_TEST_PLUGIN_CRASH".to_owned(), "1".to_owned());
+      LocalPluginLauncher.launch(request).await
+    }
+  }
+
   struct TestSetup {
     plugin_manager: PluginManager,
     plugin_path: PathBuf,
@@ -1718,37 +1730,13 @@ time.sleep(10)  # Simulate a hanging plugin
 
   #[tokio::test]
   async fn test_plugin_crash_during_startup() {
-    let temp_dir = TempDir::new().unwrap();
-
-    // Create a plugin that crashes immediately
-    let crashing_plugin = temp_dir.path().join("crash.py");
-    fs::write(
-      &crashing_plugin,
-      r#"
-import sys
-print("startup stdout", flush=True)
-print("startup stderr", file=sys.stderr, flush=True)
-sys.exit(1)  # Crash immediately
-      "#,
-    )
-    .await
-    .unwrap();
-
-    // Make the plugin executable on Unix systems
-    #[cfg(unix)]
-    {
-      use std::os::unix::fs::PermissionsExt;
-      fs::set_permissions(&crashing_plugin, std::fs::Permissions::from_mode(0o755))
-        .await
-        .unwrap();
-    }
-
-    let setup = TestSetup::new(temp_dir.keep(), "crash.py").await;
-
-    let result = setup
-      .plugin_manager
-      .start_plugin(crashing_plugin.file_name().unwrap().to_str().unwrap())
-      .await;
+    let plugins_dir = PathBuf::from("../../plugins").canonicalize().unwrap();
+    let manager = PluginManager::with_launcher(
+      &plugins_dir,
+      std::env::current_dir().unwrap(),
+      Arc::new(CrashingLauncher),
+    );
+    let result = manager.start_plugin(TEST_PLUGIN).await;
 
     assert!(matches!(
       result,

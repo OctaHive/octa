@@ -3,7 +3,7 @@
 //! Keeping the fixture on the Rust SDK exercises the real local-socket
 //! protocol without making Windows tests depend on Python and pywin32.
 
-use std::sync::Arc;
+use std::{io::Write as _, sync::Arc};
 
 use async_trait::async_trait;
 use octa_plugin::{
@@ -89,5 +89,21 @@ impl Plugin for TestPlugin {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+  // The manager's startup-failure test uses the same native executable so its
+  // process and pipe behavior remains representative on every supported OS.
+  if std::env::var_os("OCTA_TEST_PLUGIN_CRASH").is_some() {
+    {
+      let mut stdout = std::io::stdout().lock();
+      writeln!(stdout, "startup stdout")?;
+      stdout.flush()?;
+    }
+    {
+      let mut stderr = std::io::stderr().lock();
+      writeln!(stderr, "startup stderr")?;
+      stderr.flush()?;
+    }
+    std::process::exit(1);
+  }
+
   serve_plugin(TestPlugin, schema()).await
 }
