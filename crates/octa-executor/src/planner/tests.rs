@@ -984,6 +984,36 @@ tasks:
 }
 
 #[tokio::test]
+async fn cache_outputs_cannot_own_octa_workspace_state() -> ExecutorResult<()> {
+  let temp_dir = TempDir::new().unwrap();
+  let octafile_path = temp_dir.path().join("Octafile.yml");
+  fs::write(
+    &octafile_path,
+    r#"
+version: 1
+tasks:
+  build:
+    files:
+      inputs: [Octafile.yml]
+      outputs: [.octa/generated]
+    cache: {}
+    shell: echo build
+"#,
+  )?;
+
+  let octafile = Octafile::load(Some(octafile_path), false, vec!["shell".to_owned()], "shell")?;
+  let result = TaskGraphBuilder::new(started_shell_manager().await)?
+    .with_working_directory(temp_dir.path().to_path_buf())
+    .build(octafile, "build", false, vec![])
+    .await;
+  assert!(matches!(
+    result,
+    Err(ExecutorError::InvalidCacheConfiguration(message)) if message.contains("reserved .octa")
+  ));
+  Ok(())
+}
+
+#[tokio::test]
 async fn rejects_parallel_cache_output_owners_but_allows_dependency_order() -> ExecutorResult<()> {
   let temp_dir = TempDir::new().unwrap();
   let octafile_path = temp_dir.path().join("Octafile.yml");

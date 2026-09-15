@@ -1,0 +1,12 @@
+version: 1
+
+tasks:
+  build:
+    desc: Copy one declared input into a restorable output directory
+    files:
+      inputs:
+        - input/message.txt
+      outputs:
+        - dist
+    cache: {}
+    shell: mkdir -p dist && cp input/message.txt dist/message.txt && echo built dist/message.txt

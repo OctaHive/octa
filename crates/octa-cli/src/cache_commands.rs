@@ -8,6 +8,7 @@
 
 use std::{path::Path, sync::Arc};
 
+use octa_octafile::Octafile;
 use octa_output::{Console, ConsoleLevel};
 use octa_runtime::{RunOptions, Runtime, RuntimeCacheConfig};
 
@@ -23,11 +24,17 @@ pub(super) fn explain_task(command: Option<&CacheCommand>) -> Option<String> {
 pub(super) async fn run_management(
   command: &CacheCommand,
   workspace: &Path,
+  octafile: Option<&Path>,
+  global: bool,
+  data_dir: &Path,
   cache_profile: Option<&Path>,
   console: &Console,
 ) -> OctaResult<()> {
-  let profile = cache_profile.ok_or(OctaError::CacheProfileRequired)?;
-  let cache = RuntimeCacheConfig::load_profile(profile, workspace)?.open().await?;
+  let config = match cache_profile {
+    Some(profile) => RuntimeCacheConfig::load_profile(profile, workspace)?,
+    None => automatic_cache_config(workspace, octafile, global, data_dir)?,
+  };
+  let cache = config.open().await?;
   match command {
     CacheCommand::Status => {
       let status = cache.status().await?;
@@ -64,6 +71,28 @@ pub(super) async fn run_management(
     CacheCommand::Explain { .. } => return Err(OctaError::CacheExplainUnavailable),
   }
   Ok(())
+}
+
+/// Resolves the same root Octafile used by runtime loading without starting plugins.
+fn automatic_cache_config(
+  workspace: &Path,
+  octafile: Option<&Path>,
+  global: bool,
+  data_dir: &Path,
+) -> OctaResult<RuntimeCacheConfig> {
+  let entry = Octafile::resolve_path(octafile.map(Path::to_path_buf), global, Some(workspace.to_path_buf()))?;
+  let data_dir = if data_dir.is_absolute() {
+    data_dir.to_path_buf()
+  } else {
+    workspace.join(data_dir)
+  };
+  let resolution = octa_monorepo::resolve(
+    &entry,
+    workspace,
+    octafile.is_some() || global,
+    &data_dir.join("monorepo"),
+  )?;
+  Ok(RuntimeCacheConfig::automatic_local(&resolution.root_octafile)?)
 }
 
 pub(super) async fn run_explain(runtime: Arc<Runtime>, console: &Console, task: String, args: &Cli) -> OctaResult<()> {

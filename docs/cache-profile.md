@@ -1,5 +1,15 @@
 # Task-result cache profile
 
+The interactive CLI does not require a profile. When a loaded task graph contains `cache:`, Octa
+lazily creates a local read/write cache below the root Octafile at `.octa/cache`. Non-cacheable
+graphs do not create the directory. This automatic mode is intended for trusted local development;
+it separates Octa versions and host platforms but cannot discover every compiler or SDK used by an
+opaque shell command.
+
+Use a profile when the cache must have a precise operator-maintained toolchain identity, controlled
+capacity or access mode, an external local path, or a remote L2. An explicit profile replaces the
+automatic local configuration.
+
 The filesystem contract belongs in `Octafile.yml`, but storage paths, capacity,
 toolchain identity, and resource limits depend on the machine running Octa.
 They are loaded from a separate strict TOML profile:
@@ -27,7 +37,7 @@ request_timeout_seconds = 30
 max_parallel_transfers = 8
 ```
 
-Run a cacheable task with:
+Run a cacheable task with the explicit profile:
 
 ```console
 octa --cache-profile cache.toml build
@@ -139,6 +149,7 @@ plugin-backed template values may therefore perform their documented reads or
 external calls. `prune` performs an exclusive bounded
 mark-and-sweep pass and reports removed action, blob, and maintenance objects.
 
-`status` and `prune` remain local maintenance operations. The remote service
+Without `--cache-profile`, these commands inspect or maintain the automatic
+`<root Octafile directory>/.octa/cache`. `status` and `prune` remain local maintenance operations. The remote service
 owns its own quota, retention, and backing storage; Octa does not expose S3
 details or use an S3 SDK.

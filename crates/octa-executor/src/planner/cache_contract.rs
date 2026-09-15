@@ -98,6 +98,15 @@ impl TaskGraphBuilder {
       .map(RelativePath::new)
       .collect::<Result<Vec<_>, _>>()
       .map_err(|error| ExecutorError::InvalidCacheConfiguration(error.to_string()))?;
+    if let Some(path) = outputs
+      .iter()
+      .find(|path| octa_cache_protocol::is_octa_workspace_state_path(path))
+    {
+      return Err(ExecutorError::InvalidCacheConfiguration(format!(
+        "cache output '{}' uses Octa's reserved .octa workspace state",
+        path.as_str()
+      )));
+    }
 
     Ok(EffectiveFileContract {
       input_pattern_sets,

@@ -1501,15 +1501,30 @@ values are distinct. `salt` is an optional manual invalidation value, not a subs
 real inputs. The planning protocol and plugin obligations are documented in
 [Plugin protocol](docs/plugins.md#planning-a-cache-contract).
 
-Storage and native toolchain identity are configured outside the Octafile:
+With no profile, the CLI lazily creates a local read/write cache at
+`<root Octafile directory>/.octa/cache` when the loaded task graph contains at least one
+`cache:` declaration. Ordinary non-cacheable task graphs do not open or create it. The automatic
+identity separates Octa versions, operating systems, and CPU architectures, which is convenient
+for trusted local development but cannot identify every compiler or SDK invoked by an opaque shell
+command.
+
+Run the complete example in [`example/cache`](example/cache), or try the commands directly:
+
+```console
+octa build
+octa cache explain build
+```
+
+For toolchain-sensitive CI, custom capacity or a shared remote L2, supply an explicit profile. It
+replaces the automatic configuration:
 
 ```console
 octa --cache-profile cache.toml build
-octa --cache-profile cache.toml cache explain build
 ```
 
-See the [cache profile reference](docs/cache-profile.md) for local capacity,
-read/write modes, inspection, and pruning.
+See the [cache profile reference](docs/cache-profile.md) for environment identity, local capacity,
+read/write modes, remote transport, inspection, and pruning. Headless `octa-runner` never enables
+the workspace-local default: its supervisor must negotiate an explicit cache session.
 
 On a verified hit Octa restores the output bundle transactionally and replays stdout, public task
 outputs, artifacts, and reports without invoking the command. Existing outputs whose canonical
@@ -1528,7 +1543,8 @@ published under its immutable action key.
 
 Patterns are applied in declaration order. Prefix an input pattern with `!` to exclude matches and
 quote it in YAML; prefix with `\!` for a literal leading exclamation mark. Paths use `/` separators
-on every operating system and stay inside the workspace.
+on every operating system and stay inside the workspace. The `.octa` directory is reserved runtime
+state: input discovery always excludes it and cache outputs cannot own it.
 
 Use `artifacts` and `reports` for files that an external runner should collect. These are exact
 paths relative to the task working directory and should also be covered by `files.outputs` when the

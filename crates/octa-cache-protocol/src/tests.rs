@@ -645,3 +645,14 @@ fn action_result_rejects_inconsistent_or_unbounded_metadata() {
     .to_string()
     .contains("result metadata exceeds"));
 }
+#[test]
+fn recognizes_only_the_reserved_octa_workspace_state_tree() {
+  assert!(is_octa_workspace_state_path(&RelativePath::new(".octa").unwrap()));
+  assert!(is_octa_workspace_state_path(
+    &RelativePath::new(".octa/cache/object").unwrap()
+  ));
+  assert!(!is_octa_workspace_state_path(&RelativePath::new(".octafile").unwrap()));
+  assert!(!is_octa_workspace_state_path(
+    &RelativePath::new("nested/.octa/cache").unwrap()
+  ));
+}

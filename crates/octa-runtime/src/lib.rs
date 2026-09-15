@@ -99,8 +99,8 @@ pub struct RuntimeConfig {
   pub plugin_lock: Option<PathBuf>,
   /// Optional logical-secret provider profile.
   pub secrets_profile: Option<PathBuf>,
-  /// Validated machine-specific result-cache configuration.
-  pub result_cache: Option<RuntimeCacheConfig>,
+  /// Result-cache selection for this runtime.
+  pub cache: RuntimeCacheSelection,
   /// Additional plugins requested by the caller.
   pub plugins: Vec<String>,
   /// Optional default plugin for bare task definitions.
@@ -130,7 +130,7 @@ impl RuntimeConfig {
       plugins_dir,
       plugin_lock: None,
       secrets_profile: None,
-      result_cache: None,
+      cache: RuntimeCacheSelection::Disabled,
       plugins: Vec::new(),
       default_plugin: None,
       variables: Vec::new(),
@@ -141,6 +141,22 @@ impl RuntimeConfig {
       cancellation: CancellationToken::new(),
     }
   }
+}
+
+/// Selects whether the runtime disables, discovers, or explicitly configures caching.
+///
+/// The interactive CLI uses [`Self::AutomaticLocal`]. Headless runners remain
+/// disabled unless their negotiated job request supplies a complete explicit
+/// cache session.
+#[derive(Clone, Debug, Default)]
+pub enum RuntimeCacheSelection {
+  /// Do not attach a task-result cache.
+  #[default]
+  Disabled,
+  /// Lazily open `<root Octafile directory>/.octa/cache` when a task enables caching.
+  AutomaticLocal,
+  /// Use a validated operator or coordinator supplied cache configuration.
+  Configured(Box<RuntimeCacheConfig>),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -195,7 +211,7 @@ impl Runtime {
       plugins_dir,
       plugin_lock,
       secrets_profile,
-      result_cache,
+      cache,
       plugins,
       default_plugin,
       variables,
@@ -207,12 +223,15 @@ impl Runtime {
     } = config;
 
     check_cancelled(&cancellation)?;
-    // Opening includes an exact bounded scan and crash recovery. Complete it
-    // before starting plugins so a cache failure cannot leak child processes
-    // from a partially constructed runtime.
-    let result_cache = match result_cache {
-      Some(config) => Some(config.open_with_cancellation(cancellation.clone()).await?),
-      None => None,
+    // Explicit operator configuration is opened before plugins. Automatic CLI
+    // storage is delayed until the complete Octafile proves caching is used,
+    // keeping ordinary commands free of cache I/O and filesystem state.
+    let (result_cache, automatic_cache) = match cache {
+      RuntimeCacheSelection::Configured(config) => {
+        (Some(config.open_with_cancellation(cancellation.clone()).await?), false)
+      },
+      RuntimeCacheSelection::AutomaticLocal => (None, true),
+      RuntimeCacheSelection::Disabled => (None, false),
     };
     let secret_session = secrets_profile
       .map(|path| if path.is_absolute() { path } else { workspace.join(path) })
@@ -259,6 +278,7 @@ impl Runtime {
     )
     .map_err(classify_monorepo_error)?;
     check_cancelled(&cancellation)?;
+    let root_octafile = monorepo.root_octafile.clone();
     let synthetic_includes = synthetic_includes(&monorepo);
     let loaded = Octafile::load_with_schemas_vars_and_includes_from(
       Some(monorepo.root_octafile),
@@ -269,6 +289,16 @@ impl Runtime {
       &variables,
       &synthetic_includes,
     )?;
+
+    let result_cache = if result_cache.is_none() && automatic_cache && octafile_uses_cache(&loaded)? {
+      Some(
+        RuntimeCacheConfig::automatic_local(&root_octafile)?
+          .open_with_cancellation(cancellation.clone())
+          .await?,
+      )
+    } else {
+      result_cache
+    };
 
     let summary = Arc::new(Summary::new());
     let effective_concurrency = effective_concurrency(concurrency, loaded.concurrency);
@@ -484,6 +514,18 @@ impl Runtime {
         .await;
     }
   }
+}
+
+fn octafile_uses_cache(octafile: &Octafile) -> RuntimeResult<bool> {
+  if octafile.tasks.values().any(|task| task.cache.is_some()) {
+    return Ok(true);
+  }
+  for included in octafile.get_all_included()?.values() {
+    if octafile_uses_cache(included)? {
+      return Ok(true);
+    }
+  }
+  Ok(false)
 }
 
 fn synthetic_includes(monorepo: &MonorepoResolution) -> Vec<SyntheticInclude> {

@@ -27,6 +27,8 @@ use serde::Deserialize;
 use thiserror::Error;
 
 const MAX_CACHE_PROFILE_BYTES: u64 = 256 * 1024;
+const AUTOMATIC_CACHE_NAMESPACE: &str = "local/default";
+const AUTOMATIC_CACHE_FORMAT: &str = "octa-automatic-local-v1";
 
 /// Failure while decoding or composing an operational cache profile.
 #[derive(Debug, Error)]
@@ -83,6 +85,38 @@ pub struct RuntimeCacheConfig {
 }
 
 impl RuntimeCacheConfig {
+  /// Creates the implicit CLI cache below the directory containing the root Octafile.
+  ///
+  /// This convenience identity separates Octa releases and host platforms, but
+  /// cannot discover every compiler or SDK used by an opaque shell command.
+  /// Toolchain-sensitive or shared builds should therefore use an explicit
+  /// profile with an operator-maintained environment identity.
+  pub fn automatic_local(root_octafile: &Path) -> Result<Self, RuntimeCacheError> {
+    if !root_octafile.is_absolute() {
+      return Err(RuntimeCacheError::Invalid(
+        "root Octafile path must be absolute for automatic caching".to_owned(),
+      ));
+    }
+    let root = root_octafile.parent().ok_or_else(|| {
+      RuntimeCacheError::Invalid(format!(
+        "root Octafile '{}' has no parent directory",
+        root_octafile.display()
+      ))
+    })?;
+    let identity = format!(
+      "{AUTOMATIC_CACHE_FORMAT}:octa={}:os={}:arch={}",
+      env!("CARGO_PKG_VERSION"),
+      std::env::consts::OS,
+      std::env::consts::ARCH
+    );
+    Self::local(
+      CacheMode::ReadWrite,
+      AUTOMATIC_CACHE_NAMESPACE,
+      root.join(".octa/cache"),
+      native_runtime_identity(&identity)?,
+    )
+  }
+
   /// Creates a local cache session with centralized production defaults.
   pub fn local(
     mode: CacheMode,
@@ -541,6 +575,24 @@ fn host_architecture() -> Result<PlatformArchitecture, RuntimeCacheError> {
 mod tests {
   use super::*;
   use tempfile::TempDir;
+
+  #[test]
+  fn automatic_cache_uses_root_octafile_state_and_a_host_specific_identity() {
+    let workspace = TempDir::new().unwrap();
+    let octafile = workspace.path().join("Octafile.yml");
+    fs::write(&octafile, "version: 1\ntasks: {}\n").unwrap();
+
+    let first = RuntimeCacheConfig::automatic_local(&octafile).unwrap();
+    let second = RuntimeCacheConfig::automatic_local(&octafile).unwrap();
+    assert_eq!(first.mode, CacheMode::ReadWrite);
+    assert_eq!(first.namespace, AUTOMATIC_CACHE_NAMESPACE);
+    assert_eq!(first.local.root, workspace.path().join(".octa/cache"));
+    assert_eq!(first.runtime, second.runtime);
+    assert!(matches!(
+      RuntimeCacheConfig::automatic_local(Path::new("Octafile.yml")),
+      Err(RuntimeCacheError::Invalid(_))
+    ));
+  }
 
   #[test]
   fn loads_defaults_with_an_absolute_operator_cache_directory() {

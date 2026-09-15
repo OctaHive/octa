@@ -31,7 +31,7 @@ use octa_executor::{SourceWatcher, VariablePrompt, VariableResolver};
 use octa_finder::OctaFinder;
 use octa_octafile::{Octafile, OctafileError, OutputConfig, OutputMode, PresentationConfig, Silence, WatchInterval};
 use octa_output::{CliDocument, Console, ConsoleLevel, SummaryItem, TaskListItem};
-use octa_runtime::{RunOptions, Runtime, RuntimeCacheConfig, RuntimeConfig};
+use octa_runtime::{RunOptions, Runtime, RuntimeCacheConfig, RuntimeCacheSelection, RuntimeConfig};
 use presentation::{terminal_console, CiMode};
 
 mod cache_commands;
@@ -103,7 +103,7 @@ pub(crate) struct Cli {
   #[arg(long, value_name = "PATH", env = "OCTA_SECRETS_PROFILE")]
   pub secrets_profile: Option<PathBuf>,
 
-  /// Load machine-specific task-result cache settings from this TOML profile.
+  /// Override the automatic local task-result cache with this TOML profile.
   #[arg(long, value_name = "PATH", env = "OCTA_CACHE_PROFILE")]
   pub cache_profile: Option<PathBuf>,
 
@@ -692,18 +692,23 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
       return run_plugin_management(command, &workspace, &plugins_dir, &console).await;
     },
     Some(ManagementCommand::Cache { command }) if cache_explain.is_none() => {
-      return cache_commands::run_management(command, &workspace, args.cache_profile.as_deref(), &console).await;
+      return cache_commands::run_management(
+        command,
+        &workspace,
+        args.octafile.as_deref(),
+        args.global,
+        &data_dir,
+        args.cache_profile.as_deref(),
+        &console,
+      )
+      .await;
     },
     _ => {},
   }
-  let result_cache = args
-    .cache_profile
-    .as_deref()
-    .map(|path| RuntimeCacheConfig::load_profile(path, &workspace))
-    .transpose()?;
-  if cache_explain.is_some() && result_cache.is_none() {
-    return Err(OctaError::CacheProfileRequired);
-  }
+  let cache = match args.cache_profile.as_deref() {
+    Some(path) => RuntimeCacheSelection::Configured(Box::new(RuntimeCacheConfig::load_profile(path, &workspace)?)),
+    None => RuntimeCacheSelection::AutomaticLocal,
+  };
   let cancellation = CancellationToken::new();
   setup_signal_handling(cancellation.clone(), console.clone()).await;
   let runtime = Arc::new(
@@ -715,7 +720,7 @@ async fn run_with_console_mode(console: Arc<Console>, diagnostics: DiagnosticsSe
       plugins_dir,
       plugin_lock: args.plugin_lock.clone(),
       secrets_profile: args.secrets_profile.clone(),
-      result_cache,
+      cache,
       plugins: config.plugins,
       default_plugin: config.default_plugin,
       variables: args.vars.clone(),

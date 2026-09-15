@@ -20,7 +20,7 @@ use ignore::{
   gitignore::{Gitignore, GitignoreBuilder},
   Match,
 };
-use octa_cache_protocol::RelativePath;
+use octa_cache_protocol::{RelativePath, OCTA_WORKSPACE_STATE_DIRECTORY};
 use octa_cache_protocol::{MAX_CACHE_LIST_ITEMS, MAX_CACHE_STRING_BYTES};
 use tokio_util::sync::CancellationToken;
 
@@ -455,6 +455,13 @@ impl IgnoreFilter {
       path: path.to_path_buf(),
       reason: "input escaped the workspace".to_owned(),
     })?;
+    if relative
+      .components()
+      .next()
+      .is_some_and(|component| component.as_os_str() == OCTA_WORKSPACE_STATE_DIRECTORY)
+    {
+      return Ok(true);
+    }
     let parent = relative.parent().unwrap_or_else(|| Path::new(""));
     let mut directory = self.root.clone();
     let mut active = Vec::new();
@@ -742,6 +749,17 @@ mod tests {
       .len(),
       1
     );
+  }
+
+  #[test]
+  fn octa_workspace_state_is_never_an_input() {
+    let root = TempDir::new().unwrap();
+    fs::create_dir_all(root.path().join(".octa/cache")).unwrap();
+    fs::write(root.path().join(".octa/cache/object"), "internal").unwrap();
+    fs::write(root.path().join("input"), "public").unwrap();
+
+    let paths = collect(&["**/*".to_owned()], root.path(), usize::MAX, &CancellationToken::new()).unwrap();
+    assert_eq!(paths, vec![root.path().join("input").canonicalize().unwrap()]);
   }
 
   #[test]

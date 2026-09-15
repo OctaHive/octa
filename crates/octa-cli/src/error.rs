@@ -30,9 +30,6 @@ pub enum OctaError {
   #[error("Failed to load config file: {0}")]
   ConfigLoadError(String),
 
-  #[error("cache management requires --cache-profile PATH")]
-  CacheProfileRequired,
-
   #[error("selected task graph has no cacheable task to explain")]
   CacheExplainUnavailable,
 

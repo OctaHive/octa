@@ -161,6 +161,52 @@ identity = "cli-runner-shared-test-environment"
 }
 
 #[test]
+fn test_automatic_local_cache_restores_outputs_without_a_profile() {
+  let workspace = TempDir::new().unwrap();
+  fs::write(workspace.path().join("input.txt"), "input").unwrap();
+  fs::write(
+    workspace.path().join("Octafile.yml"),
+    r#"
+version: 1
+tasks:
+  build:
+    files:
+      inputs: [input.txt]
+      outputs: [output.txt]
+    cache: {}
+    shell: echo generated > output.txt
+"#,
+  )
+  .unwrap();
+
+  let run = || {
+    let mut command = Command::cargo_bin("octa").unwrap();
+    command
+      .current_dir(workspace.path())
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+      .arg("build")
+      .output()
+      .unwrap()
+  };
+  assert!(run().status.success());
+  fs::remove_file(workspace.path().join("output.txt")).unwrap();
+  assert!(run().status.success());
+  assert_eq!(
+    fs::read_to_string(workspace.path().join("output.txt")).unwrap(),
+    "generated\n"
+  );
+  assert!(workspace.path().join(".octa/cache/v1").is_dir());
+
+  let mut status = Command::cargo_bin("octa").unwrap();
+  status
+    .current_dir(workspace.path())
+    .args(["cache", "status"])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("bytes used"));
+}
+
+#[test]
 fn test_plugin_contract_caches_a_task_without_user_declared_files() {
   let workspace = TempDir::new().unwrap();
   let cache = TempDir::new().unwrap();
@@ -501,6 +547,49 @@ fn test_monorepo_uses_the_current_project_for_bare_task_names() -> Result<(), Bo
     .success()
     .stdout(predicate::str::contains("current-project"));
 
+  Ok(())
+}
+
+#[test]
+fn test_automatic_cache_is_rooted_at_the_monorepo_octafile() -> Result<(), Box<dyn std::error::Error>> {
+  let workspace = TempDir::new()?;
+  let api_dir = workspace.path().join("packages/api");
+  fs::create_dir_all(&api_dir)?;
+  fs::write(
+    workspace.path().join("Octafile.yml"),
+    "version: 1\nmonorepo:\n  roots: [packages/**]\ntasks: {}\n",
+  )?;
+  fs::write(api_dir.join("input.txt"), "input")?;
+  fs::write(
+    api_dir.join("Octafile.yml"),
+    r#"
+version: 1
+tasks:
+  build:
+    files:
+      inputs: [packages/api/input.txt]
+      outputs: [packages/api/output.txt]
+    cache: {}
+    shell: echo generated > output.txt
+"#,
+  )?;
+
+  let run = || -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::cargo_bin("octa")?;
+    command
+      .current_dir(workspace.path())
+      .arg("packages:api:build")
+      .env("OCTA_PLUGINS_DIR", validation_plugins_dir());
+    command.assert().success();
+    Ok(())
+  };
+  run()?;
+  fs::remove_file(api_dir.join("output.txt"))?;
+  run()?;
+
+  assert_eq!(fs::read_to_string(api_dir.join("output.txt"))?, "generated\n");
+  assert!(workspace.path().join(".octa/cache/v1").is_dir());
+  assert!(!api_dir.join(".octa/cache").exists());
   Ok(())
 }
 
@@ -2979,6 +3068,7 @@ fn test_standalone_execution_and_clean_do_not_create_monorepo_state() -> Result<
   cmd.arg("test");
   cmd.assert().success();
   assert!(!tmp_dir.path().join(".octa/monorepo").exists());
+  assert!(!tmp_dir.path().join(".octa/cache").exists());
 
   let mut cmd = Command::cargo_bin("octa")?;
   cmd.current_dir(tmp_dir.path());

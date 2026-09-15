@@ -63,6 +63,17 @@ pub const MAX_REMOTE_CACHE_PARALLEL_TRANSFERS: usize = 256;
 pub const TASK_RESULT_CACHE_FEATURE_V1: &str = "task-result-cache-v1";
 /// Runner capability identifying the version-one HTTP remote-cache transport.
 pub const TASK_RESULT_CACHE_HTTP_FEATURE_V1: &str = "task-result-cache-http-v1";
+/// Workspace-local Octa state excluded from task inputs and outputs.
+pub const OCTA_WORKSPACE_STATE_DIRECTORY: &str = ".octa";
+
+/// Returns whether a portable path addresses Octa's reserved workspace state.
+pub fn is_octa_workspace_state_path(path: &RelativePath) -> bool {
+  path.as_str() == OCTA_WORKSPACE_STATE_DIRECTORY
+    || path
+      .as_str()
+      .strip_prefix(OCTA_WORKSPACE_STATE_DIRECTORY)
+      .is_some_and(|suffix| suffix.starts_with('/'))
+}
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 /// Invalid cache identity or result metadata.

@@ -229,7 +229,7 @@ async fn load_runtime(
   config.octafile = request.octafile.clone();
   config.plugin_lock = request.plugin_lock.clone();
   config.secrets_profile = request.secrets_profile.clone();
-  config.result_cache = request
+  config.cache = request
     .cache
     .as_ref()
     .map(|cache| {
@@ -251,7 +251,10 @@ async fn load_runtime(
         None => Ok(local),
       }
     })
-    .transpose()?;
+    .transpose()?
+    .map(Box::new)
+    .map(octa_runtime::RuntimeCacheSelection::Configured)
+    .unwrap_or(octa_runtime::RuntimeCacheSelection::Disabled);
   config.plugins = request.plugins.clone();
   config.default_plugin = request.default_plugin.clone();
   config.variables = request.variables.clone().into_iter().collect();
