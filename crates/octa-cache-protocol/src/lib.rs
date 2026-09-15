@@ -10,6 +10,7 @@
 #![warn(missing_docs)]
 
 mod action;
+mod capacity;
 mod digest;
 mod layer;
 mod path;
@@ -20,6 +21,7 @@ mod result;
 pub use action::{
   ActionDescriptorV1, PlatformArchitecture, PlatformOs, PluginIdentity, RuntimeIdentity, ACTION_KEY_FORMAT_V1,
 };
+pub use capacity::LocalCacheCapacity;
 pub use digest::{Digest, DigestAlgorithm};
 pub use layer::CacheLayer;
 pub use path::RelativePath;
@@ -57,6 +59,10 @@ pub const MAX_CACHE_TOKEN_FILE_BYTES: u64 = 64 * 1024;
 pub const MAX_REMOTE_CACHE_REQUEST_TIMEOUT_SECONDS: u64 = 10 * 60;
 /// Largest blob-transfer concurrency accepted for one runner job.
 pub const MAX_REMOTE_CACHE_PARALLEL_TRANSFERS: usize = 256;
+/// Runner capability identifying the version-one task-result cache semantics.
+pub const TASK_RESULT_CACHE_FEATURE_V1: &str = "task-result-cache-v1";
+/// Runner capability identifying the version-one HTTP remote-cache transport.
+pub const TASK_RESULT_CACHE_HTTP_FEATURE_V1: &str = "task-result-cache-http-v1";
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 /// Invalid cache identity or result metadata.

@@ -12,12 +12,13 @@ use octa_output::{ConsoleEntry, ConsoleRenderer};
 use octa_plugin::protocol::PLUGIN_PROTOCOL_VERSION;
 pub use octa_runner_protocol::{
   CacheMode, CacheSessionSpec, RemoteCacheSession, RunRequest, RunStatus, RunnerCommand, RunnerMessage, Silence,
-  MAX_CACHE_TOKEN_FILE_BYTES, MAX_RUNNER_INPUT_FRAME_BYTES, RUNNER_EVENT_SCHEMA_VERSION, RUNNER_INPUT_SCHEMA_V2,
-  RUNNER_OUTPUT_SCHEMA_V2, RUNNER_PROTOCOL_VERSION,
+  MAX_CACHE_TOKEN_FILE_BYTES, MAX_RUNNER_INPUT_FRAME_BYTES, RUNNER_EVENT_SCHEMA_VERSION, RUNNER_INPUT_SCHEMA_V3,
+  RUNNER_OUTPUT_SCHEMA_V3, RUNNER_PROTOCOL_VERSION, TASK_RESULT_CACHE_FEATURE_V1, TASK_RESULT_CACHE_HTTP_FEATURE_V1,
 };
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
 
+/// Builds the initial runner handshake for the exact compiled protocol set.
 pub fn hello() -> RunnerMessage<String, (), ()> {
   RunnerMessage::Hello {
     protocol_version: RUNNER_PROTOCOL_VERSION,
@@ -27,6 +28,7 @@ pub fn hello() -> RunnerMessage<String, (), ()> {
   }
 }
 
+/// Describes the protocols and execution features supported by this runner.
 pub fn capabilities() -> RunnerMessage<String, (), ()> {
   RunnerMessage::Capabilities {
     octa_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -43,8 +45,8 @@ pub fn capabilities() -> RunnerMessage<String, (), ()> {
       "vault-secrets",
       "graceful-cancellation",
       "versioned-events",
-      "task-result-cache-v1",
-      "task-result-cache-http-v1",
+      TASK_RESULT_CACHE_FEATURE_V1,
+      TASK_RESULT_CACHE_HTTP_FEATURE_V1,
     ]
     .into_iter()
     .map(str::to_owned)
@@ -108,6 +110,7 @@ impl MessageWriter {
   }
 }
 
+/// Converts executor console entries into request-bound runner event frames.
 pub struct RunnerEventRenderer {
   request_id: String,
   output: MessageWriter,

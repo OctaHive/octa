@@ -20,7 +20,9 @@ use capacity::CapacityLedger;
 use fs2::FileExt as _;
 pub(crate) use object::{acquire_lock, blob_relative_path};
 use object::{open_lock_file, record_sampled_access, verify_encoded_blob, LockedBlobReader};
-use octa_cache_protocol::{ActionResultV1, BlobDescriptor, Digest, DigestAlgorithm, MAX_ACTION_RESULT_WIRE_BYTES};
+use octa_cache_protocol::{
+  ActionResultV1, BlobDescriptor, Digest, DigestAlgorithm, LocalCacheCapacity, MAX_ACTION_RESULT_WIRE_BYTES,
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use uuid::Uuid;
 
@@ -107,6 +109,18 @@ impl LocalCacheConfig {
       temporary_grace: DEFAULT_MAINTENANCE_INTERVAL,
       access_update_interval: DEFAULT_MAINTENANCE_INTERVAL,
     }
+  }
+
+  /// Replaces the default capacity with an already versioned protocol policy.
+  pub fn with_capacity(mut self, capacity: LocalCacheCapacity) -> CacheResult<Self> {
+    capacity
+      .validate()
+      .map_err(|error| CacheError::Configuration(error.to_string()))?;
+    self.max_bytes = capacity.max_bytes;
+    self.high_watermark_bytes = capacity.high_watermark_bytes;
+    self.low_watermark_bytes = capacity.low_watermark_bytes;
+    self.validate()?;
+    Ok(self)
   }
 
   fn validate(&self) -> CacheResult<()> {

@@ -19,9 +19,9 @@ use octa_cache::{
 };
 use octa_cache_http::{HttpCacheConfig, HttpCacheStore};
 pub use octa_cache_protocol::CacheMode;
-use octa_cache_protocol::{
-  Digest, DigestAlgorithm, PlatformArchitecture, PlatformOs, RuntimeIdentity, MAX_CACHE_STRING_BYTES,
-};
+#[cfg(test)]
+use octa_cache_protocol::{Digest, DigestAlgorithm};
+use octa_cache_protocol::{LocalCacheCapacity, PlatformArchitecture, PlatformOs, RuntimeIdentity};
 use octa_executor::ResultCache;
 use serde::Deserialize;
 use thiserror::Error;
@@ -109,6 +109,15 @@ impl RuntimeCacheConfig {
       bundle_limits: BundleLimits::default(),
       remote: None,
     })
+  }
+
+  /// Applies an operator-selected capacity to the mandatory local L1 store.
+  ///
+  /// The values remain explicit at the runner boundary so a supervisor never
+  /// silently inherits workstation-oriented defaults.
+  pub fn with_local_capacity(mut self, capacity: LocalCacheCapacity) -> Result<Self, RuntimeCacheError> {
+    self.local = self.local.with_capacity(capacity)?;
+    Ok(self)
   }
 
   /// Adds a remote L2 endpoint while retaining the mandatory local L1 store.
@@ -503,21 +512,8 @@ fn profile_changed_error(path: &Path) -> RuntimeCacheError {
 }
 
 fn native_runtime_identity(identity: &str) -> Result<RuntimeIdentity, RuntimeCacheError> {
-  if identity.is_empty() || identity.len() > MAX_CACHE_STRING_BYTES || identity.chars().any(char::is_control) {
-    return Err(RuntimeCacheError::Invalid(format!(
-      "environment.identity must contain 1 to {MAX_CACHE_STRING_BYTES} UTF-8 bytes and no control characters"
-    )));
-  }
-  let digest = Digest::new(
-    DigestAlgorithm::Blake3,
-    *blake3::hash(identity.as_bytes()).as_bytes(),
-    identity.len() as u64,
-  );
-  Ok(RuntimeIdentity::Native {
-    os: host_os()?,
-    architecture: host_architecture()?,
-    environment: digest,
-  })
+  RuntimeIdentity::native(host_os()?, host_architecture()?, identity)
+    .map_err(|error| RuntimeCacheError::Invalid(format!("environment.identity is invalid: {error}")))
 }
 
 fn host_os() -> Result<PlatformOs, RuntimeCacheError> {

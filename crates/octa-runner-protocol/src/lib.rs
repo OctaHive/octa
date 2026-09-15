@@ -12,18 +12,21 @@ use std::{collections::BTreeMap, num::NonZeroUsize, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use octa_cache_protocol::{CacheMode, MAX_CACHE_TOKEN_FILE_BYTES};
+pub use octa_cache_protocol::{
+  CacheMode, LocalCacheCapacity, MAX_CACHE_TOKEN_FILE_BYTES, TASK_RESULT_CACHE_FEATURE_V1,
+  TASK_RESULT_CACHE_HTTP_FEATURE_V1,
+};
 
 /// Current incompatible version of the runner command envelope.
-pub const RUNNER_PROTOCOL_VERSION: u16 = 2;
+pub const RUNNER_PROTOCOL_VERSION: u16 = 3;
 /// Event schema version carried inside runner event messages.
 pub const RUNNER_EVENT_SCHEMA_VERSION: u16 = 4;
 /// Maximum bytes accepted for one newline-delimited input command.
 pub const MAX_RUNNER_INPUT_FRAME_BYTES: usize = 1024 * 1024;
-/// Published JSON Schema for protocol-v2 input commands.
-pub const RUNNER_INPUT_SCHEMA_V2: &str = include_str!("../schema/input-v2.schema.json");
-/// Published JSON Schema for protocol-v2 output messages.
-pub const RUNNER_OUTPUT_SCHEMA_V2: &str = include_str!("../schema/output-v2.schema.json");
+/// Published JSON Schema for protocol-v3 input commands.
+pub const RUNNER_INPUT_SCHEMA_V3: &str = include_str!("../schema/input-v3.schema.json");
+/// Published JSON Schema for protocol-v3 output messages.
+pub const RUNNER_OUTPUT_SCHEMA_V3: &str = include_str!("../schema/output-v3.schema.json");
 
 /// Command sent by a supervisor over runner standard input.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -72,7 +75,7 @@ pub enum Silence {
 
 /// Optional remote endpoint negotiated for the HTTP-backed L2 cache.
 ///
-/// Version two carries the security-sensitive shape so agents never need to
+/// Protocol v3 carries the security-sensitive shape so agents never need to
 /// inject bearer values into the process environment or command line. The
 /// runner validates and reads the token file before execution, and advertises
 /// `task-result-cache-http-v1` only while this transport is compiled in.
@@ -92,7 +95,7 @@ pub struct RemoteCacheSession {
   pub max_parallel_transfers: NonZeroUsize,
 }
 
-/// Job-scoped cache configuration supplied by the agent in protocol v2.
+/// Job-scoped cache configuration supplied by the agent in protocol v3.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CacheSessionSpec {
@@ -102,6 +105,8 @@ pub struct CacheSessionSpec {
   pub namespace: String,
   /// Absolute agent-local L1 cache directory, separate from Octa state.
   pub local_directory: PathBuf,
+  /// Capacity and collection watermarks for the persistent local L1.
+  pub local_capacity: LocalCacheCapacity,
   /// Exact host toolchain or immutable OCI image identity used by the job.
   pub runtime: octa_cache_protocol::RuntimeIdentity,
   /// Optional remote L2 settings; usable only when the runner advertises its transport.
@@ -115,6 +120,7 @@ impl CacheSessionSpec {
     if !self.local_directory.is_absolute() {
       return Err("cache local_directory must be an absolute path".to_owned());
     }
+    self.local_capacity.validate().map_err(|error| error.to_string())?;
     self.runtime.validate().map_err(|error| error.to_string())?;
     if let Some(remote) = &self.remote {
       if !remote.endpoint.starts_with("https://") || remote.endpoint.len() == "https://".len() {
@@ -217,7 +223,7 @@ pub struct RunRequest {
   /// Optional environment-specific logical-secret provider profile.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub secrets_profile: Option<PathBuf>,
-  /// Optional task-result cache session; valid only in runner protocol v2.
+  /// Optional task-result cache session; valid only in runner protocol v3.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub cache: Option<CacheSessionSpec>,
   /// Additional plugin names requested by the job.
@@ -461,6 +467,7 @@ mod tests {
       mode: CacheMode::ReadWrite,
       namespace: "project/example".to_owned(),
       local_directory: absolute.clone(),
+      local_capacity: LocalCacheCapacity::new(10_000, 9_000, 8_000).unwrap(),
       runtime: RuntimeIdentity::Native {
         os: PlatformOs::Linux,
         architecture: PlatformArchitecture::Amd64,
@@ -479,6 +486,9 @@ mod tests {
     invalid = spec.clone();
     invalid.local_directory = PathBuf::from("relative");
     assert!(invalid.validate().unwrap_err().contains("absolute"));
+    invalid = spec.clone();
+    invalid.local_capacity.low_watermark_bytes = invalid.local_capacity.high_watermark_bytes + 1;
+    assert!(invalid.validate().unwrap_err().contains("watermark"));
     invalid = spec.clone();
     invalid.runtime = RuntimeIdentity::Native {
       os: PlatformOs::Linux,
@@ -546,7 +556,7 @@ mod tests {
     let messages = [
       json!({
         "type": "hello",
-        "protocol_version": 2,
+        "protocol_version": RUNNER_PROTOCOL_VERSION,
         "octa_version": "0.3.0",
         "event_schema_version": 4,
         "plugin_protocol_version": 2
@@ -554,7 +564,7 @@ mod tests {
       json!({
         "type": "capabilities",
         "octa_version": "0.3.0",
-        "runner_protocols": [2],
+        "runner_protocols": [RUNNER_PROTOCOL_VERSION],
         "event_schemas": [4],
         "plugin_protocols": [2],
         "octafile_versions": [1],
@@ -591,7 +601,7 @@ mod tests {
 
   #[test]
   fn schemas_validate_public_examples() {
-    let input_schema: Value = serde_json::from_str(RUNNER_INPUT_SCHEMA_V2).unwrap();
+    let input_schema: Value = serde_json::from_str(RUNNER_INPUT_SCHEMA_V3).unwrap();
     let input_validator = jsonschema::validator_for(&input_schema).unwrap();
     let input = json!({
       "type": "start",
@@ -602,7 +612,7 @@ mod tests {
     assert!(input_validator.is_valid(&input));
     let mut cache_input = json!({
       "type": "start",
-      "protocol_version": 2,
+      "protocol_version": RUNNER_PROTOCOL_VERSION,
       "request_id": "cached-job",
       "request": {
         "workspace": "/workspace",
@@ -611,6 +621,11 @@ mod tests {
           "mode": "read_write",
           "namespace": "project/example",
           "local_directory": "/cache",
+          "local_capacity": {
+            "max_bytes": 10000,
+            "high_watermark_bytes": 9000,
+            "low_watermark_bytes": 8000
+          },
           "runtime": {
             "kind": "native",
             "os": "linux",
@@ -642,12 +657,12 @@ mod tests {
       json!(octa_cache_protocol::MAX_REMOTE_CACHE_PARALLEL_TRANSFERS + 1);
     assert!(!input_validator.is_valid(&cache_input));
 
-    let output_schema: Value = serde_json::from_str(RUNNER_OUTPUT_SCHEMA_V2).unwrap();
+    let output_schema: Value = serde_json::from_str(RUNNER_OUTPUT_SCHEMA_V3).unwrap();
     let validator = jsonschema::validator_for(&output_schema).unwrap();
     for output in [
       json!({
         "type": "hello",
-        "protocol_version": 2,
+        "protocol_version": RUNNER_PROTOCOL_VERSION,
         "octa_version": "0.3.0",
         "event_schema_version": 4,
         "plugin_protocol_version": 2
@@ -655,7 +670,7 @@ mod tests {
       json!({
         "type": "capabilities",
         "octa_version": "0.3.0",
-        "runner_protocols": [2],
+        "runner_protocols": [RUNNER_PROTOCOL_VERSION],
         "event_schemas": [4],
         "plugin_protocols": [2],
         "octafile_versions": [1],
@@ -697,5 +712,19 @@ mod tests {
       "path": "reports/result.json",
       "format": "invalid format"
     })));
+  }
+
+  #[test]
+  fn documented_start_example_matches_protocol_v3() {
+    let documentation = include_str!("../../../docs/runner-protocol.md");
+    let example = documentation
+      .split_once("```json\n")
+      .and_then(|(_, remainder)| remainder.split_once("\n```"))
+      .map(|(json, _)| json)
+      .expect("runner documentation must contain a JSON Start example");
+    let value: Value = serde_json::from_str(example).unwrap();
+    let schema: Value = serde_json::from_str(RUNNER_INPUT_SCHEMA_V3).unwrap();
+    assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&value));
+    let _: RunnerCommand = serde_json::from_value(value).unwrap();
   }
 }

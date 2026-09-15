@@ -238,7 +238,8 @@ async fn load_runtime(
         cache.namespace.clone(),
         cache.local_directory.clone(),
         cache.runtime.clone(),
-      )?;
+      )?
+      .with_local_capacity(cache.local_capacity)?;
       match &cache.remote {
         Some(remote) => local.with_remote(
           &remote.endpoint,

@@ -11,6 +11,31 @@ fn digest(byte: u8, size: u64) -> Digest {
 }
 
 #[test]
+fn local_capacity_keeps_one_shared_watermark_invariant() {
+  let capacity = LocalCacheCapacity::new(100, 90, 80).unwrap();
+  assert_eq!(capacity.max_bytes, 100);
+  for invalid in [
+    LocalCacheCapacity {
+      max_bytes: 100,
+      high_watermark_bytes: 90,
+      low_watermark_bytes: 0,
+    },
+    LocalCacheCapacity {
+      max_bytes: 100,
+      high_watermark_bytes: 90,
+      low_watermark_bytes: 91,
+    },
+    LocalCacheCapacity {
+      max_bytes: 100,
+      high_watermark_bytes: 101,
+      low_watermark_bytes: 90,
+    },
+  ] {
+    assert!(invalid.validate().is_err());
+  }
+}
+
+#[test]
 fn remote_envelopes_validate_versions_batches_and_action_binding_data() {
   assert_eq!(
     REMOTE_CACHE_PROTOCOL_HEADER_VALUE_V1.parse::<u16>().unwrap(),
@@ -241,6 +266,19 @@ fn every_action_component_changes_the_identity() {
   let mut candidate = original;
   candidate.salt = Some("rust-release-v2".to_owned());
   assert_changed(candidate);
+}
+
+#[test]
+fn native_runtime_identity_has_one_canonical_constructor() {
+  let identity =
+    RuntimeIdentity::native(PlatformOs::Linux, PlatformArchitecture::Amd64, "rust-1.98-toolchain-v1").unwrap();
+  assert!(identity.validate().is_ok());
+  assert!(RuntimeIdentity::native(PlatformOs::Linux, PlatformArchitecture::Amd64, "").is_err());
+  assert!(matches!(
+    identity,
+    RuntimeIdentity::Native { environment, .. }
+      if environment == Digest::blake3(b"rust-1.98-toolchain-v1")
+  ));
 }
 
 #[test]

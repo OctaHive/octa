@@ -16,7 +16,7 @@ use octa_plugin_manager::plugin_lock::{
   current_platform, sha256_file, write_plugin_lock, PluginLock, PluginManifest, PLUGIN_LOCK_VERSION,
   PLUGIN_MANIFEST_VERSION,
 };
-use octa_runner::{MAX_RUNNER_INPUT_FRAME_BYTES, RUNNER_OUTPUT_SCHEMA_V2, RUNNER_PROTOCOL_VERSION};
+use octa_runner::{MAX_RUNNER_INPUT_FRAME_BYTES, RUNNER_OUTPUT_SCHEMA_V3, RUNNER_PROTOCOL_VERSION};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
@@ -126,6 +126,11 @@ fn cached_request(workspace: &TempDir, cache_directory: &std::path::Path, comman
           "mode": "read_write",
           "namespace": "tests/runner",
           "local_directory": cache_directory,
+          "local_capacity": {
+            "max_bytes": 104857600,
+            "high_watermark_bytes": 94371840,
+            "low_watermark_bytes": 83886080
+          },
           "runtime": native_runtime_identity()
         }
       }
@@ -191,7 +196,7 @@ fn messages(output: &[u8]) -> Vec<Value> {
 }
 
 fn assert_valid_output(messages: &[Value]) {
-  let schema = serde_json::from_str(RUNNER_OUTPUT_SCHEMA_V2).unwrap();
+  let schema = serde_json::from_str(RUNNER_OUTPUT_SCHEMA_V3).unwrap();
   let validator = jsonschema::validator_for(&schema).unwrap();
   for message in messages {
     let errors = validator
@@ -212,14 +217,14 @@ fn reports_capabilities_without_starting_a_job() {
   assert_eq!(messages.len(), 1);
   assert_valid_output(&messages);
   assert_eq!(messages[0]["type"], "capabilities");
-  assert_eq!(messages[0]["runner_protocols"], json!([2]));
+  assert_eq!(messages[0]["runner_protocols"], json!([RUNNER_PROTOCOL_VERSION]));
   assert_eq!(messages[0]["event_schemas"], json!([4]));
   assert_eq!(messages[0]["plugin_protocols"], json!([2]));
   assert_eq!(messages[0]["octafile_versions"], json!([1]));
 }
 
 #[test]
-fn protocol_v2_reuses_one_local_result_across_workspaces() {
+fn protocol_v3_reuses_one_local_result_across_workspaces() {
   let cache = TempDir::new().unwrap();
   let first = TempDir::new().unwrap();
   let second = TempDir::new().unwrap();
@@ -582,6 +587,11 @@ tasks:
             "mode": "read_write",
             "namespace": format!("tests/secret-{environment}"),
             "local_directory": &cache,
+            "local_capacity": {
+              "max_bytes": 104857600,
+              "high_watermark_bytes": 94371840,
+              "low_watermark_bytes": 83886080
+            },
             "runtime": native_runtime_identity()
           }
         }

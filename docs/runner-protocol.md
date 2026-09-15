@@ -31,8 +31,8 @@ build commit.
 An input frame is limited to 1 MiB including its JSON payload. An oversized
 or unterminated frame is rejected without buffering unbounded input. The
 machine-readable schemas are published as
-[v2 input](../crates/octa-runner-protocol/schema/input-v2.schema.json) and
-[v2 output](../crates/octa-runner-protocol/schema/output-v2.schema.json).
+[v3 input](../crates/octa-runner-protocol/schema/input-v3.schema.json) and
+[v3 output](../crates/octa-runner-protocol/schema/output-v3.schema.json).
 
 Runtime event production uses a bounded queue. If the caller stops reading
 stdout, backpressure eventually pauses task output instead of accumulating an
@@ -43,7 +43,7 @@ unbounded in-memory event backlog.
 ```json
 {
   "type": "start",
-  "protocol_version": 2,
+  "protocol_version": 3,
   "request_id": "job-42-attempt-1",
   "request": {
     "workspace": "/workspace/project",
@@ -56,6 +56,11 @@ unbounded in-memory event backlog.
       "mode": "read_write",
       "namespace": "project/example",
       "local_directory": "/var/cache/octa",
+      "local_capacity": {
+        "max_bytes": 2147483648,
+        "high_watermark_bytes": 1932735283,
+        "low_watermark_bytes": 1717986918
+      },
       "runtime": {
         "kind": "native",
         "os": "linux",
@@ -92,8 +97,8 @@ request never contains secret values; see [secret providers](secrets.md).
 The request describes execution only. Repository, lease, sandbox, resource,
 and server transport settings intentionally do not belong to this protocol.
 
-Protocol v1 is intentionally not accepted: Octa does not maintain a partial
-compatibility adapter for the pre-cache runner contract. `local_directory` is agent-selected and absolute;
+Older protocol versions are intentionally not accepted: Octa does not maintain
+a partial compatibility adapter for earlier runner contracts. `local_directory` is agent-selected and absolute;
 `runtime` is the exact Native environment or immutable OCI image identity used
 by the job. The optional `remote` member enables the HTTPS L2 transport when
 the runner advertises `task-result-cache-http-v1`; the local CAS remains the L1
@@ -130,7 +135,7 @@ The initial handshake reports protocol compatibility:
 ```json
 {
   "type": "hello",
-  "protocol_version": 2,
+  "protocol_version": 3,
   "octa_version": "0.3.0",
   "event_schema_version": 4,
   "plugin_protocol_version": 2

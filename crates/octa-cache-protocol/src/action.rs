@@ -151,6 +151,28 @@ pub enum RuntimeIdentity {
 }
 
 impl RuntimeIdentity {
+  /// Builds the canonical Native identity used by both local and agent runs.
+  ///
+  /// The public identity string should describe the complete compiler,
+  /// toolchain, and relevant host configuration. Hashing it here keeps the
+  /// digest bytes and source length identical across every composition root.
+  pub fn native(
+    os: PlatformOs,
+    architecture: PlatformArchitecture,
+    identity: &str,
+  ) -> Result<Self, CacheProtocolError> {
+    if identity.is_empty() || identity.len() > MAX_CACHE_STRING_BYTES || identity.chars().any(char::is_control) {
+      return Err(CacheProtocolError::Configuration(format!(
+        "Native runtime environment identity must contain 1 to {MAX_CACHE_STRING_BYTES} UTF-8 bytes and no control characters"
+      )));
+    }
+    Ok(Self::Native {
+      os,
+      architecture,
+      environment: Digest::blake3(identity.as_bytes()),
+    })
+  }
+
   /// Validates the immutable environment identity accepted by Octa execution.
   ///
   /// Native environments are Octa-owned BLAKE3 identities. OCI images retain

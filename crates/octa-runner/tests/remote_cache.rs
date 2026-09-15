@@ -1,4 +1,4 @@
-//! Cross-process proof that runner protocol v2 shares results through HTTPS.
+//! Cross-process proof that runner protocol v3 shares results through HTTPS.
 
 use std::{
   env, fs,
@@ -145,6 +145,11 @@ fn request(workspace: &TempDir, local: &Path, server: &HttpsCache, token: &Path)
           "mode": "read_write",
           "namespace": "tests/remote-runner",
           "local_directory": local,
+          "local_capacity": {
+            "max_bytes": 104857600,
+            "high_watermark_bytes": 94371840,
+            "low_watermark_bytes": 83886080
+          },
           "runtime": runtime,
           "remote": {
             "endpoint": server.endpoint(),
@@ -215,6 +220,8 @@ fn two_runner_processes_share_a_result_over_https() {
     String::from_utf8_lossy(&first_output.stderr)
   );
   assert_eq!(server.state.action_count(), 1, "remote action was not published");
+  assert!(!String::from_utf8_lossy(&first_output.stdout).contains("fixture-token"));
+  assert!(!String::from_utf8_lossy(&first_output.stderr).contains("fixture-token"));
   let second_output = execute(&second, &second_cache);
   assert!(
     second_output.status.success(),
@@ -250,6 +257,10 @@ fn two_runner_processes_share_a_result_over_https() {
     "generated\n"
   );
   assert!(!second.path().join("runs.txt").exists());
+  assert!(!String::from_utf8_lossy(&second_output.stdout).contains("fixture-token"));
+  assert!(!String::from_utf8_lossy(&second_output.stderr).contains("fixture-token"));
+  assert!(first_cache.path().join("v1/actions").is_dir());
+  assert!(second_cache.path().join("v1/actions").is_dir());
 
   // A same-sized L1 corruption is invisible to metadata-only lookup. The
   // expanded bundle verifier must quarantine it and retry the independent L2
