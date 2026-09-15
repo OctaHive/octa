@@ -399,6 +399,12 @@ mod tests {
   use octa_cache_protocol::{Digest, PlatformArchitecture, PlatformOs, RuntimeIdentity};
   use serde_json::json;
 
+  fn first_json_block(documentation: &str) -> Option<&str> {
+    documentation
+      .split("```")
+      .find_map(|block| block.strip_prefix("json\n").or_else(|| block.strip_prefix("json\r\n")))
+  }
+
   fn request(workspace: PathBuf) -> RunRequest {
     RunRequest {
       workspace,
@@ -717,14 +723,21 @@ mod tests {
   #[test]
   fn documented_start_example_matches_protocol_v3() {
     let documentation = include_str!("../../../docs/runner-protocol.md");
-    let example = documentation
-      .split_once("```json\n")
-      .and_then(|(_, remainder)| remainder.split_once("\n```"))
-      .map(|(json, _)| json)
-      .expect("runner documentation must contain a JSON Start example");
+    let example = first_json_block(documentation).expect("runner documentation must contain a JSON Start example");
     let value: Value = serde_json::from_str(example).unwrap();
     let schema: Value = serde_json::from_str(RUNNER_INPUT_SCHEMA_V3).unwrap();
     assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&value));
     let _: RunnerCommand = serde_json::from_value(value).unwrap();
+  }
+
+  #[test]
+  fn documented_json_block_accepts_crlf() {
+    for documentation in [
+      "before\n```json\n{}\n```\nafter",
+      "before\r\n```json\r\n{}\r\n```\r\nafter",
+    ] {
+      let example = first_json_block(documentation).expect("JSON block must support native line endings");
+      assert_eq!(serde_json::from_str::<Value>(example).unwrap(), json!({}));
+    }
   }
 }
