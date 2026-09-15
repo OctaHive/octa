@@ -1,7 +1,7 @@
 [package]
 name = "octa-cli"
 description = "Command line interface for Octa builder"
-version = "0.3.0"
+version = "0.4.0"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -16,15 +16,15 @@ path = "src/main.rs"
 
 [dependencies]
 async-trait = { workspace = true }
-octa-finder = { version = "0.3.0", path = "../octa-finder" }
-octa-monorepo = { version = "0.3.0", path = "../octa-monorepo" }
-octa-octafile = { version = "0.3.0", path = "../octa-octafile" }
-octa-output = { version = "0.3.0", path = "../octa-output" }
-octa-executor = { version = "0.3.0", path = "../octa-executor" }
-octa-cache-protocol = { version = "0.3.0", path = "../octa-cache-protocol" }
-octa-runtime = { version = "0.3.0", path = "../octa-runtime" }
-octa-plugin-manager = { version = "0.3.0", path = "../octa-plugin-manager" }
-octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
+octa-finder = { version = "0.4.0", path = "../octa-finder" }
+octa-monorepo = { version = "0.4.0", path = "../octa-monorepo" }
+octa-octafile = { version = "0.4.0", path = "../octa-octafile" }
+octa-output = { version = "0.4.0", path = "../octa-output" }
+octa-executor = { version = "0.4.0", path = "../octa-executor" }
+octa-cache-protocol = { version = "0.4.0", path = "../octa-cache-protocol" }
+octa-runtime = { version = "0.4.0", path = "../octa-runtime" }
+octa-plugin-manager = { version = "0.4.0", path = "../octa-plugin-manager" }
+octa-plugin = { version = "0.4.0", path = "../octa-plugin" }
 clap_complete = "4"
 clap = { version = "4.6", features = ["derive", "env"] }
 dialoguer = "0.12"

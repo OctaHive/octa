@@ -1288,7 +1288,7 @@ mod tests {
       .unwrap()
       .is_none());
     assert_eq!(identity.name, "test");
-    assert_eq!(identity.version, "0.3.0");
+    assert_eq!(identity.version, "0.4.0");
     assert_eq!(
       identity.protocol_version,
       octa_plugin::protocol::PLUGIN_PROTOCOL_VERSION

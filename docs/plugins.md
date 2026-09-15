@@ -55,13 +55,13 @@ execution phase.
 Octa sends the protocol version, its product version, and enabled features:
 
 ```json
-{"type":"Hello","payload":{"protocol_version":2,"version":"0.3.0","features":[]}}
+{"type":"Hello","payload":{"protocol_version":2,"version":"0.4.0","features":[]}}
 ```
 
 The plugin responds with the same protocol version and its own product version:
 
 ```json
-{"type":"Hello","payload":{"protocol_version":2,"version":"0.3.0","features":[]}}
+{"type":"Hello","payload":{"protocol_version":2,"version":"0.4.0","features":[]}}
 ```
 
 | Field | Type | Meaning |

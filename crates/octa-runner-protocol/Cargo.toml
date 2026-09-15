@@ -1,7 +1,7 @@
 [package]
 name = "octa-runner-protocol"
 description = "Versioned wire protocol for the headless Octa runner"
-version = "0.3.0"
+version = "0.4.0"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -11,7 +11,7 @@ repository.workspace = true
 include = ["src/", "schema/", "README.md"]
 
 [dependencies]
-octa-cache-protocol = { version = "0.3.0", path = "../octa-cache-protocol" }
+octa-cache-protocol = { version = "0.4.0", path = "../octa-cache-protocol" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 

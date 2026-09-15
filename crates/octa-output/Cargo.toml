@@ -1,7 +1,7 @@
 [package]
 name = "octa-output"
 description = "Structured output and rendering for Octa"
-version = "0.3.0"
+version = "0.4.0"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true

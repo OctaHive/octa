@@ -1,7 +1,7 @@
 [package]
 name = "octa-plugin-manager"
 description = "Plugin common"
-version = "0.3.0"
+version = "0.4.0"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -16,8 +16,8 @@ futures-util = "0.3.34"
 interprocess = { git = "https://github.com/federico-terzi/interprocess", features = [
   "tokio",
 ] }
-octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
-octa-plugin-lock = { version = "0.3.0", path = "../octa-plugin-lock" }
+octa-plugin = { version = "0.4.0", path = "../octa-plugin" }
+octa-plugin-lock = { version = "0.4.0", path = "../octa-plugin-lock" }
 dunce = "1.0.5"
 serde = { workspace = true }
 serde_json = { workspace = true }

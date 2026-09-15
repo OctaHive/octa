@@ -563,13 +563,13 @@ mod tests {
       json!({
         "type": "hello",
         "protocol_version": RUNNER_PROTOCOL_VERSION,
-        "octa_version": "0.3.0",
+        "octa_version": "0.4.0",
         "event_schema_version": 4,
         "plugin_protocol_version": 2
       }),
       json!({
         "type": "capabilities",
-        "octa_version": "0.3.0",
+        "octa_version": "0.4.0",
         "runner_protocols": [RUNNER_PROTOCOL_VERSION],
         "event_schemas": [4],
         "plugin_protocols": [2],
@@ -669,13 +669,13 @@ mod tests {
       json!({
         "type": "hello",
         "protocol_version": RUNNER_PROTOCOL_VERSION,
-        "octa_version": "0.3.0",
+        "octa_version": "0.4.0",
         "event_schema_version": 4,
         "plugin_protocol_version": 2
       }),
       json!({
         "type": "capabilities",
-        "octa_version": "0.3.0",
+        "octa_version": "0.4.0",
         "runner_protocols": [RUNNER_PROTOCOL_VERSION],
         "event_schemas": [4],
         "plugin_protocols": [2],

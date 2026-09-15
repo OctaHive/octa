@@ -1,7 +1,7 @@
 [package]
 name = "octa-executor"
 description = "Execute tasks"
-version = "0.3.0"
+version = "0.4.0"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -11,14 +11,14 @@ repository.workspace = true
 include = ["src/"]
 
 [dependencies]
-octa-octafile = { version = "0.3.0", path = "../octa-octafile" }
-octa-dag = { version = "0.3.0", path = "../octa-dag" }
-octa-finder = { version = "0.3.0", path = "../octa-finder" }
-octa-plugin = { version = "0.3.0", path = "../octa-plugin" }
-octa-plugin-manager = { version = "0.3.0", path = "../octa-plugin-manager" }
-octa-output = { version = "0.3.0", path = "../octa-output" }
-octa-cache = { version = "0.3.0", path = "../octa-cache" }
-octa-cache-protocol = { version = "0.3.0", path = "../octa-cache-protocol" }
+octa-octafile = { version = "0.4.0", path = "../octa-octafile" }
+octa-dag = { version = "0.4.0", path = "../octa-dag" }
+octa-finder = { version = "0.4.0", path = "../octa-finder" }
+octa-plugin = { version = "0.4.0", path = "../octa-plugin" }
+octa-plugin-manager = { version = "0.4.0", path = "../octa-plugin-manager" }
+octa-output = { version = "0.4.0", path = "../octa-output" }
+octa-cache = { version = "0.4.0", path = "../octa-cache" }
+octa-cache-protocol = { version = "0.4.0", path = "../octa-cache-protocol" }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 chrono = { version = "0.4.45", features = ["serde"] }
