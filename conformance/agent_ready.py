@@ -13,6 +13,11 @@ import tempfile
 from pathlib import Path
 
 
+# This black-box suite intentionally pins the public runner contract instead
+# of importing implementation constants or accepting any advertised version.
+RUNNER_PROTOCOL_VERSION = 3
+
+
 def runtime_platform() -> str:
     system = {"Darwin": "macos", "Linux": "linux", "Windows": "windows"}[platform.system()]
     machine = platform.machine().lower()
@@ -82,7 +87,7 @@ def main() -> None:
     plugins = args.plugins.resolve()
 
     capabilities = json.loads(subprocess.run([runner, "capabilities"], check=True, text=True, stdout=subprocess.PIPE).stdout)
-    assert capabilities["runner_protocols"] == [2]
+    assert capabilities["runner_protocols"] == [RUNNER_PROTOCOL_VERSION]
     assert capabilities["event_schemas"] == [4]
     assert len(capabilities["plugin_protocols"]) == 1
     plugin_protocol = capabilities["plugin_protocols"][0]
@@ -122,7 +127,7 @@ tasks:
         lock = write_locked_plugins(plugins, locked_plugins, plugin_protocol)
         start = {
             "type": "start",
-            "protocol_version": 2,
+            "protocol_version": RUNNER_PROTOCOL_VERSION,
             "request_id": "conformance",
             "request": {
                 "workspace": str(root),
