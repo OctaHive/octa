@@ -850,7 +850,13 @@ fn supports_unicode_workspaces_and_partial_output_lines() {
 
   let mut command = Command::cargo_bin("octa-runner").unwrap();
   let output = command.write_stdin(input).output().unwrap();
-  assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+  assert!(
+    output.status.success(),
+    "runner failed with {}\nstdout:\n{}\nstderr:\n{}",
+    output.status,
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
   let messages = messages(&output.stdout);
   assert_valid_output(&messages);
   assert_eq!(

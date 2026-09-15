@@ -759,7 +759,7 @@ mod tests {
     fs::write(root.path().join("input"), "public").unwrap();
 
     let paths = collect(&["**/*".to_owned()], root.path(), usize::MAX, &CancellationToken::new()).unwrap();
-    assert_eq!(paths, vec![root.path().join("input").canonicalize().unwrap()]);
+    assert_eq!(paths, vec![dunce::canonicalize(root.path()).unwrap().join("input")]);
   }
 
   #[test]
