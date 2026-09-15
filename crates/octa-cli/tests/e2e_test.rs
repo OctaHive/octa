@@ -287,7 +287,7 @@ fn test_cache_management_uses_the_automatic_store_and_explain_requires_a_cacheab
     .args(["cache", "status"])
     .assert()
     .success()
-    .stdout(predicate::str::contains(".octa/cache"));
+    .stdout(predicate::str::contains("bytes used"));
   assert!(workspace.path().join(".octa/cache/v1").is_dir());
 
   let mut no_cacheable_task = Command::cargo_bin("octa").unwrap();
