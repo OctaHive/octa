@@ -1,0 +1,6 @@
+{
+  "format_version": 1,
+  "runner_capabilities": "octa-runner-capabilities.json",
+  "checksums": "SHA256SUMS",
+  "provenance": "github-build-provenance"
+}

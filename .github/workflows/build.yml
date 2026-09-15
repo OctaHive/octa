@@ -15,21 +15,27 @@ jobs:
   build:
     name: Build for ${{ matrix.platform.os_name }}
     runs-on: ${{ matrix.platform.os }}
-    permissions:
-      contents: write
     strategy:
       matrix:
         platform:
           - os_name: Linux-amd64
-            os: ubuntu-latest
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             bin: octa
             name: octa-Linux-amd64.tar.gz
             cargo_command: cargo
             runtime_platform: linux-x86_64
 
+          - os_name: Linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bin: octa
+            name: octa-Linux-arm64.tar.gz
+            cargo_command: cargo
+            runtime_platform: linux-aarch64
+
           - os_name: Windows-amd64
-            os: windows-latest
+            os: windows-2025
             target: x86_64-pc-windows-msvc
             bin: octa.exe
             name: octa-Windows-amd64.zip
@@ -37,7 +43,7 @@ jobs:
             runtime_platform: windows-x86_64
 
           - os_name: macOS-aarch64
-            os: macOS-latest
+            os: macos-14
             target: aarch64-apple-darwin
             bin: octa
             name: octa-Darwin-aarch64.tar.gz
@@ -45,7 +51,7 @@ jobs:
             runtime_platform: macos-aarch64
 
           - os_name: macOS-x86_64
-            os: macOS-latest
+            os: macos-15-intel
             target: x86_64-apple-darwin
             bin: octa
             name: octa-Darwin-x86_64.tar.gz
@@ -53,11 +59,12 @@ jobs:
             runtime_platform: macos-x86_64
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
+          toolchain: 1.98.1
           targets: ${{ matrix.platform.target }}
 
       - name: Build binary (*nix)
@@ -85,8 +92,8 @@ jobs:
       - name: Package as archive
         shell: bash
         run: |
-          # Some release targets are cross-compiled and cannot be executed on
-          # the packaging host, so read the single protocol source of truth.
+          # Read the single protocol source of truth before constructing the
+          # release metadata consumed by OctaCity inventory.
           PLUGIN_PROTOCOL=$(sed -n 's/^pub const PLUGIN_PROTOCOL_VERSION: u16 = \([0-9][0-9]*\);$/\1/p' crates/octa-plugin/src/protocol.rs)
           if [[ ! "${PLUGIN_PROTOCOL}" =~ ^[0-9]+$ ]]; then
             echo "Could not read PLUGIN_PROTOCOL_VERSION from the protocol crate" >&2
@@ -95,7 +102,7 @@ jobs:
           cd target/${{ matrix.platform.target }}/release
           mkdir ./release
           mkdir ./release/plugins
-          if [[ "${{ matrix.platform.os }}" == "windows-latest" ]]; then
+          if [[ "${{ matrix.platform.os }}" == "windows-2025" ]]; then
             cp ./octa_plugin_shell.exe ./release/plugins
             cp ./octa_plugin_tpl.exe ./release/plugins
             cp ./octa_plugin_junit.exe ./release/plugins
@@ -112,7 +119,7 @@ jobs:
           SHELL_ENTRY="octa_plugin_shell"
           TPL_ENTRY="octa_plugin_tpl"
           JUNIT_ENTRY="octa_plugin_junit"
-          if [[ "${{ matrix.platform.os }}" == "windows-latest" ]]; then
+          if [[ "${{ matrix.platform.os }}" == "windows-2025" ]]; then
             SHELL_ENTRY="${SHELL_ENTRY}.exe"
             TPL_ENTRY="${TPL_ENTRY}.exe"
             JUNIT_ENTRY="${JUNIT_ENTRY}.exe"
@@ -120,7 +127,6 @@ jobs:
           SHELL_DIGEST=$(shasum -a 256 "./release/plugins/${SHELL_ENTRY}" | cut -d ' ' -f 1)
           TPL_DIGEST=$(shasum -a 256 "./release/plugins/${TPL_ENTRY}" | cut -d ' ' -f 1)
           JUNIT_DIGEST=$(shasum -a 256 "./release/plugins/${JUNIT_ENTRY}" | cut -d ' ' -f 1)
-          (cd ./release && shasum -a 256 "${{ matrix.platform.bin }}" "octa-runner${{ contains(matrix.platform.os, 'windows') && '.exe' || '' }}" > SHA256SUMS)
           VERSION="${GITHUB_REF_NAME#v}"
           printf 'manifest_version: 1\nname: shell\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\ncapabilities:\n  - shell\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$SHELL_ENTRY" "$SHELL_DIGEST" > ./release/plugins/shell.plugin.yml
           printf 'manifest_version: 1\nname: tpl\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$TPL_ENTRY" "$TPL_DIGEST" > ./release/plugins/tpl.plugin.yml
@@ -131,7 +137,14 @@ jobs:
           # protocol or digest drift fails before an unusable archive is built.
           OCTA_PLUGINS_DIR=./release/plugins "./release/${{ matrix.platform.bin }}" plugin verify --lock ./release/Octa.lock
 
-          if [[ "${{ matrix.platform.os }}" == "windows-latest" ]]; then
+          # Inventory consumes this manifest without executing a potentially
+          # guest-only binary on the agent host. Every matrix entry is native
+          # to its release runner, so the executable remains its source of truth.
+          "./release/octa-runner${{ contains(matrix.platform.os, 'windows') && '.exe' || '' }}" capabilities > ./release/octa-runner-capabilities.json
+          cp ../../../.github/release-contract.json ./release/octa-release-contract.json
+          (cd ./release && find . -type f ! -name SHA256SUMS -print | LC_ALL=C sort | while IFS= read -r file; do shasum -a 256 "$file"; done > SHA256SUMS)
+
+          if [[ "${{ matrix.platform.os }}" == "windows-2025" ]]; then
             7z a ../../../${{ matrix.platform.name }} ./release/*
           else
             tar czvf ../../../${{ matrix.platform.name }} -C ./release .
@@ -140,18 +153,41 @@ jobs:
 
           shasum -a 256 "${{ matrix.platform.name }}" > "${{ matrix.platform.name }}.sha256"
 
-      - name: Publish release artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: octa-${{ matrix.platform.os_name }}
-          path: "octa*"
-        if: github.ref == 'refs/tags/test-release'
+          path: |
+            ${{ matrix.platform.name }}
+            ${{ matrix.platform.name }}.sha256
+          if-no-files-found: error
 
+  attest-and-publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Checkout release notes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download release artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          pattern: octa-*
+          path: dist
+          merge-multiple: true
+      - name: Attest archives and checksums
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/*
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: true
-          files: "octa-*"
+          files: "dist/*"
           token: ${{ github.token }}
           body_path: Changelog.md
         if: startsWith( github.ref, 'refs/tags/v' )
