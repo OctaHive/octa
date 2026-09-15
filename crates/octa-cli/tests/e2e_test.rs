@@ -273,43 +273,28 @@ identity = "plugin-contract-test-environment"
 }
 
 #[test]
-fn test_cache_management_requires_a_profile_and_explain_requires_a_cacheable_task() {
+fn test_cache_management_uses_the_automatic_store_and_explain_requires_a_cacheable_task() {
   let workspace = TempDir::new().unwrap();
-  let cache = TempDir::new().unwrap();
   fs::write(
     workspace.path().join("Octafile.yml"),
     "version: 1\ntasks:\n  build:\n    shell: echo build\n",
   )
   .unwrap();
 
-  let mut missing_profile = Command::cargo_bin("octa").unwrap();
-  missing_profile
+  let mut automatic_status = Command::cargo_bin("octa").unwrap();
+  automatic_status
     .current_dir(workspace.path())
     .args(["cache", "status"])
     .assert()
-    .failure()
-    .stderr(predicate::str::contains("requires --cache-profile"));
+    .success()
+    .stdout(predicate::str::contains(".octa/cache"));
+  assert!(workspace.path().join(".octa/cache/v1").is_dir());
 
-  fs::write(
-    workspace.path().join("cache.toml"),
-    format!(
-      r#"
-mode = "read_only"
-namespace = "tests/explain"
-[local]
-directory = "{}"
-[environment]
-identity = "test-environment"
-"#,
-      cache.path().to_string_lossy().replace('\\', "/")
-    ),
-  )
-  .unwrap();
   let mut no_cacheable_task = Command::cargo_bin("octa").unwrap();
   no_cacheable_task
     .current_dir(workspace.path())
     .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
-    .args(["--cache-profile", "cache.toml", "cache", "explain", "build"])
+    .args(["cache", "explain", "build"])
     .assert()
     .failure()
     .stderr(predicate::str::contains("no cacheable task"));
