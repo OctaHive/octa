@@ -13,9 +13,9 @@
 
 ## 3. Build a constrained Codex invocation
 
-- [ ] 3.1 Implement bounded prompt loading, BLAKE3 prompt identity, stdin delivery, and typed construction of unattended JSONL/structured-result arguments; verify unit tests cover inline/file prompts, Unicode, size limits, and the absence of prompt text and arbitrary pass-through flags in the process command line.
-- [ ] 3.2 Construct the child environment from a documented minimal platform baseline plus explicit public and secret variable mappings, reject credential mappings to variables not marked secret, and verify tests prove unselected environment and secret values are absent.
-- [ ] 3.3 Resolve only the operator-selected Codex executable, validate it against the documented compatibility set before workspace mutation, and verify missing, non-executable, malformed-version, and unsupported-version fixtures return bounded compatibility diagnostics without a shell fallback.
+- [x] 3.1 Implement bounded prompt loading, BLAKE3 prompt identity, stdin delivery, and typed construction of unattended JSONL/structured-result arguments; verify unit tests cover inline/file prompts, Unicode, size limits, and the absence of prompt text and arbitrary pass-through flags in the process command line.
+- [x] 3.2 Construct the child environment from a documented minimal platform baseline plus explicit public and secret variable mappings, reject credential mappings to variables not marked secret, and verify tests prove unselected environment and secret values are absent.
+- [x] 3.3 Resolve only the operator-selected Codex executable, validate it against the documented compatibility set before workspace mutation, and verify missing, non-executable, malformed-version, and unsupported-version fixtures return bounded compatibility diagnostics without a shell fallback.
 
 ## 4. Stream and sanitize harness events
 

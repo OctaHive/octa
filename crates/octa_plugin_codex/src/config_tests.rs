@@ -171,6 +171,13 @@ fn rejects_invalid_environment_mappings_and_duplicate_deliverables() {
         "secret": { "TOKEN": "secret_token" }
       }
     }),
+    json!({
+      "prompt": "work",
+      "environment": {
+        "public": { "token": "public_token" },
+        "secret": { "TOKEN": "secret_token" }
+      }
+    }),
     json!({ "prompt": "work", "environment": { "public": public, "secret": secret } }),
     json!({
       "prompt": "work",

@@ -54,13 +54,18 @@ impl Plugin for CodexPlugin {
     command: PluginCommand,
     writer: Arc<Mutex<impl AsyncWrite + Send + 'static + Unpin>>,
     _logger: Arc<impl Logger>,
-    _cancel_token: CancellationToken,
+    cancel_token: CancellationToken,
   ) -> anyhow::Result<()> {
     let PluginCommand { id, dry, value, .. } = command;
     let _config = config::CodexConfig::parse(value)?;
     if dry {
       return send_completed(&writer, id, 0, records::dry_run_outputs()).await;
     }
+    // Compatibility is established before prompt files, credentials, schema
+    // files, or run-record directories are touched. This implementation slice
+    // intentionally stops after validation; task 5 consumes the typed value.
+    // There is deliberately no PATH or shell fallback here.
+    let _executable = invocation::CodexExecutable::resolve_from_operator_environment(&cancel_token).await?;
     anyhow::bail!("Codex task contract is not implemented")
   }
 }

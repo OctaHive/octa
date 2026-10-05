@@ -12,8 +12,8 @@ use anyhow::{bail, Context};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-/// Maximum UTF-8 size of an inline prompt.
-const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+/// Maximum UTF-8 size of either an inline prompt or a loaded prompt file.
+pub(crate) const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 size of a complete portable workspace-relative path.
 const MAX_PATH_BYTES: usize = 4 * 1024;
 /// Maximum encoded size reserved for the unique invocation directory name.
@@ -135,12 +135,13 @@ impl EnvironmentSelection {
       bail!("environment mappings are limited to {MAX_ENVIRONMENT_MAPPINGS} entries");
     }
 
+    let mut environment_names = HashSet::with_capacity(self.public.len() + self.secret.len());
     for (environment_name, variable_name) in self.public.iter().chain(&self.secret) {
       validate_environment_name(environment_name)?;
       validate_name("Octa variable name", variable_name)?;
-    }
-    if let Some(name) = self.public.keys().find(|name| self.secret.contains_key(*name)) {
-      bail!("child environment variable '{name}' cannot be both public and secret");
+      if !environment_names.insert(environment_name.to_ascii_uppercase()) {
+        bail!("child environment variable '{environment_name}' is configured more than once ignoring ASCII case");
+      }
     }
     Ok(())
   }
@@ -178,7 +179,8 @@ fn validate_deliverables(deliverables: &[Deliverable]) -> anyhow::Result<()> {
   Ok(())
 }
 
-fn validate_prompt(prompt: &str) -> anyhow::Result<()> {
+/// Applies the prompt invariants shared by inline configuration and files.
+pub(crate) fn validate_prompt(prompt: &str) -> anyhow::Result<()> {
   if prompt.trim().is_empty() {
     bail!("prompt must not be empty");
   }
