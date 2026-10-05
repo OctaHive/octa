@@ -1,9 +1,7 @@
 use std::{ffi::OsString, fs};
 
-use serde_json::json;
-use tokio::io::AsyncReadExt;
-
 use super::*;
+use serde_json::json;
 
 fn config(value: serde_json::Value) -> CodexConfig {
   CodexConfig::parse(value).unwrap()
@@ -82,11 +80,7 @@ async fn inline_unicode_prompt_has_a_stable_identity_and_is_delivered_only_over_
   );
   assert!(invocation.arguments().iter().all(|argument| argument != prompt));
 
-  let (mut writer, mut reader) = tokio::io::duplex(prompt.len() + 1);
-  invocation.write_prompt(&mut writer).await.unwrap();
-  let mut delivered = Vec::new();
-  reader.read_to_end(&mut delivered).await.unwrap();
-  assert_eq!(delivered, prompt.as_bytes());
+  assert_eq!(invocation.prompt_bytes(), prompt.as_bytes());
 }
 
 #[tokio::test]
@@ -112,11 +106,7 @@ async fn prompt_file_uses_the_same_bytes_and_identity_as_an_inline_prompt() {
   .unwrap();
 
   assert_eq!(from_file.prompt_identity(), inline.prompt_identity());
-  let (mut writer, mut reader) = tokio::io::duplex(prompt.len() + 1);
-  from_file.write_prompt(&mut writer).await.unwrap();
-  let mut delivered = String::new();
-  reader.read_to_string(&mut delivered).await.unwrap();
-  assert_eq!(delivered, prompt);
+  assert_eq!(from_file.prompt_bytes(), prompt.as_bytes());
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@
 //! and command execution. The host owns framing, correlation, cancellation,
 //! and response serialization.
 
-use std::{collections::HashMap, ffi::OsStr, io, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, ffi::OsStr, io, path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use clap::Parser;
@@ -13,7 +13,9 @@ use interprocess::local_socket::{
   ListenerOptions,
 };
 use logger::{collect_value_redactions, collect_variable_redactions, redact, Logger, LoggerSystem, RedactingLogger};
-use protocol::{OctaCommand, PluginCachePlan, PluginCachePlanRequest, PluginResponse, Schema, Version};
+use protocol::{
+  OctaCommand, PluginCachePlan, PluginCachePlanRequest, PluginResponse, Schema, Version, MAX_PLUGIN_FRAME_BYTES,
+};
 use serde_json::{Map, Value};
 use socket::interpret_local_socket_name;
 use tokio::io::{AsyncReadExt, AsyncWrite, ReadHalf};
@@ -30,6 +32,55 @@ pub mod socket;
 
 /// Capability used for values that execute a command and return its stdout.
 pub const SHELL_CAPABILITY: &str = "shell";
+
+/// Maximum time one complete protocol response may occupy the shared writer.
+///
+/// A local peer that stops reading must not keep a plugin command—and any
+/// process tree it owns—alive indefinitely. Timing out poisons that connection:
+/// callers must propagate the error instead of attempting to continue the
+/// response stream.
+const RESPONSE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Serializes and writes one newline-delimited plugin response atomically with
+/// respect to the other commands sharing `writer`.
+///
+/// The encoded JSON is checked before the newline is appended, matching the
+/// host's frame reader. Serialization occurs before taking the lock so a large
+/// or invalid response cannot stall unrelated commands. A write timeout means
+/// the stream may contain a partial frame and is therefore no longer usable.
+pub async fn send_response<W>(writer: &Arc<Mutex<W>>, response: &PluginResponse) -> io::Result<()>
+where
+  W: AsyncWrite + Send + Unpin,
+{
+  send_response_with_timeout(writer, response, RESPONSE_WRITE_TIMEOUT).await
+}
+
+async fn send_response_with_timeout<W>(
+  writer: &Arc<Mutex<W>>,
+  response: &PluginResponse,
+  timeout: Duration,
+) -> io::Result<()>
+where
+  W: AsyncWrite + Send + Unpin,
+{
+  let mut frame = serde_json::to_vec(response).map_err(io::Error::other)?;
+  if frame.len() > MAX_PLUGIN_FRAME_BYTES {
+    return Err(io::Error::new(
+      io::ErrorKind::InvalidData,
+      format!("plugin response exceeds the {MAX_PLUGIN_FRAME_BYTES}-byte frame limit"),
+    ));
+  }
+  frame.push(b'\n');
+
+  tokio::time::timeout(timeout, async {
+    let mut writer = writer.lock().await;
+    writer.write_all(&frame).await?;
+    writer.flush().await
+  })
+  .await
+  .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "timed out while writing a plugin response"))??;
+  Ok(())
+}
 
 #[derive(Clone)]
 pub struct PluginSchema {
@@ -142,8 +193,7 @@ where
           id,
           message: format!("Failed to read {output_type}: {error}"),
         };
-        let response_json = serde_json::to_string(&response)? + "\n";
-        writer.lock().await.write_all(response_json.as_bytes()).await?;
+        send_response(&writer, &response).await?;
         return Ok(());
       },
     };
@@ -153,8 +203,7 @@ where
     } else {
       PluginResponse::StderrBytes { id: id.clone(), bytes }
     };
-    let response_json = serde_json::to_string(&response)? + "\n";
-    writer.lock().await.write_all(response_json.as_bytes()).await?;
+    send_response(&writer, &response).await?;
   }
 }
 
@@ -182,8 +231,7 @@ where
           message: format!("Cache planning failed: {error}"),
         },
       };
-      let response_json = serde_json::to_string(&response)? + "\n";
-      writer.lock().await.write_all(response_json.as_bytes()).await?;
+      send_response(&writer, &response).await?;
     },
     OctaCommand::Execute {
       id,
@@ -209,8 +257,7 @@ where
       {
         // Send started response
         let start_response = PluginResponse::Started { id: id.clone() };
-        let start_json = serde_json::to_string(&start_response)? + "\n";
-        writer.lock().await.write_all(start_json.as_bytes()).await?;
+        send_response(&writer, &start_response).await?;
 
         command_logger.log(&format!("Send Start command for command id '{}'", id))?;
       }
@@ -255,11 +302,7 @@ where
             id: command_id.clone(),
             message: redact(&format!("Command execution error: {}", e), &redactions),
           };
-          if let Ok(json) = serde_json::to_string(&error) {
-            let error_json = json + "\n";
-            let mut lock = writer_clone.lock().await;
-            let _ = lock.write_all(error_json.as_bytes()).await;
-          }
+          let _ = send_response(&writer_clone, &error).await;
         }
         active_commands_for_task.lock().await.remove(&command_id);
       });
@@ -315,11 +358,7 @@ where
         id: "protocol_error".to_string(),
         message: "Unexpected Schema command".to_owned(),
       };
-      writer
-        .lock()
-        .await
-        .write_all(serde_json::to_string(&response)?.as_bytes())
-        .await?;
+      send_response(&writer, &response).await?;
 
       logger.log("Received unexpected Schema command")?;
     },
@@ -328,11 +367,7 @@ where
         id: "protocol_error".to_string(),
         message: "Unexpected Hello command".to_owned(),
       };
-      writer
-        .lock()
-        .await
-        .write_all(serde_json::to_string(&response)?.as_bytes())
-        .await?;
+      send_response(&writer, &response).await?;
 
       logger.log("Received unexpected Hello command")?;
     },
@@ -395,8 +430,7 @@ async fn handle_conn(
                   id: "parse_error".to_string(),
                   message: format!("Invalid command format: {}", e),
                 };
-                let response_json = serde_json::to_string(&response)? + "\n";
-                writer.lock().await.write_all(response_json.as_bytes()).await?;
+                send_response(&writer, &response).await?;
               }
             }
           },
@@ -428,11 +462,7 @@ async fn handle_conn(
   let response = PluginResponse::Shutdown {
     message: "Plugin shutting down".to_string(),
   };
-  writer
-    .lock()
-    .await
-    .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-    .await?;
+  send_response(&writer, &response).await?;
 
   Ok(())
 }
@@ -464,11 +494,7 @@ where
             client_version.protocol_version
           ),
         };
-        writer
-          .lock()
-          .await
-          .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-          .await?;
+        send_response(&writer, &response).await?;
         return Ok(false);
       }
       if let Err(e) = logger.log(&format!("Client connected with version: {}", client_version.version)) {
@@ -481,21 +507,16 @@ where
         version: plugin.version(),
         features: vec![],
       });
-      let response_json = serde_json::to_string(&response)? + "\n";
-      writer.lock().await.write_all(response_json.as_bytes()).await?;
+      send_response(&writer, &response).await?;
 
-      let _ = logger.log(&response_json.to_string());
+      let _ = logger.log("Sent plugin Hello response");
     },
     Ok(command) => {
       let response = PluginResponse::Error {
         id: "protocol_error".to_string(),
         message: "Expected Hello command".to_string(),
       };
-      writer
-        .lock()
-        .await
-        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-        .await?;
+      send_response(&writer, &response).await?;
 
       logger.log(&format!("Waiting for Hello command but received {:?}", command))?;
       return Ok(false);
@@ -505,11 +526,7 @@ where
         id: "parse_error".to_string(),
         message: format!("Invalid command format: {}", e),
       };
-      writer
-        .lock()
-        .await
-        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-        .await?;
+      send_response(&writer, &response).await?;
 
       logger.log("Failed to deserialize received command")?;
       return Ok(false);
@@ -545,21 +562,16 @@ where
         input_schema: schema.input_schema,
         output_schema: schema.output_schema,
       });
-      let response_json = serde_json::to_string(&schema_response)? + "\n";
-      writer.lock().await.write_all(response_json.as_bytes()).await?;
+      send_response(&writer, &schema_response).await?;
 
-      let _ = logger.log(&response_json.to_string());
+      let _ = logger.log("Sent plugin Schema response");
     },
     Ok(command) => {
       let response = PluginResponse::Error {
         id: "protocol_error".to_string(),
         message: "Expected Schema command".to_string(),
       };
-      writer
-        .lock()
-        .await
-        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-        .await?;
+      send_response(&writer, &response).await?;
 
       logger.log(&format!("Waiting for Schema command but received {:?}", command))?;
       return Ok(false);
@@ -569,11 +581,7 @@ where
         id: "parse_error".to_string(),
         message: format!("Invalid command format: {}", e),
       };
-      writer
-        .lock()
-        .await
-        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-        .await?;
+      send_response(&writer, &response).await?;
 
       logger.log("Failed to deserialize received command")?;
       return Ok(false);
@@ -705,6 +713,44 @@ mod tests {
     fn poll_read(self: Pin<&mut Self>, _context: &mut Context<'_>, _buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
       Poll::Ready(Err(io::Error::other("broken stream")))
     }
+  }
+
+  #[tokio::test]
+  async fn response_writer_frames_flushes_and_enforces_the_wire_limit() {
+    let response = PluginResponse::Error {
+      id: "command".to_owned(),
+      message: "bounded".to_owned(),
+    };
+    let expected = serde_json::to_string(&response).unwrap() + "\n";
+    let (writer, mut reader) = tokio::io::duplex(expected.len());
+    send_response(&Arc::new(Mutex::new(writer)), &response).await.unwrap();
+
+    let mut frame = String::new();
+    BufReader::new(&mut reader).read_line(&mut frame).await.unwrap();
+    assert_eq!(frame, expected);
+
+    let oversized = PluginResponse::Error {
+      id: "command".to_owned(),
+      message: "x".repeat(MAX_PLUGIN_FRAME_BYTES),
+    };
+    let (writer, _reader) = tokio::io::duplex(1);
+    let error = send_response(&Arc::new(Mutex::new(writer)), &oversized)
+      .await
+      .unwrap_err();
+    assert!(error.to_string().contains("frame limit"));
+  }
+
+  #[tokio::test]
+  async fn response_writer_bounds_a_peer_that_stops_reading() {
+    let response = PluginResponse::Error {
+      id: "command".to_owned(),
+      message: "blocked".to_owned(),
+    };
+    let (writer, _reader) = tokio::io::duplex(1);
+    let error = send_response_with_timeout(&Arc::new(Mutex::new(writer)), &response, Duration::from_millis(20))
+      .await
+      .unwrap_err();
+    assert!(error.to_string().contains("timed out"));
   }
 
   struct MockPlugin {

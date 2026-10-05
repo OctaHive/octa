@@ -13,6 +13,14 @@ use serde_json::{Map, Value};
 /// "opaque" rather than "old plugin" before cache lookup.
 pub const PLUGIN_PROTOCOL_VERSION: u16 = 2;
 
+/// Maximum encoded JSON bytes in one plugin protocol frame, excluding its
+/// newline delimiter.
+///
+/// The plugin host enforces this limit while reading. Plugin implementations
+/// can use the same value to reject oversized responses before writing a frame
+/// that the host would necessarily discard.
+pub const MAX_PLUGIN_FRAME_BYTES: usize = 1024 * 1024;
+
 /// Maximum total number of input patterns and output roots in one plugin plan.
 pub const MAX_PLUGIN_CACHE_PLAN_ITEMS: usize = 1_024;
 /// Maximum UTF-8 length of one target label, input pattern, or output root.

@@ -24,12 +24,11 @@ use uuid::Uuid;
 
 use octa_plugin::protocol::{
   OctaCommand, PluginCachePlan, PluginCachePlanRequest, PluginResponse, ProgressUpdate, Schema, Version,
-  PLUGIN_PROTOCOL_VERSION,
+  MAX_PLUGIN_FRAME_BYTES, PLUGIN_PROTOCOL_VERSION,
 };
 
 const CONTROL_RESPONSE_CAPACITY: usize = 16;
 const COMMAND_RESPONSE_CAPACITY: usize = 32;
-const MAX_PLUGIN_FRAME_BYTES: usize = 1024 * 1024;
 const CANCELLED_ROUTE_TTL: Duration = Duration::from_secs(5);
 const PLUGIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PLUGIN_CACHE_PLAN_TIMEOUT: Duration = Duration::from_secs(5);

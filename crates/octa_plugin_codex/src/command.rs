@@ -1,0 +1,496 @@
+//! Command-scoped coordination of one Codex invocation.
+//!
+//! This is the single owner of the child lifecycle after compatibility and
+//! task input have been validated. It arbitrates process exit against the SDK
+//! cancellation token, writes the prompt, drains both output pipes, and emits
+//! only non-terminal activity. The plugin entry point remains the sole place
+//! allowed to send `Completed` or `Error`, so exit/cancel races cannot produce
+//! two terminal protocol responses.
+
+use std::{io, path::Path, process::ExitStatus, sync::Arc, time::Duration};
+
+use anyhow::Context;
+use octa_plugin::{protocol::PluginResponse, send_response};
+use tokio::{
+  io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+  sync::Mutex,
+  task::{JoinError, JoinHandle},
+  time::Instant,
+};
+use tokio_util::sync::CancellationToken;
+
+use crate::{
+  events::{EventDecoder, HarnessEvent},
+  invocation::CodexInvocation,
+  process::ProcessTree,
+  sanitization::{RunSanitizer, SanitizedEvent},
+};
+
+const STREAM_BUFFER_BYTES: usize = 16 * 1024;
+/// Time allowed for stdin closure and cooperative process termination.
+const CANCELLATION_GRACE_PERIOD: Duration = Duration::from_secs(2);
+/// Bounds pipe draining after the owned process tree has stopped.
+const POST_TERMINATION_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bounds reaping after the force-kill request has been issued.
+const FORCE_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The single terminal decision returned to the plugin entry point.
+pub(crate) enum CommandOutcome {
+  /// The SDK cancellation token won the lifecycle race.
+  Cancelled,
+  /// The process and both output streams ended normally at the OS layer.
+  Completed(CommandCompletion),
+}
+
+/// Evidence retained after a complete, well-formed harness stream.
+pub(crate) struct CommandCompletion {
+  status: ExitStatus,
+  terminal_event: SanitizedEvent,
+}
+
+impl CommandCompletion {
+  /// Status returned by the direct Codex process leader.
+  pub(crate) fn status(&self) -> ExitStatus {
+    self.status
+  }
+
+  /// Sanitized terminal event consumed later by result normalization.
+  pub(crate) fn terminal_event(&self) -> &SanitizedEvent {
+    &self.terminal_event
+  }
+}
+
+/// Runs one prepared invocation and forwards ordered, non-terminal activity.
+pub(crate) async fn run<W>(
+  command_id: &str,
+  invocation: &CodexInvocation,
+  working_directory: &Path,
+  writer: Arc<Mutex<W>>,
+  sanitizer: &RunSanitizer,
+  cancellation: &CancellationToken,
+) -> anyhow::Result<CommandOutcome>
+where
+  W: AsyncWrite + Send + Unpin + 'static,
+{
+  run_with_grace_period(
+    command_id,
+    invocation,
+    working_directory,
+    writer,
+    sanitizer,
+    cancellation,
+    CANCELLATION_GRACE_PERIOD,
+  )
+  .await
+}
+
+async fn run_with_grace_period<W>(
+  command_id: &str,
+  invocation: &CodexInvocation,
+  working_directory: &Path,
+  writer: Arc<Mutex<W>>,
+  sanitizer: &RunSanitizer,
+  cancellation: &CancellationToken,
+  grace_period: Duration,
+) -> anyhow::Result<CommandOutcome>
+where
+  W: AsyncWrite + Send + Unpin + 'static,
+{
+  if cancellation.is_cancelled() {
+    return Ok(CommandOutcome::Cancelled);
+  }
+
+  let mut command = invocation.command(working_directory).await?;
+  // Fingerprinting may outlive a cancellation request, but process creation
+  // must not. Recheck immediately at the irreversible spawn boundary.
+  if cancellation.is_cancelled() {
+    return Ok(CommandOutcome::Cancelled);
+  }
+
+  let mut tree = ProcessTree::spawn(&mut command).context("failed to start the Codex process")?;
+  let stdin = tree.take_stdin().context("failed to capture Codex stdin")?;
+  let mut stdout = tree.take_stdout().context("failed to capture Codex stdout")?;
+  let mut stderr = tree.take_stderr().context("failed to capture Codex stderr")?;
+  let mut prompt = PromptWriter::spawn(stdin, invocation.prompt_bytes().to_vec());
+
+  let mut decoder = Some(EventDecoder::new());
+  let mut terminal_event = None;
+  let mut stdout_closed = false;
+  let mut stderr_closed = false;
+  let mut prompt_closed = false;
+  let mut exit_status = None;
+  let mut stdout_buffer = vec![0_u8; STREAM_BUFFER_BYTES];
+  let mut stderr_buffer = vec![0_u8; STREAM_BUFFER_BYTES];
+  let drain_deadline = tokio::time::sleep(Duration::MAX);
+  tokio::pin!(drain_deadline);
+
+  loop {
+    if exit_status.is_some() && stdout_closed && stderr_closed && prompt_closed {
+      break;
+    }
+
+    let step = tokio::select! {
+      biased;
+      _ = cancellation.cancelled() => LifecycleStep::Cancelled,
+      result = prompt.wait(), if !prompt_closed => LifecycleStep::Prompt(result),
+      result = stdout.read(&mut stdout_buffer), if !stdout_closed => LifecycleStep::Stdout(result),
+      result = stderr.read(&mut stderr_buffer), if !stderr_closed => LifecycleStep::Stderr(result),
+      result = tree.wait(), if exit_status.is_none() => LifecycleStep::Exited(result),
+      _ = &mut drain_deadline, if exit_status.is_some() => LifecycleStep::DrainTimedOut,
+    };
+
+    let result: anyhow::Result<()> = match step {
+      LifecycleStep::Cancelled => {
+        return finish_cancellation(&mut prompt, &mut tree, &mut stdout, &mut stderr, grace_period).await;
+      },
+      LifecycleStep::Prompt(result) => {
+        prompt_closed = true;
+        result.context("failed to deliver the Codex prompt")
+      },
+      LifecycleStep::Stdout(Ok(0)) => {
+        stdout_closed = true;
+        match finish_stdout(
+          command_id,
+          &mut decoder,
+          writer.clone(),
+          sanitizer,
+          &mut terminal_event,
+          cancellation,
+        )
+        .await
+        {
+          Ok(ActivityFlow::Continue) => Ok(()),
+          Ok(ActivityFlow::Cancelled) => {
+            return finish_cancellation(&mut prompt, &mut tree, &mut stdout, &mut stderr, grace_period).await;
+          },
+          Err(error) => Err(error),
+        }
+      },
+      LifecycleStep::Stdout(Ok(read)) => {
+        match process_stdout(
+          command_id,
+          &mut decoder,
+          &stdout_buffer[..read],
+          writer.clone(),
+          sanitizer,
+          &mut terminal_event,
+          cancellation,
+        )
+        .await
+        {
+          Ok(ActivityFlow::Continue) => Ok(()),
+          Ok(ActivityFlow::Cancelled) => {
+            return finish_cancellation(&mut prompt, &mut tree, &mut stdout, &mut stderr, grace_period).await;
+          },
+          Err(error) => Err(error),
+        }
+      },
+      LifecycleStep::Stdout(Err(error)) => Err(error).context("failed to read Codex stdout"),
+      LifecycleStep::Stderr(Ok(0)) => {
+        stderr_closed = true;
+        Ok(())
+      },
+      // Stderr forwarding and retention have their own contract. This stage
+      // drains it so a full pipe cannot deadlock lifecycle termination.
+      LifecycleStep::Stderr(Ok(_)) => Ok(()),
+      LifecycleStep::Stderr(Err(error)) => Err(error).context("failed to read Codex stderr"),
+      LifecycleStep::Exited(Ok(status)) => {
+        exit_status = Some(status);
+        drain_deadline
+          .as_mut()
+          .reset(Instant::now() + POST_TERMINATION_DRAIN_TIMEOUT);
+        Ok(())
+      },
+      LifecycleStep::Exited(Err(error)) => Err(error).context("failed to wait for the Codex process"),
+      LifecycleStep::DrainTimedOut => Err(anyhow::anyhow!(
+        "Codex output pipes did not close within {} seconds after process termination",
+        POST_TERMINATION_DRAIN_TIMEOUT.as_secs()
+      )),
+    };
+
+    if let Err(error) = result {
+      prompt.abort_and_wait().await?;
+      force_and_drain(&mut tree, &mut stdout, &mut stderr).await?;
+      return Err(error);
+    }
+  }
+
+  let terminal_event = terminal_event.ok_or_else(|| anyhow::anyhow!("Codex stdout ended without a terminal event"))?;
+  Ok(CommandOutcome::Completed(CommandCompletion {
+    status: exit_status.expect("completion requires a process status"),
+    terminal_event,
+  }))
+}
+
+enum LifecycleStep {
+  Cancelled,
+  Prompt(io::Result<()>),
+  Stdout(io::Result<usize>),
+  Stderr(io::Result<usize>),
+  Exited(io::Result<ExitStatus>),
+  DrainTimedOut,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityFlow {
+  Continue,
+  Cancelled,
+}
+
+async fn process_stdout<W>(
+  command_id: &str,
+  decoder: &mut Option<EventDecoder>,
+  mut bytes: &[u8],
+  writer: Arc<Mutex<W>>,
+  sanitizer: &RunSanitizer,
+  terminal_event: &mut Option<SanitizedEvent>,
+  cancellation: &CancellationToken,
+) -> anyhow::Result<ActivityFlow>
+where
+  W: AsyncWrite + Send + Unpin + 'static,
+{
+  while !bytes.is_empty() {
+    let Some(event) = decoder
+      .as_mut()
+      .expect("stdout decoder exists before EOF")
+      .next_event(&mut bytes)
+      .context("invalid Codex stdout stream")?
+    else {
+      continue;
+    };
+    if retain_event(
+      command_id,
+      event,
+      writer.clone(),
+      sanitizer,
+      terminal_event,
+      cancellation,
+    )
+    .await?
+      == ActivityFlow::Cancelled
+    {
+      return Ok(ActivityFlow::Cancelled);
+    }
+  }
+  Ok(ActivityFlow::Continue)
+}
+
+async fn finish_stdout<W>(
+  command_id: &str,
+  decoder: &mut Option<EventDecoder>,
+  writer: Arc<Mutex<W>>,
+  sanitizer: &RunSanitizer,
+  terminal_event: &mut Option<SanitizedEvent>,
+  cancellation: &CancellationToken,
+) -> anyhow::Result<ActivityFlow>
+where
+  W: AsyncWrite + Send + Unpin + 'static,
+{
+  let event = decoder
+    .take()
+    .expect("stdout decoder exists until EOF")
+    .finish()
+    .context("invalid Codex stdout stream")?;
+  if let Some(event) = event {
+    return retain_event(command_id, event, writer, sanitizer, terminal_event, cancellation).await;
+  }
+  Ok(ActivityFlow::Continue)
+}
+
+async fn retain_event<W>(
+  command_id: &str,
+  event: HarnessEvent,
+  writer: Arc<Mutex<W>>,
+  sanitizer: &RunSanitizer,
+  terminal_event: &mut Option<SanitizedEvent>,
+  cancellation: &CancellationToken,
+) -> anyhow::Result<ActivityFlow>
+where
+  W: AsyncWrite + Send + Unpin + 'static,
+{
+  if cancellation.is_cancelled() {
+    return Ok(ActivityFlow::Cancelled);
+  }
+  let event = sanitizer.sanitize_event(event)?;
+  for response in crate::events::normalize_activity(command_id, &event)? {
+    if cancellation.is_cancelled() {
+      return Ok(ActivityFlow::Cancelled);
+    }
+    debug_assert!(!is_terminal_response(&response));
+    send_response(&writer, &response).await?;
+  }
+  if cancellation.is_cancelled() {
+    return Ok(ActivityFlow::Cancelled);
+  }
+  if event.terminal().is_some() {
+    *terminal_event = Some(event);
+  }
+  Ok(ActivityFlow::Continue)
+}
+
+fn is_terminal_response(response: &PluginResponse) -> bool {
+  matches!(
+    response,
+    PluginResponse::Completed { .. } | PluginResponse::Error { .. }
+  )
+}
+
+async fn finish_cancellation(
+  prompt: &mut PromptWriter,
+  tree: &mut ProcessTree,
+  stdout: &mut (impl tokio::io::AsyncRead + Unpin),
+  stderr: &mut (impl tokio::io::AsyncRead + Unpin),
+  grace_period: Duration,
+) -> anyhow::Result<CommandOutcome> {
+  prompt.abort_and_wait().await?;
+  cancel_and_drain(tree, stdout, stderr, grace_period).await?;
+  Ok(CommandOutcome::Cancelled)
+}
+
+async fn cancel_and_drain(
+  tree: &mut ProcessTree,
+  stdout: &mut (impl tokio::io::AsyncRead + Unpin),
+  stderr: &mut (impl tokio::io::AsyncRead + Unpin),
+  grace_period: Duration,
+) -> anyhow::Result<()> {
+  let graceful = tree
+    .request_graceful_termination()
+    .context("failed to request graceful Codex termination");
+  let force = if graceful.is_ok() {
+    match tokio::time::timeout(grace_period, tree.wait()).await {
+      Ok(Ok(_)) => None,
+      Ok(Err(_)) | Err(_) => Some(force_terminate(tree).await),
+    }
+  } else {
+    Some(force_terminate(tree).await)
+  };
+  let drain = drain_pipes(stdout, stderr).await;
+
+  // Teardown is best-effort as a whole: a failed cooperative signal must not
+  // skip force-kill, and a failed kill must not leave pipe draining unbounded.
+  graceful?;
+  if let Some(force) = force {
+    force?;
+  }
+  drain
+}
+
+async fn force_and_drain(
+  tree: &mut ProcessTree,
+  stdout: &mut (impl tokio::io::AsyncRead + Unpin),
+  stderr: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> anyhow::Result<()> {
+  let termination = force_terminate(tree).await;
+  let drain = drain_pipes(stdout, stderr).await;
+  termination?;
+  drain
+}
+
+async fn force_terminate(tree: &mut ProcessTree) -> anyhow::Result<()> {
+  tokio::time::timeout(FORCE_TERMINATION_TIMEOUT, tree.terminate())
+    .await
+    .map_err(|_| anyhow::anyhow!("timed out while force-terminating the Codex process tree"))?
+    .context("failed to force-terminate the Codex process tree")
+}
+
+async fn drain_pipes(
+  stdout: &mut (impl tokio::io::AsyncRead + Unpin),
+  stderr: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> anyhow::Result<()> {
+  let drain = async {
+    let mut stdout_sink = tokio::io::sink();
+    let mut stderr_sink = tokio::io::sink();
+    let (stdout, stderr) = tokio::join!(
+      tokio::io::copy(stdout, &mut stdout_sink),
+      tokio::io::copy(stderr, &mut stderr_sink)
+    );
+    stdout?;
+    stderr?;
+    io::Result::Ok(())
+  };
+  tokio::time::timeout(POST_TERMINATION_DRAIN_TIMEOUT, drain)
+    .await
+    .map_err(|_| anyhow::anyhow!("Codex output pipes did not close after process termination"))??;
+  Ok(())
+}
+
+/// Abort-on-drop owner for the only task allowed to hold child stdin.
+struct PromptWriter {
+  task: JoinHandle<io::Result<()>>,
+  finished: bool,
+}
+
+impl PromptWriter {
+  fn spawn(mut stdin: tokio::process::ChildStdin, prompt: Vec<u8>) -> Self {
+    let task = tokio::spawn(async move {
+      stdin.write_all(&prompt).await?;
+      stdin.shutdown().await
+    });
+    Self { task, finished: false }
+  }
+
+  async fn wait(&mut self) -> io::Result<()> {
+    let result = (&mut self.task).await;
+    self.finished = true;
+    join_prompt(result)
+  }
+
+  async fn abort_and_wait(&mut self) -> io::Result<()> {
+    if self.finished {
+      return Ok(());
+    }
+    self.task.abort();
+    let result = (&mut self.task).await;
+    self.finished = true;
+    match result {
+      Err(error) if error.is_cancelled() => Ok(()),
+      other => join_prompt(other),
+    }
+  }
+}
+
+impl Drop for PromptWriter {
+  fn drop(&mut self) {
+    if !self.finished {
+      self.task.abort();
+    }
+  }
+}
+
+fn join_prompt(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {
+  result.map_err(|error| io::Error::other(format!("Codex prompt writer task failed: {error}")))?
+}
+
+#[cfg(test)]
+mod tests {
+  use std::collections::HashMap;
+
+  use tokio::io::AsyncReadExt;
+
+  use super::*;
+
+  #[tokio::test]
+  async fn cancelled_activity_is_not_written_or_retained() {
+    let mut decoder = EventDecoder::new();
+    let mut bytes = br#"{"type":"item.completed","item":{"type":"agent_message","text":"late"}}
+"#
+    .as_slice();
+    let event = decoder.next_event(&mut bytes).unwrap().unwrap();
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let sanitizer = RunSanitizer::from_variables(&HashMap::new(), &[]);
+    let (writer, mut reader) = tokio::io::duplex(256);
+    let writer = Arc::new(Mutex::new(writer));
+    let mut terminal = None;
+
+    let flow = retain_event("command", event, writer, &sanitizer, &mut terminal, &cancellation)
+      .await
+      .unwrap();
+
+    assert_eq!(flow, ActivityFlow::Cancelled);
+    assert!(terminal.is_none());
+    let mut emitted = Vec::new();
+    reader.read_to_end(&mut emitted).await.unwrap();
+    assert!(emitted.is_empty(), "activity was emitted after cancellation");
+  }
+}

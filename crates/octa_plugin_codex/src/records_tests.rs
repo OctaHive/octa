@@ -65,6 +65,36 @@ fn rejects_an_oversized_nested_structured_result_before_protocol_output() {
 }
 
 #[test]
+fn production_validation_enforces_utf8_message_and_usage_byte_limits() {
+  let oversized_usage = (0..MAX_USAGE_COUNTERS)
+    .map(|index| {
+      let prefix = format!("counter_{index:02}_");
+      let name = format!("{prefix}{}", "x".repeat(MAX_OUTPUT_NAME_LENGTH - prefix.len()));
+      (name, json!(u64::MAX))
+    })
+    .collect::<serde_json::Map<_, _>>();
+  let oversized_message = json!({
+    "outcome": "completed",
+    "final_message": "€".repeat(MAX_FINAL_MESSAGE_BYTES / 3 + 1),
+    "harness_identifiers": {},
+    "usage": {},
+    "record_paths": record_paths()
+  });
+  let oversized_usage = json!({
+    "outcome": "completed",
+    "final_message": "done",
+    "harness_identifiers": {},
+    "usage": oversized_usage,
+    "record_paths": record_paths()
+  });
+
+  let message_error = validate_outputs(oversized_message.as_object().unwrap()).unwrap_err();
+  assert!(message_error.to_string().contains("final message exceeds"));
+  let usage_error = validate_outputs(oversized_usage.as_object().unwrap()).unwrap_err();
+  assert!(usage_error.to_string().contains("usage metadata exceeds"));
+}
+
+#[test]
 fn production_validation_rejects_schema_invalid_outputs() {
   let value = json!({
     "outcome": "completed",
@@ -154,7 +184,7 @@ fn enforces_message_identifier_and_collection_bounds() {
   for value in [
     json!({
       "outcome": "completed",
-      "final_message": "x".repeat(MAX_FINAL_MESSAGE_LENGTH + 1),
+      "final_message": "x".repeat(MAX_FINAL_MESSAGE_CHARACTERS + 1),
       "harness_identifiers": {},
       "usage": {},
       "record_paths": record_paths()

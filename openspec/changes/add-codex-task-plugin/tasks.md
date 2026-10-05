@@ -19,16 +19,16 @@
 
 ## 4. Stream and sanitize harness events
 
-- [ ] 4.1 Implement a bounded incremental JSONL decoder with one terminal-event state machine, and verify tests cover split reads, Unicode boundaries, unknown additive events, malformed/oversized frames, duplicate terminals, missing terminals, and preserved ordering.
+- [x] 4.1 Implement a bounded incremental JSONL decoder with one terminal-event state machine, and verify tests cover split reads, Unicode boundaries, unknown additive events, malformed/oversized frames, duplicate terminals, missing terminals, and preserved ordering.
 - [ ] 4.2 Normalize supported harness activity into existing stdout, stderr, progress, and diagnostic responses, and verify a socket-level plugin test observes activity before the terminal response with no Codex-specific protocol variants.
 - [ ] 4.3 Sanitize resolved secret scalars recursively before logging, forwarding, retaining, or writing event data, and verify adversarial fixtures cannot expose selected secrets in stdout, stderr, diagnostics, structured output, or the sanitized trace.
 - [ ] 4.4 Enforce independent named limits for stderr, trace, final message, structured result, and usage metadata, and verify each limit cancels the fixture process and returns a bounded error without retaining an incomplete record as a valid result.
 
 ## 5. Own the process lifecycle
 
-- [ ] 5.1 Implement direct child spawning with piped stdin/stdout/stderr and complete descendant ownership through a Unix process group and Windows Job Object, and verify platform tests observe no surviving descendant after normal completion, error, or plugin drop.
-- [ ] 5.2 Coordinate process exit, SDK cancellation, reader completion, and one terminal plugin response with a bounded graceful-then-forced teardown; verify race tests cover cancel-before-spawn, cancel-during-output, exit-versus-cancel, timeout, and shutdown.
-- [ ] 5.3 Add the cross-platform Codex fixture executable used by integration tests, including controllable partial frames, descendants, terminal outcomes, secret echoes, malformed output, and shutdown behavior; verify fixture scenarios run without network or credentials.
+- [x] 5.1 Implement direct child spawning with piped stdin/stdout/stderr and complete descendant ownership through a Unix process group and Windows Job Object, and verify platform tests observe no surviving descendant after normal completion, error, or plugin drop.
+- [x] 5.2 Coordinate process exit, SDK cancellation, reader completion, and one terminal plugin response with a bounded graceful-then-forced teardown; verify race tests cover cancel-before-spawn, cancel-during-output, exit-versus-cancel, timeout, and shutdown.
+- [x] 5.3 Add the cross-platform Codex fixture executable used by integration tests, including controllable partial frames, descendants, terminal outcomes, secret echoes, malformed output, and shutdown behavior; verify fixture scenarios run without network or credentials.
 
 ## 6. Validate results and publish auditable resources
 

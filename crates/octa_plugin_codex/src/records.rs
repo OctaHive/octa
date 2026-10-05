@@ -1,22 +1,28 @@
-//! Sanitized, durable run-record construction and resource declarations.
+//! Validation contracts for durable run records and plugin outputs.
 //!
-//! This module writes trace, result, and provenance data only after receiving
-//! normalized events. It neither interprets task configuration nor controls
-//! the Codex process.
+//! The module defines the shapes and bounded sizes that the record writer and
+//! protocol boundary must enforce. It neither interprets task configuration
+//! nor controls the Codex process.
 
-use std::{io, sync::OnceLock};
+use std::sync::OnceLock;
 
-use anyhow::{bail, Context};
-use serde::Serialize;
+use anyhow::bail;
 use serde_json::{Map, Value};
 
 use crate::config;
 
-/// Maximum number of characters retained in a plain final message.
+mod limits;
+use limits::{
+  validate_encoded_size, MAX_FINAL_MESSAGE_BYTES, MAX_PLUGIN_OUTPUT_BYTES, MAX_STRUCTURED_RESULT_BYTES,
+  MAX_USAGE_METADATA_BYTES,
+};
+
+/// Maximum number of characters advertised for a plain final message.
 ///
-/// The event reader also applies a byte limit before constructing this value;
-/// the schema limit protects every consumer of the advertised plugin output.
-const MAX_FINAL_MESSAGE_LENGTH: usize = 256 * 1024;
+/// JSON Schema counts Unicode characters rather than encoded bytes. Runtime
+/// retention additionally enforces [`MAX_FINAL_MESSAGE_BYTES`], so this is a
+/// portable upper bound rather than a second independently chosen limit.
+const MAX_FINAL_MESSAGE_CHARACTERS: usize = MAX_FINAL_MESSAGE_BYTES;
 /// Maximum number of harness identifiers retained for one invocation.
 const MAX_HARNESS_IDENTIFIERS: usize = 16;
 /// Maximum number of characters retained in one harness identifier.
@@ -25,11 +31,6 @@ const MAX_HARNESS_IDENTIFIER_LENGTH: usize = 1024;
 const MAX_USAGE_COUNTERS: usize = 32;
 /// Maximum portable name length for an identifier or usage counter.
 const MAX_OUTPUT_NAME_LENGTH: usize = 128;
-/// Maximum encoded size of the arbitrary JSON value returned by Codex.
-const MAX_STRUCTURED_RESULT_BYTES: usize = 256 * 1024;
-/// Maximum encoded size of the complete successful plugin output.
-const MAX_PLUGIN_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
-
 static OUTPUT_VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
 
 /// Returns the successful-completion schema advertised by the Codex plugin.
@@ -62,7 +63,7 @@ pub(crate) fn output_schema() -> Map<String, Value> {
       "final_message": {
         "type": "string",
         "minLength": 1,
-        "maxLength": MAX_FINAL_MESSAGE_LENGTH
+        "maxLength": MAX_FINAL_MESSAGE_CHARACTERS
       },
       "structured_result": true,
       "harness_identifiers": bounded_string_map_schema(
@@ -120,8 +121,18 @@ pub(crate) fn output_schema() -> Map<String, Value> {
 pub(crate) fn validate_outputs(outputs: &Map<String, Value>) -> anyhow::Result<()> {
   validate_encoded_size("Codex output", outputs, MAX_PLUGIN_OUTPUT_BYTES)?;
 
+  if outputs
+    .get("final_message")
+    .and_then(Value::as_str)
+    .is_some_and(|message| message.len() > MAX_FINAL_MESSAGE_BYTES)
+  {
+    bail!("final message exceeds {MAX_FINAL_MESSAGE_BYTES} UTF-8 bytes");
+  }
   if let Some(structured_result) = outputs.get("structured_result") {
     validate_encoded_size("structured_result", structured_result, MAX_STRUCTURED_RESULT_BYTES)?;
+  }
+  if let Some(usage) = outputs.get("usage") {
+    validate_encoded_size("usage metadata", usage, MAX_USAGE_METADATA_BYTES)?;
   }
 
   let value = Value::Object(outputs.clone());
@@ -132,44 +143,6 @@ pub(crate) fn validate_outputs(outputs: &Map<String, Value>) -> anyhow::Result<(
     bail!("Codex output does not satisfy the advertised schema");
   }
   Ok(())
-}
-
-fn validate_encoded_size(kind: &str, value: &impl Serialize, maximum: usize) -> anyhow::Result<()> {
-  let mut counter = EncodedSizeCounter::new(maximum);
-  let result = serde_json::to_writer(&mut counter, value);
-  if counter.exceeded {
-    bail!("{kind} exceeds {maximum} encoded bytes");
-  }
-  result.with_context(|| format!("failed to encode {kind}"))
-}
-
-struct EncodedSizeCounter {
-  remaining: usize,
-  exceeded: bool,
-}
-
-impl EncodedSizeCounter {
-  fn new(maximum: usize) -> Self {
-    Self {
-      remaining: maximum,
-      exceeded: false,
-    }
-  }
-}
-
-impl io::Write for EncodedSizeCounter {
-  fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-    if bytes.len() > self.remaining {
-      self.exceeded = true;
-      return Err(io::Error::other("encoded size limit exceeded"));
-    }
-    self.remaining -= bytes.len();
-    Ok(bytes.len())
-  }
-
-  fn flush(&mut self) -> io::Result<()> {
-    Ok(())
-  }
 }
 
 /// Returns the only successful output that does not represent a harness run.

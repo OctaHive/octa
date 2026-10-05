@@ -1,26 +1,31 @@
-//! Minimal Codex process fixture used by invocation contract tests.
+//! Deterministic Codex process fixture used by machine-boundary tests.
 //!
 //! `--version` emits a sibling-file-controlled response without network or
-//! credentials. Other invocations leave an observable marker so dry-run tests
-//! can prove the harness was never started. Later lifecycle tasks extend this
-//! fixture with JSONL and shutdown scenarios.
+//! credentials. A sibling `run-mode` file selects one JSONL, process-tree, or
+//! shutdown scenario. Marker files coordinate races without sleeps in the
+//! caller, while the fixture itself keeps every wait bounded.
 
 use std::{
-  io::Write,
+  io::{Read, Write},
   path::Path,
   process::{Command, Stdio},
   thread,
   time::Duration,
 };
 
+const SECRET_ENV: &str = "OCTA_CODEX_FIXTURE_SECRET";
+const OVERSIZED_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024 + 1;
+const CONTROL_WAIT_STEPS: usize = 600;
+const CONTROL_WAIT_INTERVAL: Duration = Duration::from_millis(5);
+
 fn main() {
   let executable = std::env::current_exe().expect("fixture executable path must be available");
   let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
   if arguments
     .first()
-    .is_some_and(|argument| argument == "--probe-descendant")
+    .is_some_and(|argument| argument == "--fixture-descendant")
   {
-    let heartbeat = arguments.get(1).expect("probe descendant requires a heartbeat path");
+    let heartbeat = arguments.get(1).expect("fixture descendant requires a heartbeat path");
     run_heartbeat(Path::new(heartbeat));
   }
   if arguments == ["--version"] {
@@ -30,7 +35,7 @@ fn main() {
       .expect("fixture probe marker must be writable");
     if executable.with_extension("spawn-version-descendant").exists() {
       let heartbeat = executable.with_extension("version-descendant-heartbeat");
-      spawn_probe_descendant(&executable, &heartbeat);
+      spawn_descendant(&executable, &heartbeat, "version descendant must start");
       for _ in 0..200 {
         if heartbeat.exists() {
           break;
@@ -51,6 +56,137 @@ fn main() {
     .expect("fixture executable must have a parent")
     .join("spawned");
   std::fs::write(marker, b"spawned").expect("fixture marker must be writable");
+  let mut prompt = String::new();
+  std::io::stdin()
+    .read_to_string(&mut prompt)
+    .expect("fixture prompt must be readable");
+  assert!(!prompt.is_empty(), "fixture requires a stdin prompt");
+
+  let mode = std::fs::read_to_string(executable.with_extension("run-mode")).unwrap_or_else(|_| "complete".to_owned());
+  match mode.trim() {
+    "complete" => emit_event(r#"{"type":"turn.completed","message":"done"}"#),
+    "failed" => emit_event(r#"{"type":"turn.failed","error":{"message":"fixture failure"}}"#),
+    "structured" => emit_event(
+      r#"{"type":"turn.completed","result":{"outcome":"completed","files":2},"usage":{"input_tokens":3,"output_tokens":5}}"#,
+    ),
+    "unknown" => {
+      emit_event(r#"{"type":"future.additive","payload":{"retained":true}}"#);
+      emit_event(r#"{"type":"turn.completed","message":"done"}"#);
+    },
+    "partial" => emit_controlled_partial_frame(&executable),
+    "secret-echo" => emit_secret_echo(),
+    "malformed" => emit_event("{not-json}"),
+    "oversized" => emit_oversized_frame(),
+    "duplicate-terminal" => {
+      emit_event(r#"{"type":"turn.completed","message":"first"}"#);
+      emit_event(r#"{"type":"turn.completed","message":"second"}"#);
+    },
+    "missing-terminal" => emit_event(r#"{"type":"turn.started"}"#),
+    "descendant" => {
+      let heartbeat = executable.with_extension("run-descendant-heartbeat");
+      spawn_descendant(&executable, &heartbeat, "runtime descendant must start");
+      wait_for_file(&heartbeat, "runtime descendant did not become ready");
+      emit_event(r#"{"type":"turn.completed","message":"done"}"#);
+    },
+    "hang" => {
+      emit_event(r#"{"type":"turn.started"}"#);
+      run_heartbeat(&executable.with_extension("run-heartbeat"));
+    },
+    "ignore-termination" => {
+      ignore_cooperative_termination();
+      emit_event(r#"{"type":"turn.started"}"#);
+      run_heartbeat(&executable.with_extension("run-heartbeat"));
+    },
+    "exit-race" => {
+      emit_event(r#"{"type":"turn.started"}"#);
+      let ready = executable.with_extension("run-heartbeat");
+      std::fs::write(&ready, b"ready").expect("race-ready marker must be writable");
+      let release = executable.with_extension("release-run");
+      wait_for_file(&release, "race fixture was not released");
+      emit_event(r#"{"type":"turn.completed","message":"done"}"#);
+    },
+    _ => panic!("unknown Codex fixture run mode"),
+  }
+}
+
+fn emit_event(event: &str) {
+  println!("{event}");
+  std::io::stdout().flush().expect("fixture event must flush");
+}
+
+fn emit_controlled_partial_frame(executable: &Path) {
+  const EVENT: &str = r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial 🧪"}}"#;
+  let unicode = EVENT.find('\u{1f9ea}').expect("partial event contains Unicode");
+  let split = unicode + 2;
+  let mut stdout = std::io::stdout().lock();
+  stdout
+    .write_all(&EVENT.as_bytes()[..split])
+    .expect("partial event prefix must be writable");
+  stdout.flush().expect("partial event prefix must flush");
+  let ready = executable.with_extension("partial-ready");
+  std::fs::write(&ready, b"ready").expect("partial-ready marker must be writable");
+  wait_for_file(
+    &executable.with_extension("release-run"),
+    "partial fixture was not released",
+  );
+  stdout
+    .write_all(&EVENT.as_bytes()[split..])
+    .expect("partial event suffix must be writable");
+  stdout.write_all(b"\n").expect("partial event newline must be writable");
+  stdout
+    .write_all(b"{\"type\":\"turn.completed\",\"message\":\"done\"}\n")
+    .expect("partial terminal event must be writable");
+  stdout.flush().expect("completed partial stream must flush");
+}
+
+fn emit_secret_echo() {
+  let secret = std::env::var(SECRET_ENV).expect("secret-echo mode requires its explicit fixture variable");
+  let event = serde_json::json!({
+    "type": "item.completed",
+    "item": { "type": "agent_message", "text": format!("stdout {secret}") }
+  });
+  emit_event(&serde_json::to_string(&event).expect("fixture event must serialize"));
+  eprintln!("stderr {secret}");
+  emit_event(r#"{"type":"turn.completed","message":"done"}"#);
+}
+
+fn emit_oversized_frame() {
+  let mut stdout = std::io::stdout().lock();
+  stdout
+    .write_all(b"{\"type\":\"future.additive\",\"padding\":\"")
+    .expect("oversized event prefix must be writable");
+  stdout
+    .write_all(&vec![b'x'; OVERSIZED_FRAME_PAYLOAD_BYTES])
+    .expect("oversized event body must be writable");
+  stdout
+    .write_all(b"\"}\n")
+    .expect("oversized event suffix must be writable");
+  stdout.flush().expect("oversized event must flush");
+}
+
+fn wait_for_file(path: &Path, failure: &str) {
+  for _ in 0..CONTROL_WAIT_STEPS {
+    if path.exists() {
+      return;
+    }
+    thread::sleep(CONTROL_WAIT_INTERVAL);
+  }
+  panic!("{failure}");
+}
+
+#[cfg(unix)]
+fn ignore_cooperative_termination() {
+  // SAFETY: this test fixture deliberately ignores SIGTERM so the plugin's
+  // bounded grace period must advance to its force-kill path.
+  unsafe {
+    libc::signal(libc::SIGTERM, libc::SIG_IGN);
+  }
+}
+
+#[cfg(not(unix))]
+fn ignore_cooperative_termination() {
+  // Closing stdin is the portable graceful request on Windows. The fixture
+  // has already consumed it and intentionally keeps running.
 }
 
 fn run_heartbeat(path: &Path) -> ! {
@@ -66,11 +202,13 @@ fn run_heartbeat(path: &Path) -> ! {
   clippy::zombie_processes,
   reason = "the fixture intentionally leaves this descendant for the plugin process owner to reap"
 )]
-fn spawn_probe_descendant(executable: &Path, heartbeat: &Path) {
+fn spawn_descendant(executable: &Path, heartbeat: &Path, failure: &str) {
   Command::new(executable)
-    .arg("--probe-descendant")
+    .arg("--fixture-descendant")
     .arg(heartbeat)
     .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
     .spawn()
-    .expect("version descendant must start");
+    .unwrap_or_else(|error| panic!("{failure}: {error}"));
 }

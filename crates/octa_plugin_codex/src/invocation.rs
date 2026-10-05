@@ -17,10 +17,7 @@ use cap_std::{
 };
 use octa_plugin::logger::{collect_variable_redactions, redact};
 use serde_json::Value;
-use tokio::{
-  fs::File,
-  io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
-};
+use tokio::{fs::File, io::AsyncReadExt, process::Command};
 
 use crate::config::{validate_prompt, CodexConfig, EnvironmentSelection, ReasoningEffort, MAX_PROMPT_BYTES};
 
@@ -67,14 +64,16 @@ const PLATFORM_ENVIRONMENT: &[&str] = &["HOME", "PATH", "TMPDIR", "TEMP", "TMP"]
 ///
 /// The enum makes schema activation an intentional choice. It also prevents
 /// callers from appending arbitrary strings to the Codex command line.
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 constructs the complete invocation"))]
 pub(crate) enum StructuredResultTarget {
   Disabled,
+  #[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "phase 6 materializes a validated structured-result schema")
+  )]
   SchemaFile(PathBuf),
 }
 
 /// Resolved task context from which the allowlisted child environment is built.
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 constructs the complete invocation"))]
 pub(crate) struct EnvironmentSources<'a> {
   pub(crate) variables: &'a HashMap<String, Value>,
   pub(crate) secret_variables: &'a [String],
@@ -85,38 +84,44 @@ pub(crate) struct EnvironmentSources<'a> {
 ///
 /// This type deliberately has no `Debug` implementation: the prompt and child
 /// environment can contain credentials and must not enter diagnostic logs.
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 executes the complete invocation"))]
 pub(crate) struct CodexInvocation {
   executable: CodexExecutable,
   arguments: Vec<OsString>,
   environment: BTreeMap<String, String>,
   prompt: LoadedPrompt,
+  #[cfg_attr(
+    not(test),
+    expect(
+      dead_code,
+      reason = "phase 6 materializes the validated schema document before spawn"
+    )
+  )]
   result_schema: Option<ResultSchemaDocument>,
 }
 
 /// JSON Schema bytes that the process layer must materialize at `path` before
 /// spawning Codex.
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "task 5 materializes the structured-result schema")
-)]
 pub(crate) struct ResultSchemaDocument {
   path: PathBuf,
+  #[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "phase 6 writes these validated bytes atomically before spawn")
+  )]
   bytes: Vec<u8>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 sends the loaded prompt to Codex"))]
 struct LoadedPrompt {
   bytes: Vec<u8>,
+  #[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "phase 6 records the prompt identity in provenance")
+  )]
   identity: blake3::Hash,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 constructs the fixed Codex command"))]
 const SANDBOX_MODE: &str = "workspace-write";
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 constructs the fixed Codex command"))]
 const APPROVAL_POLICY: &str = "never";
 
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 constructs the fixed Codex command"))]
 impl ReasoningEffort {
   const fn as_str(self) -> &'static str {
     match self {
@@ -131,10 +136,6 @@ impl ReasoningEffort {
   }
 }
 
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "task 5 constructs and executes the complete invocation")
-)]
 impl CodexInvocation {
   /// Loads the bounded prompt and constructs the complete fixed-shape argv.
   ///
@@ -163,11 +164,13 @@ impl CodexInvocation {
   /// Returns the exact, compatibility-checked executable selected by the
   /// operator. The process layer must use this path directly with no shell or
   /// `PATH` lookup.
+  #[cfg(test)]
   pub(crate) fn executable(&self) -> &CodexExecutable {
     &self.executable
   }
 
   /// Returns argv entries passed directly to `Command`, without shell parsing.
+  #[cfg(test)]
   pub(crate) fn arguments(&self) -> &[OsString] {
     &self.arguments
   }
@@ -178,37 +181,40 @@ impl CodexInvocation {
   /// entries; inheriting the plugin process environment would defeat the
   /// explicit mapping contract. Values may contain credentials and must never
   /// be logged or serialized into run records.
+  #[cfg(test)]
   pub(crate) fn environment(&self) -> &BTreeMap<String, String> {
     &self.environment
   }
 
   /// Returns the BLAKE3 identity of the exact UTF-8 bytes sent to Codex.
+  #[cfg(test)]
   pub(crate) fn prompt_identity(&self) -> blake3::Hash {
     self.prompt.identity
   }
 
   /// Returns the schema document that must exist before the child is spawned.
+  #[cfg(test)]
   pub(crate) fn result_schema(&self) -> Option<&ResultSchemaDocument> {
     self.result_schema.as_ref()
   }
 
-  /// Writes the prompt exactly once and closes stdin to signal end-of-input.
-  pub(crate) async fn write_prompt<W>(&self, writer: &mut W) -> anyhow::Result<()>
-  where
-    W: AsyncWrite + Unpin,
-  {
-    writer
-      .write_all(&self.prompt.bytes)
-      .await
-      .context("failed to write the Codex prompt to stdin")?;
-    writer.shutdown().await.context("failed to close Codex stdin")
+  /// Builds the exact direct child command after revalidating the executable.
+  pub(crate) async fn command(&self, working_directory: &Path) -> anyhow::Result<Command> {
+    let mut command = self.executable.command().await?;
+    command
+      .args(&self.arguments)
+      .env_clear()
+      .envs(&self.environment)
+      .current_dir(working_directory);
+    Ok(command)
+  }
+
+  /// Returns the bounded prompt bytes for the command-scoped stdin writer.
+  pub(crate) fn prompt_bytes(&self) -> &[u8] {
+    &self.prompt.bytes
   }
 }
 
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "task 5 constructs the allowlisted child environment")
-)]
 fn build_environment(
   selection: &EnvironmentSelection,
   sources: EnvironmentSources<'_>,
@@ -256,10 +262,6 @@ fn build_environment(
 }
 
 #[cfg(windows)]
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "task 5 constructs the allowlisted child environment")
-)]
 fn environment_value<'a>(environment: &'a HashMap<String, String>, name: &str) -> anyhow::Result<Option<&'a str>> {
   let mut matching = environment
     .iter()
@@ -272,18 +274,10 @@ fn environment_value<'a>(environment: &'a HashMap<String, String>, name: &str) -
 }
 
 #[cfg(not(windows))]
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "task 5 constructs the allowlisted child environment")
-)]
 fn environment_value<'a>(environment: &'a HashMap<String, String>, name: &str) -> anyhow::Result<Option<&'a str>> {
   Ok(environment.get(name).map(String::as_str))
 }
 
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "task 5 constructs the allowlisted child environment")
-)]
 fn resolve_variable(variables: &HashMap<String, Value>, name: &str) -> anyhow::Result<String> {
   match variables.get(name) {
     Some(Value::String(value)) => Ok(value.clone()),
@@ -295,10 +289,6 @@ fn resolve_variable(variables: &HashMap<String, Value>, name: &str) -> anyhow::R
   }
 }
 
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "task 5 constructs the allowlisted child environment")
-)]
 fn insert_environment(environment: &mut BTreeMap<String, String>, name: &str, value: &str) -> anyhow::Result<()> {
   if value.contains('\0') {
     bail!("child environment value for '{name}' must not contain NUL characters");
@@ -312,10 +302,6 @@ fn insert_environment(environment: &mut BTreeMap<String, String>, name: &str, va
   Ok(())
 }
 
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "task 5 materializes the structured-result schema")
-)]
 impl ResultSchemaDocument {
   /// Filesystem location referenced by `--output-schema`.
   pub(crate) fn path(&self) -> &Path {
@@ -323,6 +309,7 @@ impl ResultSchemaDocument {
   }
 
   /// Validated JSON Schema bytes to write at [`Self::path`].
+  #[cfg(test)]
   pub(crate) fn bytes(&self) -> &[u8] {
     &self.bytes
   }
@@ -347,7 +334,6 @@ impl ResultSchemaDocument {
   }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 loads and sends the prompt"))]
 impl LoadedPrompt {
   async fn load(config: &CodexConfig, working_directory: &Path) -> anyhow::Result<Self> {
     let bytes = match (&config.prompt, &config.prompt_file) {
@@ -362,7 +348,6 @@ impl LoadedPrompt {
   }
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 loads and sends the prompt"))]
 async fn load_prompt_file(working_directory: &Path, relative_path: &str) -> anyhow::Result<Vec<u8>> {
   let workspace = working_directory.to_owned();
   let requested_path = relative_path.to_owned();
@@ -376,14 +361,12 @@ async fn load_prompt_file(working_directory: &Path, relative_path: &str) -> anyh
 /// capability path walk cannot escape through a concurrently replaced
 /// ancestor, and all subsequent reads use the returned handle rather than
 /// reopening a validated path by name.
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 loads and sends the prompt"))]
 fn open_prompt_beneath(working_directory: &Path, relative_path: &str) -> anyhow::Result<(std::fs::File, usize)> {
   let root = Dir::open_ambient_dir(working_directory, ambient_authority())
     .map_err(|_| anyhow::anyhow!("failed to open the effective task directory"))?;
   open_prompt_from_directory(&root, relative_path)
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 loads and sends the prompt"))]
 fn open_prompt_from_directory(root: &Dir, relative_path: &str) -> anyhow::Result<(std::fs::File, usize)> {
   let link_metadata = root.symlink_metadata(relative_path).map_err(|_| {
     anyhow::anyhow!("prompt_file '{relative_path}' could not be inspected safely beneath the task directory")
@@ -430,7 +413,6 @@ fn configure_prompt_open(options: &mut OpenOptions) {
 #[cfg(not(any(unix, windows)))]
 fn configure_prompt_open(_options: &mut OpenOptions) {}
 
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 loads and sends the prompt"))]
 async fn read_bounded_prompt(
   reader: impl tokio::io::AsyncRead + Unpin,
   relative_path: &str,
@@ -448,7 +430,6 @@ async fn read_bounded_prompt(
   Ok(bytes)
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "task 5 constructs the fixed Codex command"))]
 fn build_arguments(config: &CodexConfig, result_schema: Option<&ResultSchemaDocument>) -> Vec<OsString> {
   let mut arguments = vec![
     OsString::from("exec"),

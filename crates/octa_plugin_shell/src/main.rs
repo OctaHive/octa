@@ -9,7 +9,7 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Context;
 use async_trait::async_trait;
 use octa_plugin::logger::Logger;
-use octa_plugin::{protocol::PluginResponse, serve_plugin, Plugin, PluginCommand, PluginInput};
+use octa_plugin::{protocol::PluginResponse, send_response, serve_plugin, Plugin, PluginCommand, PluginInput};
 use octa_plugin::{PluginSchema, SHELL_CAPABILITY};
 #[cfg(windows)]
 use portable_pty::MasterPty;
@@ -19,7 +19,7 @@ use serde_json::Value;
 use tera::{Context as TeraContext, Tera};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::{
-  io::{AsyncReadExt, AsyncWriteExt},
+  io::AsyncReadExt,
   sync::{mpsc, Mutex},
 };
 use tokio_util::sync::CancellationToken;
@@ -107,19 +107,19 @@ async fn forward_output(
   stream: impl AsyncRead + Unpin,
   id: String,
   stdout: bool,
-  tx: mpsc::Sender<String>,
-  logger: Arc<impl Logger>,
+  writer: Arc<Mutex<impl AsyncWrite + Send + 'static + Unpin>>,
   cancel_token: CancellationToken,
-) {
+) -> anyhow::Result<()> {
   let mut stream = stream;
   let mut buffer = vec![0; 8 * 1024];
   loop {
     let read = tokio::select! {
       read = stream.read(&mut buffer) => read,
-      _ = cancel_token.cancelled() => break,
+      _ = cancel_token.cancelled() => return Ok(()),
     };
     match read {
-      Ok(0) | Err(_) => break,
+      Ok(0) => return Ok(()),
+      Err(error) => return Err(error).context("Failed to read command output"),
       Ok(count) => {
         let bytes = buffer[..count].to_vec();
         let response = if stdout {
@@ -127,9 +127,7 @@ async fn forward_output(
         } else {
           PluginResponse::StderrBytes { id: id.clone(), bytes }
         };
-        let response_json = serde_json::to_string(&response).unwrap() + "\n";
-        let _ = logger.log(&response_json);
-        let _ = tx.send(response_json).await;
+        send_response(&writer, &response).await?;
       },
     }
   }
@@ -215,10 +213,7 @@ async fn execute_raw_pty(
         match output {
           Some(bytes) => {
             let response = PluginResponse::StdoutBytes { id: id.clone(), bytes };
-            let json = serde_json::to_string(&response)? + "\n";
-            let mut writer = writer.lock().await;
-            writer.write_all(json.as_bytes()).await?;
-            writer.flush().await?;
+            send_response(&writer, &response).await?;
           },
           None => output_closed = true,
         }
@@ -283,10 +278,7 @@ async fn execute_raw_pty(
     code: code.unwrap_or(-1),
     outputs: Default::default(),
   };
-  let json = serde_json::to_string(&response)? + "\n";
-  let mut writer = writer.lock().await;
-  writer.write_all(json.as_bytes()).await?;
-  writer.flush().await?;
+  send_response(&writer, &response).await?;
   Ok(())
 }
 
@@ -358,15 +350,12 @@ impl Plugin for ShellPlugin {
     if dry {
       logger.log(&format!("Run command in dry mode: {}", result))?;
 
-      let response = serde_json::to_string(&PluginResponse::Completed {
+      let response = PluginResponse::Completed {
         id: id.clone(),
         code: 0,
         outputs: Default::default(),
-      })?
-        + "\n";
-      let mut writer = writer.lock().await;
-      writer.write_all(response.as_bytes()).await?;
-      writer.flush().await?;
+      };
+      send_response(&writer, &response).await?;
 
       return Ok(());
     }
@@ -393,29 +382,14 @@ impl Plugin for ShellPlugin {
     // produce output. Keep anything with arguments, expansions, redirects, or
     // comments on the regular Brush path because those forms may have effects.
     if is_effect_free_noop(&result) {
-      let response = serde_json::to_string(&PluginResponse::Completed {
+      let response = PluginResponse::Completed {
         id,
         code: 0,
         outputs: Default::default(),
-      })?
-        + "\n";
-      let mut writer = writer.lock().await;
-      writer.write_all(response.as_bytes()).await?;
-      writer.flush().await?;
+      };
+      send_response(&writer, &response).await?;
       return Ok(());
     }
-
-    let (tx, mut rx): (mpsc::Sender<String>, mpsc::Receiver<String>) = mpsc::channel(100);
-    let writer_handle = tokio::spawn({
-      let writer = Arc::clone(&writer);
-      async move {
-        while let Some(msg) = rx.recv().await {
-          let mut lock = writer.lock().await;
-          let _ = lock.write_all(msg.as_bytes()).await;
-          let _ = lock.flush().await;
-        }
-      }
-    });
 
     let mut command = brush::command(&result, &dir, envs, self.coreutils.path())?;
     #[cfg(windows)]
@@ -430,25 +404,18 @@ impl Plugin for ShellPlugin {
     let stdout = child.stdout.take().context("Failed to capture stdout")?;
     let stderr = child.stderr.take().context("Failed to capture stderr")?;
 
-    let tx_stdout = tx.clone();
-    let tx_stderr = tx.clone();
-
     let stdout_handle = {
       let id = id.clone();
-      let logger = logger.clone();
+      let writer = writer.clone();
       let cancel_token = cancel_token.clone();
-      tokio::spawn(async move {
-        forward_output(stdout, id, true, tx_stdout, logger, cancel_token).await;
-      })
+      tokio::spawn(async move { forward_output(stdout, id, true, writer, cancel_token).await })
     };
 
     let stderr_handle = {
       let id = id.clone();
-      let logger = logger.clone();
+      let writer = writer.clone();
       let cancel_token = cancel_token.clone();
-      tokio::spawn(async move {
-        forward_output(stderr, id, false, tx_stderr, logger, cancel_token).await;
-      })
+      tokio::spawn(async move { forward_output(stderr, id, false, writer, cancel_token).await })
     };
 
     let code = brush::wait_for_command(&mut child, process_group, &cancel_token).await?;
@@ -457,19 +424,19 @@ impl Plugin for ShellPlugin {
     #[cfg(windows)]
     drop(command_job);
 
-    let _: (Result<(), _>, Result<(), _>) = tokio::join!(stdout_handle, stderr_handle);
+    // Both readers must finish before the terminal frame. Besides preserving
+    // protocol ordering, propagating their I/O and join errors prevents a
+    // broken output path from being misreported to the host as a clean exit.
+    let (stdout_result, stderr_result) = tokio::join!(stdout_handle, stderr_handle);
+    stdout_result.context("Failed to join the stdout forwarding task")??;
+    stderr_result.context("Failed to join the stderr forwarding task")??;
 
     let response = PluginResponse::Completed {
       id,
       code,
       outputs: Default::default(),
     };
-    let response_json = serde_json::to_string(&response)? + "\n";
-    let _ = tx.send(response_json.clone()).await;
-    let _ = logger.log(&response_json);
-
-    drop(tx);
-    let _ = writer_handle.await;
+    send_response(&writer, &response).await?;
 
     Ok(())
   }
@@ -492,9 +459,22 @@ async fn main() -> anyhow::Result<ExitCode> {
 mod tests {
   use super::*;
   use octa_plugin::logger::{Logger, MockLogger};
-  use std::io;
+  use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+  };
   use tempfile::tempdir;
+  use tokio::io::ReadBuf;
   use tokio::sync::Mutex;
+
+  struct ErrorReader;
+
+  impl AsyncRead for ErrorReader {
+    fn poll_read(self: Pin<&mut Self>, _context: &mut Context<'_>, _buffer: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+      Poll::Ready(Err(io::Error::other("broken command output")))
+    }
+  }
 
   struct TestWriter {
     buffer: Vec<u8>,
@@ -569,6 +549,23 @@ mod tests {
     for command in [": argument", ": > output", ": ${VALUE?}", ": # comment", "true", ""] {
       assert!(!is_effect_free_noop(command), "unexpected no-op: {command:?}");
     }
+  }
+
+  #[tokio::test]
+  async fn output_forwarding_surfaces_stream_failures() {
+    let (writer, _, _) = setup_test().await;
+
+    let error = forward_output(
+      ErrorReader,
+      "command".to_owned(),
+      true,
+      writer,
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("Failed to read command output"));
   }
 
   #[tokio::test]

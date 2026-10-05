@@ -41,13 +41,6 @@ pub(crate) struct CodexConfig {
   pub(crate) prompt: Option<String>,
   pub(crate) prompt_file: Option<String>,
   pub(crate) model: Option<String>,
-  #[cfg_attr(
-    not(test),
-    expect(
-      dead_code,
-      reason = "task 3.1 consumes the validated setting when building CLI arguments"
-    )
-  )]
   pub(crate) reasoning_effort: Option<ReasoningEffort>,
   pub(crate) result_schema: Option<Map<String, Value>>,
   #[serde(default = "default_run_records")]

@@ -10,7 +10,6 @@ use std::{
   io,
   io::Read,
   path::{Path, PathBuf},
-  process::Stdio,
   time::Duration,
 };
 
@@ -44,13 +43,9 @@ pub(crate) struct CodexExecutable {
   path: PathBuf,
   #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "task 6.2 records the observed version in provenance")
+    expect(dead_code, reason = "phase 6 records the probed Codex release in provenance")
   )]
   version: Version,
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "task 5.1 revalidates this identity at the task spawn boundary")
-  )]
   fingerprint: ExecutableFingerprint,
 }
 
@@ -93,21 +88,24 @@ impl CodexExecutable {
   }
 
   /// Canonical executable path recorded in future provenance.
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "task 6.2 records the executable identity in provenance")
-  )]
+  #[cfg(test)]
   pub(crate) fn path(&self) -> &Path {
     &self.path
   }
 
   /// Validated Codex CLI release observed during the compatibility probe.
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "task 6.2 records the observed version in provenance")
-  )]
+  #[cfg(test)]
   pub(crate) fn version(&self) -> String {
     self.version.to_string()
+  }
+
+  /// Revalidates the pinned file identity and creates a direct command.
+  ///
+  /// Keeping construction here prevents a caller from accidentally using the
+  /// previously validated path after the executable has been replaced.
+  pub(crate) async fn command(&self) -> anyhow::Result<Command> {
+    self.fingerprint.ensure_unchanged(&self.path).await?;
+    Ok(Command::new(&self.path))
   }
 
   /// Provides non-spawning compatibility evidence to invocation unit tests.
@@ -131,6 +129,15 @@ struct ExecutableFingerprint {
 
 impl ExecutableFingerprint {
   fn read(path: &Path) -> anyhow::Result<Self> {
+    // Opening a directory as `File` succeeds on Unix but returns access denied
+    // on Windows. Inspect the canonical path first so both platforms report the
+    // same bounded contract error. Metadata is checked again on the opened
+    // handle below; this preliminary check is not trusted against replacement.
+    let path_metadata = std::fs::metadata(path).context("failed to inspect the operator-selected Codex executable")?;
+    if !path_metadata.is_file() {
+      bail!("operator-selected Codex executable must be a regular file");
+    }
+
     let mut file = std::fs::File::open(path).context("failed to open the operator-selected Codex executable")?;
     let metadata = file
       .metadata()
@@ -213,12 +220,7 @@ async fn probe_version(
 ) -> anyhow::Result<Version> {
   fingerprint.ensure_unchanged(path).await?;
   let mut command = Command::new(path);
-  command
-    .arg("--version")
-    .env_clear()
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped());
+  command.arg("--version").env_clear();
   if let Some(parent) = path.parent() {
     command.current_dir(parent);
   }
@@ -230,7 +232,12 @@ async fn probe_version(
 
   let outcome = process::run_version_probe(command, VERSION_PROBE_TIMEOUT, MAX_VERSION_STREAM_BYTES, cancellation)
     .await
-    .map_err(|_| anyhow::anyhow!("operator-selected Codex executable could not be started or supervised"))?;
+    .map_err(|error| {
+      anyhow::anyhow!(
+        "operator-selected Codex executable could not be started or supervised ({:?})",
+        error.kind()
+      )
+    })?;
   let (status, stdout, stderr) = match outcome {
     ProbeOutcome::Completed { status, stdout, stderr } => (status, stdout, stderr),
     ProbeOutcome::Cancelled => bail!("Codex version probe was cancelled"),

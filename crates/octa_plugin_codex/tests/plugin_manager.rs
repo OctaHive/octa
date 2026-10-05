@@ -9,12 +9,16 @@ use std::{
 use async_trait::async_trait;
 use octa_plugin::protocol::PluginResponse;
 use octa_plugin_manager::{
-  plugin_client::PluginExecutionRequest,
+  plugin_client::{PluginExecution, PluginExecutionRequest},
   plugin_manager::PluginManager,
   plugin_process::{LocalPluginLauncher, PluginLaunchError, PluginLaunchRequest, PluginLauncher, PluginProcess},
 };
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
+
+mod support;
+
+use support::{configured_process_fixture, install_process_fixture};
 
 fn plugin_artifact() -> (&'static Path, String) {
   let executable = Path::new(env!("CARGO_BIN_EXE_octa_plugin_codex"));
@@ -53,18 +57,6 @@ fn plugin_manager_with_codex(workspace: &Path, codex_executable: PathBuf) -> (Pl
   (PluginManager::with_launcher(directory, workspace, launcher), name)
 }
 
-fn install_process_fixture(directory: &Path) -> std::path::PathBuf {
-  let source = Path::new(env!("CARGO_BIN_EXE_codex-test-fixture"));
-  let target = directory.join(format!("codex{}", std::env::consts::EXE_SUFFIX));
-  fs::copy(source, &target).expect("copy Codex process fixture");
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("make Codex process fixture executable");
-  }
-  target
-}
-
 fn dry_run_request(workspace: &Path, fixture_directory: &Path) -> PluginExecutionRequest {
   PluginExecutionRequest {
     params: json!({
@@ -94,6 +86,76 @@ fn compatibility_request(workspace: &Path, path_directory: &Path) -> PluginExecu
     redact_params: true,
     raw: false,
   }
+}
+
+fn lifecycle_request(workspace: &Path) -> PluginExecutionRequest {
+  PluginExecutionRequest {
+    params: json!({ "prompt": "perform the fixture task" }),
+    dry: false,
+    args: Vec::new(),
+    dir: workspace.to_owned(),
+    vars: HashMap::new(),
+    envs: HashMap::new(),
+    secret_vars: Vec::new(),
+    redact_params: true,
+    raw: false,
+  }
+}
+
+async fn start_lifecycle_execution(workspace: &Path, fixture: PathBuf) -> (PluginManager, PluginExecution) {
+  let (manager, plugin_name) = plugin_manager_with_codex(workspace, fixture);
+  manager.start_plugin(&plugin_name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let execution = client
+    .start_execution(lifecycle_request(workspace), CancellationToken::new())
+    .await
+    .unwrap();
+  (manager, execution)
+}
+
+async fn receive_terminal(execution: &mut PluginExecution) -> PluginResponse {
+  tokio::time::timeout(Duration::from_secs(10), async {
+    loop {
+      match execution.receive_output(&CancellationToken::new()).await.unwrap() {
+        Some(response @ (PluginResponse::Completed { .. } | PluginResponse::Error { .. })) => return response,
+        Some(_) => {},
+        None => panic!("plugin response stream closed before a terminal response"),
+      }
+    }
+  })
+  .await
+  .expect("Codex execution timed out")
+}
+
+async fn assert_response_stream_closed(execution: &mut PluginExecution) {
+  let response = tokio::time::timeout(
+    Duration::from_secs(1),
+    execution.receive_output(&CancellationToken::new()),
+  )
+  .await
+  .expect("plugin response route remained open after its terminal response")
+  .expect("plugin response route failed after its terminal response");
+  assert!(
+    response.is_none(),
+    "plugin emitted a second response after terminal: {response:?}"
+  );
+}
+
+async fn wait_for_file(path: &Path) {
+  tokio::time::timeout(Duration::from_secs(5), async {
+    while !path.exists() {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .unwrap_or_else(|_| panic!("fixture did not create {}", path.display()));
+}
+
+async fn assert_heartbeat_stopped(path: &Path) {
+  let before = fs::read_to_string(path).unwrap();
+  tokio::time::sleep(Duration::from_millis(100)).await;
+  let after = fs::read_to_string(path).unwrap();
+  assert_eq!(before, after, "fixture process survived lifecycle teardown");
 }
 
 async fn compatibility_response(workspace: &Path, selected: PathBuf, path_directory: &Path) -> PluginResponse {
@@ -235,7 +297,10 @@ async fn compatibility_probe_fails_closed_without_path_or_shell_fallback() {
     let selected = install_process_fixture(directory.path());
     fs::write(selected.with_extension("version"), response).unwrap();
     let message = compatibility_error(workspace.path(), selected, path_directory.path()).await;
-    assert!(message.contains(expected), "unexpected error: {message}");
+    assert!(
+      message.contains(expected),
+      "expected {expected:?}, unexpected error: {message}"
+    );
     assert!(message.len() < 512, "unbounded compatibility error: {message}");
   }
 
@@ -245,10 +310,7 @@ async fn compatibility_probe_fails_closed_without_path_or_shell_fallback() {
   let PluginResponse::Error { message, .. } = response else {
     panic!("supported compatibility probe returned an unexpected response: {response:?}");
   };
-  assert_eq!(
-    message,
-    "Command execution error: Codex task contract is not implemented"
-  );
+  assert!(message.contains("prompt_file"), "unexpected error: {message}");
   assert!(supported.with_extension("version-probed").exists());
 
   assert!(fs::read_dir(workspace.path()).unwrap().all(|entry| {
@@ -266,9 +328,7 @@ async fn compatibility_probe_owns_descendants_and_honors_cancellation() {
   let with_descendant = install_process_fixture(descendant_directory.path());
   fs::write(with_descendant.with_extension("spawn-version-descendant"), b"").unwrap();
   let response = compatibility_response(workspace.path(), with_descendant.clone(), path_directory.path()).await;
-  assert!(
-    matches!(response, PluginResponse::Error { message, .. } if message == "Command execution error: Codex task contract is not implemented")
-  );
+  assert!(matches!(response, PluginResponse::Error { message, .. } if message.contains("prompt_file")));
   let heartbeat = with_descendant.with_extension("version-descendant-heartbeat");
   let before = fs::read_to_string(&heartbeat).unwrap();
   tokio::time::sleep(Duration::from_millis(100)).await;
@@ -299,5 +359,107 @@ async fn compatibility_probe_owns_descendants_and_honors_cancellation() {
     .await
     .expect("cancelled version probe did not terminate promptly")
     .unwrap();
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn cancellation_during_output_stops_the_tree_and_returns_one_terminal_response() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture_directory = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(fixture_directory.path(), "hang");
+  let heartbeat = fixture.with_extension("run-heartbeat");
+  let (manager, mut execution) = start_lifecycle_execution(workspace.path(), fixture).await;
+  wait_for_file(&heartbeat).await;
+
+  tokio::time::timeout(Duration::from_secs(5), execution.cancel_and_wait())
+    .await
+    .expect("cancellation did not complete")
+    .unwrap();
+  let response = receive_terminal(&mut execution).await;
+  assert!(matches!(response, PluginResponse::Completed { code: -1, .. }));
+  assert_response_stream_closed(&mut execution).await;
+  assert_heartbeat_stopped(&heartbeat).await;
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn exit_racing_with_cancellation_produces_one_terminal_response() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture_directory = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(fixture_directory.path(), "exit-race");
+  let ready = fixture.with_extension("run-heartbeat");
+  let release = fixture.with_extension("release-run");
+  let (manager, mut execution) = start_lifecycle_execution(workspace.path(), fixture).await;
+  wait_for_file(&ready).await;
+
+  fs::write(release, b"release").unwrap();
+  tokio::time::timeout(Duration::from_secs(5), execution.cancel_and_wait())
+    .await
+    .expect("exit-versus-cancel race did not settle")
+    .unwrap();
+  let terminal = receive_terminal(&mut execution).await;
+  assert!(matches!(
+    terminal,
+    PluginResponse::Completed { code: -1, .. } | PluginResponse::Error { .. }
+  ));
+  assert_response_stream_closed(&mut execution).await;
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn cancellation_timeout_forces_an_uncooperative_process_tree_down() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture_directory = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(fixture_directory.path(), "ignore-termination");
+  let heartbeat = fixture.with_extension("run-heartbeat");
+  let (manager, mut execution) = start_lifecycle_execution(workspace.path(), fixture).await;
+  wait_for_file(&heartbeat).await;
+
+  let started = std::time::Instant::now();
+  tokio::time::timeout(Duration::from_secs(5), execution.cancel_and_wait())
+    .await
+    .expect("forced cancellation did not complete")
+    .unwrap();
+  assert!(
+    started.elapsed() >= Duration::from_millis(1500),
+    "uncooperative fixture did not exercise the graceful timeout"
+  );
+  let response = receive_terminal(&mut execution).await;
+  assert!(matches!(response, PluginResponse::Completed { code: -1, .. }));
+  assert_heartbeat_stopped(&heartbeat).await;
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn plugin_shutdown_cancels_the_active_command_and_stops_its_tree() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture_directory = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(fixture_directory.path(), "hang");
+  let heartbeat = fixture.with_extension("run-heartbeat");
+  let (manager, _execution) = start_lifecycle_execution(workspace.path(), fixture).await;
+  wait_for_file(&heartbeat).await;
+
+  let results = tokio::time::timeout(Duration::from_secs(5), manager.shutdown_all())
+    .await
+    .expect("plugin shutdown did not complete");
+  assert!(results.into_iter().all(|result| result.is_ok()));
+  assert_heartbeat_stopped(&heartbeat).await;
+}
+
+#[tokio::test]
+async fn normal_fixture_completion_stops_its_runtime_descendant() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture_directory = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(fixture_directory.path(), "descendant");
+  let heartbeat = fixture.with_extension("run-descendant-heartbeat");
+  let (manager, mut execution) = start_lifecycle_execution(workspace.path(), fixture).await;
+  wait_for_file(&heartbeat).await;
+
+  let terminal = receive_terminal(&mut execution).await;
+  assert!(matches!(
+    terminal,
+    PluginResponse::Error { message, .. } if message.contains("terminal result normalization")
+  ));
+  assert_heartbeat_stopped(&heartbeat).await;
   assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
 }

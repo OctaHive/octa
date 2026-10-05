@@ -37,6 +37,19 @@ async fn missing_or_relative_operator_selection_fails_without_path_search() {
   }
 }
 
+#[test]
+fn directories_are_reported_as_non_regular_executables() {
+  let directory = tempfile::tempdir().unwrap();
+
+  let error = ExecutableFingerprint::read(directory.path())
+    .err()
+    .expect("directory must not be accepted as an executable")
+    .to_string();
+
+  assert!(error.contains("regular file"), "unexpected error: {error}");
+  assert!(error.len() < 200, "unbounded compatibility error: {error}");
+}
+
 #[tokio::test]
 async fn changed_executable_fails_identity_revalidation() {
   let directory = tempfile::tempdir().unwrap();

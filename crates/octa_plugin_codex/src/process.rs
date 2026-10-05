@@ -6,14 +6,19 @@
 //! a dedicated process group and keeps the leader waitable until descendants
 //! are terminated. Windows assigns the child to a kill-on-close Job Object.
 
-use std::{io, process::ExitStatus, time::Duration};
+use std::{io, process::ExitStatus, process::Stdio, time::Duration};
 
 use tokio::{
   io::{AsyncRead, AsyncReadExt},
-  process::{Child, Command},
+  process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
   task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
+
+/// Bounds forceful cleanup after a compatibility probe is cancelled or times out.
+const PROBE_TERMINATION_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bounds pipe collection after the owned process boundary has been closed.
+const PROBE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Captured bytes from one bounded probe stream.
 pub(crate) enum CapturedStream {
@@ -49,16 +54,11 @@ pub(crate) async fn run_version_probe(
   cancellation: &CancellationToken,
 ) -> io::Result<ProbeOutcome> {
   let mut tree = ProcessTree::spawn(&mut command)?;
-  let stdout = tree
-    .child
-    .stdout
-    .take()
-    .ok_or_else(|| io::Error::other("Codex version probe did not expose stdout"))?;
-  let stderr = tree
-    .child
-    .stderr
-    .take()
-    .ok_or_else(|| io::Error::other("Codex version probe did not expose stderr"))?;
+  // The compatibility probe has no input. Taking and dropping the pipe makes
+  // EOF observable immediately even when the selected executable reads stdin.
+  drop(tree.take_stdin()?);
+  let stdout = tree.take_stdout()?;
+  let stderr = tree.take_stderr()?;
   let stdout = tokio::spawn(read_bounded(stdout, stream_limit));
   let stderr = tokio::spawn(read_bounded(stderr, stream_limit));
 
@@ -73,14 +73,8 @@ pub(crate) async fn run_version_probe(
 
   let outcome = match terminal {
     ProbeTerminal::Exited(Ok(status)) => {
-      // Await both readers before propagating either failure. Dropping the
-      // second JoinHandle after an early `?` would detach a live task.
-      let (stdout, stderr) = tokio::join!(join_reader(stdout), join_reader(stderr));
-      ProbeOutcome::Completed {
-        status,
-        stdout: stdout?,
-        stderr: stderr?,
-      }
+      let (stdout, stderr) = join_readers_bounded(stdout, stderr, PROBE_DRAIN_TIMEOUT).await?;
+      ProbeOutcome::Completed { status, stdout, stderr }
     },
     ProbeTerminal::Exited(Err(error)) => {
       let _ = terminate_and_drain(&mut tree, stdout, stderr).await;
@@ -104,10 +98,35 @@ enum ProbeTerminal {
   TimedOut,
 }
 
-async fn join_reader(reader: JoinHandle<io::Result<CapturedStream>>) -> io::Result<CapturedStream> {
-  reader
+async fn join_reader(reader: &mut JoinHandle<io::Result<CapturedStream>>) -> io::Result<CapturedStream> {
+  (&mut *reader)
     .await
     .map_err(|error| io::Error::other(format!("probe reader task failed: {error}")))?
+}
+
+async fn join_readers_bounded(
+  mut stdout: JoinHandle<io::Result<CapturedStream>>,
+  mut stderr: JoinHandle<io::Result<CapturedStream>>,
+  timeout: Duration,
+) -> io::Result<(CapturedStream, CapturedStream)> {
+  let joined = async {
+    // Join both before propagating either error. An early return would detach
+    // the other reader and could keep inherited pipe handles alive unnoticed.
+    let (stdout, stderr) = tokio::join!(join_reader(&mut stdout), join_reader(&mut stderr));
+    Ok((stdout?, stderr?))
+  };
+  match tokio::time::timeout(timeout, joined).await {
+    Ok(result) => result,
+    Err(_) => {
+      stdout.abort();
+      stderr.abort();
+      let _ = tokio::join!(&mut stdout, &mut stderr);
+      Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "Codex compatibility output pipes did not close after process termination",
+      ))
+    },
+  }
 }
 
 async fn terminate_and_drain(
@@ -115,11 +134,19 @@ async fn terminate_and_drain(
   stdout: JoinHandle<io::Result<CapturedStream>>,
   stderr: JoinHandle<io::Result<CapturedStream>>,
 ) -> io::Result<()> {
-  // Closing the tree must make both pipes finite. Always join both tasks even
-  // when termination itself fails, otherwise a reader could escape detached.
-  let termination = tree.terminate().await;
-  let _ = tokio::join!(join_reader(stdout), join_reader(stderr));
-  termination
+  // Always bound and join both operations. A malicious descendant may retain
+  // inherited pipe handles even after escaping the owned process boundary.
+  let termination = tokio::time::timeout(PROBE_TERMINATION_TIMEOUT, tree.terminate())
+    .await
+    .unwrap_or_else(|_| {
+      Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "timed out while terminating the Codex compatibility probe",
+      ))
+    });
+  let drain = join_readers_bounded(stdout, stderr, PROBE_DRAIN_TIMEOUT).await;
+  termination?;
+  drain.map(|_| ())
 }
 
 async fn read_bounded(reader: impl AsyncRead + Unpin, limit: usize) -> io::Result<CapturedStream> {
@@ -135,17 +162,33 @@ async fn read_bounded(reader: impl AsyncRead + Unpin, limit: usize) -> io::Resul
   }
 }
 
-struct ProcessTree {
+/// Direct child plus the operating-system boundary that owns its descendants.
+///
+/// All handles are piped here rather than at call sites so every Codex launch
+/// has the same isolation and I/O contract. Dropping this value closes the
+/// Windows Job Object or kills the Unix process group before killing the
+/// leader, preventing a descendant from retaining pipes or continuing work.
+pub(crate) struct ProcessTree {
   child: Child,
   #[cfg(unix)]
-  process_group: i32,
+  process_group: Option<i32>,
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  child_events: tokio::signal::unix::Signal,
   #[cfg(windows)]
   job: Option<std::os::windows::io::OwnedHandle>,
 }
 
 impl ProcessTree {
-  fn spawn(command: &mut Command) -> io::Result<Self> {
-    command.kill_on_drop(true);
+  /// Spawns one directly selected executable without involving a shell.
+  pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let child_events = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+
+    command
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .stderr(Stdio::piped())
+      .kill_on_drop(true);
     configure_process(command);
     let child = command.spawn()?;
 
@@ -154,8 +197,13 @@ impl ProcessTree {
       let process_group = child
         .id()
         .and_then(|id| i32::try_from(id).ok())
-        .ok_or_else(|| io::Error::other("Codex version probe has no valid process id"))?;
-      Ok(Self { child, process_group })
+        .ok_or_else(|| io::Error::other("Codex process has no valid process id"))?;
+      Ok(Self {
+        child,
+        process_group: Some(process_group),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        child_events,
+      })
     }
 
     #[cfg(windows)]
@@ -179,24 +227,59 @@ impl ProcessTree {
     }
   }
 
-  async fn wait(&mut self) -> io::Result<ExitStatus> {
+  /// Takes the only writable handle to the child's standard input.
+  pub(crate) fn take_stdin(&mut self) -> io::Result<ChildStdin> {
+    self
+      .child
+      .stdin
+      .take()
+      .ok_or_else(|| io::Error::other("Codex process did not expose stdin"))
+  }
+
+  /// Takes the only readable handle to the child's standard output.
+  pub(crate) fn take_stdout(&mut self) -> io::Result<ChildStdout> {
+    self
+      .child
+      .stdout
+      .take()
+      .ok_or_else(|| io::Error::other("Codex process did not expose stdout"))
+  }
+
+  /// Takes the only readable handle to the child's standard error.
+  pub(crate) fn take_stderr(&mut self) -> io::Result<ChildStderr> {
+    self
+      .child
+      .stderr
+      .take()
+      .ok_or_else(|| io::Error::other("Codex process did not expose stderr"))
+  }
+
+  /// Waits for the leader and terminates descendants before returning.
+  pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-      let pid = self.process_group;
-      let mut child_events = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+      let Some(pid) = self.process_group else {
+        return self.child.wait().await;
+      };
       loop {
         if process_exited_without_reaping(pid)? {
-          kill_process_group(pid);
-          return self.child.wait().await;
+          // Disarm ownership before signalling. Once the direct child is
+          // reaped the numeric PGID may be reused, so Drop must never signal
+          // it a second time.
+          let termination = self.close_exited_process_group();
+          let status = self.child.wait().await;
+          termination?;
+          return status;
         }
-        child_events.recv().await;
+        self.child_events.recv().await;
       }
     }
 
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
       let status = self.child.wait().await;
-      kill_process_group(self.process_group);
+      let termination = self.close_process_group(libc::SIGKILL);
+      termination?;
       status
     }
 
@@ -215,9 +298,36 @@ impl ProcessTree {
     }
   }
 
-  async fn terminate(&mut self) -> io::Result<()> {
+  /// Requests cooperative termination without releasing process ownership.
+  ///
+  /// The coordinator closes stdin before calling this method. Unix additionally
+  /// sends `SIGTERM` to the complete process group. Windows has no reliable
+  /// console-control channel for a hidden process, so closed stdin is its
+  /// portable graceful signal; the Job Object remains armed for force-kill.
+  #[cfg(unix)]
+  pub(crate) fn request_graceful_termination(&self) -> io::Result<()> {
+    self.process_group.map_or(Ok(()), |process_group| {
+      signal_process_group(process_group, libc::SIGTERM)
+    })
+  }
+
+  /// Requests cooperative termination on platforms without Unix signals.
+  #[cfg(not(unix))]
+  pub(crate) fn request_graceful_termination(&self) -> io::Result<()> {
+    Ok(())
+  }
+
+  /// Force-terminates the complete owned tree and reaps the direct child.
+  pub(crate) async fn terminate(&mut self) -> io::Result<()> {
     #[cfg(unix)]
-    kill_process_group(self.process_group);
+    let termination = self.close_process_group(libc::SIGKILL);
+
+    #[cfg(unix)]
+    if termination.is_err() {
+      // Preserve the group error, but still make a best effort to ensure the
+      // direct child can be reaped instead of waiting forever.
+      let _ = self.child.start_kill();
+    }
 
     #[cfg(windows)]
     {
@@ -229,14 +339,46 @@ impl ProcessTree {
       let _ = self.child.start_kill();
     }
 
-    self.child.wait().await.map(|_| ())
+    let reaped = self.child.wait().await.map(|_| ());
+    #[cfg(unix)]
+    termination?;
+    reaped
+  }
+
+  #[cfg(unix)]
+  fn close_process_group(&mut self, signal: i32) -> io::Result<()> {
+    self
+      .process_group
+      .take()
+      .map_or(Ok(()), |process_group| signal_process_group(process_group, signal))
+  }
+
+  #[cfg(any(target_os = "linux", target_os = "macos"))]
+  fn close_exited_process_group(&mut self) -> io::Result<()> {
+    let Some(process_group) = self.process_group.take() else {
+      return Ok(());
+    };
+    let result = signal_process_group(process_group, libc::SIGKILL);
+    #[cfg(target_os = "macos")]
+    if result
+      .as_ref()
+      .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+    {
+      // macOS reports EPERM when the group contains only its waitable zombie
+      // leader. `waitid(WNOWAIT)` above proves that leader has exited; a live
+      // same-user descendant would make the group signal succeed.
+      return Ok(());
+    }
+    result
   }
 }
 
 impl Drop for ProcessTree {
   fn drop(&mut self) {
     #[cfg(unix)]
-    kill_process_group(self.process_group);
+    if let Some(process_group) = self.process_group.take() {
+      let _ = signal_process_group(process_group, libc::SIGKILL);
+    }
 
     #[cfg(windows)]
     {
@@ -289,12 +431,18 @@ fn process_exited_without_reaping(pid: i32) -> io::Result<bool> {
 }
 
 #[cfg(unix)]
-fn kill_process_group(process_group: i32) {
-  // SAFETY: a negative pid addresses the process group created exclusively
-  // for this probe. Failure is intentionally ignored during best-effort Drop.
-  unsafe {
-    libc::kill(-process_group, libc::SIGKILL);
+fn signal_process_group(process_group: i32, signal: i32) -> io::Result<()> {
+  // SAFETY: the negative pid identifies the dedicated group created by
+  // `configure_process`; no unrelated process can join it through this API.
+  let result = unsafe { libc::kill(-process_group, signal) };
+  if result == 0 {
+    return Ok(());
   }
+  let error = io::Error::last_os_error();
+  if error.raw_os_error() == Some(libc::ESRCH) {
+    return Ok(());
+  }
+  Err(error)
 }
 
 #[cfg(windows)]
@@ -330,7 +478,7 @@ fn assign_kill_on_close_job(child: &Child) -> io::Result<std::os::windows::io::O
   }
   let process = child
     .raw_handle()
-    .ok_or_else(|| io::Error::other("Codex version probe exited before Job Object assignment"))?;
+    .ok_or_else(|| io::Error::other("Codex process exited before Job Object assignment"))?;
   if unsafe { AssignProcessToJobObject(raw_job, process.cast()) } == 0 {
     return Err(io::Error::last_os_error());
   }
@@ -356,7 +504,7 @@ fn resume_primary_thread(child: &Child) -> io::Result<()> {
 
   let process_id = child
     .id()
-    .ok_or_else(|| io::Error::other("suspended Codex version probe has no process id"))?;
+    .ok_or_else(|| io::Error::other("suspended Codex process has no process id"))?;
   let raw_snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
   if raw_snapshot == INVALID_HANDLE_VALUE {
     return Err(io::Error::last_os_error());
@@ -388,7 +536,7 @@ fn resume_primary_thread(child: &Child) -> io::Result<()> {
     present = unsafe { Thread32Next(raw_snapshot, &mut entry) } != 0;
   }
   Err(io::Error::other(
-    "suspended Codex version probe has no discoverable primary thread",
+    "suspended Codex process has no discoverable primary thread",
   ))
 }
 
