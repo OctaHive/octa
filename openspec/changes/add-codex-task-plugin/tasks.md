@@ -6,10 +6,10 @@
 
 ## 2. Create the Codex plugin contract
 
-- [ ] 2.1 Add `octa_plugin_codex` to the workspace with focused `config`, `invocation`, `process`, `events`, and `records` modules and module-level documentation, and verify the crate builds without introducing a public backend trait.
-- [ ] 2.2 Define the deny-unknown-fields input schema and Rust configuration types for exactly one prompt source, model/reasoning settings, result schema, safe run-record root, explicit public/secret variable mappings, optional source revision, and bounded deliverables; verify schema and semantic-validation tests cover valid forms and every invalid/unsafe path form.
-- [ ] 2.3 Define and document the bounded output schema for semantic outcome, final message or structured result, harness identifiers, usage, and record paths; verify representative successful and blocked values validate while oversized or malformed values fail.
-- [ ] 2.4 Return no automatic cache plan and implement side-effect-free dry-run validation; verify tests prove dry-run does not read prompt files or secrets, spawn the fixture executable, or create run-record paths.
+- [x] 2.1 Add `octa_plugin_codex` to the workspace with focused `config`, `invocation`, `process`, `events`, and `records` modules and module-level documentation, and verify the crate builds without introducing a public backend trait.
+- [x] 2.2 Define the deny-unknown-fields input schema and Rust configuration types for exactly one prompt source, model/reasoning settings, result schema, safe run-record root, explicit public/secret variable mappings, optional source revision, and bounded deliverables; verify schema and semantic-validation tests cover valid forms and every invalid/unsafe path form.
+- [x] 2.3 Define and document the bounded output schema for semantic outcome, final message or structured result, harness identifiers, usage, and record paths; verify representative successful and blocked values validate while oversized or malformed values fail.
+- [x] 2.4 Return no automatic cache plan and implement side-effect-free dry-run validation; verify tests prove dry-run does not read prompt files or secrets, spawn the fixture executable, or create run-record paths.
 
 ## 3. Build a constrained Codex invocation
 

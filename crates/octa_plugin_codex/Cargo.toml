@@ -1,0 +1,36 @@
+[package]
+name = "octa_plugin_codex"
+description = "Codex task execution plugin for Octa"
+version = "0.4.0"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+include = ["src/"]
+
+[[bin]]
+name = "octa_plugin_codex"
+bench = false
+
+[[bin]]
+name = "codex-test-fixture"
+path = "tests/fixtures/codex_test_fixture.rs"
+test = false
+bench = false
+doc = false
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+jsonschema = { workspace = true }
+octa-plugin = { version = "0.4.0", path = "../octa-plugin" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+octa-plugin-manager = { version = "0.4.0", path = "../octa-plugin-manager" }
+tempfile = { workspace = true }

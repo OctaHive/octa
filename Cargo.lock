@@ -2861,6 +2861,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "octa_plugin_codex"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "jsonschema",
+ "octa-plugin",
+ "octa-plugin-manager",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "octa_plugin_junit"
 version = "0.4.0"
 dependencies = [

@@ -21,6 +21,7 @@ members = [
   "crates/octa_plugin_shell",
   "crates/octa_plugin_tpl",
   "crates/octa_plugin_junit",
+  "crates/octa_plugin_codex",
 ]
 
 [workspace.package]
