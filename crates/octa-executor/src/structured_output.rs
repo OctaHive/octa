@@ -46,7 +46,7 @@ impl StructuredOutputBudget {
     let size = step_size.saturating_add(task_size);
     self
       .used
-      .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+      .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
         used.checked_add(size).filter(|total| *total <= self.limit)
       })
       .map(|_| ())

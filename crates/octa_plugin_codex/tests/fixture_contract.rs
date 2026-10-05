@@ -8,23 +8,26 @@ use std::{fs, io::Read, io::Write, path::Path, process::Stdio, time::Duration};
 
 use serde_json::Value;
 
-mod support;
-
-use support::configured_process_fixture;
-
 const FIXTURE_SECRET_ENV: &str = "OCTA_CODEX_FIXTURE_SECRET";
+const FIXTURE_MODE_ENV: &str = "OCTA_CODEX_FIXTURE_MODE";
+const FIXTURE_CONTROL_DIRECTORY_ENV: &str = "OCTA_CODEX_FIXTURE_CONTROL_DIRECTORY";
 
 struct FixtureOutput {
   stdout: Vec<u8>,
   stderr: Vec<u8>,
 }
 
+fn process_fixture() -> &'static Path {
+  Path::new(env!("CARGO_BIN_EXE_codex-test-fixture"))
+}
+
 fn run_fixture(mode: &str, environment: Option<(&str, &str)>) -> FixtureOutput {
   let directory = tempfile::tempdir().unwrap();
-  let executable = configured_process_fixture(directory.path(), mode);
-  let mut command = std::process::Command::new(executable);
+  let mut command = std::process::Command::new(process_fixture());
   command
     .env_clear()
+    .env(FIXTURE_MODE_ENV, mode)
+    .env(FIXTURE_CONTROL_DIRECTORY_ENV, directory.path())
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
@@ -99,12 +102,13 @@ fn fixture_exposes_each_invalid_stream_shape_deterministically() {
 #[test]
 fn partial_frame_waits_for_an_explicit_release_and_splits_unicode() {
   let directory = tempfile::tempdir().unwrap();
-  let executable = configured_process_fixture(directory.path(), "partial");
-  let ready = executable.with_extension("partial-ready");
-  let release = executable.with_extension("release-run");
-  let mut command = std::process::Command::new(&executable);
+  let ready = directory.path().join("partial-ready");
+  let release = directory.path().join("release-run");
+  let mut command = std::process::Command::new(process_fixture());
   command
     .env_clear()
+    .env(FIXTURE_MODE_ENV, "partial")
+    .env(FIXTURE_CONTROL_DIRECTORY_ENV, directory.path())
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());

@@ -1,25 +1,29 @@
 //! Deterministic Codex process fixture used by machine-boundary tests.
 //!
 //! `--version` emits a sibling-file-controlled response without network or
-//! credentials. A sibling `run-mode` file selects one JSONL, process-tree, or
-//! shutdown scenario. Marker files coordinate races without sleeps in the
-//! caller, while the fixture itself keeps every wait bounded.
+//! credentials. A sibling `run-mode` file selects production-boundary
+//! scenarios; direct contract tests use explicit environment overrides so they
+//! can execute Cargo's immutable binary without a copy-then-exec race. Marker
+//! files coordinate races without sleeps, and every wait remains bounded.
 
 use std::{
   io::{Read, Write},
-  path::Path,
+  path::{Path, PathBuf},
   process::{Command, Stdio},
   thread,
   time::Duration,
 };
 
 const SECRET_ENV: &str = "OCTA_CODEX_FIXTURE_SECRET";
+const MODE_ENV: &str = "OCTA_CODEX_FIXTURE_MODE";
+const CONTROL_DIRECTORY_ENV: &str = "OCTA_CODEX_FIXTURE_CONTROL_DIRECTORY";
 const OVERSIZED_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024 + 1;
 const CONTROL_WAIT_STEPS: usize = 600;
 const CONTROL_WAIT_INTERVAL: Duration = Duration::from_millis(5);
 
 fn main() {
   let executable = std::env::current_exe().expect("fixture executable path must be available");
+  let control_directory = std::env::var_os(CONTROL_DIRECTORY_ENV).map(PathBuf::from);
   let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
   if arguments
     .first()
@@ -51,10 +55,7 @@ fn main() {
     }
     return;
   }
-  let marker = executable
-    .parent()
-    .expect("fixture executable must have a parent")
-    .join("spawned");
+  let marker = runtime_path(&executable, control_directory.as_deref(), "spawned");
   std::fs::write(marker, b"spawned").expect("fixture marker must be writable");
   let mut prompt = String::new();
   std::io::stdin()
@@ -62,7 +63,9 @@ fn main() {
     .expect("fixture prompt must be readable");
   assert!(!prompt.is_empty(), "fixture requires a stdin prompt");
 
-  let mode = std::fs::read_to_string(executable.with_extension("run-mode")).unwrap_or_else(|_| "complete".to_owned());
+  let mode = std::env::var(MODE_ENV).unwrap_or_else(|_| {
+    std::fs::read_to_string(executable.with_extension("run-mode")).unwrap_or_else(|_| "complete".to_owned())
+  });
   match mode.trim() {
     "complete" => emit_event(r#"{"type":"turn.completed","message":"done"}"#),
     "failed" => emit_event(r#"{"type":"turn.failed","error":{"message":"fixture failure"}}"#),
@@ -73,7 +76,7 @@ fn main() {
       emit_event(r#"{"type":"future.additive","payload":{"retained":true}}"#);
       emit_event(r#"{"type":"turn.completed","message":"done"}"#);
     },
-    "partial" => emit_controlled_partial_frame(&executable),
+    "partial" => emit_controlled_partial_frame(&executable, control_directory.as_deref()),
     "secret-echo" => emit_secret_echo(),
     "malformed" => emit_event("{not-json}"),
     "oversized" => emit_oversized_frame(),
@@ -83,25 +86,33 @@ fn main() {
     },
     "missing-terminal" => emit_event(r#"{"type":"turn.started"}"#),
     "descendant" => {
-      let heartbeat = executable.with_extension("run-descendant-heartbeat");
+      let heartbeat = runtime_path(&executable, control_directory.as_deref(), "run-descendant-heartbeat");
       spawn_descendant(&executable, &heartbeat, "runtime descendant must start");
       wait_for_file(&heartbeat, "runtime descendant did not become ready");
       emit_event(r#"{"type":"turn.completed","message":"done"}"#);
     },
     "hang" => {
       emit_event(r#"{"type":"turn.started"}"#);
-      run_heartbeat(&executable.with_extension("run-heartbeat"));
+      run_heartbeat(&runtime_path(
+        &executable,
+        control_directory.as_deref(),
+        "run-heartbeat",
+      ));
     },
     "ignore-termination" => {
       ignore_cooperative_termination();
       emit_event(r#"{"type":"turn.started"}"#);
-      run_heartbeat(&executable.with_extension("run-heartbeat"));
+      run_heartbeat(&runtime_path(
+        &executable,
+        control_directory.as_deref(),
+        "run-heartbeat",
+      ));
     },
     "exit-race" => {
       emit_event(r#"{"type":"turn.started"}"#);
-      let ready = executable.with_extension("run-heartbeat");
+      let ready = runtime_path(&executable, control_directory.as_deref(), "run-heartbeat");
       std::fs::write(&ready, b"ready").expect("race-ready marker must be writable");
-      let release = executable.with_extension("release-run");
+      let release = runtime_path(&executable, control_directory.as_deref(), "release-run");
       wait_for_file(&release, "race fixture was not released");
       emit_event(r#"{"type":"turn.completed","message":"done"}"#);
     },
@@ -114,7 +125,7 @@ fn emit_event(event: &str) {
   std::io::stdout().flush().expect("fixture event must flush");
 }
 
-fn emit_controlled_partial_frame(executable: &Path) {
+fn emit_controlled_partial_frame(executable: &Path, control_directory: Option<&Path>) {
   const EVENT: &str = r#"{"type":"item.completed","item":{"type":"agent_message","text":"partial 🧪"}}"#;
   let unicode = EVENT.find('\u{1f9ea}').expect("partial event contains Unicode");
   let split = unicode + 2;
@@ -123,10 +134,10 @@ fn emit_controlled_partial_frame(executable: &Path) {
     .write_all(&EVENT.as_bytes()[..split])
     .expect("partial event prefix must be writable");
   stdout.flush().expect("partial event prefix must flush");
-  let ready = executable.with_extension("partial-ready");
+  let ready = runtime_path(executable, control_directory, "partial-ready");
   std::fs::write(&ready, b"ready").expect("partial-ready marker must be writable");
   wait_for_file(
-    &executable.with_extension("release-run"),
+    &runtime_path(executable, control_directory, "release-run"),
     "partial fixture was not released",
   );
   stdout
@@ -137,6 +148,12 @@ fn emit_controlled_partial_frame(executable: &Path) {
     .write_all(b"{\"type\":\"turn.completed\",\"message\":\"done\"}\n")
     .expect("partial terminal event must be writable");
   stdout.flush().expect("completed partial stream must flush");
+}
+
+fn runtime_path(executable: &Path, control_directory: Option<&Path>, name: &str) -> PathBuf {
+  control_directory
+    .map(|directory| directory.join(name))
+    .unwrap_or_else(|| executable.with_extension(name))
 }
 
 fn emit_secret_echo() {
