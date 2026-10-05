@@ -1,11 +1,12 @@
 use std::{
   any::Any,
+  collections::HashMap,
   fs::{File, OpenOptions},
   io::{self, Write},
   path::PathBuf,
   sync::{
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-    mpsc, Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
   },
   thread,
 };
@@ -13,7 +14,35 @@ use std::{
 use async_trait::async_trait;
 
 use chrono::Local;
-use tokio::sync::Mutex;
+/// Stable marker inserted wherever a resolved secret value was removed.
+pub const REDACTION_MARKER: &str = "*****";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RedactionMatch {
+  Substring,
+  Token,
+}
+
+/// One resolved secret value together with its safe free-text matching rule.
+///
+/// String secrets are replaced wherever they occur. JSON numbers and booleans
+/// are replaced only as standalone tokens so a value such as `42` does not
+/// corrupt an unrelated version (`v42`) or path component.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Redaction {
+  value: String,
+  match_kind: RedactionMatch,
+}
+
+impl Redaction {
+  /// Returns the exact UTF-8 representation used by conservative byte-stream redaction.
+  ///
+  /// A byte stream has no reliable token boundaries across arbitrary chunks,
+  /// so consumers should replace this complete sequence wherever it occurs.
+  pub fn as_bytes(&self) -> &[u8] {
+    self.value.as_bytes()
+  }
+}
 
 #[async_trait]
 pub trait Logger: Send + Sync + Any + 'static {
@@ -23,25 +52,38 @@ pub trait Logger: Send + Sync + Any + 'static {
 }
 
 /// Replaces resolved secret values before a plugin writes diagnostic messages.
-pub fn redact(message: &str, secrets: &[String]) -> String {
-  let mut secrets: Vec<&str> = secrets
-    .iter()
-    .map(String::as_str)
-    .filter(|secret| !secret.is_empty())
-    .collect();
+pub fn redact(message: &str, secrets: &[Redaction]) -> String {
+  let mut secrets: Vec<&Redaction> = secrets.iter().filter(|secret| !secret.value.is_empty()).collect();
   // Replace longer values first so an overlapping prefix cannot leave a secret suffix behind.
-  secrets.sort_unstable_by_key(|secret| std::cmp::Reverse(secret.len()));
+  secrets.sort_unstable_by_key(|secret| {
+    (
+      std::cmp::Reverse(secret.value.len()),
+      matches!(secret.match_kind, RedactionMatch::Token),
+    )
+  });
   secrets
     .into_iter()
-    .fold(message.to_owned(), |message, secret| message.replace(secret, "*****"))
+    .fold(message.to_owned(), |message, secret| match secret.match_kind {
+      RedactionMatch::Substring => message.replace(&secret.value, REDACTION_MARKER),
+      RedactionMatch::Token => replace_token(&message, &secret.value),
+    })
 }
 
 /// Collects scalar leaves because templates can expose individual fields of a structured secret.
-pub fn collect_value_redactions(value: &serde_json::Value, redactions: &mut Vec<String>) {
+///
+/// The scalar's JSON type is retained so free-text redaction can distinguish a
+/// string secret from a low-entropy numeric or boolean token.
+pub fn collect_value_redactions(value: &serde_json::Value, redactions: &mut Vec<Redaction>) {
   match value {
-    serde_json::Value::String(value) if !value.is_empty() => redactions.push(value.clone()),
+    serde_json::Value::String(value) if !value.is_empty() => redactions.push(Redaction {
+      value: value.clone(),
+      match_kind: RedactionMatch::Substring,
+    }),
     serde_json::Value::String(_) | serde_json::Value::Null => {},
-    serde_json::Value::Bool(_) | serde_json::Value::Number(_) => redactions.push(value.to_string()),
+    serde_json::Value::Bool(_) | serde_json::Value::Number(_) => redactions.push(Redaction {
+      value: value.to_string(),
+      match_kind: RedactionMatch::Token,
+    }),
     serde_json::Value::Array(values) => {
       for value in values {
         collect_value_redactions(value, redactions);
@@ -55,15 +97,58 @@ pub fn collect_value_redactions(value: &serde_json::Value, redactions: &mut Vec<
   }
 }
 
+/// Resolves scalar redaction values only from variables marked as secret.
+///
+/// Unknown names are ignored because a variable can be absent after platform
+/// or task filtering. Ordinary variables are deliberately excluded so their
+/// diagnostic values remain useful to plugin authors.
+pub fn collect_variable_redactions(
+  vars: &HashMap<String, serde_json::Value>,
+  secret_vars: &[String],
+) -> Vec<Redaction> {
+  let mut redactions = Vec::new();
+  for value in secret_vars.iter().filter_map(|name| vars.get(name)) {
+    collect_value_redactions(value, &mut redactions);
+  }
+  redactions
+}
+
+fn replace_token(message: &str, secret: &str) -> String {
+  let mut result = String::with_capacity(message.len());
+  let mut copied_until = 0;
+  for (start, _) in message.match_indices(secret) {
+    let end = start + secret.len();
+    let begins_at_boundary = message[..start]
+      .chars()
+      .next_back()
+      .is_none_or(|character| !is_token_character(character));
+    let ends_at_boundary = message[end..]
+      .chars()
+      .next()
+      .is_none_or(|character| !is_token_character(character));
+    if begins_at_boundary && ends_at_boundary {
+      result.push_str(&message[copied_until..start]);
+      result.push_str(REDACTION_MARKER);
+      copied_until = end;
+    }
+  }
+  result.push_str(&message[copied_until..]);
+  result
+}
+
+fn is_token_character(character: char) -> bool {
+  character.is_alphanumeric() || character == '_'
+}
+
 /// Logger adapter that removes resolved secret values before delegating a message.
 pub struct RedactingLogger<L> {
   logger: Arc<L>,
-  secrets: Vec<String>,
+  secrets: Vec<Redaction>,
 }
 
 impl<L> RedactingLogger<L> {
   /// Wraps a logger with the scalar secret values that must be replaced.
-  pub fn new(logger: Arc<L>, secrets: Vec<String>) -> Self {
+  pub fn new(logger: Arc<L>, secrets: Vec<Redaction>) -> Self {
     Self { logger, secrets }
   }
 }
@@ -215,23 +300,20 @@ impl LoggerSystem {
   }
 }
 
-// Add MockLogger implementation
 #[derive(Clone)]
 pub struct MockLogger {
   messages: Arc<Mutex<Vec<String>>>,
-  log_count: Arc<AtomicUsize>,
 }
 
 impl MockLogger {
   pub fn new() -> Self {
     Self {
       messages: Arc::new(Mutex::new(Vec::new())),
-      log_count: Arc::new(AtomicUsize::new(0)),
     }
   }
 
-  pub async fn get_messages(&self) -> Vec<String> {
-    self.messages.lock().await.clone()
+  pub fn get_messages(&self) -> Vec<String> {
+    self.messages.lock().expect("mock logger lock poisoned").clone()
   }
 }
 
@@ -243,12 +325,11 @@ impl Default for MockLogger {
 
 impl Logger for MockLogger {
   fn log(&self, message: &str) -> anyhow::Result<()> {
-    self.log_count.fetch_add(1, Ordering::SeqCst);
-    let messages = self.messages.clone();
-    let message = message.to_string();
-    tokio::spawn(async move {
-      messages.lock().await.push(message);
-    });
+    self
+      .messages
+      .lock()
+      .map_err(|_| anyhow::anyhow!("mock logger lock poisoned"))?
+      .push(message.to_owned());
     Ok(())
   }
 
@@ -265,10 +346,9 @@ mod tests {
 
   #[test]
   fn redacts_longest_secret_values_first() {
-    let message = redact(
-      "token-123 token",
-      &["token".to_owned(), "token-123".to_owned(), String::new()],
-    );
+    let mut redactions = Vec::new();
+    collect_value_redactions(&serde_json::json!(["token", "token-123", ""]), &mut redactions);
+    let message = redact("token-123 token", &redactions);
 
     assert_eq!(message, "***** *****");
   }
@@ -281,20 +361,61 @@ mod tests {
       &serde_json::json!({ "token": "private", "nested": [42, true, null] }),
       &mut redactions,
     );
-    redactions.sort();
+    redactions.sort_by(|left, right| left.value.cmp(&right.value));
 
-    assert_eq!(redactions, vec!["42", "private", "true"]);
+    assert_eq!(
+      redactions
+        .iter()
+        .map(|redaction| redaction.value.as_str())
+        .collect::<Vec<_>>(),
+      ["42", "private", "true"]
+    );
   }
 
-  #[tokio::test]
-  async fn redacting_logger_masks_messages() {
+  #[test]
+  fn typed_scalars_are_redacted_only_as_standalone_tokens() {
+    let mut redactions = Vec::new();
+    collect_value_redactions(&serde_json::json!([42, false]), &mut redactions);
+
+    assert_eq!(
+      redact("v42 falsehood; values: 42 false", &redactions),
+      "v42 falsehood; values: ***** *****"
+    );
+  }
+
+  #[test]
+  fn resolves_nested_secret_variables_without_collecting_ordinary_values() {
+    let vars = HashMap::from([
+      (
+        "SECRET".to_owned(),
+        serde_json::json!({ "token": "private", "nested": [42, true, null] }),
+      ),
+      ("PUBLIC".to_owned(), serde_json::json!({ "value": "visible" })),
+    ]);
+
+    let mut redactions = collect_variable_redactions(&vars, &["SECRET".to_owned(), "MISSING".to_owned()]);
+    redactions.sort_by(|left, right| left.value.cmp(&right.value));
+
+    assert_eq!(
+      redactions
+        .iter()
+        .map(|redaction| redaction.value.as_str())
+        .collect::<Vec<_>>(),
+      ["42", "private", "true"]
+    );
+    assert!(!redactions.iter().any(|redaction| redaction.value == "visible"));
+  }
+
+  #[test]
+  fn redacting_logger_masks_messages() {
     let logger = Arc::new(MockLogger::new());
-    let redacting = RedactingLogger::new(logger.clone(), vec!["private-value".to_owned()]);
+    let mut redactions = Vec::new();
+    collect_value_redactions(&serde_json::json!("private-value"), &mut redactions);
+    let redacting = RedactingLogger::new(logger.clone(), redactions);
 
     redacting.log("using private-value").unwrap();
-    tokio::task::yield_now().await;
 
-    assert_eq!(logger.get_messages().await, vec!["using *****"]);
+    assert_eq!(logger.get_messages(), vec!["using *****"]);
   }
 
   #[test]

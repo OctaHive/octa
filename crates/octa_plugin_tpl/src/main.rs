@@ -385,6 +385,7 @@ mod tests {
           args: vec![],
           dir,
           vars: HashMap::from([("name".to_owned(), Value::String("Hello, World!".to_owned()))]),
+          secret_vars: Vec::new(),
           envs: HashMap::new(),
           raw: false,
           input: tokio::sync::mpsc::unbounded_channel().1,
@@ -420,7 +421,7 @@ mod tests {
 
     // Check logger messages using as_any()
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
+    let log_messages = mock_logger.get_messages();
     assert!(!log_messages.is_empty());
     assert!(log_messages.iter().any(|msg| msg.contains("Stdout")));
   }
@@ -441,6 +442,7 @@ mod tests {
           args: vec![],
           dir,
           vars: HashMap::from([("name".to_owned(), Value::String("World".to_owned()))]),
+          secret_vars: Vec::new(),
           envs: HashMap::new(),
           raw: false,
           input: tokio::sync::mpsc::unbounded_channel().1,
@@ -478,6 +480,7 @@ mod tests {
           args: vec![],
           dir,
           vars: HashMap::new(),
+          secret_vars: Vec::new(),
           envs: HashMap::new(),
           raw: false,
           input: tokio::sync::mpsc::unbounded_channel().1,

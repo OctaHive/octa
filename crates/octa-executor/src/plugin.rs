@@ -10,7 +10,7 @@ use std::{
 use async_trait::async_trait;
 use octa_output::{ConsoleStream, ProgressUpdate, SourceLocation};
 use octa_plugin::{
-  logger::{collect_value_redactions, redact},
+  logger::{collect_variable_redactions, redact, Redaction, REDACTION_MARKER},
   protocol::{ArtifactDeclaration, DiagnosticLevel as PluginDiagnosticLevel, PluginResponse, ReportDeclaration},
 };
 use octa_plugin_manager::plugin_client::PluginExecutionRequest;
@@ -114,10 +114,7 @@ impl PluginInvoker {
       dry,
       redact_params,
     } = request.context;
-    let mut redactions = Vec::new();
-    for value in secret_vars.iter().filter_map(|name| vars.get(name)) {
-      collect_value_redactions(value, &mut redactions);
-    }
+    let redactions = collect_variable_redactions(&vars, &secret_vars);
     if request.raw && !redactions.is_empty() {
       return Err(ExecutorError::RawUnsupported(
         "raw execution with resolved secrets cannot be safely redacted".to_owned(),
@@ -491,15 +488,16 @@ struct OutputRedactor {
 #[derive(Clone, Copy)]
 struct ResponseSecurity<'a> {
   plugin_name: &'a str,
-  redactions: &'a [String],
+  redactions: &'a [Redaction],
 }
 
 impl OutputRedactor {
-  fn new(redactions: &[String]) -> Self {
+  fn new(redactions: &[Redaction]) -> Self {
     let needles = redactions
       .iter()
+      .map(Redaction::as_bytes)
       .filter(|value| !value.is_empty())
-      .map(|value| value.as_bytes().to_vec())
+      .map(<[u8]>::to_vec)
       .collect::<Vec<_>>();
     let reserve = needles.iter().map(Vec::len).max().unwrap_or(1).saturating_sub(1);
     Self {
@@ -564,8 +562,8 @@ fn redact_bytes(mut bytes: Vec<u8>, needles: &[Vec<u8>]) -> Vec<u8> {
     let mut start = 0;
     while let Some(relative) = bytes[start..].windows(needle.len()).position(|window| window == needle) {
       let found = start + relative;
-      bytes.splice(found..found + needle.len(), b"*****".iter().copied());
-      start = found + 5;
+      bytes.splice(found..found + needle.len(), REDACTION_MARKER.as_bytes().iter().copied());
+      start = found + REDACTION_MARKER.len();
     }
   }
   bytes
@@ -673,15 +671,7 @@ impl PluginEvaluator for ManagerPluginEvaluator {
         .map_err(|_| ExecutorError::LockError("plugin use tracker poisoned".to_owned()))?
         .insert(request.target.clone());
     }
-    let mut redactions = Vec::new();
-    for value in request
-      .context
-      .secret_vars
-      .iter()
-      .filter_map(|name| request.context.vars.get(name))
-    {
-      collect_value_redactions(value, &mut redactions);
-    }
+    let redactions = collect_variable_redactions(&request.context.vars, &request.context.secret_vars);
     let output = self
       .invoker
       .invoke(
@@ -749,15 +739,7 @@ impl PluginEvaluator for SystemTestEvaluator {
       return Ok(String::from_utf8_lossy(output.stdout.trim_ascii_end()).into_owned());
     }
 
-    let mut redactions = Vec::new();
-    for value in request
-      .context
-      .secret_vars
-      .iter()
-      .filter_map(|name| request.context.vars.get(name))
-    {
-      collect_value_redactions(value, &mut redactions);
-    }
+    let redactions = collect_variable_redactions(&request.context.vars, &request.context.secret_vars);
     Err(ExecutorError::PluginEvaluationFailed {
       key: request.target.name().to_owned(),
       code: output.status.code().unwrap_or(-1),
@@ -782,9 +764,17 @@ mod tests {
 
   use super::*;
 
+  fn text_redactions(value: &str) -> Vec<Redaction> {
+    collect_variable_redactions(
+      &HashMap::from([("SECRET".to_owned(), Value::String(value.to_owned()))]),
+      &["SECRET".to_owned()],
+    )
+  }
+
   #[test]
   fn redacts_secrets_split_across_binary_frames() {
-    let mut redactor = OutputRedactor::new(&["split-secret".to_owned()]);
+    let redactions = text_redactions("split-secret");
+    let mut redactor = OutputRedactor::new(&redactions);
     let mut output = redactor.push(ConsoleStream::Stdout, b"before split-".to_vec());
     output.extend(redactor.push(ConsoleStream::Stdout, b"secret after".to_vec()));
     output.extend(redactor.finish(ConsoleStream::Stdout));
@@ -796,7 +786,8 @@ mod tests {
 
   #[test]
   fn redacts_secrets_across_binary_and_line_frames() {
-    let mut redactor = OutputRedactor::new(&["split-secret".to_owned()]);
+    let redactions = text_redactions("split-secret");
+    let mut redactor = OutputRedactor::new(&redactions);
     let mut output = redactor.push(ConsoleStream::Stdout, b"before split-".to_vec());
     output.extend(redactor.push(ConsoleStream::Stdout, b"secret\n".to_vec()));
     output.extend(redactor.finish(ConsoleStream::Stdout));
@@ -1061,7 +1052,8 @@ mod tests {
   #[tokio::test]
   async fn redacts_secrets_split_between_byte_and_line_responses() {
     let mut output = OutputCapture::default();
-    let mut redactor = OutputRedactor::new(&["split-secret".to_owned()]);
+    let redactions = text_redactions("split-secret");
+    let mut redactor = OutputRedactor::new(&redactions);
     for (stream, bytes, line) in [
       (ConsoleStream::Stdout, b"out split-".to_vec(), "secret\n"),
       (ConsoleStream::Stderr, b"err split-".to_vec(), "secret\n"),
@@ -1084,7 +1076,7 @@ mod tests {
         &mut output,
         ResponseSecurity {
           plugin_name: "shell",
-          redactions: &["split-secret".to_owned()],
+          redactions: &redactions,
         },
         &mut redactor,
       )
@@ -1108,7 +1100,7 @@ mod tests {
         &mut output,
         ResponseSecurity {
           plugin_name: "shell",
-          redactions: &["split-secret".to_owned()],
+          redactions: &redactions,
         },
         &mut redactor,
       )

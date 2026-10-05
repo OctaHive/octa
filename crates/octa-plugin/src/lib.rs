@@ -12,7 +12,7 @@ use interprocess::local_socket::{
   tokio::{prelude::*, Stream},
   ListenerOptions,
 };
-use logger::{collect_value_redactions, redact, Logger, LoggerSystem, RedactingLogger};
+use logger::{collect_value_redactions, collect_variable_redactions, redact, Logger, LoggerSystem, RedactingLogger};
 use protocol::{OctaCommand, PluginCachePlan, PluginCachePlanRequest, PluginResponse, Schema, Version};
 use serde_json::{Map, Value};
 use socket::interpret_local_socket_name;
@@ -62,6 +62,13 @@ pub struct PluginCommand {
   pub args: Vec<String>,
   pub dir: PathBuf,
   pub vars: HashMap<String, Value>,
+  /// Names of entries in `vars` whose resolved scalar values are sensitive.
+  ///
+  /// Implementations can use this metadata to sanitize plugin-owned files or
+  /// child-process output. The host sanitizes the supplied [`Logger`] and an
+  /// error returned by [`Plugin::execute_command`]; implementations must
+  /// sanitize protocol responses and files before writing them.
+  pub secret_vars: Vec<String>,
   pub envs: HashMap<String, String>,
   pub raw: bool,
   pub input: mpsc::UnboundedReceiver<PluginInput>,
@@ -191,10 +198,7 @@ where
       dry,
     } => {
       // Pass values rather than names to the logger because plugin diagnostics contain rendered data.
-      let mut redactions = Vec::new();
-      for value in secret_vars.iter().filter_map(|name| vars.get(name)) {
-        collect_value_redactions(value, &mut redactions);
-      }
+      let mut redactions = collect_variable_redactions(&vars, &secret_vars);
       if redact_params {
         collect_value_redactions(&params, &mut redactions);
       }
@@ -235,6 +239,7 @@ where
               args,
               dir,
               vars,
+              secret_vars,
               envs,
               raw,
               input: input_rx,
@@ -337,7 +342,7 @@ where
     },
   }
 
-  logger.log("Execute command process sucessfully")?;
+  logger.log("Execute command processed successfully")?;
   Ok(())
 }
 
@@ -709,6 +714,42 @@ mod tests {
     output_lines: Vec<String>,
   }
 
+  struct SecretMetadataPlugin {
+    received: Arc<Mutex<Vec<String>>>,
+  }
+
+  #[async_trait]
+  impl Plugin for SecretMetadataPlugin {
+    fn version(&self) -> String {
+      "1.0.0".to_owned()
+    }
+
+    async fn execute_command(
+      &self,
+      request: PluginCommand,
+      writer: Arc<Mutex<impl AsyncWrite + Send + 'static + Unpin>>,
+      logger: Arc<impl Logger>,
+      _cancel_token: CancellationToken,
+    ) -> anyhow::Result<()> {
+      let PluginCommand {
+        id, secret_vars, vars, ..
+      } = request;
+      *self.received.lock().await = secret_vars;
+      logger.log(&format!("Resolved variables: {vars:?}"))?;
+      let response = PluginResponse::Completed {
+        id,
+        code: 0,
+        outputs: Default::default(),
+      };
+      writer
+        .lock()
+        .await
+        .write_all((serde_json::to_string(&response)? + "\n").as_bytes())
+        .await?;
+      Ok(())
+    }
+  }
+
   #[async_trait]
   impl Plugin for MockPlugin {
     fn version(&self) -> String {
@@ -1006,8 +1047,50 @@ mod tests {
     assert!(matches!(responses[4], PluginResponse::Completed { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
+    let log_messages = mock_logger.get_messages();
     assert!(!log_messages.is_empty());
+  }
+
+  #[tokio::test]
+  async fn execute_exposes_existing_secret_metadata_to_the_plugin() {
+    let (reader, writer) = tokio::io::duplex(1024);
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let plugin = Arc::new(SecretMetadataPlugin {
+      received: received.clone(),
+    });
+    let command = OctaCommand::Execute {
+      id: "command".to_owned(),
+      params: Value::String("test".to_owned()),
+      args: Vec::new(),
+      dir: PathBuf::from("/test/dir"),
+      envs: HashMap::new(),
+      vars: HashMap::from([("TOKEN".to_owned(), Value::String("resolved".to_owned()))]),
+      secret_vars: vec!["TOKEN".to_owned()],
+      redact_params: false,
+      raw: false,
+      dry: false,
+    };
+    let responses = tokio::spawn(async move { read_responses(reader).await });
+
+    handle_command(
+      command,
+      Arc::new(Mutex::new(writer)),
+      Arc::new(Mutex::new(HashMap::new())),
+      plugin,
+      Arc::new(MockLogger::new()),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+      responses.await.unwrap().as_slice(),
+      [
+        PluginResponse::Started { .. },
+        PluginResponse::Completed { code: 0, .. }
+      ]
+    ));
+    assert_eq!(*received.lock().await, ["TOKEN"]);
   }
 
   #[tokio::test]
@@ -1049,14 +1132,54 @@ mod tests {
     .unwrap();
     response_handle.await.unwrap();
 
-    let messages = logger
-      .as_any()
-      .downcast_ref::<MockLogger>()
-      .unwrap()
-      .get_messages()
-      .await;
+    let messages = logger.as_any().downcast_ref::<MockLogger>().unwrap().get_messages();
     assert!(messages.iter().all(|message| !message.contains(secret)));
     assert!(messages.iter().any(|message| message.contains("*****")));
+  }
+
+  #[tokio::test]
+  async fn plugin_logger_redacts_only_nested_values_from_named_secret_variables() {
+    let (reader, writer) = tokio::io::duplex(1024);
+    let received = Arc::new(Mutex::new(Vec::new()));
+    let logger = Arc::new(MockLogger::new());
+    let command = OctaCommand::Execute {
+      id: "command".to_owned(),
+      params: Value::String("test".to_owned()),
+      args: Vec::new(),
+      dir: PathBuf::from("."),
+      envs: HashMap::new(),
+      vars: HashMap::from([
+        (
+          "SECRET".to_owned(),
+          serde_json::json!({ "token": "nested-secret", "metadata": [987654321, false] }),
+        ),
+        ("PUBLIC".to_owned(), Value::String("visible-value".to_owned())),
+      ]),
+      secret_vars: vec!["SECRET".to_owned()],
+      redact_params: false,
+      raw: false,
+      dry: false,
+    };
+    let responses = tokio::spawn(async move { read_responses(reader).await });
+
+    handle_command(
+      command,
+      Arc::new(Mutex::new(writer)),
+      Arc::new(Mutex::new(HashMap::new())),
+      Arc::new(SecretMetadataPlugin { received }),
+      logger.clone(),
+      CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    responses.await.unwrap();
+
+    let messages = logger.get_messages();
+    assert!(messages.iter().any(|message| message.contains("visible-value")));
+    assert!(messages.iter().any(|message| message.contains("*****")));
+    for secret in ["nested-secret", "987654321", "false"] {
+      assert!(messages.iter().all(|message| !message.contains(secret)));
+    }
   }
 
   #[tokio::test]
@@ -1093,8 +1216,11 @@ mod tests {
     assert!(cancel_token.is_cancelled());
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
-    assert!(log_messages.is_empty());
+    let log_messages = mock_logger.get_messages();
+    assert_eq!(
+      log_messages,
+      ["Receiving shutdown command", "Execute command processed successfully"]
+    );
   }
 
   #[tokio::test]
@@ -1253,7 +1379,7 @@ mod tests {
     assert!(matches!(responses[2], PluginResponse::Error { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
+    let log_messages = mock_logger.get_messages();
     assert!(!log_messages.is_empty());
   }
 
@@ -1311,7 +1437,7 @@ mod tests {
     assert!(matches!(responses[3], PluginResponse::Completed { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
+    let log_messages = mock_logger.get_messages();
     assert!(!log_messages.is_empty());
   }
 
@@ -1379,7 +1505,7 @@ mod tests {
     assert!(cancel_token.is_cancelled());
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
+    let log_messages = mock_logger.get_messages();
     assert!(!log_messages.is_empty());
   }
 
@@ -1416,7 +1542,7 @@ mod tests {
     assert!(matches!(responses[0], PluginResponse::Error { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
+    let log_messages = mock_logger.get_messages();
     assert!(!log_messages.is_empty());
   }
 
@@ -1449,7 +1575,6 @@ mod tests {
       .downcast_ref::<MockLogger>()
       .unwrap()
       .get_messages()
-      .await
       .is_empty());
   }
 
@@ -1502,7 +1627,7 @@ mod tests {
     assert!(matches!(responses[1], PluginResponse::Completed { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
+    let log_messages = mock_logger.get_messages();
     assert!(!log_messages.is_empty());
   }
 
@@ -1559,7 +1684,7 @@ mod tests {
     assert!(matches!(responses[2], PluginResponse::Completed { .. }));
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
+    let log_messages = mock_logger.get_messages();
     assert!(!log_messages.is_empty());
   }
 
@@ -1624,7 +1749,7 @@ mod tests {
     }
 
     let mock_logger = logger.as_any().downcast_ref::<MockLogger>().unwrap();
-    let log_messages = mock_logger.get_messages().await;
+    let log_messages = mock_logger.get_messages();
     assert!(!log_messages.is_empty());
   }
 

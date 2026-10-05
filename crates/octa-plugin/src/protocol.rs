@@ -183,7 +183,10 @@ pub enum OctaCommand {
     dir: PathBuf,
     envs: HashMap<String, String>,
     vars: HashMap<String, Value>,
-    /// Variable names whose resolved values the plugin SDK must redact from diagnostics.
+    /// Variable names whose resolved values are sensitive and require redaction.
+    ///
+    /// The SDK sanitizes its logger and returned execution errors. A plugin is
+    /// responsible for sanitizing protocol responses and files it writes.
     /// The default keeps the wire protocol compatible with runners that predate secret variables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     secret_vars: Vec<String>,
@@ -503,6 +506,41 @@ mod tests {
     assert!(secret_vars.is_empty());
     assert!(!redact_params);
     assert!(!raw);
+  }
+
+  #[test]
+  fn execute_secret_metadata_retains_the_protocol_v2_wire_shape() {
+    assert_eq!(PLUGIN_PROTOCOL_VERSION, 2);
+
+    let command = OctaCommand::Execute {
+      id: "command".to_owned(),
+      params: Value::String("run".to_owned()),
+      args: Vec::new(),
+      dir: PathBuf::from("."),
+      envs: HashMap::new(),
+      vars: HashMap::from([("TOKEN".to_owned(), Value::String("resolved".to_owned()))]),
+      secret_vars: vec!["TOKEN".to_owned()],
+      redact_params: false,
+      raw: false,
+      dry: false,
+    };
+
+    assert_eq!(
+      serde_json::to_value(command).unwrap(),
+      serde_json::json!({
+        "type": "Execute",
+        "payload": {
+          "id": "command",
+          "params": "run",
+          "args": [],
+          "dir": ".",
+          "envs": {},
+          "vars": { "TOKEN": "resolved" },
+          "secret_vars": ["TOKEN"],
+          "dry": false
+        }
+      })
+    );
   }
 
   #[test]

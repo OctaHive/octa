@@ -130,6 +130,7 @@ mod tests {
       args: Vec::new(),
       dir: PathBuf::from("workspace"),
       vars: HashMap::new(),
+      secret_vars: Vec::new(),
       envs: HashMap::new(),
       raw: false,
       input: tokio::sync::mpsc::unbounded_channel().1,
