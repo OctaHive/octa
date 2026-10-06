@@ -347,39 +347,24 @@ fn prepare_directory(workspace: &Path, root_path: &str, component: &str) -> anyh
     },
     Err(error) => return Err(error).context("failed to create the Codex run-record invocation directory"),
   }
-  let invocation = match open_directory_no_follow(&root, component) {
-    Ok(directory) => directory,
-    Err(error) => return Err(cleanup_reservation(&root, component, error, OPEN_INVOCATION_ERROR)),
-  };
-  if let Err(error) = invocation.create_dir(RECORDS_STAGING_DIRECTORY) {
-    drop(invocation);
-    return Err(cleanup_reservation(
-      &root,
-      component,
-      error,
-      "failed to create the Codex run-record staging directory",
-    ));
-  }
-  let staging = match open_directory_no_follow(&invocation, RECORDS_STAGING_DIRECTORY) {
-    Ok(staging) => staging,
+  let prepared = (|| {
+    let invocation = open_directory_no_follow(&root, component).context(OPEN_INVOCATION_ERROR)?;
+    invocation
+      .create_dir(RECORDS_STAGING_DIRECTORY)
+      .context("failed to create the Codex run-record staging directory")?;
+    let staging = open_directory_no_follow(&invocation, RECORDS_STAGING_DIRECTORY)
+      .context("failed to open the Codex run-record staging directory")?;
+    let trace = create_exclusive(&staging, TRACE_TEMP).context(CREATE_TRACE_ERROR)?;
+    Ok::<_, anyhow::Error>((invocation, staging, trace))
+  })();
+  let (invocation, staging, trace) = match prepared {
+    Ok(prepared) => prepared,
     Err(error) => {
-      let _ = invocation.remove_dir(RECORDS_STAGING_DIRECTORY);
-      drop(invocation);
-      return Err(cleanup_reservation(
-        &root,
-        component,
-        error,
-        "failed to open the Codex run-record staging directory",
-      ));
-    },
-  };
-  let trace = match create_exclusive(&staging, TRACE_TEMP) {
-    Ok(file) => file,
-    Err(error) => {
-      drop(staging);
-      let _ = invocation.remove_dir(RECORDS_STAGING_DIRECTORY);
-      drop(invocation);
-      return Err(cleanup_reservation(&root, component, error, CREATE_TRACE_ERROR));
+      if let Ok(invocation) = open_directory_no_follow(&root, component) {
+        cleanup_owned_directory(&invocation, RECORDS_STAGING_DIRECTORY);
+      }
+      let _ = root.remove_dir(component);
+      return Err(error);
     },
   };
   Ok(PreparedDirectory {
@@ -388,16 +373,6 @@ fn prepare_directory(workspace: &Path, root_path: &str, component: &str) -> anyh
     staging,
     trace,
   })
-}
-
-pub(super) fn cleanup_reservation(
-  root: &Dir,
-  component: &str,
-  error: io::Error,
-  operation: &'static str,
-) -> anyhow::Error {
-  let _ = root.remove_dir(component);
-  anyhow::Error::new(error).context(operation)
 }
 
 fn invocation_component(command_id: &str) -> String {

@@ -368,19 +368,23 @@ async fn bounds_the_trace_and_refuses_a_stable_file_injected_before_publish() {
 }
 
 #[test]
-fn preparation_failure_cleanup_removes_only_the_empty_reserved_directory() {
+fn filesystem_creation_rejects_invalid_components_and_creation_errors() {
+  use crate::filesystem::create_directory_path_no_follow;
+
   let workspace = tempfile::tempdir().unwrap();
   let root = Dir::open_ambient_dir(workspace.path(), ambient_authority()).unwrap();
-  root.create_dir("reserved").unwrap();
-  let error = super::writer::cleanup_reservation(
-    &root,
-    "reserved",
-    std::io::Error::other("fixture failure"),
-    "prepare fixture",
+  for invalid in ["", ".", "..", "nested//child"] {
+    assert_eq!(
+      create_directory_path_no_follow(&root, invalid).unwrap_err().kind(),
+      std::io::ErrorKind::InvalidInput
+    );
+  }
+  assert_eq!(
+    create_directory_path_no_follow(&root, "invalid\0component")
+      .unwrap_err()
+      .kind(),
+    std::io::ErrorKind::InvalidInput
   );
-
-  assert!(error.to_string().contains("prepare fixture"));
-  assert!(!workspace.path().join("reserved").exists());
 
   root.create_dir("not-a-file").unwrap();
   assert!(super::writer::remove_if_present(&root, "not-a-file").is_err());
@@ -429,4 +433,39 @@ async fn record_root_never_follows_a_workspace_symlink() {
 
   assert!(error.to_string().contains("safely open"));
   assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn publication_refuses_an_existing_stable_record_directory() {
+  let workspace = tempfile::tempdir().unwrap();
+  let config = CodexConfig::parse(json!({"prompt": "work"})).unwrap();
+  let variables = HashMap::new();
+  let invocation = invocation(
+    &config,
+    workspace.path(),
+    StructuredResultTarget::Disabled,
+    &variables,
+    &[],
+  )
+  .await;
+  let sanitizer = RunSanitizer::from_variables(&variables, &[]);
+  let terminal = sanitized_event(json!({"type": "turn.completed", "message": "done"}), &sanitizer);
+  let mut records = RunRecords::create(workspace.path(), &config.run_records, "stable-directory-collision")
+    .await
+    .unwrap();
+  let invocation_directory = workspace.path().join(records.relative_directory());
+  fs::create_dir(invocation_directory.join(RECORDS_DIRECTORY)).unwrap();
+  records.trace().append(&terminal).await.unwrap();
+
+  let result = normalize_terminal(&terminal, None).unwrap();
+  let error = records
+    .commit(result, &config, &invocation, &sanitizer)
+    .await
+    .expect_err("an existing stable record directory must not be replaced");
+
+  assert!(error.to_string().contains("atomically publish"));
+  assert!(
+    !invocation_directory.exists(),
+    "failed publication left a partial invocation directory"
+  );
 }
