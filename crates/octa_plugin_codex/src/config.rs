@@ -9,8 +9,10 @@
 use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{bail, Context};
-use serde::Deserialize;
+use serde::{de::Error as _, Deserialize, Deserializer};
 use serde_json::{Map, Value};
+
+use crate::contract::{RECORDS_STAGING_DIRECTORY, RESERVED_RESOURCE_NAMES};
 
 /// Maximum UTF-8 size of either an inline prompt or a loaded prompt file.
 pub(crate) const MAX_PROMPT_BYTES: usize = 1024 * 1024;
@@ -21,7 +23,8 @@ pub(crate) const MAX_INVOCATION_COMPONENT_BYTES: usize = 128;
 /// Maximum encoded size reserved for any plugin-owned record file name.
 pub(crate) const MAX_RECORD_FILE_NAME_BYTES: usize = 64;
 /// A record root must leave room for `/<invocation>/<record-file>`.
-const MAX_RUN_RECORDS_BYTES: usize = MAX_PATH_BYTES - 2 - MAX_INVOCATION_COMPONENT_BYTES - MAX_RECORD_FILE_NAME_BYTES;
+const MAX_RUN_RECORDS_BYTES: usize =
+  MAX_PATH_BYTES - 3 - MAX_INVOCATION_COMPONENT_BYTES - RECORDS_STAGING_DIRECTORY.len() - MAX_RECORD_FILE_NAME_BYTES;
 /// Maximum UTF-8 size of a model name or variable reference.
 const MAX_NAME_BYTES: usize = 256;
 /// Maximum UTF-8 size of an optional source revision.
@@ -81,14 +84,36 @@ pub(crate) struct EnvironmentSelection {
 pub(crate) enum Deliverable {
   Artifact {
     name: String,
-    path: String,
+    path: DeliverablePath,
     content_type: Option<String>,
   },
   Report {
     name: String,
-    path: String,
+    path: DeliverablePath,
     format: String,
   },
+}
+
+/// Portable path proven safe while the untrusted task configuration is parsed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeliverablePath(String);
+
+impl DeliverablePath {
+  /// Returns the validated protocol representation without reinterpreting it.
+  pub(crate) fn as_str(&self) -> &str {
+    &self.0
+  }
+}
+
+impl<'de> Deserialize<'de> for DeliverablePath {
+  fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+  where
+    D: Deserializer<'de>,
+  {
+    let path = String::deserialize(deserializer)?;
+    validate_path("deliverable path", &path).map_err(D::Error::custom)?;
+    Ok(Self(path))
+  }
 }
 
 impl CodexConfig {
@@ -147,24 +172,22 @@ fn validate_deliverables(deliverables: &[Deliverable]) -> anyhow::Result<()> {
 
   let mut names = HashSet::with_capacity(deliverables.len());
   for deliverable in deliverables {
-    let (name, path) = match deliverable {
-      Deliverable::Artifact {
-        name,
-        path,
-        content_type,
-      } => {
+    let name = match deliverable {
+      Deliverable::Artifact { name, content_type, .. } => {
         if let Some(content_type) = content_type {
           validate_name("artifact content type", content_type)?;
         }
-        (name, path)
+        name
       },
-      Deliverable::Report { name, path, format } => {
+      Deliverable::Report { name, format, .. } => {
         validate_name("report format", format)?;
-        (name, path)
+        name
       },
     };
     validate_name("deliverable name", name)?;
-    validate_path("deliverable path", path)?;
+    if RESERVED_RESOURCE_NAMES.contains(&name.as_str()) {
+      bail!("deliverable name '{name}' is reserved for a Codex run record");
+    }
     if !names.insert(name) {
       bail!("deliverable name '{name}' is configured more than once");
     }

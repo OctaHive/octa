@@ -23,6 +23,7 @@ use crate::{
   events::{EventDecoder, HarnessEvent},
   invocation::CodexInvocation,
   process::ProcessTree,
+  records::TraceWriter,
   sanitization::{RunSanitizer, SanitizedEvent},
 };
 
@@ -44,16 +45,19 @@ pub(crate) enum CommandOutcome {
 
 /// Evidence retained after a complete, well-formed harness stream.
 pub(crate) struct CommandCompletion {
-  status: ExitStatus,
   terminal_event: SanitizedEvent,
 }
 
-impl CommandCompletion {
-  /// Status returned by the direct Codex process leader.
-  pub(crate) fn status(&self) -> ExitStatus {
-    self.status
-  }
+/// References shared by event handling during one command invocation.
+struct CommandContext<'a, W> {
+  command_id: &'a str,
+  writer: Arc<Mutex<W>>,
+  sanitizer: &'a RunSanitizer,
+  trace: &'a mut TraceWriter,
+  cancellation: &'a CancellationToken,
+}
 
+impl CommandCompletion {
   /// Sanitized terminal event consumed later by result normalization.
   pub(crate) fn terminal_event(&self) -> &SanitizedEvent {
     &self.terminal_event
@@ -67,43 +71,39 @@ pub(crate) async fn run<W>(
   working_directory: &Path,
   writer: Arc<Mutex<W>>,
   sanitizer: &RunSanitizer,
+  trace: &mut TraceWriter,
   cancellation: &CancellationToken,
 ) -> anyhow::Result<CommandOutcome>
 where
   W: AsyncWrite + Send + Unpin + 'static,
 {
-  run_with_grace_period(
+  let context = CommandContext {
     command_id,
-    invocation,
-    working_directory,
     writer,
     sanitizer,
+    trace,
     cancellation,
-    CANCELLATION_GRACE_PERIOD,
-  )
-  .await
+  };
+  run_with_grace_period(invocation, working_directory, context, CANCELLATION_GRACE_PERIOD).await
 }
 
 async fn run_with_grace_period<W>(
-  command_id: &str,
   invocation: &CodexInvocation,
   working_directory: &Path,
-  writer: Arc<Mutex<W>>,
-  sanitizer: &RunSanitizer,
-  cancellation: &CancellationToken,
+  mut context: CommandContext<'_, W>,
   grace_period: Duration,
 ) -> anyhow::Result<CommandOutcome>
 where
   W: AsyncWrite + Send + Unpin + 'static,
 {
-  if cancellation.is_cancelled() {
+  if context.cancellation.is_cancelled() {
     return Ok(CommandOutcome::Cancelled);
   }
 
   let mut command = invocation.command(working_directory).await?;
   // Fingerprinting may outlive a cancellation request, but process creation
   // must not. Recheck immediately at the irreversible spawn boundary.
-  if cancellation.is_cancelled() {
+  if context.cancellation.is_cancelled() {
     return Ok(CommandOutcome::Cancelled);
   }
 
@@ -131,7 +131,7 @@ where
 
     let step = tokio::select! {
       biased;
-      _ = cancellation.cancelled() => LifecycleStep::Cancelled,
+      _ = context.cancellation.cancelled() => LifecycleStep::Cancelled,
       result = prompt.wait(), if !prompt_closed => LifecycleStep::Prompt(result),
       result = stdout.read(&mut stdout_buffer), if !stdout_closed => LifecycleStep::Stdout(result),
       result = stderr.read(&mut stderr_buffer), if !stderr_closed => LifecycleStep::Stderr(result),
@@ -149,16 +149,7 @@ where
       },
       LifecycleStep::Stdout(Ok(0)) => {
         stdout_closed = true;
-        match finish_stdout(
-          command_id,
-          &mut decoder,
-          writer.clone(),
-          sanitizer,
-          &mut terminal_event,
-          cancellation,
-        )
-        .await
-        {
+        match finish_stdout(&mut decoder, &mut context, &mut terminal_event).await {
           Ok(ActivityFlow::Continue) => Ok(()),
           Ok(ActivityFlow::Cancelled) => {
             return finish_cancellation(&mut prompt, &mut tree, &mut stdout, &mut stderr, grace_period).await;
@@ -167,17 +158,7 @@ where
         }
       },
       LifecycleStep::Stdout(Ok(read)) => {
-        match process_stdout(
-          command_id,
-          &mut decoder,
-          &stdout_buffer[..read],
-          writer.clone(),
-          sanitizer,
-          &mut terminal_event,
-          cancellation,
-        )
-        .await
-        {
+        match process_stdout(&mut decoder, &stdout_buffer[..read], &mut context, &mut terminal_event).await {
           Ok(ActivityFlow::Continue) => Ok(()),
           Ok(ActivityFlow::Cancelled) => {
             return finish_cancellation(&mut prompt, &mut tree, &mut stdout, &mut stderr, grace_period).await;
@@ -216,10 +197,11 @@ where
   }
 
   let terminal_event = terminal_event.ok_or_else(|| anyhow::anyhow!("Codex stdout ended without a terminal event"))?;
-  Ok(CommandOutcome::Completed(CommandCompletion {
-    status: exit_status.expect("completion requires a process status"),
-    terminal_event,
-  }))
+  debug_assert!(
+    exit_status.is_some(),
+    "the lifecycle loop exits only after process exit"
+  );
+  Ok(CommandOutcome::Completed(CommandCompletion { terminal_event }))
 }
 
 enum LifecycleStep {
@@ -238,13 +220,10 @@ enum ActivityFlow {
 }
 
 async fn process_stdout<W>(
-  command_id: &str,
   decoder: &mut Option<EventDecoder>,
   mut bytes: &[u8],
-  writer: Arc<Mutex<W>>,
-  sanitizer: &RunSanitizer,
+  context: &mut CommandContext<'_, W>,
   terminal_event: &mut Option<SanitizedEvent>,
-  cancellation: &CancellationToken,
 ) -> anyhow::Result<ActivityFlow>
 where
   W: AsyncWrite + Send + Unpin + 'static,
@@ -258,17 +237,7 @@ where
     else {
       continue;
     };
-    if retain_event(
-      command_id,
-      event,
-      writer.clone(),
-      sanitizer,
-      terminal_event,
-      cancellation,
-    )
-    .await?
-      == ActivityFlow::Cancelled
-    {
+    if retain_event(event, context, terminal_event).await? == ActivityFlow::Cancelled {
       return Ok(ActivityFlow::Cancelled);
     }
   }
@@ -276,12 +245,9 @@ where
 }
 
 async fn finish_stdout<W>(
-  command_id: &str,
   decoder: &mut Option<EventDecoder>,
-  writer: Arc<Mutex<W>>,
-  sanitizer: &RunSanitizer,
+  context: &mut CommandContext<'_, W>,
   terminal_event: &mut Option<SanitizedEvent>,
-  cancellation: &CancellationToken,
 ) -> anyhow::Result<ActivityFlow>
 where
   W: AsyncWrite + Send + Unpin + 'static,
@@ -292,34 +258,32 @@ where
     .finish()
     .context("invalid Codex stdout stream")?;
   if let Some(event) = event {
-    return retain_event(command_id, event, writer, sanitizer, terminal_event, cancellation).await;
+    return retain_event(event, context, terminal_event).await;
   }
   Ok(ActivityFlow::Continue)
 }
 
 async fn retain_event<W>(
-  command_id: &str,
   event: HarnessEvent,
-  writer: Arc<Mutex<W>>,
-  sanitizer: &RunSanitizer,
+  context: &mut CommandContext<'_, W>,
   terminal_event: &mut Option<SanitizedEvent>,
-  cancellation: &CancellationToken,
 ) -> anyhow::Result<ActivityFlow>
 where
   W: AsyncWrite + Send + Unpin + 'static,
 {
-  if cancellation.is_cancelled() {
+  if context.cancellation.is_cancelled() {
     return Ok(ActivityFlow::Cancelled);
   }
-  let event = sanitizer.sanitize_event(event)?;
-  for response in crate::events::normalize_activity(command_id, &event)? {
-    if cancellation.is_cancelled() {
+  let event = context.sanitizer.sanitize_event(event)?;
+  context.trace.append(&event).await?;
+  for response in crate::events::normalize_activity(context.command_id, &event)? {
+    if context.cancellation.is_cancelled() {
       return Ok(ActivityFlow::Cancelled);
     }
     debug_assert!(!is_terminal_response(&response));
-    send_response(&writer, &response).await?;
+    send_response(&context.writer, &response).await?;
   }
-  if cancellation.is_cancelled() {
+  if context.cancellation.is_cancelled() {
     return Ok(ActivityFlow::Cancelled);
   }
   if event.terminal().is_some() {
@@ -477,6 +441,7 @@ mod tests {
   use crate::{
     config::CodexConfig,
     invocation::{CodexExecutable, EnvironmentSources, StructuredResultTarget},
+    records::RunRecords,
   };
 
   struct CancelOnWrite {
@@ -517,12 +482,20 @@ mod tests {
     .unwrap()
   }
 
-  fn sanitizer() -> RunSanitizer {
+  fn test_sanitizer() -> RunSanitizer {
     RunSanitizer::from_variables(&HashMap::new(), &[])
+  }
+
+  async fn test_records(workspace: &Path) -> RunRecords {
+    RunRecords::create(workspace, ".octa/test-codex-runs", "command")
+      .await
+      .unwrap()
   }
 
   #[tokio::test]
   async fn cancelled_activity_is_not_written_or_retained() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut records = test_records(workspace.path()).await;
     let mut decoder = EventDecoder::new();
     let mut bytes = br#"{"type":"item.completed","item":{"type":"agent_message","text":"late"}}
 "#
@@ -530,14 +503,20 @@ mod tests {
     let event = decoder.next_event(&mut bytes).unwrap().unwrap();
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    let sanitizer = sanitizer();
+    let sanitizer = test_sanitizer();
     let (writer, mut reader) = tokio::io::duplex(256);
     let writer = Arc::new(Mutex::new(writer));
     let mut terminal = None;
+    let mut context = CommandContext {
+      command_id: "command",
+      writer,
+      sanitizer: &sanitizer,
+      trace: records.trace(),
+      cancellation: &cancellation,
+    };
 
-    let flow = retain_event("command", event, writer, &sanitizer, &mut terminal, &cancellation)
-      .await
-      .unwrap();
+    let flow = retain_event(event, &mut context, &mut terminal).await.unwrap();
+    drop(context);
 
     assert_eq!(flow, ActivityFlow::Cancelled);
     assert!(terminal.is_none());
@@ -548,23 +527,25 @@ mod tests {
 
   #[tokio::test]
   async fn stdout_helpers_cover_partial_terminal_and_mid_delivery_cancellation() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut records = test_records(workspace.path()).await;
     let mut decoder = Some(EventDecoder::new());
     let (writer, _reader) = tokio::io::duplex(512);
     let writer = Arc::new(Mutex::new(writer));
     let cancellation = CancellationToken::new();
+    let sanitizer = test_sanitizer();
     let mut terminal = None;
-
-    let flow = process_stdout(
-      "command",
-      &mut decoder,
-      br#"{"type":"turn.started""#,
+    let mut context = CommandContext {
+      command_id: "command",
       writer,
-      &sanitizer(),
-      &mut terminal,
-      &cancellation,
-    )
-    .await
-    .unwrap();
+      sanitizer: &sanitizer,
+      trace: records.trace(),
+      cancellation: &cancellation,
+    };
+
+    let flow = process_stdout(&mut decoder, br#"{"type":"turn.started""#, &mut context, &mut terminal)
+      .await
+      .unwrap();
     assert_eq!(flow, ActivityFlow::Continue);
 
     let cancellation = CancellationToken::new();
@@ -573,15 +554,20 @@ mod tests {
     }));
     let mut decoder = Some(EventDecoder::new());
     let mut terminal = None;
+    let sanitizer = test_sanitizer();
+    let mut context = CommandContext {
+      command_id: "command",
+      writer,
+      sanitizer: &sanitizer,
+      trace: records.trace(),
+      cancellation: &cancellation,
+    };
     let flow = process_stdout(
-      "command",
       &mut decoder,
       br#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}
 "#,
-      writer,
-      &sanitizer(),
+      &mut context,
       &mut terminal,
-      &cancellation,
     )
     .await
     .unwrap();
@@ -598,15 +584,20 @@ mod tests {
     }));
     let mut decoder = Some(EventDecoder::new());
     let mut terminal = None;
+    let sanitizer = test_sanitizer();
+    let mut context = CommandContext {
+      command_id: "command",
+      writer,
+      sanitizer: &sanitizer,
+      trace: records.trace(),
+      cancellation: &cancellation,
+    };
     let flow = process_stdout(
-      "command",
       &mut decoder,
       br#"{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"failed","exit_code":1,"status":"failed"}}
 "#,
-      writer,
-      &sanitizer(),
+      &mut context,
       &mut terminal,
-      &cancellation,
     )
     .await
     .unwrap();
@@ -620,16 +611,16 @@ mod tests {
       .next_event(&mut br#"{"type":"turn.completed","message":"done"}"#.as_slice())
       .unwrap();
     let mut terminal = None;
-    let flow = finish_stdout(
-      "command",
-      &mut decoder,
-      Arc::new(Mutex::new(writer)),
-      &sanitizer(),
-      &mut terminal,
-      &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
+    let sanitizer = test_sanitizer();
+    let cancellation = CancellationToken::new();
+    let mut context = CommandContext {
+      command_id: "command",
+      writer: Arc::new(Mutex::new(writer)),
+      sanitizer: &sanitizer,
+      trace: records.trace(),
+      cancellation: &cancellation,
+    };
+    let flow = finish_stdout(&mut decoder, &mut context, &mut terminal).await.unwrap();
     assert_eq!(flow, ActivityFlow::Continue);
     assert!(terminal.is_some());
   }
@@ -638,35 +629,37 @@ mod tests {
   async fn cancelled_and_invalid_invocations_finish_without_leaking_process_state() {
     let workspace = tempfile::tempdir().unwrap();
     let invocation = test_invocation(workspace.path()).await;
+    let mut records = test_records(workspace.path()).await;
     let cancellation = CancellationToken::new();
     cancellation.cancel();
     let (writer, _reader) = tokio::io::duplex(512);
-    let outcome = run_with_grace_period(
-      "command",
-      &invocation,
-      workspace.path(),
-      Arc::new(Mutex::new(writer)),
-      &sanitizer(),
-      &cancellation,
-      Duration::from_millis(20),
-    )
-    .await
-    .unwrap();
+    let sanitizer = test_sanitizer();
+    let context = CommandContext {
+      command_id: "command",
+      writer: Arc::new(Mutex::new(writer)),
+      sanitizer: &sanitizer,
+      trace: records.trace(),
+      cancellation: &cancellation,
+    };
+    let outcome = run_with_grace_period(&invocation, workspace.path(), context, Duration::from_millis(20))
+      .await
+      .unwrap();
     assert!(matches!(outcome, CommandOutcome::Cancelled));
 
     let (writer, _reader) = tokio::io::duplex(512);
-    let error = run_with_grace_period(
-      "command",
-      &invocation,
-      workspace.path(),
-      Arc::new(Mutex::new(writer)),
-      &sanitizer(),
-      &CancellationToken::new(),
-      Duration::from_millis(20),
-    )
-    .await
-    .err()
-    .expect("invalid harness stream must fail");
+    let sanitizer = test_sanitizer();
+    let cancellation = CancellationToken::new();
+    let context = CommandContext {
+      command_id: "command",
+      writer: Arc::new(Mutex::new(writer)),
+      sanitizer: &sanitizer,
+      trace: records.trace(),
+      cancellation: &cancellation,
+    };
+    let error = run_with_grace_period(&invocation, workspace.path(), context, Duration::from_millis(20))
+      .await
+      .err()
+      .expect("invalid harness stream must fail");
     assert!(
       error.to_string().contains("invalid Codex stdout stream"),
       "unexpected lifecycle error: {error:#}"

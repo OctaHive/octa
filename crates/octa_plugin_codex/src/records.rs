@@ -12,10 +12,15 @@ use serde_json::{Map, Value};
 use crate::config;
 
 mod limits;
+mod normalize;
+mod writer;
 use limits::{
   validate_encoded_size, MAX_FINAL_MESSAGE_BYTES, MAX_PLUGIN_OUTPUT_BYTES, MAX_STRUCTURED_RESULT_BYTES,
   MAX_USAGE_METADATA_BYTES,
 };
+pub(crate) use normalize::normalize_terminal;
+use normalize::SemanticOutcome;
+pub(crate) use writer::{RunRecordPaths, RunRecords, TraceWriter};
 
 /// Maximum number of characters advertised for a plain final message.
 ///
@@ -58,7 +63,7 @@ pub(crate) fn output_schema() -> Map<String, Value> {
     "properties": {
       "outcome": {
         "type": "string",
-        "enum": ["completed", "blocked", "needs_input", "budget_exhausted", "failed"]
+        "enum": SemanticOutcome::names()
       },
       "final_message": {
         "type": "string",
@@ -147,7 +152,10 @@ pub(crate) fn validate_outputs(outputs: &Map<String, Value>) -> anyhow::Result<(
 
 /// Returns the only successful output that does not represent a harness run.
 pub(crate) fn dry_run_outputs() -> Map<String, Value> {
-  Map::from_iter([("outcome".to_owned(), Value::String("completed".to_owned()))])
+  Map::from_iter([(
+    "outcome".to_owned(),
+    Value::String(SemanticOutcome::Completed.as_str().to_owned()),
+  )])
 }
 
 fn bounded_string_map_schema(maximum_entries: usize, maximum_value_length: usize) -> Value {
@@ -176,3 +184,11 @@ fn output_name_schema() -> Value {
 #[cfg(test)]
 #[path = "records_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "records_normalize_tests.rs"]
+mod normalize_tests;
+
+#[cfg(test)]
+#[path = "records_writer_tests.rs"]
+mod writer_tests;

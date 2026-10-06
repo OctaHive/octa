@@ -192,6 +192,22 @@ fn rejects_invalid_environment_mappings_and_duplicate_deliverables() {
 }
 
 #[test]
+fn rejects_deliverables_that_shadow_plugin_owned_run_records() {
+  for name in RESERVED_RESOURCE_NAMES {
+    let value = json!({
+      "prompt": "work",
+      "deliverables": [{ "kind": "artifact", "name": name, "path": "out/value" }]
+    });
+    assert!(
+      validator().is_valid(&value),
+      "wire schema unexpectedly owns semantic names"
+    );
+    let error = CodexConfig::parse(value).unwrap_err();
+    assert!(error.to_string().contains("reserved for a Codex run record"));
+  }
+}
+
+#[test]
 fn accepts_only_the_documented_reasoning_efforts() {
   for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
     let value = json!({ "prompt": "work", "reasoning_effort": effort });

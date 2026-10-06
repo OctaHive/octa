@@ -69,6 +69,10 @@ fn main() {
   match mode.trim() {
     "complete" => emit_event(r#"{"type":"turn.completed","message":"done"}"#),
     "failed" => emit_event(r#"{"type":"turn.failed","error":{"message":"fixture failure"}}"#),
+    "failed-nonzero" => {
+      emit_event(r#"{"type":"turn.failed","error":{"message":"fixture failure"}}"#);
+      std::process::exit(17);
+    },
     "structured" => emit_event(
       r#"{"type":"turn.completed","result":{"outcome":"completed","files":2},"usage":{"input_tokens":3,"output_tokens":5}}"#,
     ),
@@ -89,7 +93,16 @@ fn main() {
       let heartbeat = runtime_path(&executable, control_directory.as_deref(), "run-descendant-heartbeat");
       spawn_descendant(&executable, &heartbeat, "runtime descendant must start");
       wait_for_file(&heartbeat, "runtime descendant did not become ready");
-      emit_event(r#"{"type":"turn.completed","message":"done"}"#);
+      emit_event(r#"{"type":"turn.started"}"#);
+      wait_for_file(
+        &runtime_path(&executable, control_directory.as_deref(), "release-run"),
+        "auditable descendant fixture was not released",
+      );
+      emit_event(r#"{"type":"item.completed","item":{"type":"agent_message","text":"working-1"}}"#);
+      emit_event(r#"{"type":"item.completed","item":{"type":"agent_message","text":"working-2"}}"#);
+      emit_event(
+        r#"{"type":"turn.completed","message":"done","thread_id":"fixture-thread","turn_id":"fixture-turn","usage":{"input_tokens":3,"output_tokens":5}}"#,
+      );
     },
     "hang" => {
       emit_event(r#"{"type":"turn.started"}"#);

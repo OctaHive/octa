@@ -18,10 +18,13 @@ use tokio_util::sync::CancellationToken;
 
 mod command;
 mod config;
+mod contract;
 mod events;
+mod filesystem;
 mod invocation;
 mod process;
 mod records;
+mod resources;
 mod sanitization;
 
 struct CodexPlugin;
@@ -81,15 +84,21 @@ impl Plugin for CodexPlugin {
       Err(_) if cancel_token.is_cancelled() => return send_cancelled(&writer, id).await,
       Err(error) => return Err(error),
     };
-    if config.result_schema.is_some() {
-      anyhow::bail!("structured Codex results require safe schema-file materialization");
-    }
+    let structured_result = if config.result_schema.is_some() {
+      invocation::StructuredResultTarget::SchemaFile(records::RunRecords::schema_path_for(
+        &dir,
+        &config.run_records,
+        &id,
+      ))
+    } else {
+      invocation::StructuredResultTarget::Disabled
+    };
     let sanitizer = sanitization::RunSanitizer::from_variables(&vars, &secret_vars);
     let invocation = invocation::CodexInvocation::load(
       executable,
       &config,
       &dir,
-      invocation::StructuredResultTarget::Disabled,
+      structured_result,
       invocation::EnvironmentSources {
         variables: &vars,
         secret_variables: &secret_vars,
@@ -97,18 +106,29 @@ impl Plugin for CodexPlugin {
       },
     )
     .await?;
+    let mut run_records = records::RunRecords::create(&dir, &config.run_records, &id).await?;
+    run_records.materialize_schema(invocation.result_schema()).await?;
     if cancel_token.is_cancelled() {
       return send_cancelled(&writer, id).await;
     }
 
-    match command::run(&id, &invocation, &dir, writer.clone(), &sanitizer, &cancel_token).await? {
+    match command::run(
+      &id,
+      &invocation,
+      &dir,
+      writer.clone(),
+      &sanitizer,
+      run_records.trace(),
+      &cancel_token,
+    )
+    .await?
+    {
       command::CommandOutcome::Cancelled => send_cancelled(&writer, id).await,
       command::CommandOutcome::Completed(completion) => {
-        if !completion.status().success() {
-          anyhow::bail!("Codex process exited unsuccessfully");
-        }
-        let _terminal = completion.terminal_event();
-        anyhow::bail!("Codex terminal result normalization is not implemented")
+        let normalized = records::normalize_terminal(completion.terminal_event(), config.result_schema.as_ref())?;
+        let committed = run_records.commit(normalized, &config, &invocation, &sanitizer).await?;
+        resources::publish(&writer, &id, &dir, &committed.paths, &config.deliverables).await?;
+        send_completed(&writer, id, 0, committed.outputs).await
       },
     }
   }
@@ -142,3 +162,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 #[path = "plugin_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "resources_tests.rs"]
+mod resources_tests;

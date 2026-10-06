@@ -114,11 +114,27 @@ async fn start_lifecycle_execution(workspace: &Path, fixture: PathBuf) -> (Plugi
 }
 
 async fn receive_terminal(execution: &mut PluginExecution) -> PluginResponse {
+  receive_through_terminal(execution)
+    .await
+    .pop()
+    .expect("a terminal response was collected")
+}
+
+async fn receive_through_terminal(execution: &mut PluginExecution) -> Vec<PluginResponse> {
   tokio::time::timeout(Duration::from_secs(10), async {
+    let mut responses = Vec::new();
     loop {
       match execution.receive_output(&CancellationToken::new()).await.unwrap() {
-        Some(response @ (PluginResponse::Completed { .. } | PluginResponse::Error { .. })) => return response,
-        Some(_) => {},
+        Some(response) => {
+          let terminal = matches!(
+            response,
+            PluginResponse::Completed { .. } | PluginResponse::Error { .. }
+          );
+          responses.push(response);
+          if terminal {
+            return responses;
+          }
+        },
         None => panic!("plugin response stream closed before a terminal response"),
       }
     }
@@ -398,9 +414,12 @@ async fn exit_racing_with_cancellation_produces_one_terminal_response() {
     .expect("exit-versus-cancel race did not settle")
     .unwrap();
   let terminal = receive_terminal(&mut execution).await;
+  // Releasing the fixture and cancelling are intentionally concurrent. A
+  // fully observed semantic completion may win before the cancellation token;
+  // otherwise the plugin reports cancellation (or a bounded transport error).
   assert!(matches!(
     terminal,
-    PluginResponse::Completed { code: -1, .. } | PluginResponse::Error { .. }
+    PluginResponse::Completed { code: -1 | 0, .. } | PluginResponse::Error { .. }
   ));
   assert_response_stream_closed(&mut execution).await;
   assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
@@ -447,19 +466,157 @@ async fn plugin_shutdown_cancels_the_active_command_and_stops_its_tree() {
 }
 
 #[tokio::test]
-async fn normal_fixture_completion_stops_its_runtime_descendant() {
+async fn plugin_host_streams_an_auditable_completion_and_stops_its_runtime_descendant() {
   let workspace = tempfile::tempdir().unwrap();
   let fixture_directory = tempfile::tempdir().unwrap();
   let fixture = configured_process_fixture(fixture_directory.path(), "descendant");
   let heartbeat = fixture.with_extension("run-descendant-heartbeat");
+  let release = fixture.with_extension("release-run");
   let (manager, mut execution) = start_lifecycle_execution(workspace.path(), fixture).await;
   wait_for_file(&heartbeat).await;
 
-  let terminal = receive_terminal(&mut execution).await;
-  assert!(matches!(
-    terminal,
-    PluginResponse::Error { message, .. } if message.contains("terminal result normalization")
-  ));
+  let first = tokio::time::timeout(
+    Duration::from_secs(5),
+    execution.receive_output(&CancellationToken::new()),
+  )
+  .await
+  .expect("fixture progress was not observed")
+  .unwrap()
+  .expect("plugin response stream closed before fixture progress");
+  fs::write(release, b"release").unwrap();
+  let mut responses = vec![first];
+  responses.extend(receive_through_terminal(&mut execution).await);
+  let [PluginResponse::Progress { id, progress }, PluginResponse::Stdout {
+    id: first_stdout_id,
+    line: first_line,
+  }, PluginResponse::Stdout {
+    id: second_stdout_id,
+    line: second_line,
+  }, PluginResponse::RegisterArtifact {
+    id: trace_id,
+    artifact: trace,
+  }, PluginResponse::RegisterArtifact {
+    id: provenance_id,
+    artifact: provenance,
+  }, PluginResponse::RegisterReport { id: report_id, report }, PluginResponse::Completed {
+    id: terminal_id,
+    code: 0,
+    outputs,
+  }] = responses.as_slice()
+  else {
+    panic!("unexpected ordered plugin-host responses: {responses:?}");
+  };
+
+  assert_eq!(progress.message, "Codex turn started");
+  assert_eq!(first_line, "working-1");
+  assert_eq!(second_line, "working-2");
+  for response_id in [
+    first_stdout_id,
+    second_stdout_id,
+    trace_id,
+    provenance_id,
+    report_id,
+    terminal_id,
+  ] {
+    assert_eq!(response_id, id, "one invocation must retain one response id");
+  }
+  assert_eq!(outputs["outcome"], "completed");
+  assert_eq!(outputs["final_message"], "done");
+  assert_eq!(
+    outputs["harness_identifiers"],
+    json!({ "thread_id": "fixture-thread", "turn_id": "fixture-turn" })
+  );
+  assert_eq!(outputs["usage"], json!({ "input_tokens": 3, "output_tokens": 5 }));
+
+  let trace_path = outputs["record_paths"]["trace"].as_str().unwrap();
+  let result_path = outputs["record_paths"]["result"].as_str().unwrap();
+  let provenance_path = outputs["record_paths"]["provenance"].as_str().unwrap();
+  assert_eq!(trace.name, "codex-run-trace");
+  assert_eq!(trace.path, Path::new(trace_path));
+  assert_eq!(trace.content_type.as_deref(), Some("application/x-ndjson"));
+  assert_eq!(provenance.name, "codex-run-provenance");
+  assert_eq!(provenance.path, Path::new(provenance_path));
+  assert_eq!(provenance.content_type.as_deref(), Some("application/json"));
+  assert_eq!(report.name, "codex-run-result");
+  assert_eq!(report.path, Path::new(result_path));
+  assert_eq!(report.format, "octa.codex.result.v1");
+
+  for name in ["trace", "result", "provenance"] {
+    let path = outputs["record_paths"][name].as_str().unwrap();
+    assert!(workspace.path().join(path).is_file(), "missing {name} run record");
+  }
+  let result: Value = serde_json::from_slice(&fs::read(workspace.path().join(result_path)).unwrap()).unwrap();
+  assert_eq!(result["format_version"], 1);
+  assert_eq!(
+    responses
+      .iter()
+      .filter(|response| matches!(
+        response,
+        PluginResponse::Completed { .. } | PluginResponse::Error { .. }
+      ))
+      .count(),
+    1
+  );
+  assert_response_stream_closed(&mut execution).await;
   assert_heartbeat_stopped(&heartbeat).await;
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn semantic_failure_remains_auditable_when_the_harness_exits_nonzero() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture_directory = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(fixture_directory.path(), "failed-nonzero");
+  let (manager, mut execution) = start_lifecycle_execution(workspace.path(), fixture).await;
+
+  let responses = receive_through_terminal(&mut execution).await;
+  let Some(PluginResponse::Completed { code, outputs, .. }) = responses.last() else {
+    panic!("semantic failure was not retained as a completion: {responses:?}");
+  };
+  assert_eq!(*code, 0);
+  assert_eq!(outputs["outcome"], "failed");
+  assert_eq!(outputs["final_message"], "fixture failure");
+  assert_eq!(
+    responses
+      .iter()
+      .filter(|response| matches!(
+        response,
+        PluginResponse::RegisterArtifact { .. } | PluginResponse::RegisterReport { .. }
+      ))
+      .count(),
+    3,
+    "an auditable semantic failure must retain all run records"
+  );
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn a_missing_required_deliverable_publishes_no_resources() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture_directory = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(fixture_directory.path(), "complete");
+  let (manager, plugin_name) = plugin_manager_with_codex(workspace.path(), fixture);
+  manager.start_plugin(&plugin_name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let mut request = lifecycle_request(workspace.path());
+  request.params = json!({
+    "prompt": "perform the fixture task",
+    "deliverables": [{
+      "kind": "artifact",
+      "name": "required-output",
+      "path": "missing/output"
+    }]
+  });
+  let mut execution = client.start_execution(request, CancellationToken::new()).await.unwrap();
+  let responses = receive_through_terminal(&mut execution).await;
+
+  assert!(matches!(
+    responses.last(),
+    Some(PluginResponse::Error { message, .. }) if message.contains("missing or inaccessible")
+  ));
+  assert!(responses.iter().all(|response| !matches!(
+    response,
+    PluginResponse::RegisterArtifact { .. } | PluginResponse::RegisterReport { .. }
+  )));
   assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
 }

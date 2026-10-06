@@ -66,10 +66,6 @@ const PLATFORM_ENVIRONMENT: &[&str] = &["HOME", "PATH", "TMPDIR", "TEMP", "TMP"]
 /// callers from appending arbitrary strings to the Codex command line.
 pub(crate) enum StructuredResultTarget {
   Disabled,
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "phase 6 materializes a validated structured-result schema")
-  )]
   SchemaFile(PathBuf),
 }
 
@@ -89,13 +85,6 @@ pub(crate) struct CodexInvocation {
   arguments: Vec<OsString>,
   environment: BTreeMap<String, String>,
   prompt: LoadedPrompt,
-  #[cfg_attr(
-    not(test),
-    expect(
-      dead_code,
-      reason = "phase 6 materializes the validated schema document before spawn"
-    )
-  )]
   result_schema: Option<ResultSchemaDocument>,
 }
 
@@ -103,19 +92,11 @@ pub(crate) struct CodexInvocation {
 /// spawning Codex.
 pub(crate) struct ResultSchemaDocument {
   path: PathBuf,
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "phase 6 writes these validated bytes atomically before spawn")
-  )]
   bytes: Vec<u8>,
 }
 
 struct LoadedPrompt {
   bytes: Vec<u8>,
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "phase 6 records the prompt identity in provenance")
-  )]
   identity: blake3::Hash,
 }
 
@@ -123,7 +104,7 @@ const SANDBOX_MODE: &str = "workspace-write";
 const APPROVAL_POLICY: &str = "never";
 
 impl ReasoningEffort {
-  const fn as_str(self) -> &'static str {
+  pub(crate) const fn as_str(self) -> &'static str {
     match self {
       Self::None => "none",
       Self::Minimal => "minimal",
@@ -187,15 +168,18 @@ impl CodexInvocation {
   }
 
   /// Returns the BLAKE3 identity of the exact UTF-8 bytes sent to Codex.
-  #[cfg(test)]
   pub(crate) fn prompt_identity(&self) -> blake3::Hash {
     self.prompt.identity
   }
 
   /// Returns the schema document that must exist before the child is spawned.
-  #[cfg(test)]
   pub(crate) fn result_schema(&self) -> Option<&ResultSchemaDocument> {
     self.result_schema.as_ref()
+  }
+
+  /// Returns the compatibility-checked Codex CLI release for provenance.
+  pub(crate) fn codex_version(&self) -> String {
+    self.executable.version()
   }
 
   /// Builds the exact direct child command after revalidating the executable.
@@ -309,7 +293,6 @@ impl ResultSchemaDocument {
   }
 
   /// Validated JSON Schema bytes to write at [`Self::path`].
-  #[cfg(test)]
   pub(crate) fn bytes(&self) -> &[u8] {
     &self.bytes
   }

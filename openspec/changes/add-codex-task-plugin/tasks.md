@@ -32,10 +32,10 @@
 
 ## 6. Validate results and publish auditable resources
 
-- [ ] 6.1 Normalize well-formed terminal states into the documented semantic outcomes and validate configured structured results with the declared JSON Schema; verify semantic failure remains an auditable code-zero result while missing/invalid contract data fails execution.
-- [ ] 6.2 Atomically write versioned sanitized `trace.jsonl`, `result.json`, and `provenance.json` under a unique invocation directory, and verify tests cover concurrent commands, collision refusal, partial-write cleanup, stable serialization, prompt digest, optional source revision, and absence of secret/environment dumps.
-- [ ] 6.3 Revalidate finalized run-record and exact deliverable paths after process-tree termination, then emit existing artifact/report declarations only for safe required resources; verify missing paths, symlink escapes, devices, platform-ambiguous paths, and mutation races publish nothing unsafe.
-- [ ] 6.4 Add an end-to-end plugin-host test that executes the fixture through the local socket and verifies ordered events, normalized outputs, versioned report format, artifact declarations, and exactly one terminal response.
+- [x] 6.1 Normalize well-formed terminal states into the documented semantic outcomes and validate configured structured results with the declared JSON Schema; verify semantic failure remains an auditable code-zero result while missing/invalid contract data fails execution.
+- [x] 6.2 Atomically write versioned sanitized `trace.jsonl`, `result.json`, and `provenance.json` under a unique invocation directory, and verify tests cover concurrent commands, collision refusal, partial-write cleanup, stable serialization, prompt digest, optional source revision, and absence of secret/environment dumps.
+- [x] 6.3 Revalidate finalized run-record and exact deliverable paths after process-tree termination, then emit existing artifact/report declarations only for safe required resources; verify missing paths, symlink escapes, devices, platform-ambiguous paths, and mutation races publish nothing unsafe.
+- [x] 6.4 Add an end-to-end plugin-host test that executes the fixture through the local socket and verifies ordered events, normalized outputs, versioned report format, artifact declarations, and exactly one terminal response.
 
 ## 7. Integrate with Octa and runner behavior
 

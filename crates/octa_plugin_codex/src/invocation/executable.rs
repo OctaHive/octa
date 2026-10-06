@@ -41,10 +41,6 @@ const SUPPORTED_CODEX_VERSIONS: &[&str] = &["0.130.0"];
 /// callers can only prepare a command after that identity is revalidated.
 pub(crate) struct CodexExecutable {
   path: PathBuf,
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "phase 6 records the probed Codex release in provenance")
-  )]
   version: Version,
   fingerprint: ExecutableFingerprint,
 }
@@ -94,7 +90,6 @@ impl CodexExecutable {
   }
 
   /// Validated Codex CLI release observed during the compatibility probe.
-  #[cfg(test)]
   pub(crate) fn version(&self) -> String {
     self.version.to_string()
   }
