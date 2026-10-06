@@ -111,7 +111,7 @@ impl CodexExecutable {
   /// Provides non-spawning compatibility evidence to invocation unit tests.
   /// Production construction remains restricted to the resolver above.
   #[cfg(test)]
-  pub(super) fn fixture() -> Self {
+  pub(crate) fn fixture() -> Self {
     let path = std::env::current_exe().expect("test executable path must be available");
     Self {
       fingerprint: ExecutableFingerprint::read(&path).expect("test executable must be fingerprintable"),

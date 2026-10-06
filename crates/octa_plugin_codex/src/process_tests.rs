@@ -37,10 +37,39 @@ async fn bounded_reader_join_aborts_pipes_that_never_close() {
   assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
 }
 
+#[tokio::test]
+async fn version_probe_bounds_cancellation_and_timeout() {
+  let temporary = tempfile::tempdir().unwrap();
+  let cancelled_heartbeat = temporary.path().join("cancelled-heartbeat");
+  let cancelled = CancellationToken::new();
+  cancelled.cancel();
+  let cancelled_outcome = run_version_probe(
+    fixture_command("linger", &cancelled_heartbeat),
+    Duration::from_secs(1),
+    1_024,
+    &cancelled,
+  )
+  .await
+  .unwrap();
+  assert!(matches!(cancelled_outcome, ProbeOutcome::Cancelled));
+
+  let timed_out_heartbeat = temporary.path().join("timed-out-heartbeat");
+  let timed_out = run_version_probe(
+    fixture_command("linger", &timed_out_heartbeat),
+    Duration::from_millis(20),
+    1_024,
+    &CancellationToken::new(),
+  )
+  .await
+  .unwrap();
+  assert!(matches!(timed_out, ProbeOutcome::TimedOut));
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn wait_without_reaping_rejects_an_unknown_child() {
   assert!(process_exited_without_reaping(i32::MAX).is_err());
+  assert!(signal_process_group(i32::MAX, libc::SIGKILL).is_ok());
 }
 
 #[test]
@@ -127,6 +156,13 @@ async fn process_tree_pipes_io_and_owns_descendants_after_success_or_error() {
     assert!(
       tree.process_group.is_none(),
       "wait retained a reusable process-group id"
+    );
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    tree.close_exited_process_group().unwrap();
+    assert_eq!(
+      tree.wait().await.unwrap(),
+      status,
+      "repeated wait changed the exit status"
     );
     let (stdout, stderr) = tokio::join!(stdout_reader, stderr_reader);
     assert_eq!(status.success(), expected_success);

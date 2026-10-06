@@ -319,7 +319,13 @@ impl ProcessTree {
 
   /// Force-terminates the complete owned tree and reaps the direct child.
   pub(crate) async fn terminate(&mut self) -> io::Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let termination = match self.process_group {
+      Some(process_group) if process_exited_without_reaping(process_group)? => self.close_exited_process_group(),
+      _ => self.close_process_group(libc::SIGKILL),
+    };
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     let termination = self.close_process_group(libc::SIGKILL);
 
     #[cfg(unix)]

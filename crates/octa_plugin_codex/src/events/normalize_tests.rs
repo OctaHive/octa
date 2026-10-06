@@ -99,6 +99,16 @@ fn normalizes_messages_and_command_results_to_ordered_output() {
     [PluginResponse::Stdout { line, .. }] if line == "ok"
   ));
 
+  let success_without_status = normalize_json(json!({
+    "type": "item.completed",
+    "item": {"type": "command_execution", "aggregated_output": "ok", "exit_code": 0}
+  }))
+  .unwrap();
+  assert!(matches!(
+    success_without_status.as_slice(),
+    [PluginResponse::Stdout { line, .. }] if line == "ok"
+  ));
+
   let failure = normalize_json(json!({
     "type": "item.completed",
     "item": {

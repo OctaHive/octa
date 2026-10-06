@@ -463,11 +463,63 @@ fn join_prompt(result: Result<io::Result<()>, JoinError>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-  use std::collections::HashMap;
+  use std::{
+    collections::HashMap,
+    future::pending,
+    pin::Pin,
+    task::{Context, Poll},
+  };
 
+  use serde_json::json;
   use tokio::io::AsyncReadExt;
 
   use super::*;
+  use crate::{
+    config::CodexConfig,
+    invocation::{CodexExecutable, EnvironmentSources, StructuredResultTarget},
+  };
+
+  struct CancelOnWrite {
+    cancellation: CancellationToken,
+  }
+
+  impl AsyncWrite for CancelOnWrite {
+    fn poll_write(self: Pin<&mut Self>, _context: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+      self.cancellation.cancel();
+      Poll::Ready(Ok(bytes.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+      Poll::Ready(Ok(()))
+    }
+  }
+
+  async fn test_invocation(workspace: &Path) -> CodexInvocation {
+    let config = CodexConfig::parse(json!({"prompt": "fixture prompt"})).unwrap();
+    let variables = HashMap::new();
+    let task_environment = HashMap::new();
+    CodexInvocation::load(
+      CodexExecutable::fixture(),
+      &config,
+      workspace,
+      StructuredResultTarget::Disabled,
+      EnvironmentSources {
+        variables: &variables,
+        secret_variables: &[],
+        task_environment: &task_environment,
+      },
+    )
+    .await
+    .unwrap()
+  }
+
+  fn sanitizer() -> RunSanitizer {
+    RunSanitizer::from_variables(&HashMap::new(), &[])
+  }
 
   #[tokio::test]
   async fn cancelled_activity_is_not_written_or_retained() {
@@ -478,7 +530,7 @@ mod tests {
     let event = decoder.next_event(&mut bytes).unwrap().unwrap();
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    let sanitizer = RunSanitizer::from_variables(&HashMap::new(), &[]);
+    let sanitizer = sanitizer();
     let (writer, mut reader) = tokio::io::duplex(256);
     let writer = Arc::new(Mutex::new(writer));
     let mut terminal = None;
@@ -492,5 +544,154 @@ mod tests {
     let mut emitted = Vec::new();
     reader.read_to_end(&mut emitted).await.unwrap();
     assert!(emitted.is_empty(), "activity was emitted after cancellation");
+  }
+
+  #[tokio::test]
+  async fn stdout_helpers_cover_partial_terminal_and_mid_delivery_cancellation() {
+    let mut decoder = Some(EventDecoder::new());
+    let (writer, _reader) = tokio::io::duplex(512);
+    let writer = Arc::new(Mutex::new(writer));
+    let cancellation = CancellationToken::new();
+    let mut terminal = None;
+
+    let flow = process_stdout(
+      "command",
+      &mut decoder,
+      br#"{"type":"turn.started""#,
+      writer,
+      &sanitizer(),
+      &mut terminal,
+      &cancellation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(flow, ActivityFlow::Continue);
+
+    let cancellation = CancellationToken::new();
+    let writer = Arc::new(Mutex::new(CancelOnWrite {
+      cancellation: cancellation.clone(),
+    }));
+    let mut decoder = Some(EventDecoder::new());
+    let mut terminal = None;
+    let flow = process_stdout(
+      "command",
+      &mut decoder,
+      br#"{"type":"item.completed","item":{"type":"agent_message","text":"done"}}
+"#,
+      writer,
+      &sanitizer(),
+      &mut terminal,
+      &cancellation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(flow, ActivityFlow::Cancelled);
+
+    let mut shutdown_writer = CancelOnWrite {
+      cancellation: CancellationToken::new(),
+    };
+    shutdown_writer.shutdown().await.unwrap();
+
+    let cancellation = CancellationToken::new();
+    let writer = Arc::new(Mutex::new(CancelOnWrite {
+      cancellation: cancellation.clone(),
+    }));
+    let mut decoder = Some(EventDecoder::new());
+    let mut terminal = None;
+    let flow = process_stdout(
+      "command",
+      &mut decoder,
+      br#"{"type":"item.completed","item":{"type":"command_execution","aggregated_output":"failed","exit_code":1,"status":"failed"}}
+"#,
+      writer,
+      &sanitizer(),
+      &mut terminal,
+      &cancellation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(flow, ActivityFlow::Cancelled);
+
+    let (writer, _reader) = tokio::io::duplex(512);
+    let mut decoder = Some(EventDecoder::new());
+    decoder
+      .as_mut()
+      .unwrap()
+      .next_event(&mut br#"{"type":"turn.completed","message":"done"}"#.as_slice())
+      .unwrap();
+    let mut terminal = None;
+    let flow = finish_stdout(
+      "command",
+      &mut decoder,
+      Arc::new(Mutex::new(writer)),
+      &sanitizer(),
+      &mut terminal,
+      &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(flow, ActivityFlow::Continue);
+    assert!(terminal.is_some());
+  }
+
+  #[tokio::test]
+  async fn cancelled_and_invalid_invocations_finish_without_leaking_process_state() {
+    let workspace = tempfile::tempdir().unwrap();
+    let invocation = test_invocation(workspace.path()).await;
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let (writer, _reader) = tokio::io::duplex(512);
+    let outcome = run_with_grace_period(
+      "command",
+      &invocation,
+      workspace.path(),
+      Arc::new(Mutex::new(writer)),
+      &sanitizer(),
+      &cancellation,
+      Duration::from_millis(20),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, CommandOutcome::Cancelled));
+
+    let (writer, _reader) = tokio::io::duplex(512);
+    let error = run_with_grace_period(
+      "command",
+      &invocation,
+      workspace.path(),
+      Arc::new(Mutex::new(writer)),
+      &sanitizer(),
+      &CancellationToken::new(),
+      Duration::from_millis(20),
+    )
+    .await
+    .err()
+    .expect("invalid harness stream must fail");
+    assert!(
+      error.to_string().contains("invalid Codex stdout stream"),
+      "unexpected lifecycle error: {error:#}"
+    );
+  }
+
+  #[tokio::test]
+  async fn prompt_writer_abort_and_drop_are_idempotent() {
+    let mut completed = PromptWriter {
+      task: tokio::spawn(async { Ok(()) }),
+      finished: false,
+    };
+    completed.wait().await.unwrap();
+    completed.abort_and_wait().await.unwrap();
+
+    let mut pending_writer = PromptWriter {
+      task: tokio::spawn(pending::<io::Result<()>>()),
+      finished: false,
+    };
+    pending_writer.abort_and_wait().await.unwrap();
+
+    let dropped = PromptWriter {
+      task: tokio::spawn(pending::<io::Result<()>>()),
+      finished: false,
+    };
+    drop(dropped);
   }
 }
