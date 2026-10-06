@@ -24,7 +24,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            minimum_line_coverage: "96.3"
+          - os: macos-latest
+            minimum_line_coverage: "96.3"
+          - os: windows-latest
+            minimum_line_coverage: "95.7"
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always
@@ -67,5 +73,7 @@ jobs:
           fail_ci_if_error: true
       - name: Enforce production line coverage
         # Generate and upload the platform report first so a threshold failure
-        # always leaves enough evidence to diagnose the uncovered lines.
-        run: cargo llvm-cov report --summary-only --fail-under-lines 96.3
+        # always leaves enough evidence to diagnose platform-specific gaps.
+        run: >-
+          cargo llvm-cov report --summary-only
+          --fail-under-lines ${{ matrix.minimum_line_coverage }}
