@@ -1,3 +1,0 @@
-# Codex is an optional plugin and therefore must be selected by the local
-# operator. The runner expresses the same selection in its start request.
-plugins: [codex]

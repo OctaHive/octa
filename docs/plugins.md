@@ -14,6 +14,9 @@ are the source of truth. Plugin authors should normally use the `octa-plugin` SD
 Release manifests and lock-file verification are documented in
 [Reproducible plugins](plugin-distribution.md).
 
+Configuration and operational requirements for the official autonomous coding
+plugin are documented in [Codex task plugin](codex-plugin.md).
+
 `Hello` carries `protocol_version: 2` independently from the Octa and plugin
 package versions. Compatibility is decided from this protocol version; product
 semver is informational and may differ between Octa and a plugin.

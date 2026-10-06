@@ -117,12 +117,14 @@ jobs:
             cp ./octa_plugin_shell.exe ./release/plugins
             cp ./octa_plugin_tpl.exe ./release/plugins
             cp ./octa_plugin_junit.exe ./release/plugins
+            cp ./octa_plugin_codex.exe ./release/plugins
             cp octa.exe ./release
             cp octa-runner.exe ./release
           else
             cp ./octa_plugin_shell ./release/plugins
             cp ./octa_plugin_tpl ./release/plugins
             cp ./octa_plugin_junit ./release/plugins
+            cp ./octa_plugin_codex ./release/plugins
             cp octa ./release
             cp octa-runner ./release
           fi
@@ -130,23 +132,36 @@ jobs:
           SHELL_ENTRY="octa_plugin_shell"
           TPL_ENTRY="octa_plugin_tpl"
           JUNIT_ENTRY="octa_plugin_junit"
+          CODEX_ENTRY="octa_plugin_codex"
           if [[ "${{ matrix.platform.os }}" == "windows-2025" ]]; then
             SHELL_ENTRY="${SHELL_ENTRY}.exe"
             TPL_ENTRY="${TPL_ENTRY}.exe"
             JUNIT_ENTRY="${JUNIT_ENTRY}.exe"
+            CODEX_ENTRY="${CODEX_ENTRY}.exe"
           fi
           SHELL_DIGEST=$(sha256_digest "./release/plugins/${SHELL_ENTRY}")
           TPL_DIGEST=$(sha256_digest "./release/plugins/${TPL_ENTRY}")
           JUNIT_DIGEST=$(sha256_digest "./release/plugins/${JUNIT_ENTRY}")
+          CODEX_DIGEST=$(sha256_digest "./release/plugins/${CODEX_ENTRY}")
           VERSION="${GITHUB_REF_NAME#v}"
           printf 'manifest_version: 1\nname: shell\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\ncapabilities:\n  - shell\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$SHELL_ENTRY" "$SHELL_DIGEST" > ./release/plugins/shell.plugin.yml
           printf 'manifest_version: 1\nname: tpl\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$TPL_ENTRY" "$TPL_DIGEST" > ./release/plugins/tpl.plugin.yml
           printf 'manifest_version: 1\nname: junit\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$JUNIT_ENTRY" "$JUNIT_DIGEST" > ./release/plugins/junit.plugin.yml
-          printf 'version: 1\nplugins:\n  junit:\n    version: "%s"\n    protocol: %s\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    source: junit.plugin.yml\n  shell:\n    version: "%s"\n    protocol: %s\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    capabilities: [shell]\n    source: shell.plugin.yml\n  tpl:\n    version: "%s"\n    protocol: %s\n    platforms: [%s]\n    entrypoint: %s\n    sha256: %s\n    source: tpl.plugin.yml\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$JUNIT_ENTRY" "$JUNIT_DIGEST" "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$SHELL_ENTRY" "$SHELL_DIGEST" "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$TPL_ENTRY" "$TPL_DIGEST" > ./release/Octa.lock
+          printf 'manifest_version: 1\nname: codex\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$CODEX_ENTRY" "$CODEX_DIGEST" > ./release/plugins/codex.plugin.yml
 
-          # Exercise the packaged binary against the exact generated lock so a
-          # protocol or digest drift fails before an unusable archive is built.
-          OCTA_PLUGINS_DIR=./release/plugins "./release/${{ matrix.platform.bin }}" plugin verify --lock ./release/Octa.lock
+          # Generate the shipped lock through Octa itself so release metadata
+          # exercises exactly the same deterministic path operators use.
+          OCTA_PLUGINS_DIR=./release/plugins "./release/${{ matrix.platform.bin }}" plugin lock --output ./release/Octa.lock
+
+          # Exercise the packaged binary, generated lock, platform entrypoints,
+          # and digest rejection before an unusable archive is built.
+          PYTHON=python3
+          if [[ "${{ matrix.platform.os }}" == "windows-2025" ]]; then PYTHON=python; fi
+          "$PYTHON" ../../../conformance/release_plugins.py \
+            --octa "./release/${{ matrix.platform.bin }}" \
+            --plugins ./release/plugins \
+            --lock ./release/Octa.lock \
+            --platform "${{ matrix.platform.runtime_platform }}"
 
           # Inventory consumes this manifest without executing a potentially
           # guest-only binary on the agent host. Every matrix entry is native

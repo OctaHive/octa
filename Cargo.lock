@@ -2951,6 +2951,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_yml",
  "tempfile",
  "tokio",
  "tokio-util",

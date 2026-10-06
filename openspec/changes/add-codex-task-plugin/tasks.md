@@ -45,7 +45,7 @@
 
 ## 8. Distribute and document the plugin
 
-- [ ] 8.1 Add Codex plugin manifest/release packaging and lock-generation coverage for every supported Octa target, and verify release tests locate the platform binary and reject a digest mismatch.
-- [ ] 8.2 Document installation responsibility, supported Codex CLI versions, configuration fields, minimal environment, authentication through Octa secrets, audit-record formats, cache warning, cancellation behavior, and the separation from OctaCity; verify documentation examples parse against the plugin schema.
-- [ ] 8.3 Add local and agent-oriented example Octafiles showing inline/file prompts, structured results, declared deliverables, and semantic gating, and verify conformance runs entirely with the fixture and produces only standard runner events/resources.
-- [ ] 8.4 Run workspace formatting, strict Clippy, tests, rustdoc missing-doc checks, and the repository coverage gate on Linux, macOS, and Windows; verify no target-specific warnings, hangs, descendant leaks, or coverage regressions remain.
+- [x] 8.1 Add Codex plugin manifest/release packaging and lock-generation coverage for every supported Octa target, and verify release tests locate the platform binary and reject a digest mismatch.
+- [x] 8.2 Document installation responsibility, supported Codex CLI versions, configuration fields, minimal environment, authentication through Octa secrets, audit-record formats, cache warning, cancellation behavior, and the separation from OctaCity; verify documentation examples parse against the plugin schema.
+- [x] 8.3 Add local and agent-oriented example Octafiles showing inline/file prompts, structured results, declared deliverables, and semantic gating, and verify conformance runs entirely with the fixture and produces only standard runner events/resources.
+- [x] 8.4 Run workspace formatting, strict Clippy, tests, rustdoc missing-doc checks, and the repository coverage gate on Linux, macOS, and Windows; verify no target-specific warnings, hangs, descendant leaks, or coverage regressions remain.

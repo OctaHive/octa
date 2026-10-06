@@ -1,0 +1,2 @@
+# Codex is optional, so a local operator selects it explicitly.
+plugins: [codex]

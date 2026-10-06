@@ -6,6 +6,43 @@ fn validator() -> jsonschema::Validator {
   jsonschema::validator_for(&Value::Object(input_schema())).expect("Codex input schema must compile")
 }
 
+#[test]
+fn documented_configurations_match_the_advertised_contract() {
+  const EXAMPLE_PREFIX: &str = "<!-- codex-config -->\n```yaml\n";
+  let documentation = include_str!("../../../docs/codex-plugin.md");
+  let mut examples = 0;
+
+  for remainder in documentation.split(EXAMPLE_PREFIX).skip(1) {
+    let source = remainder
+      .split_once("\n```")
+      .expect("documented Codex configuration must close its YAML block")
+      .0;
+    let document: Value = serde_yml::from_str(source).expect("documented Codex configuration must be valid YAML");
+    let configuration = document
+      .get("codex")
+      .cloned()
+      .expect("documented configuration must contain one codex value");
+    assert!(
+      validator().is_valid(&configuration),
+      "documented configuration does not satisfy the plugin schema: {configuration}"
+    );
+    CodexConfig::parse(configuration).expect("documented configuration must satisfy semantic validation");
+    examples += 1;
+  }
+  assert_eq!(examples, 2, "every documented Codex configuration must be validated");
+
+  let schema = input_schema();
+  let fields = schema["properties"]
+    .as_object()
+    .expect("Codex input schema properties must be an object");
+  for field in fields.keys() {
+    assert!(
+      documentation.contains(&format!("| `{field}` |")),
+      "Codex documentation omits the '{field}' configuration field"
+    );
+  }
+}
+
 fn assert_schema_and_parser_reject(value: Value) {
   assert!(!validator().is_valid(&value), "schema accepted {value}");
   assert!(CodexConfig::parse(value.clone()).is_err(), "parser accepted {value}");

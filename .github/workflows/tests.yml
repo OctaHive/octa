@@ -5,10 +5,12 @@ on:
     branches:
       - "*"
     paths:
+      - ".github/workflows/tests.yml"
       - "crates/**"
       - "conformance/**"
       - "benchmarks/**"
       - "docs/**"
+      - "example/**"
       - "Cargo.toml"
       - "Cargo.lock"
 
@@ -125,4 +127,6 @@ jobs:
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Check rustdoc
+        run: cargo rustdoc -p octa_plugin_codex --bin octa_plugin_codex --all-features -- -D missing-docs

@@ -87,6 +87,17 @@ fn main() {
     "structured" => emit_event(
       r#"{"type":"turn.completed","result":{"outcome":"completed","files":2},"usage":{"input_tokens":3,"output_tokens":5}}"#,
     ),
+    "example-local" => {
+      write_workspace_file("out/review.md", b"# Fixture review\n\nNo issues found.\n");
+      emit_event(r#"{"type":"turn.completed","message":"review completed"}"#);
+    },
+    "example-agent" => {
+      write_workspace_file("out/change.patch", b"fixture patch\n");
+      write_workspace_file("out/summary.json", b"{\"status\":\"completed\"}\n");
+      emit_event(
+        r#"{"type":"turn.completed","result":{"outcome":"completed","files":2},"usage":{"input_tokens":3,"output_tokens":5}}"#,
+      );
+    },
     "unknown" => {
       emit_event(r#"{"type":"future.additive","payload":{"retained":true}}"#);
       emit_event(r#"{"type":"turn.completed","message":"done"}"#);
@@ -156,6 +167,13 @@ fn main() {
 fn emit_event(event: &str) {
   println!("{event}");
   std::io::stdout().flush().expect("fixture event must flush");
+}
+
+fn write_workspace_file(path: &str, contents: &[u8]) {
+  let path = Path::new(path);
+  std::fs::create_dir_all(path.parent().expect("fixture output path has a parent"))
+    .expect("fixture output directory must be writable");
+  std::fs::write(path, contents).expect("fixture output file must be writable");
 }
 
 fn emit_controlled_partial_frame(executable: &Path, control_directory: Option<&Path>) {

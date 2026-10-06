@@ -1,0 +1,47 @@
+version: 1
+
+vars:
+  CODEX_AUTH:
+    secret:
+      provider: authentication
+      key: codex-auth
+
+tasks:
+  implement:
+    cmds:
+      - id: codex
+        codex:
+          prompt_file: prompts/implement.md
+          result_schema:
+            type: object
+            properties:
+              outcome: { const: completed }
+              files: { type: integer, minimum: 1 }
+            required: [outcome, files]
+            additionalProperties: false
+          environment:
+            secret:
+              OPENAI_API_KEY: CODEX_AUTH
+          deliverables:
+            - kind: artifact
+              name: proposed-patch
+              path: out/change.patch
+              content_type: text/x-diff
+            - kind: report
+              name: implementation-summary
+              path: out/summary.json
+              format: codex.implementation.v1
+    outputs:
+      outcome: { step: codex, field: outcome }
+
+  verify-implementation:
+    deps: [implement]
+    vars:
+      CODEX_OUTCOME:
+        from: { task: implement, output: outcome }
+    shell: |
+      if [ "{{ CODEX_OUTCOME }}" != "completed" ]; then
+        echo "Codex implementation did not complete: {{ CODEX_OUTCOME }}" >&2
+        exit 1
+      fi
+      printf verified > semantic-outcome.verified

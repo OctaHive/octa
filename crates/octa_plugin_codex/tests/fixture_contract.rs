@@ -23,13 +23,14 @@ fn process_fixture() -> &'static Path {
   Path::new(env!("CARGO_BIN_EXE_codex-test-fixture"))
 }
 
-fn run_fixture(mode: &str, environment: Option<(&str, &str)>) -> FixtureOutput {
+fn run_fixture_in(mode: &str, environment: Option<(&str, &str)>, workspace: &Path) -> FixtureOutput {
   let directory = tempfile::tempdir().unwrap();
   let mut command = std::process::Command::new(process_fixture());
   command
     .env_clear()
     .env(FIXTURE_MODE_ENV, mode)
     .env(FIXTURE_CONTROL_DIRECTORY_ENV, directory.path())
+    .current_dir(workspace)
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
@@ -44,6 +45,11 @@ fn run_fixture(mode: &str, environment: Option<(&str, &str)>) -> FixtureOutput {
     stdout: output.stdout,
     stderr: output.stderr,
   }
+}
+
+fn run_fixture(mode: &str, environment: Option<(&str, &str)>) -> FixtureOutput {
+  let workspace = tempfile::tempdir().unwrap();
+  run_fixture_in(mode, environment, workspace.path())
 }
 
 fn json_lines(bytes: &[u8]) -> Vec<Value> {
@@ -87,6 +93,32 @@ fn fixture_emits_terminal_structured_unknown_and_secret_scenarios_without_ambien
   assert!(spilled.stdout.len() > DISK_SPILL_THRESHOLD_BYTES);
   assert!(String::from_utf8(spilled.stdout).unwrap().contains(secret));
   assert!(String::from_utf8(spilled.stderr).unwrap().contains(secret));
+}
+
+#[test]
+fn example_modes_create_their_declared_deliverables() {
+  let local = tempfile::tempdir().unwrap();
+  let output = run_fixture_in("example-local", None, local.path());
+  assert_eq!(json_lines(&output.stdout)[0]["message"], "review completed");
+  assert_eq!(
+    fs::read_to_string(local.path().join("out/review.md")).unwrap(),
+    "# Fixture review\n\nNo issues found.\n"
+  );
+
+  let agent = tempfile::tempdir().unwrap();
+  let output = run_fixture_in("example-agent", None, agent.path());
+  assert_eq!(
+    json_lines(&output.stdout)[0]["result"],
+    serde_json::json!({ "outcome": "completed", "files": 2 })
+  );
+  assert_eq!(
+    fs::read_to_string(agent.path().join("out/change.patch")).unwrap(),
+    "fixture patch\n"
+  );
+  assert_eq!(
+    fs::read_to_string(agent.path().join("out/summary.json")).unwrap(),
+    "{\"status\":\"completed\"}\n"
+  );
 }
 
 #[test]

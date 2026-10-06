@@ -1,0 +1,29 @@
+version: 1
+
+tasks:
+  review:
+    cmds:
+      - id: codex
+        codex:
+          prompt: |
+            Review the workspace. Write the review to out/review.md and finish
+            with a concise summary.
+          deliverables:
+            - kind: artifact
+              name: review-notes
+              path: out/review.md
+              content_type: text/markdown
+    outputs:
+      outcome: { step: codex, field: outcome }
+
+  verify-review:
+    deps: [review]
+    vars:
+      CODEX_OUTCOME:
+        from: { task: review, output: outcome }
+    shell: |
+      if [ "{{ CODEX_OUTCOME }}" != "completed" ]; then
+        echo "Codex review did not complete: {{ CODEX_OUTCOME }}" >&2
+        exit 1
+      fi
+      printf verified > semantic-outcome.verified

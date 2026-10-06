@@ -305,13 +305,15 @@ fn test_plugin_lock_and_verify_commands() {
   let workspace = TempDir::new().unwrap();
   let plugins = workspace.path().join("plugins");
   fs::create_dir(&plugins).unwrap();
-  for name in ["shell", "tpl"] {
+  for name in ["codex", "junit", "shell", "tpl"] {
     #[cfg(windows)]
     let entrypoint = format!("octa_plugin_{name}.exe");
     #[cfg(not(windows))]
     let entrypoint = format!("octa_plugin_{name}");
     let destination = plugins.join(&entrypoint);
-    fs::copy(validation_plugins_dir().join(&entrypoint), &destination).unwrap();
+    // Verification treats plugin executables as opaque bytes and never starts
+    // them, so the test binary provides a dependency-free digest fixture.
+    fs::copy(env!("CARGO_BIN_EXE_octa"), &destination).unwrap();
     let sha256 = tokio::runtime::Runtime::new()
       .unwrap()
       .block_on(sha256_file(&destination))
@@ -346,7 +348,7 @@ fn test_plugin_lock_and_verify_commands() {
     .arg(&lock)
     .assert()
     .success()
-    .stdout(predicate::str::contains("Locked 2 plugins"));
+    .stdout(predicate::str::contains("Locked 4 plugins"));
   assert!(lock.is_file());
 
   let mut command = Command::cargo_bin("octa").unwrap();
@@ -356,7 +358,31 @@ fn test_plugin_lock_and_verify_commands() {
     .args(["plugin", "verify", "--lock", "Octa.lock"])
     .assert()
     .success()
-    .stdout(predicate::str::contains("Verified 2 locked plugins"));
+    .stdout(predicate::str::contains("Verified 4 locked plugins"));
+
+  let release_test = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../conformance/release_plugins.py");
+  #[cfg(windows)]
+  let python = "python";
+  #[cfg(not(windows))]
+  let python = "python3";
+  let output = std::process::Command::new(python)
+    .arg(release_test)
+    .arg("--octa")
+    .arg(env!("CARGO_BIN_EXE_octa"))
+    .arg("--plugins")
+    .arg(&plugins)
+    .arg("--lock")
+    .arg(&lock)
+    .arg("--platform")
+    .arg(current_platform())
+    .output()
+    .unwrap();
+  assert!(
+    output.status.success(),
+    "release plugin verification failed:\nstdout={}\nstderr={}",
+    String::from_utf8_lossy(&output.stdout),
+    String::from_utf8_lossy(&output.stderr)
+  );
 }
 
 #[test]
