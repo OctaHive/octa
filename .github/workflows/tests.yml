@@ -43,6 +43,8 @@ jobs:
         if: matrix.os == 'windows-latest'
         with:
           python-version: "3.13"
+      - name: Build Codex plugin and fixture
+        run: cargo build -p octa_plugin_codex --bins
       - name: Build plugin for Linux and Mac OS
         if: matrix.os != 'windows-latest'
         run: |
@@ -76,6 +78,31 @@ jobs:
           RUNNER="target/debug/octa-runner"
           if [[ "${{ matrix.os }}" == "windows-latest" ]]; then RUNNER="${RUNNER}.exe"; fi
           python conformance/agent_ready.py --runner "$RUNNER" --plugins target/debug
+      - name: Run Codex CLI and runner conformance
+        shell: bash
+        run: |
+          OCTA="target/debug/octa"
+          RUNNER="target/debug/octa-runner"
+          CODEX_FIXTURE="target/debug/codex-test-fixture"
+          if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+            OCTA="${OCTA}.exe"
+            RUNNER="${RUNNER}.exe"
+            CODEX_FIXTURE="${CODEX_FIXTURE}.exe"
+          fi
+          python conformance/codex_task.py \
+            --octa "$OCTA" \
+            --runner "$RUNNER" \
+            --plugins target/debug \
+            --codex-fixture "$CODEX_FIXTURE"
+          python conformance/codex_runner.py \
+            --runner "$RUNNER" \
+            --plugins target/debug \
+            --codex-fixture "$CODEX_FIXTURE"
+          python conformance/codex_secrets.py \
+            --octa "$OCTA" \
+            --runner "$RUNNER" \
+            --plugins target/debug \
+            --codex-fixture "$CODEX_FIXTURE"
       - name: Upload Log to Github
         if: failure()
         uses: actions/upload-artifact@v4

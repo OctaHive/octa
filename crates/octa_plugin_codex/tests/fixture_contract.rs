@@ -11,6 +11,8 @@ use serde_json::Value;
 const FIXTURE_SECRET_ENV: &str = "OCTA_CODEX_FIXTURE_SECRET";
 const FIXTURE_MODE_ENV: &str = "OCTA_CODEX_FIXTURE_MODE";
 const FIXTURE_CONTROL_DIRECTORY_ENV: &str = "OCTA_CODEX_FIXTURE_CONTROL_DIRECTORY";
+const DISK_SPILL_THRESHOLD_BYTES: usize = 1024 * 1024;
+const TRACE_LIMIT_BYTES: usize = 16 * 1024 * 1024;
 
 struct FixtureOutput {
   stdout: Vec<u8>,
@@ -80,6 +82,11 @@ fn fixture_emits_terminal_structured_unknown_and_secret_scenarios_without_ambien
   let echoed = run_fixture("secret-echo", Some((FIXTURE_SECRET_ENV, secret)));
   assert!(String::from_utf8(echoed.stdout).unwrap().contains(secret));
   assert!(String::from_utf8(echoed.stderr).unwrap().contains(secret));
+
+  let spilled = run_fixture("secret-spill", Some((FIXTURE_SECRET_ENV, secret)));
+  assert!(spilled.stdout.len() > DISK_SPILL_THRESHOLD_BYTES);
+  assert!(String::from_utf8(spilled.stdout).unwrap().contains(secret));
+  assert!(String::from_utf8(spilled.stderr).unwrap().contains(secret));
 }
 
 #[test]
@@ -97,6 +104,20 @@ fn fixture_exposes_each_invalid_stream_shape_deterministically() {
   let missing = json_lines(&run_fixture("missing-terminal", None).stdout);
   assert_eq!(missing.len(), 1);
   assert_eq!(missing[0]["type"], "turn.started");
+
+  let noisy = json_lines(&run_fixture("noisy-stream", None).stdout);
+  assert!(noisy.len() > 32, "noisy stream did not exceed the response queue");
+  assert_eq!(noisy.last().unwrap()["type"], "turn.completed");
+
+  let trace_overflow = run_fixture("trace-overflow-stream", None);
+  assert!(
+    trace_overflow.stdout.len() > TRACE_LIMIT_BYTES,
+    "trace-overflow stream did not exceed the retained trace limit"
+  );
+  assert_eq!(
+    json_lines(&trace_overflow.stdout).last().unwrap()["type"],
+    "turn.completed"
+  );
 }
 
 #[test]

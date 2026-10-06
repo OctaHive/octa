@@ -20,9 +20,9 @@
 ## 4. Stream and sanitize harness events
 
 - [x] 4.1 Implement a bounded incremental JSONL decoder with one terminal-event state machine, and verify tests cover split reads, Unicode boundaries, unknown additive events, malformed/oversized frames, duplicate terminals, missing terminals, and preserved ordering.
-- [ ] 4.2 Normalize supported harness activity into existing stdout, stderr, progress, and diagnostic responses, and verify a socket-level plugin test observes activity before the terminal response with no Codex-specific protocol variants.
-- [ ] 4.3 Sanitize resolved secret scalars recursively before logging, forwarding, retaining, or writing event data, and verify adversarial fixtures cannot expose selected secrets in stdout, stderr, diagnostics, structured output, or the sanitized trace.
-- [ ] 4.4 Enforce independent named limits for stderr, trace, final message, structured result, and usage metadata, and verify each limit cancels the fixture process and returns a bounded error without retaining an incomplete record as a valid result.
+- [x] 4.2 Normalize supported harness activity into existing stdout, stderr, progress, and diagnostic responses, and verify a socket-level plugin test observes activity before the terminal response with no Codex-specific protocol variants.
+- [x] 4.3 Sanitize resolved secret scalars recursively before logging, forwarding, retaining, or writing event data, and verify adversarial fixtures cannot expose selected secrets in stdout, stderr, diagnostics, structured output, or the sanitized trace.
+- [x] 4.4 Enforce independent named limits for stderr, trace, final message, structured result, and usage metadata, and verify each limit cancels the fixture process and returns a bounded error without retaining an incomplete record as a valid result.
 
 ## 5. Own the process lifecycle
 
@@ -39,9 +39,9 @@
 
 ## 7. Integrate with Octa and runner behavior
 
-- [ ] 7.1 Add an Octafile/CLI integration fixture for a local Codex task and a semantic-outcome gate task, and verify the same fixture produces generic outputs, reports, and artifacts through `octa-runner` without an OctaCity dependency.
-- [ ] 7.2 Add runner tests for cancellation, task timeout, slow event consumers, bounded records, and resource-path validation with the Codex fixture, and verify failures leave no child process or publishable partial records.
-- [ ] 7.3 Add secret-provider integration coverage that supplies an authentication variable through the existing secrets profile, and verify the value is absent from JobSpec fixtures, runner events, plugin logs, spool/output captures, and all run records.
+- [x] 7.1 Add an Octafile/CLI integration fixture for a local Codex task and a semantic-outcome gate task, and verify the same fixture produces generic outputs, reports, and artifacts through `octa-runner` without an OctaCity dependency.
+- [x] 7.2 Add runner tests for cancellation, task timeout, slow event consumers, bounded records, and resource-path validation with the Codex fixture, and verify failures leave no child process or publishable partial records.
+- [x] 7.3 Add secret-provider integration coverage that supplies an authentication variable through the existing secrets profile, and verify the value is absent from JobSpec fixtures, runner events, plugin logs, spool/output captures, and all run records.
 
 ## 8. Distribute and document the plugin
 

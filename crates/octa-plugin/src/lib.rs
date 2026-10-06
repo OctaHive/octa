@@ -1140,7 +1140,7 @@ mod tests {
   }
 
   #[tokio::test]
-  async fn secret_producer_payload_is_redacted_from_plugin_logs() {
+  async fn secret_producer_payload_is_redacted_from_persisted_plugin_logs() {
     let (reader, writer) = tokio::io::duplex(1024);
     let writer = Arc::new(Mutex::new(writer));
     let active_commands = Arc::new(Mutex::new(HashMap::new()));
@@ -1150,7 +1150,9 @@ mod tests {
       should_fail: false,
       output_lines: Vec::new(),
     });
-    let logger = Arc::new(MockLogger::new());
+    let logs = tempdir().unwrap();
+    let logger_system = LoggerSystem::new("codex", Some(logs.path().to_string_lossy().into_owned())).unwrap();
+    let logger = logger_system.get_logger();
     let secret = "secret-producing-payload";
     let command = OctaCommand::Execute {
       id: "command".to_owned(),
@@ -1178,9 +1180,11 @@ mod tests {
     .unwrap();
     response_handle.await.unwrap();
 
-    let messages = logger.as_any().downcast_ref::<MockLogger>().unwrap().get_messages();
-    assert!(messages.iter().all(|message| !message.contains(secret)));
-    assert!(messages.iter().any(|message| message.contains("*****")));
+    drop(logger);
+    logger_system.shutdown().unwrap();
+    let persisted = std::fs::read_to_string(logs.path().join("codex.log")).unwrap();
+    assert!(!persisted.contains(secret));
+    assert!(persisted.contains("*****"));
   }
 
   #[tokio::test]

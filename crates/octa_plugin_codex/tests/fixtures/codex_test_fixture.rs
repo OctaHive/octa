@@ -20,6 +20,17 @@ const CONTROL_DIRECTORY_ENV: &str = "OCTA_CODEX_FIXTURE_CONTROL_DIRECTORY";
 const OVERSIZED_FRAME_PAYLOAD_BYTES: usize = 1024 * 1024 + 1;
 const CONTROL_WAIT_STEPS: usize = 600;
 const CONTROL_WAIT_INTERVAL: Duration = Duration::from_millis(5);
+// Exceeds the plugin client's private response queue and the runner's output
+// pipe while remaining comfortably below the Codex trace byte limit.
+const NOISY_EVENT_COUNT: usize = 10_000;
+const TRACE_OVERFLOW_EVENT_COUNT: usize = 20;
+// Twenty frames at this size exceed the 16 MiB retained-trace limit while
+// each individual frame remains below the 1 MiB protocol-frame limit.
+const TRACE_OVERFLOW_PAYLOAD_BYTES: usize = 900 * 1024;
+const SECRET_SPILL_EVENT_COUNT: usize = 80;
+// The aggregate sanitized output exceeds both 1 MiB disk-spill thresholds but
+// remains below the independent trace and runner-capture limits.
+const SECRET_SPILL_PADDING_BYTES: usize = 16 * 1024;
 
 fn main() {
   let executable = std::env::current_exe().expect("fixture executable path must be available");
@@ -80,8 +91,19 @@ fn main() {
       emit_event(r#"{"type":"future.additive","payload":{"retained":true}}"#);
       emit_event(r#"{"type":"turn.completed","message":"done"}"#);
     },
+    "noisy" => {
+      spawn_runtime_descendant(&executable, control_directory.as_deref());
+      emit_noisy_stream();
+    },
+    "noisy-stream" => emit_noisy_stream(),
+    "trace-overflow" => {
+      spawn_runtime_descendant(&executable, control_directory.as_deref());
+      emit_trace_overflow_stream();
+    },
+    "trace-overflow-stream" => emit_trace_overflow_stream(),
     "partial" => emit_controlled_partial_frame(&executable, control_directory.as_deref()),
     "secret-echo" => emit_secret_echo(),
+    "secret-spill" => emit_secret_spill(),
     "malformed" => emit_event("{not-json}"),
     "oversized" => emit_oversized_frame(),
     "duplicate-terminal" => {
@@ -90,9 +112,7 @@ fn main() {
     },
     "missing-terminal" => emit_event(r#"{"type":"turn.started"}"#),
     "descendant" => {
-      let heartbeat = runtime_path(&executable, control_directory.as_deref(), "run-descendant-heartbeat");
-      spawn_descendant(&executable, &heartbeat, "runtime descendant must start");
-      wait_for_file(&heartbeat, "runtime descendant did not become ready");
+      spawn_runtime_descendant(&executable, control_directory.as_deref());
       emit_event(r#"{"type":"turn.started"}"#);
       wait_for_file(
         &runtime_path(&executable, control_directory.as_deref(), "release-run"),
@@ -169,6 +189,12 @@ fn runtime_path(executable: &Path, control_directory: Option<&Path>, name: &str)
     .unwrap_or_else(|| executable.with_extension(name))
 }
 
+fn spawn_runtime_descendant(executable: &Path, control_directory: Option<&Path>) {
+  let heartbeat = runtime_path(executable, control_directory, "run-descendant-heartbeat");
+  spawn_descendant(executable, &heartbeat, "runtime descendant must start");
+  wait_for_file(&heartbeat, "runtime descendant did not become ready");
+}
+
 fn emit_secret_echo() {
   let secret = std::env::var(SECRET_ENV).expect("secret-echo mode requires its explicit fixture variable");
   let event = serde_json::json!({
@@ -177,6 +203,43 @@ fn emit_secret_echo() {
   });
   emit_event(&serde_json::to_string(&event).expect("fixture event must serialize"));
   eprintln!("stderr {secret}");
+  emit_event(r#"{"type":"turn.completed","message":"done"}"#);
+}
+
+fn emit_secret_spill() {
+  let secret = std::env::var(SECRET_ENV).expect("secret-spill mode requires its explicit fixture variable");
+  let padding = "x".repeat(SECRET_SPILL_PADDING_BYTES);
+  for index in 0..SECRET_SPILL_EVENT_COUNT {
+    let event = serde_json::json!({
+      "type": "item.completed",
+      "item": {
+        "type": "agent_message",
+        "text": format!("event-{index} {secret} {padding}")
+      }
+    });
+    emit_event(&serde_json::to_string(&event).expect("fixture event must serialize"));
+  }
+  eprintln!("stderr {secret}");
+  emit_event(r#"{"type":"turn.completed","message":"done"}"#);
+}
+
+fn emit_noisy_stream() {
+  for index in 0..NOISY_EVENT_COUNT {
+    emit_event(&format!(
+      r#"{{"type":"item.completed","item":{{"type":"agent_message","text":"event-{index}"}}}}"#
+    ));
+  }
+  emit_event(r#"{"type":"turn.completed","message":"done"}"#);
+}
+
+fn emit_trace_overflow_stream() {
+  let event = format!(
+    r#"{{"type":"future.additive","padding":"{}"}}"#,
+    "x".repeat(TRACE_OVERFLOW_PAYLOAD_BYTES)
+  );
+  for _ in 0..TRACE_OVERFLOW_EVENT_COUNT {
+    emit_event(&event);
+  }
   emit_event(r#"{"type":"turn.completed","message":"done"}"#);
 }
 

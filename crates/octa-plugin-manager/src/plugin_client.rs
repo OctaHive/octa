@@ -46,8 +46,16 @@ pub enum PluginClientError {
   ConnectionClosed,
   VersionMismatch,
   WriterClosed,
-  FrameTooLarge { bytes: usize, limit: usize },
-  ResponseQueueOverflow { id: String, capacity: usize },
+  FrameTooLarge {
+    bytes: usize,
+    limit: usize,
+  },
+  /// One command exhausted its private response queue. Failing only that
+  /// command keeps the shared plugin socket responsive for other executions.
+  ResponseQueueOverflow {
+    id: String,
+    capacity: usize,
+  },
 }
 
 impl From<PluginClientError> for io::Error {
@@ -147,6 +155,8 @@ struct CommandRoute {
   state: CommandRouteState,
   sender: Option<mpsc::Sender<PluginResponse>>,
   progress: watch::Sender<Option<ProgressUpdate>>,
+  /// Signals a queue overflow without blocking the single shared socket
+  /// reader, which must remain available to route unrelated commands.
   overflowed: CancellationToken,
   completed: CancellationToken,
 }
