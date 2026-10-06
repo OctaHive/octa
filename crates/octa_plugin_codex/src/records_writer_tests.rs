@@ -7,11 +7,14 @@ use serde_json::{json, Value};
 use super::*;
 use crate::{
   config::CodexConfig,
-  contract::{RECORDS_DIRECTORY, RECORDS_STAGING_DIRECTORY},
+  contract::RECORDS_DIRECTORY,
   events::EventDecoder,
   invocation::{CodexExecutable, CodexInvocation, EnvironmentSources, StructuredResultTarget},
   sanitization::{RunSanitizer, SanitizedEvent},
 };
+
+#[cfg(unix)]
+use crate::contract::RECORDS_STAGING_DIRECTORY;
 
 fn sanitized_event(value: Value, sanitizer: &RunSanitizer) -> SanitizedEvent {
   let mut bytes = serde_json::to_vec(&value).unwrap();

@@ -360,11 +360,33 @@ fn test_plugin_lock_and_verify_commands() {
     .success()
     .stdout(predicate::str::contains("Verified 4 locked plugins"));
 
-  let release_test = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../conformance/release_plugins.py");
+  let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+  let release_test = repository.join("conformance/release_plugins.py");
+  let metadata_tool = repository.join("conformance/codex_release_metadata.py");
+  let codex_source = repository.join("crates/octa_plugin_codex/src/invocation/executable.rs");
+  let codex_metadata = workspace.path().join("codex-compatibility.json");
   #[cfg(windows)]
   let python = "python";
   #[cfg(not(windows))]
   let python = "python3";
+  let metadata_output = std::process::Command::new(python)
+    .arg(metadata_tool)
+    .arg("--source")
+    .arg(&codex_source)
+    .arg("--plugin-version")
+    .arg(env!("CARGO_PKG_VERSION"))
+    .arg("--plugin-protocol")
+    .arg(PLUGIN_PROTOCOL_VERSION.to_string())
+    .arg("--output")
+    .arg(&codex_metadata)
+    .output()
+    .unwrap();
+  assert!(
+    metadata_output.status.success(),
+    "Codex release metadata generation failed:\nstdout={}\nstderr={}",
+    String::from_utf8_lossy(&metadata_output.stdout),
+    String::from_utf8_lossy(&metadata_output.stderr)
+  );
   let output = std::process::Command::new(python)
     .arg(release_test)
     .arg("--octa")
@@ -375,6 +397,14 @@ fn test_plugin_lock_and_verify_commands() {
     .arg(&lock)
     .arg("--platform")
     .arg(current_platform())
+    .arg("--codex-metadata")
+    .arg(&codex_metadata)
+    .arg("--codex-source")
+    .arg(&codex_source)
+    .arg("--plugin-version")
+    .arg(env!("CARGO_PKG_VERSION"))
+    .arg("--plugin-protocol")
+    .arg(PLUGIN_PROTOCOL_VERSION.to_string())
     .output()
     .unwrap();
   assert!(
