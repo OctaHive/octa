@@ -149,19 +149,29 @@ jobs:
           printf 'manifest_version: 1\nname: junit\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$JUNIT_ENTRY" "$JUNIT_DIGEST" > ./release/plugins/junit.plugin.yml
           printf 'manifest_version: 1\nname: codex\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$CODEX_ENTRY" "$CODEX_DIGEST" > ./release/plugins/codex.plugin.yml
 
+          PYTHON=python3
+          if [[ "${{ matrix.platform.os }}" == "windows-2025" ]]; then PYTHON=python; fi
+          "$PYTHON" ../../../conformance/codex_release_metadata.py \
+            --source ../../../crates/octa_plugin_codex/src/invocation/executable.rs \
+            --plugin-version "$VERSION" \
+            --plugin-protocol "$PLUGIN_PROTOCOL" \
+            --output ./release/codex-compatibility.json
+
           # Generate the shipped lock through Octa itself so release metadata
           # exercises exactly the same deterministic path operators use.
           OCTA_PLUGINS_DIR=./release/plugins "./release/${{ matrix.platform.bin }}" plugin lock --output ./release/Octa.lock
 
           # Exercise the packaged binary, generated lock, platform entrypoints,
           # and digest rejection before an unusable archive is built.
-          PYTHON=python3
-          if [[ "${{ matrix.platform.os }}" == "windows-2025" ]]; then PYTHON=python; fi
           "$PYTHON" ../../../conformance/release_plugins.py \
             --octa "./release/${{ matrix.platform.bin }}" \
             --plugins ./release/plugins \
             --lock ./release/Octa.lock \
-            --platform "${{ matrix.platform.runtime_platform }}"
+            --platform "${{ matrix.platform.runtime_platform }}" \
+            --codex-metadata ./release/codex-compatibility.json \
+            --codex-source ../../../crates/octa_plugin_codex/src/invocation/executable.rs \
+            --plugin-version "$VERSION" \
+            --plugin-protocol "$PLUGIN_PROTOCOL"
 
           # Inventory consumes this manifest without executing a potentially
           # guest-only binary on the agent host. Every matrix entry is native

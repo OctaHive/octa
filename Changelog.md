@@ -1,3 +1,18 @@
+## 0.5.0 - 2026-10-06
+
+### Highlights
+
+- Added the official `codex` task plugin for bounded unattended Codex CLI execution through the existing Octa plugin and runner protocols.
+- Added strict prompt, environment, structured-result, deliverable, audit-record, and supported Codex CLI `0.130.0` contracts without introducing an OctaCity-specific execution path.
+- Added sanitized bounded JSONL progress, complete process-tree cancellation, schema-validated results, and generic artifact/report publication for Codex tasks.
+- Added automatic local task-result caching for explicitly cacheable CLI task graphs while keeping headless runner caching explicitly negotiated.
+
+### Important changes
+
+- Release archives now contain `octa_plugin_codex`, `codex.plugin.yml`, and the matching `Octa.lock` entry on every supported platform. Codex CLI and its authentication remain operator-installed inputs and are not bundled.
+- `OCTA_CODEX_EXECUTABLE` must identify an absolute operator-protected Codex CLI `0.130.0` executable. Unsupported or mutable executable identities are rejected before task inputs or credentials are exposed.
+- Codex tasks are non-cacheable by default. Any explicit cache configuration remains the workflow author's responsibility and must describe all relevant model, tool, and external-service inputs.
+
 ## 0.4.0 - 2026-09-15
 
 ### Highlights

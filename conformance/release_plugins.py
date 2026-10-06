@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import codex_release_metadata
+
 
 OFFICIAL_PLUGINS = ("codex", "junit", "shell", "tpl")
 PROCESS_TIMEOUT_SECONDS = 60
@@ -44,7 +46,16 @@ def require_success(completed: subprocess.CompletedProcess[str], operation: str)
         )
 
 
-def verify_release(octa: Path, plugins: Path, lock: Path, platform: str) -> None:
+def verify_release(
+    octa: Path,
+    plugins: Path,
+    lock: Path,
+    platform: str,
+    codex_metadata: Path,
+    codex_source: Path,
+    plugin_version: str,
+    plugin_protocol: int,
+) -> None:
     """Validates manifest discovery, lock generation, and tamper rejection."""
     for plugin in OFFICIAL_PLUGINS:
         binary = plugins / entrypoint(plugin, platform)
@@ -55,6 +66,12 @@ def verify_release(octa: Path, plugins: Path, lock: Path, platform: str) -> None
     require_success(
         run_octa(octa, plugins, "plugin", "verify", "--lock", str(lock)),
         "shipped plugin lock verification",
+    )
+    expected_metadata = codex_release_metadata.document(
+        codex_source, plugin_version, plugin_protocol
+    )
+    assert codex_release_metadata.load(codex_metadata) == expected_metadata, (
+        "Codex compatibility metadata does not match the packaged plugin"
     )
 
     with tempfile.TemporaryDirectory(prefix="octa-release-plugins-") as temporary:
@@ -94,8 +111,21 @@ def main() -> None:
     parser.add_argument("--plugins", type=Path, required=True)
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--platform", required=True)
+    parser.add_argument("--codex-metadata", type=Path, required=True)
+    parser.add_argument("--codex-source", type=Path, required=True)
+    parser.add_argument("--plugin-version", required=True)
+    parser.add_argument("--plugin-protocol", type=int, required=True)
     args = parser.parse_args()
-    verify_release(args.octa.resolve(), args.plugins.resolve(), args.lock.resolve(), args.platform)
+    verify_release(
+        args.octa.resolve(),
+        args.plugins.resolve(),
+        args.lock.resolve(),
+        args.platform,
+        args.codex_metadata.resolve(),
+        args.codex_source.resolve(),
+        args.plugin_version,
+        args.plugin_protocol,
+    )
 
 
 if __name__ == "__main__":

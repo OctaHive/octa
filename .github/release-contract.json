@@ -1,6 +1,7 @@
 {
   "format_version": 1,
   "runner_capabilities": "octa-runner-capabilities.json",
+  "codex_compatibility": "codex-compatibility.json",
   "checksums": "SHA256SUMS",
   "provenance": "github-build-provenance"
 }
