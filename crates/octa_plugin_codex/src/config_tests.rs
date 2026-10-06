@@ -9,7 +9,7 @@ fn validator() -> jsonschema::Validator {
 #[test]
 fn documented_configurations_match_the_advertised_contract() {
   const EXAMPLE_PREFIX: &str = "<!-- codex-config -->\n```yaml\n";
-  let documentation = include_str!("../../../docs/codex-plugin.md");
+  let documentation = include_str!("../../../docs/codex-plugin.md").replace("\r\n", "\n");
   let mut examples = 0;
 
   for remainder in documentation.split(EXAMPLE_PREFIX).skip(1) {
