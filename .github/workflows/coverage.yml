@@ -66,8 +66,6 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
       - name: Enforce production line coverage
-        # Linux and macOS already satisfy the established gate. Windows was
-        # added later and needs a measured platform baseline before enforcing
-        # a threshold for its platform-specific control-flow.
-        if: matrix.os != 'windows-latest'
+        # Generate and upload the platform report first so a threshold failure
+        # always leaves enough evidence to diagnose the uncovered lines.
         run: cargo llvm-cov report --summary-only --fail-under-lines 96.3
