@@ -9,7 +9,10 @@ use std::{
 };
 
 use indexmap::IndexMap;
-use serde::{de::DeserializeSeed, Deserialize, Deserializer, Serialize};
+use serde::{
+  de::{DeserializeSeed, IntoDeserializer},
+  Deserialize, Deserializer, Serialize,
+};
 use serde_yml::Value;
 use tera::{Context as TeraContext, Tera};
 use tracing::{debug, info};
@@ -559,8 +562,9 @@ impl Octafile {
             } else {
               let value = task_value.into_value()?;
               let task_seed = TaskSeed { context: &context };
-              let deserializer = serde_yml::Deserializer::new(&value);
-              task_seed.deserialize(deserializer).map_err(|e| e.to_string())?
+              task_seed
+                .deserialize(value.into_deserializer())
+                .map_err(|e| e.to_string())?
             };
 
             if tasks.insert(task_name.clone(), task).is_some() {

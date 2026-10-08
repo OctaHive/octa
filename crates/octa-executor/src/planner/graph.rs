@@ -671,7 +671,10 @@ impl TaskGraphBuilder {
     FindResult {
       name: match &plugin.value {
         serde_yml::Value::String(command) => command.clone(),
-        value => value.to_string(),
+        value => serde_yml::to_string(value)
+          .expect("validated plugin values must remain YAML-serializable")
+          .trim()
+          .to_owned(),
       },
       octafile: command.octafile.clone(),
       task,

@@ -2458,19 +2458,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5438dd2b2ff4c6df6e1ce22d825ed2fa93ee2922235cc45186991717f0a892d"
 
 [[package]]
-name = "noyalib"
-version = "0.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e493c05128df7a83b9676b709d590e0ebc285c7ed3152bc679668e8c1e506af5"
-dependencies = [
- "indexmap",
- "memchr",
- "rustc-hash",
- "serde",
- "smallvec",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2694,7 +2681,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
- "serde_yml",
+ "serde_norway",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -2738,7 +2725,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "serde_yml",
+ "serde_norway",
  "shellexpand",
  "tempfile",
  "tera",
@@ -2758,7 +2745,7 @@ dependencies = [
  "anyhow",
  "octa-octafile",
  "serde",
- "serde_yml",
+ "serde_norway",
  "tempfile",
  "test-log",
  "thiserror 2.0.20",
@@ -2793,7 +2780,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
- "serde_yml",
+ "serde_norway",
  "tempfile",
  "tera",
  "thiserror 2.0.20",
@@ -2846,7 +2833,7 @@ name = "octa-plugin-lock"
 version = "0.5.1"
 dependencies = [
  "serde",
- "serde_yml",
+ "serde_norway",
 ]
 
 [[package]]
@@ -2863,7 +2850,7 @@ dependencies = [
  "same-file",
  "serde",
  "serde_json",
- "serde_yml",
+ "serde_norway",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
@@ -2893,7 +2880,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
- "serde_yml",
+ "serde_norway",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -2951,7 +2938,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "serde_yml",
+ "serde_norway",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -3942,6 +3929,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_norway"
+version = "0.9.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e408f29489b5fd500fab51ff1484fc859bb655f32c671f307dcd733b72e8168c"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml-norway",
+]
+
+[[package]]
 name = "serde_path_to_error"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3970,16 +3970,6 @@ dependencies = [
  "form_urlencoded",
  "itoa",
  "ryu",
- "serde",
-]
-
-[[package]]
-name = "serde_yml"
-version = "0.0.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "909764a65f86829ccdb5eea9ab355843aa02c019a7bfd47465092953565caa05"
-dependencies = [
- "noyalib",
  "serde",
 ]
 
@@ -4724,6 +4714,12 @@ name = "unit-prefix"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81e544489bf3d8ef66c953931f56617f423cd4b5494be343d9b9d3dda037b9a3"
+
+[[package]]
+name = "unsafe-libyaml-norway"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b39abd59bf32521c7f2301b52d05a6a2c975b6003521cbd0c6dc1582f0a22104"
 
 [[package]]
 name = "untrusted"

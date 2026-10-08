@@ -497,7 +497,7 @@ impl Context {
   fn parse_condition_command(&self, value: Value) -> Result<PluginCommand, String> {
     let (key, value) = match value {
       Value::String(command) => (self.default_plugin().to_owned(), Value::String(command)),
-      Value::Mapping(mapping) if mapping.len() == 1 => mapping.into_iter().next().unwrap(),
+      Value::Mapping(mapping) if mapping.len() == 1 => string_mapping_entry(mapping.into_iter().next().unwrap())?,
       _ => return Err("a condition must be a string or contain exactly one plugin task type".to_string()),
     };
 
@@ -559,6 +559,7 @@ impl Context {
       .transpose()?;
 
     if let Some((key, _)) = mapping.into_iter().next() {
+      let key = string_mapping_key(key)?;
       return Err(format!("unknown task condition field '{key}'"));
     }
     if before_deps.is_none() && after_deps.is_none() {
@@ -675,7 +676,7 @@ impl Context {
           return Err("a plugin command must contain exactly one plugin task type".to_string());
         }
 
-        let (key, value) = mapping.into_iter().next().unwrap();
+        let (key, value) = string_mapping_entry(mapping.into_iter().next().unwrap())?;
         if !self.contains(&key) {
           return Err(format!("unknown plugin command type '{key}'"));
         }
@@ -765,6 +766,17 @@ impl Context {
       }
     }
     Ok(())
+  }
+}
+
+fn string_mapping_entry((key, value): (Value, Value)) -> Result<(String, Value), String> {
+  Ok((string_mapping_key(key)?, value))
+}
+
+fn string_mapping_key(key: Value) -> Result<String, String> {
+  match key {
+    Value::String(key) => Ok(key),
+    _ => Err("mapping keys must be strings".to_owned()),
   }
 }
 
@@ -987,6 +999,7 @@ impl<'de> Visitor<'de> for TaskVisitor<'_> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use serde::de::IntoDeserializer as _;
 
   fn context() -> Context {
     Context::from_keys(vec!["shell".to_owned(), "tpl".to_owned()], "shell").unwrap()
@@ -1023,7 +1036,7 @@ mod tests {
   fn parse_task(context: &Context, content: &str) -> Result<Task, String> {
     let value = yaml_value(content);
     TaskSeed { context }
-      .deserialize(serde_yml::Deserializer::new(&value))
+      .deserialize(value.into_deserializer())
       .map_err(|error| error.to_string())
   }
 

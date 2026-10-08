@@ -1,6 +1,9 @@
 use std::{collections::HashMap, fs::File, io::Read, path::Path};
 
-use serde_yml::{Mapping, Number, Tag as ValueTag, TaggedValue, Value};
+use serde_yml::{
+  value::{Tag as ValueTag, TaggedValue},
+  Mapping, Number, Value,
+};
 use yaml_rust2::{
   parser::{Event, MarkedEventReceiver, Parser, Tag},
   scanner::{Marker, TScalarStyle},
@@ -80,7 +83,10 @@ impl Node {
             .map(str::to_owned)
             .ok_or_else(|| location_error(marker, "mapping keys must be strings"))?;
 
-          if mapping.insert(key.clone(), value.into_value()?).is_some() {
+          if mapping
+            .insert(Value::String(key.clone()), value.into_value()?)
+            .is_some()
+          {
             return Err(location_error(marker, &format!("duplicated key '{key}'")));
           }
         }
@@ -91,10 +97,10 @@ impl Node {
 
     if preserve_tag {
       if let Some(tag) = self.tag.filter(|tag| !is_standard_tag(tag)) {
-        return Ok(Value::Tagged(Box::new(TaggedValue::new(
-          ValueTag::new(format!("{}{}", tag.handle, tag.suffix)),
+        return Ok(Value::Tagged(Box::new(TaggedValue {
+          tag: ValueTag::new(format!("{}{}", tag.handle, tag.suffix)),
           value,
-        ))));
+        })));
       }
     }
 
