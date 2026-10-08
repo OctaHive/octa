@@ -100,6 +100,11 @@ impl ToolAuthorizer {
   #[cfg(test)]
   pub(crate) fn fixture() -> Self {
     let path = std::env::current_exe().expect("test executable path must be available");
+    Self::fixture_at(path)
+  }
+
+  #[cfg(test)]
+  pub(crate) fn fixture_at(path: PathBuf) -> Self {
     Self {
       fingerprint: ExecutableFingerprint::read(&path, TOOL_AUTHORIZER_DESCRIPTION)
         .expect("test executable must be fingerprintable"),

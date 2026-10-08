@@ -50,6 +50,26 @@ async fn tool_authorizer_requires_an_absolute_operator_selected_executable() {
 }
 
 #[tokio::test]
+async fn tool_authorizer_reports_missing_and_unresolvable_absolute_paths() {
+  let directory = tempfile::tempdir().unwrap();
+  let missing = directory.path().join("missing-authorizer");
+  let error = ToolAuthorizer::resolve_selected(Some(missing.into_os_string()))
+    .await
+    .err()
+    .expect("missing authorizer must fail")
+    .to_string();
+  assert!(error.contains("does not exist"), "unexpected error: {error}");
+
+  let invalid = directory.path().join(OsString::from("invalid\0authorizer"));
+  let error = ToolAuthorizer::resolve_selected(Some(invalid.into_os_string()))
+    .await
+    .err()
+    .expect("unresolvable authorizer must fail")
+    .to_string();
+  assert!(error.contains("cannot be resolved"), "unexpected error: {error}");
+}
+
+#[tokio::test]
 async fn changed_tool_authorizer_fails_identity_revalidation() {
   let directory = tempfile::tempdir().unwrap();
   let path = directory

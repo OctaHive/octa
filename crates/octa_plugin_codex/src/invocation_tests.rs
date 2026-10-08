@@ -139,6 +139,49 @@ async fn required_tool_authorization_installs_one_blocking_pre_tool_hook() {
 }
 
 #[tokio::test]
+async fn command_revalidates_the_tool_authorizer_before_spawn() {
+  let workspace = tempfile::tempdir().unwrap();
+  let helper_directory = tempfile::tempdir().unwrap();
+  let helper_path = helper_directory
+    .path()
+    .join(format!("authorizer{}", std::env::consts::EXE_SUFFIX));
+  fs::copy(std::env::current_exe().unwrap(), &helper_path).unwrap();
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&helper_path, fs::Permissions::from_mode(0o755)).unwrap();
+  }
+  let authorizer = ToolAuthorizer::fixture_at(helper_path.clone());
+  let config = config(json!({ "prompt": "work", "tool_authorization": "required" }));
+  let variables = HashMap::new();
+  let task_environment = HashMap::new();
+  let invocation = CodexInvocation::load(
+    CodexExecutable::fixture(),
+    Some(authorizer),
+    &config,
+    workspace.path(),
+    StructuredResultTarget::Disabled,
+    EnvironmentSources {
+      variables: &variables,
+      secret_variables: &[],
+      task_environment: &task_environment,
+    },
+  )
+  .await
+  .unwrap();
+  use std::io::Write;
+  fs::OpenOptions::new()
+    .append(true)
+    .open(helper_path)
+    .unwrap()
+    .write_all(b"changed")
+    .unwrap();
+
+  let error = invocation.command(workspace.path()).await.unwrap_err().to_string();
+  assert!(error.contains("changed after validation"));
+}
+
+#[tokio::test]
 async fn authorization_configuration_and_resolved_helper_must_agree() {
   let workspace = tempfile::tempdir().unwrap();
   let required = config(json!({ "prompt": "work", "tool_authorization": "required" }));
