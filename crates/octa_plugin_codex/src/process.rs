@@ -307,7 +307,7 @@ impl ProcessTree {
   #[cfg(unix)]
   pub(crate) fn request_graceful_termination(&self) -> io::Result<()> {
     self.process_group.map_or(Ok(()), |process_group| {
-      signal_process_group(process_group, libc::SIGTERM)
+      signal_owned_process_group(process_group, libc::SIGTERM)
     })
   }
 
@@ -353,10 +353,9 @@ impl ProcessTree {
 
   #[cfg(unix)]
   fn close_process_group(&mut self, signal: i32) -> io::Result<()> {
-    self
-      .process_group
-      .take()
-      .map_or(Ok(()), |process_group| signal_process_group(process_group, signal))
+    self.process_group.take().map_or(Ok(()), |process_group| {
+      signal_owned_process_group(process_group, signal)
+    })
   }
 
   #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -364,18 +363,7 @@ impl ProcessTree {
     let Some(process_group) = self.process_group.take() else {
       return Ok(());
     };
-    let result = signal_process_group(process_group, libc::SIGKILL);
-    #[cfg(target_os = "macos")]
-    if result
-      .as_ref()
-      .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
-    {
-      // macOS reports EPERM when the group contains only its waitable zombie
-      // leader. `waitid(WNOWAIT)` above proves that leader has exited; a live
-      // same-user descendant would make the group signal succeed.
-      return Ok(());
-    }
-    result
+    signal_owned_process_group(process_group, libc::SIGKILL)
   }
 }
 
@@ -434,6 +422,24 @@ fn process_exited_without_reaping(pid: i32) -> io::Result<bool> {
   // SAFETY: successful `waitid` initializes `siginfo_t`; a zero pid means
   // that the selected child has not exited yet under WNOHANG.
   Ok(unsafe { info.assume_init().si_pid() } != 0)
+}
+
+#[cfg(unix)]
+fn signal_owned_process_group(process_group: i32, signal: i32) -> io::Result<()> {
+  let result = signal_process_group(process_group, signal);
+  #[cfg(target_os = "macos")]
+  if result
+    .as_ref()
+    .is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+    && process_exited_without_reaping(process_group)?
+  {
+    // macOS can report EPERM when the group leader exits between the caller's
+    // state check and kill(2), leaving only its waitable zombie. Rechecking
+    // with WNOWAIT proves the leader exited; a live same-user descendant
+    // would make the process-group signal succeed instead.
+    return Ok(());
+  }
+  result
 }
 
 #[cfg(unix)]
