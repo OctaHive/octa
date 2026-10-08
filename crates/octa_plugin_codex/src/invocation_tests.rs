@@ -16,6 +16,7 @@ async fn load_invocation(
   let task_environment = HashMap::new();
   CodexInvocation::load(
     CodexExecutable::fixture(),
+    None,
     config,
     workspace,
     structured_result,
@@ -37,6 +38,7 @@ async fn load_with_environment(
 ) -> anyhow::Result<CodexInvocation> {
   CodexInvocation::load(
     CodexExecutable::fixture(),
+    None,
     config,
     workspace,
     StructuredResultTarget::Disabled,
@@ -44,6 +46,24 @@ async fn load_with_environment(
       variables,
       secret_variables,
       task_environment,
+    },
+  )
+  .await
+}
+
+async fn load_with_tool_authorizer(config: &CodexConfig, workspace: &Path) -> anyhow::Result<CodexInvocation> {
+  let variables = HashMap::new();
+  let task_environment = HashMap::new();
+  CodexInvocation::load(
+    CodexExecutable::fixture(),
+    Some(ToolAuthorizer::fixture()),
+    config,
+    workspace,
+    StructuredResultTarget::Disabled,
+    EnvironmentSources {
+      variables: &variables,
+      secret_variables: &[],
+      task_environment: &task_environment,
     },
   )
   .await
@@ -63,7 +83,7 @@ async fn inline_unicode_prompt_has_a_stable_identity_and_is_delivered_only_over_
     .unwrap();
 
   assert_eq!(invocation.prompt_identity(), blake3::hash(prompt.as_bytes()));
-  assert_eq!(invocation.executable().version(), "0.130.0");
+  assert_eq!(invocation.executable().version(), "0.161.0");
   assert!(invocation.executable().path().is_absolute());
   assert_eq!(
     invocation.arguments(),
@@ -81,6 +101,63 @@ async fn inline_unicode_prompt_has_a_stable_identity_and_is_delivered_only_over_
   assert!(invocation.arguments().iter().all(|argument| argument != prompt));
 
   assert_eq!(invocation.prompt_bytes(), prompt.as_bytes());
+}
+
+#[tokio::test]
+async fn required_tool_authorization_installs_one_blocking_pre_tool_hook() {
+  let workspace = tempfile::tempdir().unwrap();
+  let config = config(json!({
+    "prompt": "work",
+    "tool_authorization": "required"
+  }));
+  let invocation = load_with_tool_authorizer(&config, workspace.path()).await.unwrap();
+  let arguments = invocation.arguments();
+
+  assert!(arguments.contains(&OsString::from("--dangerously-bypass-hook-trust")));
+  assert!(arguments.contains(&OsString::from("--config=features.hooks=true")));
+  let hook = arguments
+    .iter()
+    .find_map(|argument| {
+      argument
+        .to_str()
+        .filter(|value| value.starts_with("--config=hooks.PreToolUse="))
+    })
+    .expect("blocking hook override must be present");
+  let hook_value = hook
+    .strip_prefix("--config=hooks.PreToolUse=")
+    .expect("hook override prefix must be stable");
+  let parsed = format!("value = {hook_value}")
+    .parse::<toml::Table>()
+    .expect("hook override must remain valid TOML");
+  let groups = parsed["value"].as_array().expect("hook override must contain groups");
+  let handlers = groups[0]["hooks"].as_array().expect("hook group must contain handlers");
+  let handler = &handlers[0];
+  assert_eq!(handler["type"].as_str(), Some("command"));
+  assert_eq!(handler["timeout"].as_integer(), Some(60));
+  assert_eq!(handler["statusMessage"].as_str(), Some("Authorizing tool action"));
+  assert!(!invocation.environment().contains_key(executable::TOOL_AUTHORIZER_ENV));
+}
+
+#[tokio::test]
+async fn authorization_configuration_and_resolved_helper_must_agree() {
+  let workspace = tempfile::tempdir().unwrap();
+  let required = config(json!({ "prompt": "work", "tool_authorization": "required" }));
+  assert!(
+    load_invocation(&required, workspace.path(), StructuredResultTarget::Disabled)
+      .await
+      .err()
+      .expect("required authorization without a helper must fail")
+      .to_string()
+      .contains("required tool authorization helper")
+  );
+
+  let ordinary = config(json!({ "prompt": "work" }));
+  assert!(load_with_tool_authorizer(&ordinary, workspace.path())
+    .await
+    .err()
+    .expect("an unexpected helper must fail")
+    .to_string()
+    .contains("required tool authorization helper"));
 }
 
 #[tokio::test]

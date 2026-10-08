@@ -24,13 +24,19 @@ The machine or agent image operator must:
 4. supply authentication through an environment-specific Octa secrets
    profile.
 
+Tasks that opt into blocking tool authorization additionally require the
+operator to set `OCTA_CODEX_TOOL_AUTHORIZER` to an absolute protected native
+helper. The helper receives the bounded Codex `PreToolUse` document on stdin
+and returns a supported Codex hook disposition on stdout. A task cannot select
+or replace this executable.
+
 The plugin never searches `PATH` and never invokes a shell as a fallback. It
 runs a bounded `--version` probe and fingerprints the selected executable
 before accepting work, then revalidates that identity at process spawn.
 
 The currently supported Codex CLI compatibility set is:
 
-- `0.130.0`
+- `0.161.0`
 
 Each listed release is covered by the plugin's machine-interface fixtures.
 Any other release is rejected before prompt files, credentials, or workspace
@@ -54,6 +60,7 @@ Windows names, and unsafe separators are rejected.
 | `environment` | Explicit `public` and `secret` child-environment mappings from environment names to Octa variable names. |
 | `source_revision` | Optional bounded revision identifier copied into provenance. |
 | `deliverables` | At most 64 exact required artifacts or reports to register after a successful, validated run. |
+| `tool_authorization` | Optional `required`; fails before prompt or credentials are exposed unless the operator-selected blocking authorizer is available. |
 
 <!-- codex-config -->
 ```yaml
@@ -82,6 +89,7 @@ codex:
     required: [verdict]
     additionalProperties: false
   run_records: .octa/codex-audit
+  tool_authorization: required
   deliverables:
     - kind: artifact
       name: proposed-patch
@@ -98,6 +106,16 @@ to an already resolved Octa variable name; they never contain the value. A
 secret mapping is accepted only when the source variable is marked secret by
 Octa. An unrelated variable, including another secret, is not inherited by the
 Codex process.
+
+`tool_authorization: required` installs one synchronous `PreToolUse` hook for
+all Codex-supported local tool paths and enables it only for that invocation.
+The helper executable is fingerprinted before task material is read and again
+immediately before Codex starts. Hook configuration is supplied as a fixed
+command-line override, so repository files cannot replace it. The operator
+must protect both Codex and the helper from workload mutation after spawn.
+Because Codex hooks are a guardrail rather than the final security boundary,
+the outer Agent/backend must independently enforce the same disposition at
+the protected operation.
 
 ## Minimal child environment and authentication
 

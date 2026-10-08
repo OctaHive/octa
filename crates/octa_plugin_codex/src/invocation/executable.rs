@@ -31,8 +31,14 @@ pub(crate) const CODEX_EXECUTABLE_ENV: &str = "OCTA_CODEX_EXECUTABLE";
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_VERSION_STREAM_BYTES: usize = 4 * 1024;
 const VERSION_PRODUCT: &str = "codex-cli";
+const CODEX_EXECUTABLE_DESCRIPTION: &str = "operator-selected Codex executable";
+const TOOL_AUTHORIZER_DESCRIPTION: &str = "operator-selected tool authorizer";
 /// Exact Codex CLI releases whose JSONL contract is covered by fixtures.
-const SUPPORTED_CODEX_VERSIONS: &[&str] = &["0.130.0"];
+const SUPPORTED_CODEX_VERSIONS: &[&str] = &["0.161.0"];
+
+/// Operator-owned helper invoked synchronously for every supported Codex tool
+/// proposal when a task requires authorization.
+pub(crate) const TOOL_AUTHORIZER_ENV: &str = "OCTA_CODEX_TOOL_AUTHORIZER";
 
 /// One exact executable whose machine-readable contract is supported.
 ///
@@ -43,6 +49,63 @@ pub(crate) struct CodexExecutable {
   path: PathBuf,
   version: Version,
   fingerprint: ExecutableFingerprint,
+}
+
+/// Exact operator-selected helper embedded into the trusted Codex hook.
+///
+/// The helper is fingerprinted before any task material is read and again
+/// immediately before Codex is spawned. The outer Agent remains responsible
+/// for protecting the executable from the workload after spawn.
+pub(crate) struct ToolAuthorizer {
+  path: PathBuf,
+  fingerprint: ExecutableFingerprint,
+}
+
+impl ToolAuthorizer {
+  /// Resolves the helper from operator-owned plugin process configuration.
+  pub(crate) async fn resolve_from_operator_environment() -> anyhow::Result<Self> {
+    Self::resolve_selected(std::env::var_os(TOOL_AUTHORIZER_ENV)).await
+  }
+
+  async fn resolve_selected(selection: Option<OsString>) -> anyhow::Result<Self> {
+    let Some(selection) = selection.filter(|value| !value.is_empty()) else {
+      bail!("tool authorization is required but {TOOL_AUTHORIZER_ENV} is not configured");
+    };
+    let selected = PathBuf::from(selection);
+    if !selected.is_absolute() {
+      bail!("operator-selected tool authorizer path must be absolute");
+    }
+    let path = match tokio::fs::canonicalize(&selected).await {
+      Ok(path) => path,
+      Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        bail!("operator-selected tool authorizer does not exist")
+      },
+      Err(_) => bail!("operator-selected tool authorizer cannot be resolved"),
+    };
+    let fingerprint = fingerprint_executable(path.clone(), TOOL_AUTHORIZER_DESCRIPTION).await?;
+    Ok(Self { path, fingerprint })
+  }
+
+  pub(crate) fn path(&self) -> &Path {
+    &self.path
+  }
+
+  pub(crate) async fn ensure_unchanged(&self) -> anyhow::Result<()> {
+    self
+      .fingerprint
+      .ensure_unchanged(&self.path, TOOL_AUTHORIZER_DESCRIPTION)
+      .await
+  }
+
+  #[cfg(test)]
+  pub(crate) fn fixture() -> Self {
+    let path = std::env::current_exe().expect("test executable path must be available");
+    Self {
+      fingerprint: ExecutableFingerprint::read(&path, TOOL_AUTHORIZER_DESCRIPTION)
+        .expect("test executable must be fingerprintable"),
+      path,
+    }
+  }
 }
 
 impl CodexExecutable {
@@ -68,10 +131,12 @@ impl CodexExecutable {
       },
       Err(_) => bail!("operator-selected Codex executable cannot be resolved"),
     };
-    let fingerprint = fingerprint_executable(path.clone()).await?;
+    let fingerprint = fingerprint_executable(path.clone(), CODEX_EXECUTABLE_DESCRIPTION).await?;
 
     let version = probe_version(&path, &fingerprint, cancellation).await?;
-    fingerprint.ensure_unchanged(&path).await?;
+    fingerprint
+      .ensure_unchanged(&path, CODEX_EXECUTABLE_DESCRIPTION)
+      .await?;
     if !version_is_supported(&version) {
       let supported = SUPPORTED_CODEX_VERSIONS.join(", ");
       bail!("Codex CLI version {version} is not supported; supported versions: {supported}");
@@ -99,7 +164,10 @@ impl CodexExecutable {
   /// Keeping construction here prevents a caller from accidentally using the
   /// previously validated path after the executable has been replaced.
   pub(crate) async fn command(&self) -> anyhow::Result<Command> {
-    self.fingerprint.ensure_unchanged(&self.path).await?;
+    self
+      .fingerprint
+      .ensure_unchanged(&self.path, CODEX_EXECUTABLE_DESCRIPTION)
+      .await?;
     Ok(Command::new(&self.path))
   }
 
@@ -109,7 +177,8 @@ impl CodexExecutable {
   pub(crate) fn fixture() -> Self {
     let path = std::env::current_exe().expect("test executable path must be available");
     Self {
-      fingerprint: ExecutableFingerprint::read(&path).expect("test executable must be fingerprintable"),
+      fingerprint: ExecutableFingerprint::read(&path, CODEX_EXECUTABLE_DESCRIPTION)
+        .expect("test executable must be fingerprintable"),
       path,
       version: Version::parse(SUPPORTED_CODEX_VERSIONS[0]).expect("supported test version must be valid"),
     }
@@ -123,38 +192,37 @@ struct ExecutableFingerprint {
 }
 
 impl ExecutableFingerprint {
-  fn read(path: &Path) -> anyhow::Result<Self> {
+  fn read(path: &Path, description: &'static str) -> anyhow::Result<Self> {
     // Opening a directory as `File` succeeds on Unix but returns access denied
     // on Windows. Inspect the canonical path first so both platforms report the
     // same bounded contract error. Metadata is checked again on the opened
     // handle below; this preliminary check is not trusted against replacement.
-    let path_metadata = std::fs::metadata(path).context("failed to inspect the operator-selected Codex executable")?;
+    let path_metadata = std::fs::metadata(path).with_context(|| format!("failed to inspect the {description}"))?;
     if !path_metadata.is_file() {
-      bail!("operator-selected Codex executable must be a regular file");
+      bail!("{description} must be a regular file");
     }
 
-    let mut file = std::fs::File::open(path).context("failed to open the operator-selected Codex executable")?;
+    let mut file = std::fs::File::open(path).with_context(|| format!("failed to open the {description}"))?;
     let metadata = file
       .metadata()
-      .context("failed to inspect the operator-selected Codex executable")?;
+      .with_context(|| format!("failed to inspect the {description}"))?;
     if !metadata.is_file() {
-      bail!("operator-selected Codex executable must be a regular file");
+      bail!("{description} must be a regular file");
     }
-    ensure_directly_executable(path, &metadata)?;
+    ensure_directly_executable(path, &metadata, description)?;
 
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
       let read = file
         .read(&mut buffer)
-        .context("failed to fingerprint the operator-selected Codex executable")?;
+        .with_context(|| format!("failed to fingerprint the {description}"))?;
       if read == 0 {
         break;
       }
       hasher.update(&buffer[..read]);
     }
-    let handle =
-      same_file::Handle::from_file(file).context("failed to identify the operator-selected Codex executable")?;
+    let handle = same_file::Handle::from_file(file).with_context(|| format!("failed to identify the {description}"))?;
     Ok(Self {
       handle,
       size: metadata.len(),
@@ -162,35 +230,35 @@ impl ExecutableFingerprint {
     })
   }
 
-  async fn ensure_unchanged(&self, path: &Path) -> anyhow::Result<()> {
-    let current = fingerprint_executable(path.to_owned()).await;
+  async fn ensure_unchanged(&self, path: &Path, description: &'static str) -> anyhow::Result<()> {
+    let current = fingerprint_executable(path.to_owned(), description).await;
     if current
       .is_ok_and(|current| self.handle == current.handle && self.size == current.size && self.digest == current.digest)
     {
       return Ok(());
     }
-    bail!("operator-selected Codex executable changed after compatibility validation")
+    bail!("{description} changed after validation")
   }
 }
 
-async fn fingerprint_executable(path: PathBuf) -> anyhow::Result<ExecutableFingerprint> {
-  tokio::task::spawn_blocking(move || ExecutableFingerprint::read(&path))
+async fn fingerprint_executable(path: PathBuf, description: &'static str) -> anyhow::Result<ExecutableFingerprint> {
+  tokio::task::spawn_blocking(move || ExecutableFingerprint::read(&path, description))
     .await
-    .context("Codex executable fingerprint task failed")?
+    .with_context(|| format!("{description} fingerprint task failed"))?
 }
 
 #[cfg(unix)]
-fn ensure_directly_executable(_path: &Path, metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+fn ensure_directly_executable(_path: &Path, metadata: &std::fs::Metadata, description: &str) -> anyhow::Result<()> {
   use std::os::unix::fs::PermissionsExt;
 
   if metadata.permissions().mode() & 0o111 == 0 {
-    bail!("operator-selected Codex executable is not executable");
+    bail!("{description} is not executable");
   }
   Ok(())
 }
 
 #[cfg(windows)]
-fn ensure_directly_executable(path: &Path, _metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+fn ensure_directly_executable(path: &Path, _metadata: &std::fs::Metadata, description: &str) -> anyhow::Result<()> {
   // Rust may route batch files through cmd.exe on Windows. Requiring a native
   // image preserves the no-shell contract and avoids command-line re-parsing.
   if !path
@@ -198,13 +266,13 @@ fn ensure_directly_executable(path: &Path, _metadata: &std::fs::Metadata) -> any
     .and_then(OsStr::to_str)
     .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
   {
-    bail!("operator-selected Codex executable must be a native .exe file on Windows");
+    bail!("{description} must be a native .exe file on Windows");
   }
   Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn ensure_directly_executable(_path: &Path, _metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+fn ensure_directly_executable(_path: &Path, _metadata: &std::fs::Metadata, _description: &str) -> anyhow::Result<()> {
   Ok(())
 }
 
@@ -213,7 +281,7 @@ async fn probe_version(
   fingerprint: &ExecutableFingerprint,
   cancellation: &CancellationToken,
 ) -> anyhow::Result<Version> {
-  fingerprint.ensure_unchanged(path).await?;
+  fingerprint.ensure_unchanged(path, CODEX_EXECUTABLE_DESCRIPTION).await?;
   let mut command = Command::new(path);
   command.arg("--version").env_clear();
   if let Some(parent) = path.parent() {

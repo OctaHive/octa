@@ -147,7 +147,7 @@ jobs:
           printf 'manifest_version: 1\nname: shell\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\ncapabilities:\n  - shell\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$SHELL_ENTRY" "$SHELL_DIGEST" > ./release/plugins/shell.plugin.yml
           printf 'manifest_version: 1\nname: tpl\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$TPL_ENTRY" "$TPL_DIGEST" > ./release/plugins/tpl.plugin.yml
           printf 'manifest_version: 1\nname: junit\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$JUNIT_ENTRY" "$JUNIT_DIGEST" > ./release/plugins/junit.plugin.yml
-          printf 'manifest_version: 1\nname: codex\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$CODEX_ENTRY" "$CODEX_DIGEST" > ./release/plugins/codex.plugin.yml
+          printf 'manifest_version: 1\nname: codex\nversion: "%s"\nprotocol: %s\nplatforms:\n  - %s\nentrypoint: %s\nsha256: %s\ncapabilities:\n  - codex.blocking-pre-tool-authorization.v1\n' "$VERSION" "$PLUGIN_PROTOCOL" "${{ matrix.platform.runtime_platform }}" "$CODEX_ENTRY" "$CODEX_DIGEST" > ./release/plugins/codex.plugin.yml
 
           PYTHON=python3
           if [[ "${{ matrix.platform.os }}" == "windows-2025" ]]; then PYTHON=python; fi

@@ -34,6 +34,7 @@ async fn invocation(
 ) -> CodexInvocation {
   CodexInvocation::load(
     CodexExecutable::fixture(),
+    None,
     config,
     workspace,
     target,

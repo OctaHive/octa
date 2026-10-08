@@ -1,3 +1,13 @@
+## 0.5.1 - 2026-10-08
+
+### Added
+
+- Added an opt-in, capability-advertised blocking Codex `PreToolUse` hook that invokes one fingerprinted operator-selected authorization helper without exposing a task-controlled executable path.
+
+### Changed
+
+- Updated the exact supported Codex CLI release from `0.130.0` to stable `0.161.0`; prerelease and unqualified versions remain rejected before task inputs or credentials are exposed.
+
 ## 0.5.0 - 2026-10-06
 
 ### Highlights

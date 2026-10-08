@@ -58,6 +58,7 @@ fn accepts_inline_and_complete_file_configurations() {
   assert!(inline.environment.public.is_empty());
   assert!(inline.environment.secret.is_empty());
   assert!(inline.deliverables.is_empty());
+  assert!(!inline.requires_tool_authorization());
 
   let complete = json!({
     "prompt_file": "prompts/review.md",
@@ -75,6 +76,7 @@ fn accepts_inline_and_complete_file_configurations() {
       "secret": { "OPENAI_API_KEY": "openai_key" }
     },
     "source_revision": "8de7f1c",
+    "tool_authorization": "required",
     "deliverables": [
       {
         "kind": "artifact",
@@ -95,6 +97,22 @@ fn accepts_inline_and_complete_file_configurations() {
   assert_eq!(complete.prompt_file.as_deref(), Some("prompts/review.md"));
   assert_eq!(complete.reasoning_effort, Some(ReasoningEffort::High));
   assert_eq!(complete.deliverables.len(), 2);
+  assert!(complete.requires_tool_authorization());
+}
+
+#[test]
+fn tool_authorization_is_explicit_and_has_no_best_effort_mode() {
+  let required = json!({ "prompt": "work", "tool_authorization": "required" });
+  assert!(validator().is_valid(&required));
+  assert!(CodexConfig::parse(required).unwrap().requires_tool_authorization());
+
+  for value in [
+    json!({ "prompt": "work", "tool_authorization": "optional" }),
+    json!({ "prompt": "work", "tool_authorization": true }),
+    json!({ "prompt": "work", "tool_authorization": {} }),
+  ] {
+    assert_schema_and_parser_reject(value);
+  }
 }
 
 #[test]

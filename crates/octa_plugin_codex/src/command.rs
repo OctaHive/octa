@@ -469,6 +469,7 @@ mod tests {
     let task_environment = HashMap::new();
     CodexInvocation::load(
       CodexExecutable::fixture(),
+      None,
       &config,
       workspace,
       StructuredResultTarget::Disabled,

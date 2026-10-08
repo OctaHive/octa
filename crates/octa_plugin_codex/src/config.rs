@@ -53,6 +53,14 @@ pub(crate) struct CodexConfig {
   pub(crate) source_revision: Option<String>,
   #[serde(default)]
   pub(crate) deliverables: Vec<Deliverable>,
+  pub(crate) tool_authorization: Option<ToolAuthorizationMode>,
+}
+
+/// Opt-in request for the operator-owned blocking tool authorization hook.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ToolAuthorizationMode {
+  Required,
 }
 
 /// Model reasoning effort passed to the concrete Codex CLI adapter.
@@ -144,6 +152,11 @@ impl CodexConfig {
       validate_bounded_text("source_revision", revision, MAX_SOURCE_REVISION_BYTES)?;
     }
     validate_deliverables(&self.deliverables)
+  }
+
+  /// Whether this task refuses to run without the operator-owned tool gate.
+  pub(crate) fn requires_tool_authorization(&self) -> bool {
+    self.tool_authorization == Some(ToolAuthorizationMode::Required)
   }
 }
 
@@ -318,6 +331,10 @@ pub(crate) fn input_schema() -> Map<String, Value> {
         "type": "array",
         "maxItems": MAX_DELIVERABLES,
         "items": deliverable_schema()
+      },
+      "tool_authorization": {
+        "type": "string",
+        "enum": ["required"]
       }
     },
     "oneOf": [

@@ -77,7 +77,7 @@ fn exposes_the_codex_task_contract_without_raw_mode() {
 
   assert_eq!(schema.key, "codex");
   assert!(!schema.supports_raw);
-  assert!(schema.capabilities.is_empty());
+  assert_eq!(schema.capabilities, [contract::TOOL_AUTHORIZATION_CAPABILITY]);
   assert!(schema.input_schema.is_some());
   assert!(schema.output_schema.is_some());
 }

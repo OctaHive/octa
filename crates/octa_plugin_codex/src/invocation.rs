@@ -23,7 +23,7 @@ use crate::config::{validate_prompt, CodexConfig, EnvironmentSelection, Reasonin
 
 mod executable;
 
-pub(crate) use executable::CodexExecutable;
+pub(crate) use executable::{CodexExecutable, ToolAuthorizer};
 
 /// Platform values that a non-interactive Codex process may inherit on Unix.
 ///
@@ -82,6 +82,7 @@ pub(crate) struct EnvironmentSources<'a> {
 /// environment can contain credentials and must not enter diagnostic logs.
 pub(crate) struct CodexInvocation {
   executable: CodexExecutable,
+  tool_authorizer: Option<ToolAuthorizer>,
   arguments: Vec<OsString>,
   environment: BTreeMap<String, String>,
   prompt: LoadedPrompt,
@@ -124,17 +125,22 @@ impl CodexInvocation {
   /// schema requires a caller-owned file target; an absent schema forbids one.
   pub(crate) async fn load(
     executable: CodexExecutable,
+    tool_authorizer: Option<ToolAuthorizer>,
     config: &CodexConfig,
     working_directory: &Path,
     structured_result: StructuredResultTarget,
     environment_sources: EnvironmentSources<'_>,
   ) -> anyhow::Result<Self> {
+    if config.requires_tool_authorization() != tool_authorizer.is_some() {
+      bail!("required tool authorization helper was not resolved");
+    }
     let environment = build_environment(&config.environment, environment_sources)?;
     let prompt = LoadedPrompt::load(config, working_directory).await?;
     let result_schema = ResultSchemaDocument::from_config(config, structured_result)?;
-    let arguments = build_arguments(config, result_schema.as_ref());
+    let arguments = build_arguments(config, result_schema.as_ref(), tool_authorizer.as_ref())?;
     Ok(Self {
       executable,
+      tool_authorizer,
       arguments,
       environment,
       prompt,
@@ -184,6 +190,9 @@ impl CodexInvocation {
 
   /// Builds the exact direct child command after revalidating the executable.
   pub(crate) async fn command(&self, working_directory: &Path) -> anyhow::Result<Command> {
+    if let Some(authorizer) = &self.tool_authorizer {
+      authorizer.ensure_unchanged().await?;
+    }
     let mut command = self.executable.command().await?;
     command
       .args(&self.arguments)
@@ -413,13 +422,20 @@ async fn read_bounded_prompt(
   Ok(bytes)
 }
 
-fn build_arguments(config: &CodexConfig, result_schema: Option<&ResultSchemaDocument>) -> Vec<OsString> {
+fn build_arguments(
+  config: &CodexConfig,
+  result_schema: Option<&ResultSchemaDocument>,
+  tool_authorizer: Option<&ToolAuthorizer>,
+) -> anyhow::Result<Vec<OsString>> {
   let mut arguments = vec![
     OsString::from("exec"),
     OsString::from("--json"),
     OsString::from(format!("--sandbox={SANDBOX_MODE}")),
     OsString::from(format!("--ask-for-approval={APPROVAL_POLICY}")),
   ];
+  if let Some(authorizer) = tool_authorizer {
+    arguments.extend(tool_authorization_arguments(authorizer)?);
+  }
   if let Some(model) = &config.model {
     arguments.push(OsString::from(format!("--model={model}")));
   }
@@ -437,7 +453,62 @@ fn build_arguments(config: &CodexConfig, result_schema: Option<&ResultSchemaDocu
   // A single dash tells `codex exec` to read the prompt from stdin. It must
   // remain the final positional argument so no prompt bytes enter argv.
   arguments.push(OsString::from("-"));
-  arguments
+  Ok(arguments)
+}
+
+fn tool_authorization_arguments(authorizer: &ToolAuthorizer) -> anyhow::Result<[OsString; 3]> {
+  let command = hook_command(authorizer.path())?;
+  let handler = toml::Value::Table(toml::Table::from_iter([
+    ("type".to_owned(), toml::Value::String("command".to_owned())),
+    ("command".to_owned(), toml::Value::String(command.clone())),
+    ("timeout".to_owned(), toml::Value::Integer(60)),
+    (
+      "statusMessage".to_owned(),
+      toml::Value::String("Authorizing tool action".to_owned()),
+    ),
+    #[cfg(windows)]
+    ("commandWindows".to_owned(), toml::Value::String(command)),
+  ]));
+  let group = toml::Value::Table(toml::Table::from_iter([(
+    "hooks".to_owned(),
+    toml::Value::Array(vec![handler]),
+  )]));
+  let hooks = toml::Value::Array(vec![group]).to_string();
+  Ok([
+    OsString::from("--dangerously-bypass-hook-trust"),
+    OsString::from("--config=features.hooks=true"),
+    OsString::from(format!("--config=hooks.PreToolUse={hooks}")),
+  ])
+}
+
+#[cfg(unix)]
+fn hook_command(path: &Path) -> anyhow::Result<String> {
+  let path = path
+    .to_str()
+    .ok_or_else(|| anyhow::anyhow!("operator-selected tool authorizer path must be valid UTF-8"))?;
+  Ok(format!("'{}'", path.replace('\'', "'\"'\"'")))
+}
+
+#[cfg(windows)]
+fn hook_command(path: &Path) -> anyhow::Result<String> {
+  let path = path
+    .to_str()
+    .ok_or_else(|| anyhow::anyhow!("operator-selected tool authorizer path must be valid UTF-8"))?;
+  if path
+    .chars()
+    .any(|character| character.is_control() || matches!(character, '"' | '%' | '!' | '^' | '&' | '|' | '<' | '>'))
+  {
+    bail!("operator-selected tool authorizer path cannot be represented safely for the Windows hook host");
+  }
+  Ok(format!("\"{path}\""))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn hook_command(path: &Path) -> anyhow::Result<String> {
+  path
+    .to_str()
+    .map(str::to_owned)
+    .ok_or_else(|| anyhow::anyhow!("operator-selected tool authorizer path must be valid UTF-8"))
 }
 
 #[cfg(test)]

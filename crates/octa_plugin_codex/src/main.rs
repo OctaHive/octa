@@ -33,7 +33,7 @@ fn plugin_schema() -> PluginSchema {
   PluginSchema {
     key: "codex".to_owned(),
     supports_raw: false,
-    capabilities: Vec::new(),
+    capabilities: vec![contract::TOOL_AUTHORIZATION_CAPABILITY.to_owned()],
     input_schema: Some(config::input_schema()),
     output_schema: Some(records::output_schema()),
   }
@@ -84,6 +84,14 @@ impl Plugin for CodexPlugin {
       Err(_) if cancel_token.is_cancelled() => return send_cancelled(&writer, id).await,
       Err(error) => return Err(error),
     };
+    let tool_authorizer = if config.requires_tool_authorization() {
+      match invocation::ToolAuthorizer::resolve_from_operator_environment().await {
+        Ok(authorizer) => Some(authorizer),
+        Err(error) => return Err(error),
+      }
+    } else {
+      None
+    };
     let structured_result = if config.result_schema.is_some() {
       invocation::StructuredResultTarget::SchemaFile(records::RunRecords::schema_path_for(
         &dir,
@@ -96,6 +104,7 @@ impl Plugin for CodexPlugin {
     let sanitizer = sanitization::RunSanitizer::from_variables(&vars, &secret_vars);
     let invocation = invocation::CodexInvocation::load(
       executable,
+      tool_authorizer,
       &config,
       &dir,
       structured_result,

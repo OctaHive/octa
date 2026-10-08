@@ -102,6 +102,12 @@ fn lifecycle_request(workspace: &Path) -> PluginExecutionRequest {
   }
 }
 
+fn authorized_lifecycle_request(workspace: &Path) -> PluginExecutionRequest {
+  let mut request = lifecycle_request(workspace);
+  request.params["tool_authorization"] = json!("required");
+  request
+}
+
 async fn start_lifecycle_execution(workspace: &Path, fixture: PathBuf) -> (PluginManager, PluginExecution) {
   let (manager, plugin_name) = plugin_manager_with_codex(workspace, fixture);
   manager.start_plugin(&plugin_name).await.unwrap();
@@ -375,6 +381,29 @@ async fn compatibility_probe_owns_descendants_and_honors_cancellation() {
     .await
     .expect("cancelled version probe did not terminate promptly")
     .unwrap();
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn required_tool_authorization_fails_before_task_material_without_an_operator_helper() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture_directory = tempfile::tempdir().unwrap();
+  let fixture = install_process_fixture(fixture_directory.path());
+  let (manager, plugin_name) = plugin_manager_with_codex(workspace.path(), fixture);
+  manager.start_plugin(&plugin_name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let mut execution = client
+    .start_execution(authorized_lifecycle_request(workspace.path()), CancellationToken::new())
+    .await
+    .unwrap();
+
+  let response = receive_terminal(&mut execution).await;
+  assert!(matches!(
+    response,
+    PluginResponse::Error { message, .. }
+      if message.contains("OCTA_CODEX_TOOL_AUTHORIZER") && !message.contains("perform the fixture task")
+  ));
+  assert!(fs::read_dir(workspace.path()).unwrap().next().is_none());
   assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
 }
 

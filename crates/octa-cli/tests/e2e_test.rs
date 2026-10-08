@@ -326,10 +326,10 @@ fn test_plugin_lock_and_verify_commands() {
       platforms: vec![current_platform()],
       entrypoint: entrypoint.into(),
       sha256,
-      capabilities: if name == "shell" {
-        vec!["shell".to_owned()]
-      } else {
-        Vec::new()
+      capabilities: match name {
+        "shell" => vec!["shell".to_owned()],
+        "codex" => vec!["codex.blocking-pre-tool-authorization.v1".to_owned()],
+        _ => Vec::new(),
       },
     };
     fs::write(

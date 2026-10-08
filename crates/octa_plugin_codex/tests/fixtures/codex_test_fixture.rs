@@ -45,7 +45,7 @@ fn main() {
   }
   if arguments == ["--version"] {
     let response_path = executable.with_extension("version");
-    let response = std::fs::read_to_string(&response_path).unwrap_or_else(|_| "codex-cli 0.130.0\n".to_owned());
+    let response = std::fs::read_to_string(&response_path).unwrap_or_else(|_| "codex-cli 0.161.0\n".to_owned());
     std::fs::write(executable.with_extension("version-probed"), b"probed")
       .expect("fixture probe marker must be writable");
     if executable.with_extension("spawn-version-descendant").exists() {
