@@ -422,3 +422,99 @@ fn public_file_observations_keep_only_bounded_workspace_paths_and_reported_bound
   assert!(!serialized.contains("protected"));
   assert!(!serialized.contains("private"));
 }
+
+#[test]
+fn public_command_completion_without_measurements_keeps_the_outcome_unknown() {
+  let responses = normalize_json(json!({
+    "type":"item.completed", "item":{
+      "id":"unmeasured-command", "type":"command_execution", "aggregated_output":""
+    }
+  }))
+  .unwrap();
+  let observations = responses
+    .iter()
+    .filter_map(|response| match response {
+      PluginResponse::Progress { progress, .. } => progress.observation.as_ref(),
+      _ => None,
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(observations.len(), 1);
+  assert_eq!(observations[0].phase, octa_runner_protocol::OperationPhase::Completed);
+  assert_eq!(
+    observations[0].operation,
+    octa_runner_protocol::ObservedOperation::Command {
+      exit_code: None,
+      failed: None
+    }
+  );
+}
+
+#[test]
+fn public_file_completion_preserves_creation_and_deletion_in_reported_order() {
+  let responses = normalize_json(json!({"type":"item.completed", "item": {
+    "id":"edit", "type":"file_change", "status":"completed", "changes":[
+      {"path":"src/new.rs", "kind":"add"},
+      {"path":"src/old.rs", "kind":"delete"},
+      {"path":"src/unknown.rs", "kind":"future-change"}
+    ]
+  }}))
+  .unwrap();
+  let operations = responses
+    .iter()
+    .filter_map(|response| match response {
+      PluginResponse::Progress { progress, .. } => progress.observation.as_ref().map(|v| v.operation.clone()),
+      _ => None,
+    })
+    .collect::<Vec<_>>();
+  use octa_runner_protocol::{FileChangeKind, ObservedOperation};
+  assert_eq!(
+    operations,
+    vec![
+      ObservedOperation::File {
+        path: "src/new.rs".to_owned(),
+        change: FileChangeKind::Created,
+        failed: Some(false)
+      },
+      ObservedOperation::File {
+        path: "src/old.rs".to_owned(),
+        change: FileChangeKind::Deleted,
+        failed: Some(false)
+      },
+    ]
+  );
+}
+
+#[test]
+fn public_file_observations_require_a_bounded_reported_changes_list() {
+  let changes = |count| {
+    Value::Array(
+      (0..count)
+        .map(|n| json!({"path":format!("out/{n}.txt"),"kind":"add"}))
+        .collect(),
+    )
+  };
+  for (reported, expected) in [
+    (None, 0),
+    (Some(Value::Null), 0),
+    (Some(json!("unstructured")), 0),
+    (Some(changes(32)), 32),
+    (Some(changes(33)), 0),
+  ] {
+    let mut event = json!({"type":"item.completed", "item":{"id":"edit", "type":"file_change"}});
+    if let Some(reported) = reported {
+      event["item"]["changes"] = reported;
+    }
+    let responses = normalize_json(event).unwrap();
+    let observations = responses
+      .iter()
+      .filter_map(|response| match response {
+        PluginResponse::Progress { progress, .. } => progress.observation.as_ref(),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(observations.len(), expected);
+    assert!(observations.iter().all(|v| v.is_valid()));
+    assert!(matches!(&responses[0], PluginResponse::Progress { progress, .. }
+      if progress.message == "Codex finished applying file changes" && progress.observation.is_none()));
+  }
+}
