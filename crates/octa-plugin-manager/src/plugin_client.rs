@@ -562,25 +562,30 @@ impl PluginClient {
       return true;
     }
 
-    if let PluginResponse::Progress { id, progress } = response {
-      let mut commands = inner.commands.lock().await;
-      if let Some(route) = commands.get_mut(&id) {
-        match route.state {
-          CommandRouteState::Running => {
-            route.progress.send_replace(Some(progress));
-          },
-          CommandRouteState::Cancelled => {},
-          CommandRouteState::AwaitingStart(_) => {
-            drop(commands);
-            return Self::fail_protocol(
-              inner,
-              format!("Plugin sent progress before acknowledging command '{id}'"),
-            )
-            .await;
-          },
+    // Public observations are ordered facts, not replaceable UI progress.
+    // Keep them in the same bounded queue as output and terminal responses.
+    match response {
+      PluginResponse::Progress { id, progress } if progress.observation.is_none() => {
+        let mut commands = inner.commands.lock().await;
+        if let Some(route) = commands.get_mut(&id) {
+          match route.state {
+            CommandRouteState::Running => {
+              route.progress.send_replace(Some(progress));
+            },
+            CommandRouteState::Cancelled => {},
+            CommandRouteState::AwaitingStart(_) => {
+              drop(commands);
+              return Self::fail_protocol(
+                inner,
+                format!("Plugin sent progress before acknowledging command '{id}'"),
+              )
+              .await;
+            },
+          }
         }
-      }
-      return true;
+        return true;
+      },
+      _ => {},
     }
 
     let (id, terminal) = match &response {
@@ -589,6 +594,7 @@ impl PluginClient {
       | PluginResponse::StdoutBytes { id, .. }
       | PluginResponse::StderrBytes { id, .. }
       | PluginResponse::Diagnostic { id, .. }
+      | PluginResponse::Progress { id, .. }
       | PluginResponse::RegisterArtifact { id, .. }
       | PluginResponse::RegisterReport { id, .. } => (Some(id.clone()), false),
       PluginResponse::Completed { id, .. } | PluginResponse::Error { id, .. } => (Some(id.clone()), true),
@@ -1205,6 +1211,7 @@ mod tests {
             Some(PluginResponse::Progress {
               id,
               progress: ProgressUpdate {
+                observation: None,
                 message: "early".to_owned(),
                 current: None,
                 total: None,
@@ -2045,6 +2052,7 @@ mod tests {
                   PluginResponse::Progress {
                     id: id.clone(),
                     progress: ProgressUpdate {
+                      observation: None,
                       message: "working".to_owned(),
                       current: Some(current as u64),
                       total: Some((COMMAND_RESPONSE_CAPACITY * 4) as u64),

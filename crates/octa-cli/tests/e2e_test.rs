@@ -328,7 +328,10 @@ fn test_plugin_lock_and_verify_commands() {
       sha256,
       capabilities: match name {
         "shell" => vec!["shell".to_owned()],
-        "codex" => vec!["codex.blocking-pre-tool-authorization.v1".to_owned()],
+        "codex" => vec![
+          "codex.blocking-pre-tool-authorization.v1".to_owned(),
+          "public-command-file-observations.v1".to_owned(),
+        ],
         _ => Vec::new(),
       },
     };
@@ -387,7 +390,8 @@ fn test_plugin_lock_and_verify_commands() {
     String::from_utf8_lossy(&metadata_output.stdout),
     String::from_utf8_lossy(&metadata_output.stderr)
   );
-  let output = std::process::Command::new(python)
+  let mut verify_release = std::process::Command::new(python);
+  verify_release
     .arg(release_test)
     .arg("--octa")
     .arg(env!("CARGO_BIN_EXE_octa"))
@@ -404,15 +408,36 @@ fn test_plugin_lock_and_verify_commands() {
     .arg("--plugin-version")
     .arg(env!("CARGO_PKG_VERSION"))
     .arg("--plugin-protocol")
-    .arg(PLUGIN_PROTOCOL_VERSION.to_string())
-    .output()
-    .unwrap();
+    .arg(PLUGIN_PROTOCOL_VERSION.to_string());
+  let output = verify_release.output().unwrap();
   assert!(
     output.status.success(),
     "release plugin verification failed:\nstdout={}\nstderr={}",
     String::from_utf8_lossy(&output.stdout),
     String::from_utf8_lossy(&output.stderr)
   );
+  // A self-consistent digest/lock is insufficient if a qualified capability
+  // disappeared from the packaged manifest. Exercise the shipped verifier.
+  let manifest_path = plugins.join("codex.plugin.yml");
+  let mut manifest: PluginManifest = serde_yml::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+  manifest
+    .capabilities
+    .retain(|c| c != "public-command-file-observations.v1");
+  fs::write(manifest_path, serde_yml::to_string(&manifest).unwrap()).unwrap();
+  Command::cargo_bin("octa")
+    .unwrap()
+    .current_dir(workspace.path())
+    .env("OCTA_PLUGINS_DIR", &plugins)
+    .args(["plugin", "lock", "--output"])
+    .arg(&lock)
+    .assert()
+    .success();
+  let rejected = verify_release.output().unwrap();
+  assert!(
+    !rejected.status.success(),
+    "release verification accepted a lock missing qualified public operations"
+  );
+  assert!(String::from_utf8_lossy(&rejected.stderr).contains("public-command-file-observations.v1"));
 }
 
 #[test]

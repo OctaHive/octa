@@ -1,7 +1,7 @@
 [package]
 name = "octa-plugin"
 description = "Plugin common"
-version = "0.5.1"
+version = "0.6.0"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -11,6 +11,7 @@ repository.workspace = true
 include = ["src/"]
 
 [dependencies]
+octa-runner-protocol.workspace = true
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }

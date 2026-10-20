@@ -90,10 +90,12 @@ def verify_release(
         require_success(generated, "plugin lock generation")
         assert "Locked 4 plugins" in generated.stdout
         assert "codex:" in generated_lock.read_text(encoding="utf-8")
-        assert (
-            codex_release_metadata.TOOL_AUTHORIZATION_CAPABILITY
-            in generated_lock.read_text(encoding="utf-8")
-        ), "generated plugin lock omitted Codex tool-authorization capability"
+        locked_values = {line.strip().removeprefix("- ")
+                         for line in generated_lock.read_text(encoding="utf-8").splitlines()}
+        for capability in expected_metadata["plugin"]["capabilities"]:
+            assert capability in locked_values, (
+                f"generated plugin lock omitted Codex capability {capability}"
+            )
         require_success(
             run_octa(octa, copied_plugins, "plugin", "verify", "--lock", str(generated_lock)),
             "generated plugin lock verification",

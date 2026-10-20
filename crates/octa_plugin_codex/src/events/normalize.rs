@@ -12,6 +12,11 @@ use serde_json::{Map, Value};
 
 use crate::sanitization::SanitizedEvent;
 
+/// Largest set of individually reported file operations emitted for one item.
+const MAX_PUBLIC_FILE_OPERATIONS: usize = 32;
+/// Bounds untrusted harness correlation before hashing it for public use.
+const MAX_OPERATION_SOURCE_ID_BYTES: usize = 1024;
+
 /// Maximum UTF-8 bytes copied into one live output or diagnostic response.
 ///
 /// The plugin protocol permits one MiB frames. Keeping individual values at
@@ -53,7 +58,7 @@ pub(crate) fn normalize_activity(
   command_id: &str,
   event: &SanitizedEvent,
 ) -> Result<Vec<PluginResponse>, EventNormalizationError> {
-  match event.event_type() {
+  let mut responses = match event.event_type() {
     "thread.started" => Ok(vec![progress(command_id, "Codex thread started")]),
     "turn.started" => Ok(vec![progress(command_id, "Codex turn started")]),
     "item.started" => normalize_started_item(command_id, event),
@@ -72,6 +77,110 @@ pub(crate) fn normalize_activity(
       )])
     },
     _ => Ok(Vec::new()),
+  }?;
+  for observation in operation_observations(event) {
+    responses.push(PluginResponse::Progress {
+      id: command_id.to_owned(),
+      progress: ProgressUpdate {
+        observation: Some(observation),
+        message: "Reported operation".to_owned(),
+        current: None,
+        total: None,
+        unit: None,
+      },
+    });
+  }
+  Ok(responses)
+}
+
+fn operation_observations(event: &SanitizedEvent) -> Vec<octa_runner_protocol::OperationObservation> {
+  use octa_runner_protocol::{
+    is_public_operation_path, FileChangeKind, ObservedOperation, OperationObservation, OperationPhase,
+  };
+  let phase = match event.event_type() {
+    "item.started" => OperationPhase::Started,
+    "item.completed" => OperationPhase::Completed,
+    _ => return Vec::new(),
+  };
+  let Some(item) = event.value().get("item") else {
+    return Vec::new();
+  };
+  let Some(id) = item
+    .get("id")
+    .and_then(Value::as_str)
+    .filter(|v| !v.is_empty() && v.len() <= MAX_OPERATION_SOURCE_ID_BYTES)
+  else {
+    return Vec::new();
+  };
+  let completed = phase == OperationPhase::Completed;
+  let failed = |exit_code: Option<i64>| {
+    if completed {
+      match (exit_code, item.get("status").and_then(Value::as_str)) {
+        (Some(code), status) => Some(code != 0 || status == Some("failed")),
+        (_, Some("failed")) => Some(true),
+        (_, Some("completed")) => Some(false),
+        _ => None,
+      }
+    } else {
+      None
+    }
+  };
+  let Some(observed_at_unix_ms) = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .ok()
+    .and_then(|d| d.as_millis().try_into().ok())
+  else {
+    return Vec::new();
+  };
+  let observation = |identity: String, operation| OperationObservation {
+    operation_id: blake3::hash(identity.as_bytes()).to_hex().to_string(),
+    phase,
+    observed_at_unix_ms,
+    operation,
+  };
+  match item.get("type").and_then(Value::as_str) {
+    Some("command_execution") => {
+      let exit_code = completed
+        .then(|| item.get("exit_code").and_then(Value::as_i64))
+        .flatten();
+      vec![observation(
+        id.to_owned(),
+        ObservedOperation::Command {
+          exit_code,
+          failed: failed(exit_code),
+        },
+      )]
+    },
+    Some("file_change") => {
+      let Some(changes) = item
+        .get("changes")
+        .and_then(Value::as_array)
+        .filter(|c| c.len() <= MAX_PUBLIC_FILE_OPERATIONS)
+      else {
+        return Vec::new();
+      };
+      changes
+        .iter()
+        .filter_map(|entry| {
+          let path = entry.get("path")?.as_str().filter(|p| is_public_operation_path(p))?;
+          let change = match entry.get("kind")?.as_str()? {
+            "add" => FileChangeKind::Created,
+            "update" => FileChangeKind::Modified,
+            "delete" => FileChangeKind::Deleted,
+            _ => return None,
+          };
+          Some(observation(
+            format!("{id}\0{path}"),
+            ObservedOperation::File {
+              path: path.to_owned(),
+              change,
+              failed: failed(None),
+            },
+          ))
+        })
+        .collect()
+    },
+    _ => Vec::new(),
   }
 }
 
@@ -252,6 +361,7 @@ fn progress(command_id: &str, message: &str) -> PluginResponse {
   PluginResponse::Progress {
     id: command_id.to_owned(),
     progress: ProgressUpdate {
+      observation: None,
       message: message.to_owned(),
       current: None,
       total: None,

@@ -36,6 +36,10 @@ fn main() {
   let executable = std::env::current_exe().expect("fixture executable path must be available");
   let control_directory = std::env::var_os(CONTROL_DIRECTORY_ENV).map(PathBuf::from);
   let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+  if arguments == ["--fixture-operation-command"] {
+    println!("protected-command-output");
+    std::process::exit(17);
+  }
   if arguments
     .first()
     .is_some_and(|argument| argument == "--fixture-descendant")
@@ -78,6 +82,34 @@ fn main() {
     std::fs::read_to_string(executable.with_extension("run-mode")).unwrap_or_else(|_| "complete".to_owned())
   });
   match mode.trim() {
+    "public-operations" => {
+      emit_event(
+        r#"{"type":"item.started","item":{"id":"cmd-1","type":"command_execution","command":"private-command-arguments"}}"#,
+      );
+      let command = Command::new(&executable)
+        .arg("--fixture-operation-command")
+        .env_clear()
+        .output()
+        .unwrap();
+      assert_eq!(command.status.code(), Some(17));
+      emit_event(
+        r#"{"type":"item.completed","item":{"id":"cmd-1","type":"command_execution","status":"failed","exit_code":17,"aggregated_output":"protected-command-output"}}"#,
+      );
+      emit_event(
+        r#"{"type":"item.started","item":{"id":"edit-1","type":"file_change","changes":[{"path":"out/observed.txt","kind":"add"}]}}"#,
+      );
+      write_workspace_file("out/observed.txt", b"protected-file-content");
+      emit_event(
+        r#"{"type":"item.completed","item":{"id":"edit-1","type":"file_change","status":"completed","changes":[{"path":"out/observed.txt","kind":"add","diff":"protected-file-content"}]}}"#,
+      );
+      emit_event(
+        r#"{"type":"item.completed","item":{"id":"summary-1","type":"agent_message","text":"all checks passed; private-transcript"}}"#,
+      );
+      emit_event(
+        r#"{"type":"turn.completed","message":"untrusted summary","usage":{"input_tokens":11,"cached_input_tokens":7,"output_tokens":3}}"#,
+      );
+      std::fs::write("out/operations-ready", b"ready").unwrap();
+    },
     "complete" => emit_event(r#"{"type":"turn.completed","message":"done"}"#),
     "failed" => emit_event(r#"{"type":"turn.failed","error":{"message":"fixture failure"}}"#),
     "failed-nonzero" => {

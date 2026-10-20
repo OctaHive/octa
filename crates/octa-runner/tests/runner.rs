@@ -1085,3 +1085,117 @@ fn cancel_stops_an_active_command() {
   );
   assert_valid_output(&observed);
 }
+
+#[test]
+fn codex_operations_reach_the_original_runner_stream_without_private_metadata() {
+  let workspace = TempDir::new().unwrap();
+  let plugins = workspace.path().join("public-plugins");
+  fs::create_dir(&plugins).unwrap();
+  for name in ["shell", "tpl"] {
+    let binary = format!("octa_plugin_{name}{}", env::consts::EXE_SUFFIX);
+    fs::copy(plugins_dir().join(&binary), plugins.join(&binary)).expect("build builtin plugins first");
+  }
+  let filename = format!("octa_plugin_codex{}", env::consts::EXE_SUFFIX);
+  fs::copy(plugins_dir().join(&filename), plugins.join(&filename)).expect("build octa_plugin_codex first");
+  fs::write(plugins.join("codex.plugin.yml"), format!("manifest_version: 1\nname: codex\nversion: {}\nprotocol: 2\nplatforms: [{}]\nentrypoint: {}\nsha256: {}\ncapabilities: [codex.blocking-pre-tool-authorization.v1, public-command-file-observations.v1]\n", env!("CARGO_PKG_VERSION"), current_platform(), filename,
+    tokio::runtime::Runtime::new().unwrap().block_on(sha256_file(&plugins.join(&filename))).unwrap())).unwrap();
+  let fixture = workspace
+    .path()
+    .join(format!("codex-fixture{}", env::consts::EXE_SUFFIX));
+  fs::copy(
+    plugins_dir().join(format!("codex-test-fixture{}", env::consts::EXE_SUFFIX)),
+    &fixture,
+  )
+  .expect("build codex-test-fixture first");
+  fs::write(fixture.with_extension("run-mode"), "public-operations").unwrap();
+  fs::write(
+    workspace.path().join("Octafile.yml"),
+    "version: 1\ntasks:\n  observe:\n    codex:\n      prompt: private-prompt-canary\n",
+  )
+  .unwrap();
+  let input = json!({"type":"start", "protocol_version":3,"request_id":"exact-job-attempt", "request":{
+    "workspace":workspace.path(),"data_dir":workspace.path().join("cache"),"plugins_dir":plugins,"plugins":["codex"],"default_plugin":"codex","commands":["observe"],"quiet":true
+  }});
+  let output = Command::cargo_bin("octa-runner")
+    .unwrap()
+    .timeout(PROCESS_WATCHDOG)
+    .env("OCTA_CODEX_EXECUTABLE", &fixture)
+    .write_stdin(format!("{input}\n"))
+    .output()
+    .unwrap();
+  assert!(
+    output.status.success(),
+    "runner failed: {} {}",
+    String::from_utf8_lossy(&output.stderr),
+    String::from_utf8_lossy(&output.stdout)
+  );
+  let messages = messages(&output.stdout);
+  assert_valid_output(&messages);
+  let events = messages
+    .iter()
+    .filter(|v| v["type"] == "event")
+    .map(|v| &v["event"])
+    .collect::<Vec<_>>();
+  let observations = events
+    .iter()
+    .filter(|v| v["data"]["progress"]["observation"].is_object())
+    .collect::<Vec<_>>();
+  assert_eq!(
+    observations.len(),
+    4,
+    "actual plugin facts must survive runtime routing into the runner event channel"
+  );
+  let validator = jsonschema::validator_for(&serde_json::from_str(octa_output::EVENT_SCHEMA_V4).unwrap()).unwrap();
+  for event in &observations {
+    assert!(validator.is_valid(event));
+    assert!(event["data"]["step_id"].as_u64().is_some());
+    assert_eq!(event["data"]["run_id"], observations[0]["data"]["run_id"]);
+    assert_eq!(event["data"]["command_id"], observations[0]["data"]["command_id"]);
+    let entry: octa_output::ConsoleEntry = serde_json::from_value((**event).clone()).unwrap();
+    assert!(
+      event["data"]["progress"]["observation"]["observed_at_unix_ms"]
+        .as_i64()
+        .unwrap()
+        <= entry.timestamp().timestamp_millis()
+    );
+  }
+  let command_output = events
+    .iter()
+    .find(|event| event["data"]["type"] == "output" && event["data"]["payload"]["data"] == "protected-command-output")
+    .expect("original authorized output event");
+  for identity in ["run_id", "step_id", "command_id"] {
+    assert_eq!(
+      command_output["data"][identity], observations[1]["data"][identity],
+      "log navigation must retain the producing command scope"
+    );
+  }
+  for pair in events.windows(2) {
+    assert_eq!(
+      pair[1]["sequence"].as_u64().unwrap(),
+      pair[0]["sequence"].as_u64().unwrap() + 1
+    );
+  }
+  assert_eq!(
+    observations[1]["data"]["progress"]["observation"]["operation"]["exit_code"],
+    17
+  );
+  assert_eq!(
+    messages.last().unwrap()["status"],
+    "succeeded",
+    "a tool outcome is not run acceptance authority"
+  );
+  assert_eq!(
+    fs::read(workspace.path().join("out/observed.txt")).unwrap(),
+    b"protected-file-content"
+  );
+  let safe = serde_json::to_string(&observations).unwrap();
+  for forbidden in [
+    "private-prompt-canary",
+    "private-command-arguments",
+    "protected-command-output",
+    "protected-file-content",
+    "private-transcript",
+  ] {
+    assert!(!safe.contains(forbidden));
+  }
+}

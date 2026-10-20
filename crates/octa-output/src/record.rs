@@ -165,6 +165,9 @@ impl CacheReason {
 /// Transient progress reported by a concrete plugin command.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProgressUpdate {
+  /// Durable public observation; unlike ordinary progress this must not be coalesced.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub observation: Option<octa_runner_protocol::OperationObservation>,
   /// Human-readable description of the current activity.
   pub message: String,
   /// Completed amount, when the operation exposes a measurable position.
@@ -668,6 +671,7 @@ mod tests {
         step_id: Some(step.id()),
         command_id: "plugin-command-4".to_owned(),
         progress: ProgressUpdate {
+          observation: None,
           message: "Compiling".to_owned(),
           current: Some(3),
           total: Some(10),
@@ -865,5 +869,31 @@ mod tests {
       }
     });
     assert!(!validator.is_valid(&unscoped_step_output));
+  }
+}
+
+#[cfg(test)]
+mod observation_contract_tests {
+  use super::*;
+  use serde_json::json;
+
+  #[test]
+  fn current_event_schema_accepts_closed_public_operation_metadata() {
+    let schema = serde_json::from_str(EVENT_SCHEMA_V4).unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut value = json!({"schema_version":4,"sequence":7,"timestamp":"2026-10-20T08:00:00Z","category":"execution",
+    "data":{"type":"progress","run_id":2,"scope":null,"command_id":"command-1","progress":{
+      "message":"Reported operation", "observation":{"operation_id":"ab".repeat(32), "phase":"completed", "observed_at_unix_ms":1792483200000_i64,
+        "operation":{"kind":"command","exit_code":17,"failed":true}}
+    }}});
+    assert!(
+      validator.is_valid(&value),
+      "the existing event schema must advertise the optional metadata"
+    );
+    value["data"]["progress"]["observation"]["operation"]["arguments"] = json!(["private"]);
+    assert!(
+      !validator.is_valid(&value),
+      "raw invocation content cannot become public observation metadata"
+    );
   }
 }

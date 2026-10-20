@@ -71,6 +71,8 @@ jobs:
           cp target/debug/examples/octa_plugin_test.exe plugins
       - name: Run cargo test
         run: cargo test --workspace -- --nocapture
+      - name: Test release metadata contracts
+        run: python -m unittest discover -s conformance -p "test_*.py" -v
       - name: Test cache benchmark harness
         if: matrix.os != 'windows-latest'
         run: python3 -m unittest discover -s benchmarks/cache/tests -v

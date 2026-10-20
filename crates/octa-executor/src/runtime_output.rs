@@ -431,6 +431,7 @@ mod tests {
       .progress(
         "command",
         ProgressUpdate {
+          observation: None,
           message: "Compiling".to_owned(),
           current: Some(1),
           total: Some(2),
