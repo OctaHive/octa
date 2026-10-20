@@ -10,6 +10,10 @@
 - Rust consumers constructing plugin/output `ProgressUpdate` values must initialize the new optional `observation` field. Use `None` for ordinary progress. Runner protocol 3, event schema 4 and plugin protocol 2 remain unchanged.
 - Public operation observations use the existing ordered bounded output queue so delayed consumption cannot replace start/completion events with the latest progress update. Missing measurements remain unknown; summaries grant no acceptance authority.
 
+### Security
+
+- Update QUIC and TLS dependencies to patched versions of quinn-proto, rustls, rustls-webpki and webpki-roots.
+
 ## 0.5.1 - 2026-10-08
 
 ### Added
