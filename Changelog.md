@@ -1,3 +1,15 @@
+## 0.6.0 - 2026-10-20
+
+### Added
+
+- Codex reports bounded public command and file-operation observations through the existing plugin and runner event channel, with original observation times, safe outcomes and output references.
+- Release manifests and compatibility metadata advertise the qualified observation capability; release checks reject missing capabilities.
+
+### Changed
+
+- Rust consumers constructing plugin/output `ProgressUpdate` values must initialize the new optional `observation` field. Use `None` for ordinary progress. Runner protocol 3, event schema 4 and plugin protocol 2 remain unchanged.
+- Public operation observations use the existing ordered bounded output queue so delayed consumption cannot replace start/completion events with the latest progress update. Missing measurements remain unknown; summaries grant no acceptance authority.
+
 ## 0.5.1 - 2026-10-08
 
 ### Added

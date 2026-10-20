@@ -33,7 +33,10 @@ fn plugin_schema() -> PluginSchema {
   PluginSchema {
     key: "codex".to_owned(),
     supports_raw: false,
-    capabilities: vec![contract::TOOL_AUTHORIZATION_CAPABILITY.to_owned()],
+    capabilities: vec![
+      contract::TOOL_AUTHORIZATION_CAPABILITY.to_owned(),
+      octa_runner_protocol::PUBLIC_OPERATION_OBSERVATIONS_V1.to_owned(),
+    ],
     input_schema: Some(config::input_schema()),
     output_schema: Some(records::output_schema()),
   }

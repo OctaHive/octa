@@ -649,3 +649,75 @@ async fn a_missing_required_deliverable_publishes_no_resources() {
   )));
   assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
 }
+
+#[tokio::test]
+async fn real_codex_process_retains_every_public_operation_and_reported_usage() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture_directory = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(fixture_directory.path(), "public-operations");
+  let (manager, mut execution) = start_lifecycle_execution(workspace.path(), fixture).await;
+  wait_for_file(&workspace.path().join("out/operations-ready")).await;
+  // Deliberately pause consumption: durable observations must not share the
+  // lossy latest-progress slot, even when a short child has already finished.
+  tokio::time::sleep(Duration::from_millis(100)).await;
+  let responses = receive_through_terminal(&mut execution).await;
+  let observations = responses
+    .iter()
+    .filter_map(|response| {
+      let value = serde_json::to_value(response).unwrap();
+      value["payload"]["progress"]["observation"].as_object().cloned()
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(
+    observations.len(),
+    4,
+    "start and completion of both real operations survive delayed consumption"
+  );
+  assert_eq!(observations[0]["phase"], "started");
+  assert_eq!(observations[1]["operation"]["exit_code"], 17);
+  assert_eq!(observations[2]["operation"]["path"], "out/observed.txt");
+  assert_eq!(observations[3]["phase"], "completed");
+  assert_eq!(
+    fs::read(workspace.path().join("out/observed.txt")).unwrap(),
+    b"protected-file-content"
+  );
+  let encoded = serde_json::to_string(&observations).unwrap();
+  for private in [
+    "private-command",
+    "protected-command-output",
+    "protected-file-content",
+    "private-transcript",
+    "untrusted summary",
+  ] {
+    assert!(!encoded.contains(private));
+  }
+  let Some(PluginResponse::Completed { outputs, code: 0, .. }) = responses.last() else {
+    panic!("semantic completion missing");
+  };
+  assert_eq!(
+    outputs["usage"],
+    json!({"input_tokens":11,"cached_input_tokens":7,"output_tokens":3})
+  );
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn additive_process_activity_and_missing_usage_remain_unreported() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture_directory = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(fixture_directory.path(), "unknown");
+  let (manager, mut execution) = start_lifecycle_execution(workspace.path(), fixture).await;
+  let responses = receive_through_terminal(&mut execution).await;
+  assert!(responses
+    .iter()
+    .all(|r| !matches!(r, PluginResponse::Progress { progress, .. } if progress.observation.is_some())));
+  let Some(PluginResponse::Completed { outputs, code: 0, .. }) = responses.last() else {
+    panic!("completion missing");
+  };
+  assert_eq!(
+    outputs["usage"],
+    json!({}),
+    "absent measurements cannot become zero counters or cost estimates"
+  );
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}

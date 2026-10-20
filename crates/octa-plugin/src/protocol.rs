@@ -139,6 +139,9 @@ pub struct SourceLocation {
 /// Transient command progress. It is intentionally separate from stdout/stderr.
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct ProgressUpdate {
+  /// Durable public observation; unlike ordinary progress this must not be coalesced.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub observation: Option<octa_runner_protocol::OperationObservation>,
   /// Human-readable description of the current activity.
   pub message: String,
   /// Completed amount, when the operation exposes a measurable position.
@@ -422,6 +425,7 @@ mod tests {
     let response = PluginResponse::Progress {
       id: "command".to_owned(),
       progress: ProgressUpdate {
+        observation: None,
         message: "Compiling".to_owned(),
         current: Some(3),
         total: Some(10),

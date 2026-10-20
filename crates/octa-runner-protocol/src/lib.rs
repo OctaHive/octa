@@ -12,6 +12,12 @@ use std::{collections::BTreeMap, num::NonZeroUsize, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod observation;
+pub use observation::{
+  is_public_operation_path, FileChangeKind, ObservedOperation, OperationObservation, OperationPhase,
+  MAX_PUBLIC_OPERATION_PATH_BYTES, PUBLIC_OPERATION_OBSERVATIONS_V1,
+};
+
 pub use octa_cache_protocol::{
   CacheMode, LocalCacheCapacity, MAX_CACHE_TOKEN_FILE_BYTES, TASK_RESULT_CACHE_FEATURE_V1,
   TASK_RESULT_CACHE_HTTP_FEATURE_V1,

@@ -194,3 +194,38 @@ references, and a dependent semantic-outcome gate. Repository conformance runs
 those same files against the deterministic Codex fixture through both the CLI
 and the public runner protocol; the examples do not have a separate test-only
 execution path.
+
+## Public operation observations
+
+The qualified Codex adapter advertises `public-command-file-observations.v1`.
+It attaches optional typed `progress.observation` metadata to the existing plugin
+response and runner execution event. Hosts route these records through the same
+bounded ordered queue as output and completion, rather than the replaceable
+latest-progress slot. Ordinary progress retains its existing coalescing behavior.
+No new runner, plugin or Agent protocol version is required.
+
+Each observation contains an opaque operation digest, an actually reported
+`started` or `completed` boundary, the plugin's original observation time, and
+allowlisted command or file facts. The enclosing event supplies the original
+run/step/command identity, sequence and runner timestamp; the Agent supplies its
+existing fenced Job/attempt envelope. A completion does not manufacture a missing
+start. Public metadata never contains command text/arguments, environment,
+transcripts, prompts, file diffs, output bodies or raw harness identifiers.
+Command exit/failure and file failure remain unknown when not reported; these
+observations are neither verification evidence nor an acceptance decision.
+
+File observations accept at most 32 changes per harness item. Only portable
+workspace-relative paths up to 1,024 UTF-8 bytes are exposed. Absolute,
+traversing, hidden, `protected` component and non-portable paths are omitted;
+unrecognized change kinds and items without a bounded correlation identifier
+produce no observation. MCP calls, web search, reasoning and summaries are not
+qualified public operation categories. Consumers must display unsupported or
+absent facts as Not reported, rather than parse progress/output text.
+
+Token measurements continue through the existing result/provenance `usage` maps:
+`input_tokens`, `cached_input_tokens` and `output_tokens` are separate reported
+counters. Missing usage is an empty map, not zero usage or an estimated cost.
+This model token cache is distinct from Octa's existing task-result cache
+lookup/hit/miss/restore events. Observation metadata introduces no price table,
+reservation accounting or additional record store. Existing independently
+authorized log readers supply content; generic operation rows contain no output.

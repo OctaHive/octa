@@ -349,3 +349,76 @@ fn completed_non_output_items_report_progress_or_diagnostics() {
     "mcp_tool_call.error must contain a string message"
   );
 }
+
+#[test]
+fn public_command_observation_retains_outcome_without_private_invocation() {
+  let responses = normalize_json(json!({
+    "type":"item.completed", "item":{
+      "id":"command-private-id", "type":"command_execution", "status":"failed", "exit_code":17,
+      "command":"sh -c private-argument", "aggregated_output":"protected-output",
+      "prompt":"private-prompt", "environment":{"TOKEN":"private-credential"}
+    }
+  }))
+  .unwrap();
+  let observations = responses
+    .iter()
+    .map(|r| serde_json::to_value(r).unwrap())
+    .filter_map(|r| r["payload"]["progress"]["observation"].as_object().cloned())
+    .collect::<Vec<_>>();
+  assert_eq!(
+    observations.len(),
+    1,
+    "one structured operation, independently of progress/output"
+  );
+  let observation = &observations[0];
+  assert_eq!(observation["phase"], "completed");
+  assert_eq!(observation["operation"]["kind"], "command");
+  assert_eq!(observation["operation"]["exit_code"], 17);
+  assert_eq!(observation["operation"]["failed"], true);
+  assert!(observation["observed_at_unix_ms"].as_i64().unwrap() > 0);
+  let encoded = serde_json::to_string(observation).unwrap();
+  for private in [
+    "command-private-id",
+    "private-argument",
+    "protected-output",
+    "private-prompt",
+    "private-credential",
+  ] {
+    assert!(!encoded.contains(private));
+  }
+}
+
+#[test]
+fn public_file_observations_keep_only_bounded_workspace_paths_and_reported_boundaries() {
+  let mut observed = Vec::new();
+  for phase in ["item.started", "item.completed"] {
+    for response in normalize_json(json!({"type":phase, "item": {
+      "id":"edit-1", "type":"file_change", "status":"completed", "changes":[
+        {"path":"src/main.rs", "kind":"update", "diff":"protected-file-content"},
+        {"path":"/workspace/protected/test.rs", "kind":"update"},
+        {"path":"../protected/test.rs", "kind":"delete"},
+        {"path":".octa/private.json", "kind":"add"},
+        {"path":"src/../../private", "kind":"update"},
+        {"path":"src\\private", "kind":"update"}
+      ]
+    }}))
+    .unwrap()
+    {
+      let value = serde_json::to_value(response).unwrap();
+      if value["payload"]["progress"]["observation"].is_object() {
+        observed.push(value["payload"]["progress"]["observation"].clone());
+      }
+    }
+  }
+  assert_eq!(observed.len(), 2);
+  assert_eq!(observed[0]["phase"], "started");
+  assert_eq!(observed[1]["phase"], "completed");
+  assert_eq!(observed[0]["operation_id"], observed[1]["operation_id"]);
+  assert_eq!(
+    observed[1]["operation"],
+    json!({"kind":"file", "path":"src/main.rs", "change":"modified", "failed":false})
+  );
+  let serialized = serde_json::to_string(&observed).unwrap();
+  assert!(!serialized.contains("protected"));
+  assert!(!serialized.contains("private"));
+}

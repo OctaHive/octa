@@ -394,6 +394,7 @@ mod tests {
       step_id: None,
       command_id: "command".to_owned(),
       progress: ProgressUpdate {
+        observation: None,
         message: "working".to_owned(),
         current: Some(current),
         total: Some(2),

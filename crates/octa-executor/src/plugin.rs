@@ -374,6 +374,7 @@ async fn route_plugin_response_redacted(
             .progress(
               command_id,
               ProgressUpdate {
+                observation: progress.observation,
                 message: redact(&progress.message, redactions),
                 current: progress.current,
                 total: progress.total,
@@ -899,6 +900,7 @@ mod tests {
         PluginResponse::Progress {
           id: "command".to_owned(),
           progress: PluginProgressUpdate {
+            observation: None,
             message: "Compiling".to_owned(),
             current: Some(3),
             total: Some(10),
@@ -1149,6 +1151,7 @@ mod tests {
       PluginResponse::Progress {
         id: "command".to_owned(),
         progress: PluginProgressUpdate {
+          observation: None,
           message: "ignored during raw execution".to_owned(),
           current: None,
           total: None,

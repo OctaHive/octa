@@ -557,6 +557,7 @@ mod tests {
       step_id: Some(4),
       command_id: "compiler".to_owned(),
       progress: ProgressUpdate {
+        observation: None,
         message: "Compiling".to_owned(),
         current: Some(3),
         total: Some(10),
@@ -597,6 +598,7 @@ mod tests {
   fn structured_progress_formats_partial_updates_without_empty_rows() {
     assert_eq!(
       formatted_progress(&ProgressUpdate {
+        observation: None,
         message: String::new(),
         current: Some(7),
         total: None,
@@ -606,6 +608,7 @@ mod tests {
     );
     assert_eq!(
       formatted_progress(&ProgressUpdate {
+        observation: None,
         message: "Waiting".to_owned(),
         current: None,
         total: Some(10),
@@ -615,6 +618,7 @@ mod tests {
     );
     assert_eq!(
       formatted_progress(&ProgressUpdate {
+        observation: None,
         message: " \r".to_owned(),
         current: None,
         total: None,

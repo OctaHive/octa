@@ -111,6 +111,39 @@
         }
       ]
     },
+    "operation_observation": {
+      "type": "object",
+      "required": ["operation_id", "phase", "observed_at_unix_ms", "operation"],
+      "properties": {
+        "operation_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "phase": { "enum": ["started", "completed"] },
+        "observed_at_unix_ms": { "type": "integer", "minimum": 0 },
+        "operation": {
+          "oneOf": [
+            {
+              "type": "object", "required": ["kind", "exit_code", "failed"],
+              "properties": {
+                "kind": { "const": "command" },
+                "exit_code": { "type": ["integer", "null"] },
+                "failed": { "type": ["boolean", "null"] }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object", "required": ["kind", "path", "change", "failed"],
+              "properties": {
+                "kind": { "const": "file" },
+                "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+                "change": { "enum": ["created", "modified", "deleted"] },
+                "failed": { "type": ["boolean", "null"] }
+              },
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
     "progress_update": {
       "type": "object",
       "required": ["message"],
@@ -118,7 +151,8 @@
         "message": { "type": "string" },
         "current": { "type": "integer", "minimum": 0 },
         "total": { "type": "integer", "minimum": 0 },
-        "unit": { "type": "string" }
+        "unit": { "type": "string" },
+        "observation": { "$ref": "#/$defs/operation_observation" }
       },
       "additionalProperties": false
     },
