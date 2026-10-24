@@ -34,7 +34,7 @@ serde_json = { workspace = true }
 same-file = { workspace = true }
 semver = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 toml = { workspace = true }
 url = { workspace = true }
 

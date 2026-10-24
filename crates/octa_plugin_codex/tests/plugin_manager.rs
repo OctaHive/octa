@@ -904,3 +904,43 @@ async fn invalid_runtime_catalogs_are_unavailable_without_publishing_partial_sug
   assert!(!workspace.path().join(".octa").exists());
   assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn model_discovery_deadline_includes_runtime_qualification_and_reaps_the_runtime() {
+  use std::os::unix::fs::PermissionsExt;
+  let workspace = tempfile::tempdir().unwrap();
+  let executable = workspace.path().join("codex");
+  let pid_path = executable.with_extension("pid");
+  fs::write(&executable, "#!/bin/sh\nif [ \"$1\" = '--version' ]; then\n /bin/sleep 4\n printf 'codex-cli 0.161.0\\n'\n exit 0\nfi\nprintf '%s' \"$$\" > \"$0.pid\"\nexec /bin/sleep 60\n").unwrap();
+  fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+  let (manager, plugin) = plugin_manager_with_codex(workspace.path(), executable);
+  manager.start_plugin(&plugin).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let started = std::time::Instant::now();
+  let result = client.model_catalog().await;
+  let elapsed = started.elapsed();
+  let shutdown = manager.shutdown_all().await;
+  let pid: i32 = fs::read_to_string(pid_path).unwrap().parse().unwrap();
+  let exited = tokio::time::timeout(Duration::from_secs(2), async {
+    while unsafe { libc::kill(pid, 0) } == 0 {
+      tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+  })
+  .await
+  .is_ok();
+  if !exited {
+    // Cleanup belongs to this fixture's owned runtime process group, including on Red.
+    unsafe {
+      libc::kill(-pid, libc::SIGKILL);
+    }
+  }
+  let catalog = result.unwrap();
+  assert!(!catalog.available && catalog.manual_model && catalog.models.is_empty());
+  assert!(shutdown.into_iter().all(|result| result.is_ok()));
+  assert!(exited, "discovery left its runtime alive");
+  assert!(
+    elapsed < Duration::from_secs(13),
+    "qualification and discovery exceeded the single deadline: {elapsed:?}"
+  );
+}

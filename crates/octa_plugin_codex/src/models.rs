@@ -5,7 +5,7 @@ use octa_plugin::protocol::{ModelCatalog, ModelChoice};
 use serde_json::{json, Map, Value};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 use octa_runner_protocol::{
@@ -28,8 +28,8 @@ pub(crate) async fn discover(cancel: CancellationToken) -> ModelCatalog {
     parameters: parameters(),
     manual_model: true,
   };
-  let result = discover_models(&cancel).await;
-  if let Ok(models) = result {
+  let result = tokio::time::timeout(DISCOVERY_TIMEOUT, discover_models(&cancel)).await;
+  if let Ok(Ok(models)) = result {
     catalog.models = models;
     catalog.available = true;
   }
@@ -47,7 +47,9 @@ async fn discover_models(cancel: &CancellationToken) -> anyhow::Result<Vec<Model
   let mut output = BufReader::new(tree.take_stdout()?);
   // Do not retain diagnostics that may describe private runtime configuration.
   let mut stderr = tree.take_stderr()?;
-  let drain = tokio::spawn(async move { tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await });
+  let drain = AbortOnDropHandle::new(tokio::spawn(async move {
+    tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await
+  }));
   let operation = async {
     input
       .write_all(
@@ -121,7 +123,7 @@ async fn discover_models(cancel: &CancellationToken) -> anyhow::Result<Vec<Model
     Ok(models)
   };
   let result = tokio::select! {
-    result = tokio::time::timeout(DISCOVERY_TIMEOUT, operation) => result.unwrap_or_else(|_| Err(anyhow::anyhow!("discovery timed out"))),
+    result = operation => result,
     _ = cancel.cancelled() => Err(anyhow::anyhow!("discovery cancelled")),
   };
   drop(input);

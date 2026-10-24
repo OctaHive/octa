@@ -163,6 +163,9 @@ installation-owned access. It performs `initialize` and `model/list` through
 [Codex app-server](https://learn.chatgpt.com/docs/app-server), without a thread,
 inference turn, task prompt, task environment or Octa run records. Pages,
 response bytes and process lifetime are bounded by the common process owner.
+The single 10-second discovery deadline includes executable qualification and
+app-server queries. Timeout drops the existing process owner and stderr drain;
+it returns unavailable metadata without leaving the runtime running.
 The result contains `available`, `manual_model`, advisory `models` with opaque
 `id`/`label` values, and JSON Schema `parameters` at catalog and model level.
 A missing or unavailable runtime returns `available: false` with the plugin's
