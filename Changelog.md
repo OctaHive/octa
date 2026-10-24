@@ -10,6 +10,7 @@
 - Existing task fields, runner/plugin protocols, observations and usage records remain compatible. Omitting the new settings keeps the previous command; an explicit MCP map replaces ambient servers.
 - Task arguments cannot replace sandbox, approval, hook, model or output controls. MCP bearer credentials require an explicit secret mapping and HTTPS, and credential values stay out of argv and audit records.
 - External integration catalogs and authorization remain caller-owned; no OctaCity dependency or connection registry is introduced.
+- Update Tokio to 1.53.3 for RUSTSEC-2026-0386 and register the owned raw-input descriptor with its explicit lifetime contract.
 
 ## 0.6.0 - 2026-10-20
 

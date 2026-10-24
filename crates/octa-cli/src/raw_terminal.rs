@@ -124,7 +124,9 @@ async fn forward_input(input: RawTerminalInput, _terminal_mode: bool) -> io::Res
     return input.close().await;
   }
 
-  let terminal = match AsyncFd::new(descriptor) {
+  // SAFETY: AsyncFd owns the duplicated File. Its descriptor is never exposed,
+  // closed or replaced while registered; AsyncFd deregisters it before drop.
+  let terminal = match unsafe { AsyncFd::register(descriptor) }.map_err(io::Error::from) {
     Ok(terminal) => terminal,
     Err(error) if error.raw_os_error() == Some(nix::libc::EPERM) => {
       let mut descriptor = File::from(dup(&stdin).map_err(io::Error::other)?);
