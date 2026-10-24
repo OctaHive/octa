@@ -869,3 +869,38 @@ fn standalone_model_discovery_uses_the_same_plugin_contract() {
   let catalog: octa_plugin::protocol::ModelCatalog = serde_json::from_slice(&result.stdout).unwrap();
   assert!(catalog.available && catalog.manual_model && catalog.models.is_empty());
 }
+
+#[tokio::test]
+async fn invalid_runtime_catalogs_are_unavailable_without_publishing_partial_suggestions() {
+  let workspace = tempfile::tempdir().unwrap();
+  let executable = install_process_fixture(workspace.path());
+  let catalog_path = executable.with_extension("models");
+  let (manager, plugin) = plugin_manager_with_codex(workspace.path(), executable);
+  manager.start_plugin(&plugin).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let entry = json!({"model":"future-model","displayName":"Future model","supportedReasoningEfforts":[]});
+  for page in [
+    json!({"data":"invalid","nextCursor":null}),
+    json!({"data":[entry.clone(),entry],"nextCursor":null}),
+    json!({"data":[],"nextCursor":"repeated"}),
+    json!({"data":[],"nextCursor":7}),
+    json!({"data":[],"nextCursor":null,"padding":"x".repeat(256 * 1024)}),
+  ] {
+    fs::write(&catalog_path, page.to_string()).unwrap();
+    let catalog = client.model_catalog().await.unwrap();
+    assert!(
+      !catalog.available,
+      "invalid discovery must remain distinguishable from an empty list"
+    );
+    assert!(catalog.manual_model && catalog.models.is_empty());
+  }
+  fs::write(
+    &catalog_path,
+    json!({"data":[{"hidden":true}],"nextCursor":null}).to_string(),
+  )
+  .unwrap();
+  let hidden_only = client.model_catalog().await.unwrap();
+  assert!(hidden_only.available && hidden_only.models.is_empty());
+  assert!(!workspace.path().join(".octa").exists());
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
