@@ -1410,6 +1410,9 @@ mod tests {
       client.get_schema().await,
       Err(PluginClientError::WriterClosed)
     ));
+    // The timeout assertion uses virtual time; pipe teardown needs real I/O
+    // time on Windows so an idle executor cannot advance the join deadline.
+    tokio::time::resume();
     let messages = server.stop().await;
     assert!(messages.iter().any(|message| message.contains("DescribeModels")));
   }
@@ -1429,6 +1432,9 @@ mod tests {
       client.get_schema().await,
       Err(PluginClientError::WriterClosed)
     ));
+    // The timeout assertion uses virtual time; pipe teardown needs real I/O
+    // time on Windows so an idle executor cannot advance the join deadline.
+    tokio::time::resume();
     let messages = server.stop().await;
     assert!(messages.iter().any(|message| message.contains("PlanCache")));
   }
