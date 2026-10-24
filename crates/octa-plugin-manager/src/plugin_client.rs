@@ -404,6 +404,26 @@ impl PluginClient {
     }
   }
 
+  /// Explicit discovery shares the lifecycle exchange; no task or model is executed.
+  pub async fn model_catalog(&self) -> Result<octa_plugin::protocol::ModelCatalog, PluginClientError> {
+    let _exchange = self.inner.control_exchange.lock().await;
+    self.send(&OctaCommand::DescribeModels).await?;
+    let response = match tokio::time::timeout(Duration::from_secs(15), self.receive_control()).await {
+      Ok(response) => response?,
+      Err(_) => {
+        self.cleanup().await;
+        return Err(PluginClientError::Protocol("model discovery timed out".into()));
+      },
+    };
+    match response {
+      PluginResponse::ModelCatalog(catalog) => Ok(catalog),
+      PluginResponse::Error { message, .. } => Err(PluginClientError::Protocol(message)),
+      _ => Err(PluginClientError::Protocol(
+        "unexpected model discovery response".into(),
+      )),
+    }
+  }
+
   /// Requests a side-effect-free filesystem contract for one invocation.
   pub async fn plan_cache(
     &self,
@@ -1375,6 +1395,23 @@ mod tests {
     ));
     client.shutdown().await.unwrap();
     let _ = server.stop().await;
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn model_discovery_timeout_closes_the_connection_before_a_late_reply_can_be_reused() {
+    let mut server = TestServer::new().await;
+    server.start("ignore-models".to_owned()).await;
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    assert!(
+      matches!(client.model_catalog().await, Err(PluginClientError::Protocol(message)) if message.contains("timed out"))
+    );
+    assert!(matches!(
+      client.get_schema().await,
+      Err(PluginClientError::WriterClosed)
+    ));
+    let messages = server.stop().await;
+    assert!(messages.iter().any(|message| message.contains("DescribeModels")));
   }
 
   #[tokio::test(start_paused = true)]

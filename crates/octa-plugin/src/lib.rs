@@ -133,8 +133,12 @@ struct Args {
   log_dir: Option<String>,
 
   /// Path to the socket
-  #[arg(long)]
-  socket_path: String,
+  #[arg(long, required_unless_present = "describe_models")]
+  socket_path: Option<String>,
+
+  /// Print one bounded runtime catalog without starting a task or socket listener.
+  #[arg(long, conflicts_with = "socket_path")]
+  describe_models: bool,
 }
 
 #[async_trait]
@@ -148,6 +152,12 @@ pub trait Plugin: Send + Sync + 'static {
   /// `None` whenever those unavailable values can change a path; it explicitly
   /// marks the invocation opaque so a cached task must provide its own inputs.
   fn cache_plan(&self, _request: &PluginCachePlanRequest) -> anyhow::Result<Option<PluginCachePlan>> {
+    Ok(None)
+  }
+
+  /// Explicit runtime discovery. This must not run a model or workload. Unsupported
+  /// plugins retain the default; callers must capability-check before requesting it.
+  async fn model_catalog(&self, _cancel: CancellationToken) -> anyhow::Result<Option<protocol::ModelCatalog>> {
     Ok(None)
   }
 
@@ -219,6 +229,24 @@ where
   W: AsyncWrite + Send + Unpin + 'static,
 {
   match command {
+    OctaCommand::DescribeModels => {
+      let response = match plugin.model_catalog(cancel_token.child_token()).await {
+        Ok(Some(catalog)) if catalog.validate().is_ok() => PluginResponse::ModelCatalog(catalog),
+        Ok(Some(_)) => PluginResponse::Error {
+          id: "model_catalog".into(),
+          message: "invalid runtime model metadata".into(),
+        },
+        Ok(None) => PluginResponse::Error {
+          id: "model_catalog".into(),
+          message: "model discovery is unsupported".into(),
+        },
+        Err(_) => PluginResponse::Error {
+          id: "model_catalog".into(),
+          message: "runtime model discovery is unavailable".into(),
+        },
+      };
+      send_response(&writer, &response).await?;
+    },
     OctaCommand::PlanCache { id, request } => {
       let response = match plugin.cache_plan(&request) {
         Ok(Some(plan)) => match plan.validate() {
@@ -593,6 +621,24 @@ where
 
 pub async fn serve_plugin(plugin: impl Plugin + 'static, schema: PluginSchema) -> anyhow::Result<()> {
   let args = Args::parse();
+  if args.describe_models {
+    let catalog = plugin
+      .model_catalog(CancellationToken::new())
+      .await?
+      .ok_or_else(|| anyhow::anyhow!("model discovery is unsupported"))?;
+    catalog.validate().map_err(anyhow::Error::msg)?;
+    let bytes = serde_json::to_vec(&catalog)?;
+    anyhow::ensure!(
+      bytes.len() <= protocol::MAX_PLUGIN_FRAME_BYTES,
+      "model catalog exceeds frame limit"
+    );
+    use std::io::Write as _;
+    let mut output = std::io::stdout().lock();
+    output.write_all(&bytes)?;
+    output.write_all(b"\n")?;
+    return Ok(());
+  }
+  let socket_path = args.socket_path.expect("clap requires a socket outside discovery mode");
 
   let plugin = Arc::new(plugin);
   let plugin_name: String = std::env::current_exe()
@@ -616,14 +662,14 @@ pub async fn serve_plugin(plugin: impl Plugin + 'static, schema: PluginSchema) -
     signal_cancel_token.cancel();
   })?;
 
-  let socket_name = interpret_local_socket_name(OsStr::new(&args.socket_path))?;
+  let socket_name = interpret_local_socket_name(OsStr::new(&socket_path))?;
 
   logger.log(&format!(
     "Plugin {} starting with version: {}",
     plugin_name,
     plugin.version()
   ))?;
-  logger.log(&format!("Connect to socket {}", args.socket_path))?;
+  logger.log(&format!("Connect to socket {}", socket_path))?;
 
   let opts = ListenerOptions::new().name(socket_name);
   let listener = match opts.create_tokio() {
@@ -631,7 +677,7 @@ pub async fn serve_plugin(plugin: impl Plugin + 'static, schema: PluginSchema) -
       let msg = format!(
         "Error: could not start {} plugin because the socket file is occupied.
       Please check if {} is in use by another process and try again.",
-        plugin_name, args.socket_path
+        plugin_name, socket_path
       );
       logger.log(&msg)?;
       logger_system.shutdown()?;

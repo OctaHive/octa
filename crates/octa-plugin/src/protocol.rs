@@ -49,6 +49,8 @@ pub struct Schema {
   pub output_schema: Option<Map<String, Value>>,
 }
 
+pub use octa_runner_protocol::{ModelCatalog, ModelChoice};
+
 /// Execution platform for which a plugin computes a filesystem contract.
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -178,6 +180,8 @@ pub struct ReportDeclaration {
 pub enum OctaCommand {
   Hello(Version),
   Schema,
+  /// Explicit non-inference runtime model discovery.
+  DescribeModels,
   /// Requests a complete filesystem contract without executing the command.
   PlanCache {
     /// Host-assigned identity echoed by the planning response.
@@ -233,6 +237,8 @@ pub enum OctaCommand {
 pub enum PluginResponse {
   Hello(Version),
   Schema(Schema),
+  /// Bounded advisory model and parameter metadata from this plugin.
+  ModelCatalog(ModelCatalog),
   /// Complete filesystem contract for one planned plugin invocation.
   CachePlan {
     /// Identity copied from `PlanCache`.
@@ -583,5 +589,36 @@ mod tests {
     );
 
     assert!(command.is_err());
+  }
+}
+
+#[cfg(test)]
+mod model_catalog_contract_tests {
+  use super::*;
+
+  #[test]
+  fn runtime_catalog_keeps_plugin_model_names_and_parameter_schemas_open() {
+    let wire = serde_json::json!({"type":"ModelCatalog","payload":{
+      "available":true,"models":[{"id":"Vendor/new-model:preview","label":"New preview",
+      "parameters":{"type":"object","properties":{"thinking":{"type":"string","enum":["quick","deep"]}},"additionalProperties":false}}],
+      "parameters":{"type":"object","additionalProperties":false},"manual_model":true
+    }});
+    let response: PluginResponse =
+      serde_json::from_value(wire.clone()).expect("plugins can publish runtime-owned model metadata");
+    assert_eq!(serde_json::to_value(response).unwrap(), wire);
+    assert!(serde_json::from_value::<OctaCommand>(serde_json::json!({"type":"DescribeModels"})).is_ok());
+  }
+}
+
+#[cfg(test)]
+mod bounded_model_catalog_tests {
+  use super::*;
+  #[test]
+  fn model_catalog_rejects_duplicate_and_unbounded_runtime_metadata() {
+    let entry = serde_json::json!({"id":"future-model","label":"Future model","parameters":{}});
+    for models in [vec![entry.clone(), entry.clone()], vec![entry; 257]] {
+      let wire = serde_json::json!({"available":true,"manual_model":true,"parameters":{},"models":models});
+      assert!(serde_json::from_value::<ModelCatalog>(wire).is_err());
+    }
   }
 }

@@ -22,6 +22,7 @@ mod contract;
 mod events;
 mod filesystem;
 mod invocation;
+mod models;
 mod process;
 mod records;
 mod resources;
@@ -37,6 +38,7 @@ fn plugin_schema() -> PluginSchema {
       contract::TOOL_AUTHORIZATION_CAPABILITY.to_owned(),
       octa_runner_protocol::PUBLIC_OPERATION_OBSERVATIONS_V1.to_owned(),
       contract::RUNTIME_SETTINGS_CAPABILITY.to_owned(),
+      octa_runner_protocol::MODEL_CATALOG_CAPABILITY_V1.to_owned(),
     ],
     input_schema: Some(config::input_schema()),
     output_schema: Some(records::output_schema()),
@@ -53,6 +55,13 @@ impl Plugin for CodexPlugin {
   /// represented by a complete automatic filesystem contract.
   fn cache_plan(&self, _request: &PluginCachePlanRequest) -> anyhow::Result<Option<PluginCachePlan>> {
     Ok(None)
+  }
+
+  async fn model_catalog(
+    &self,
+    cancel: CancellationToken,
+  ) -> anyhow::Result<Option<octa_plugin::protocol::ModelCatalog>> {
+    Ok(Some(models::discover(cancel).await))
   }
 
   async fn execute_command(

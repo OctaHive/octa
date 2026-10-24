@@ -550,3 +550,19 @@ async fn main() -> Result<()> {
 For raw support, consume `PluginCommand.input`, emit `StdoutBytes`/`StderrBytes`, and set
 `PluginSchema.supports_raw` to `true`. Normal commands should also prefer byte responses when output
 can be incremental. Use the built-in shell plugin as the reference implementation.
+
+### Optional runtime model catalog
+
+Plugins with runtime model discovery advertise `model-catalog.v1` in their
+ordinary registration schema. Implement the optional `Plugin::model_catalog`
+hook and return the shared `ModelCatalog`; the default remains unsupported.
+The SDK exposes the same hook through `DescribeModels` and `--describe-models`.
+Hosts use `PluginClient::model_catalog()` only after checking the capability.
+This explicit operation is separate from side-effect-free cache planning and
+must not execute a workload or inference turn.
+
+Use JSON Schema for plugin-owned parameter contracts and keep model identifiers
+open in the task input schema. The shared wire type bounds catalog bytes,
+entry count and model/label text, and rejects duplicate identifiers. Refresh
+suggestions explicitly; a catalog is not a model entitlement or a global model
+registry. Existing runner/plugin protocol versions are unchanged.

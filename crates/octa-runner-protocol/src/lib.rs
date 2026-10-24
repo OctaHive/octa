@@ -12,7 +12,12 @@ use std::{collections::BTreeMap, num::NonZeroUsize, path::PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod models;
 mod observation;
+pub use models::{
+  ModelCatalog, ModelChoice, MAX_MODEL_CATALOG_BYTES, MAX_MODEL_CATALOG_ENTRIES, MAX_MODEL_ID_BYTES,
+  MODEL_CATALOG_CAPABILITY_V1,
+};
 pub use observation::{
   is_public_operation_path, FileChangeKind, ObservedOperation, OperationObservation, OperationPhase,
   MAX_PUBLIC_OPERATION_PATH_BYTES, PUBLIC_OPERATION_OBSERVATIONS_V1,

@@ -1,3 +1,15 @@
+## 0.7.1 - 2026-10-25
+
+### Added
+
+- Plugins can expose bounded advisory model catalogs and parameter schemas through the existing plugin connection and `--describe-models`. Model identifiers remain open for explicit manual selection.
+- Codex discovers model suggestions and per-model reasoning options from the operator-selected runtime without starting a task, inference turn or run records. Explicit refresh returns current metadata; unavailable discovery remains distinguishable from an empty catalog.
+
+### Compatibility
+
+- Model names and support remain runtime-owned. Suggestions are not an entitlement check or an exhaustive allowlist; execution reports an unsupported choice without selecting another model.
+- Existing runner and plugin protocol versions, task execution, usage reporting and plugins without model discovery remain compatible. The Codex plugin advertises `model-catalog.v1`.
+
 ## 0.7.0 - 2026-10-24
 
 ### Added

@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "octa-cache"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2614,7 +2614,7 @@ dependencies = [
 
 [[package]]
 name = "octa-cache-http"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2637,7 +2637,7 @@ dependencies = [
 
 [[package]]
 name = "octa-cache-protocol"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "blake3",
  "jsonschema",
@@ -2657,7 +2657,7 @@ dependencies = [
 
 [[package]]
 name = "octa-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "assert_cmd",
  "async-trait",
@@ -2693,7 +2693,7 @@ dependencies = [
 
 [[package]]
 name = "octa-dag"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "test-log",
  "thiserror 2.0.20",
@@ -2703,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "octa-executor"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -2740,7 +2740,7 @@ dependencies = [
 
 [[package]]
 name = "octa-finder"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "octa-octafile",
@@ -2756,7 +2756,7 @@ dependencies = [
 
 [[package]]
 name = "octa-monorepo"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "globset",
  "ignore",
@@ -2770,7 +2770,7 @@ dependencies = [
 
 [[package]]
 name = "octa-octafile"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -2791,7 +2791,7 @@ dependencies = [
 
 [[package]]
 name = "octa-output"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "base64",
  "chrono",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "octa-plugin"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2832,7 +2832,7 @@ dependencies = [
 
 [[package]]
 name = "octa-plugin-lock"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "serde",
  "serde_norway",
@@ -2840,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "octa-plugin-manager"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "dunce",
@@ -2863,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "octa-runner"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "assert_cmd",
  "axum-server",
@@ -2891,7 +2891,7 @@ dependencies = [
 
 [[package]]
 name = "octa-runner-protocol"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "jsonschema",
  "octa-cache-protocol",
@@ -2901,7 +2901,7 @@ dependencies = [
 
 [[package]]
 name = "octa-runtime"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "blake3",
  "octa-cache",
@@ -2926,7 +2926,7 @@ dependencies = [
 
 [[package]]
 name = "octa_plugin_codex"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2952,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "octa_plugin_junit"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2965,7 +2965,7 @@ dependencies = [
 
 [[package]]
 name = "octa_plugin_shell"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2988,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "octa_plugin_tpl"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "async-trait",

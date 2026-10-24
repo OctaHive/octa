@@ -148,6 +148,33 @@ access checks and credential ownership stay with the caller. See the official
 [Codex MCP settings](https://developers.openai.com/codex/mcp/) for the underlying
 transport and environment-name semantics.
 
+### Model discovery
+
+The plugin advertises `model-catalog.v1`. A host can explicitly request
+`DescribeModels` through the existing plugin connection, or run the same
+implementation once without a socket:
+
+```sh
+OCTA_CODEX_EXECUTABLE=/absolute/path/to/codex ./plugins/octa_plugin_codex --describe-models
+```
+
+Discovery uses the operator-selected qualified Codex executable and its
+installation-owned access. It performs `initialize` and `model/list` through
+[Codex app-server](https://learn.chatgpt.com/docs/app-server), without a thread,
+inference turn, task prompt, task environment or Octa run records. Pages,
+response bytes and process lifetime are bounded by the common process owner.
+The result contains `available`, `manual_model`, advisory `models` with opaque
+`id`/`label` values, and JSON Schema `parameters` at catalog and model level.
+A missing or unavailable runtime returns `available: false` with the plugin's
+manual-entry parameter contract; it never invents model identifiers.
+
+Suggestions are not an entitlement check or an exhaustive allowlist. Keep a
+manually entered identifier unchanged and let execution report unsupported
+models or settings without substitution. Explicit refresh must not change a
+previously saved invocation. Reads of a host's cached catalog need not start
+this command. Credentials and runtime configuration remain installation-owned;
+model metadata grants no execution, sandbox, tool or credential authority.
+
 `tool_authorization: required` installs one synchronous `PreToolUse` hook for
 all Codex-supported local tool paths and enables it only for that invocation.
 The helper executable is fingerprinted before task material is read and again

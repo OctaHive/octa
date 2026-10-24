@@ -82,7 +82,8 @@ fn exposes_the_codex_task_contract_without_raw_mode() {
     [
       contract::TOOL_AUTHORIZATION_CAPABILITY,
       "public-command-file-observations.v1",
-      "codex.task-runtime-settings.v1"
+      "codex.task-runtime-settings.v1",
+      "model-catalog.v1"
     ]
   );
   assert!(schema.input_schema.is_some());
@@ -355,4 +356,19 @@ async fn selected_secrets_never_cross_event_output_or_record_boundaries() {
     assert!(sink.contains(REDACTION_MARKER));
     assert!(sink.contains("visible-value"));
   }
+}
+
+#[tokio::test]
+async fn model_discovery_keeps_manual_identifiers_when_runtime_is_unavailable() {
+  let catalog = CodexPlugin
+    .model_catalog(CancellationToken::new())
+    .await
+    .unwrap()
+    .unwrap();
+  assert!(catalog.manual_model);
+  assert_eq!(catalog.parameters["properties"]["reasoning_effort"]["type"], "string");
+  // Suggestions never become the executable task schema's model allowlist.
+  assert!(plugin_schema().input_schema.unwrap()["properties"]["model"]
+    .get("enum")
+    .is_none());
 }

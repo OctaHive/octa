@@ -332,6 +332,7 @@ fn test_plugin_lock_and_verify_commands() {
           "codex.blocking-pre-tool-authorization.v1".to_owned(),
           "public-command-file-observations.v1".to_owned(),
           "codex.task-runtime-settings.v1".to_owned(),
+          "model-catalog.v1".to_owned(),
         ],
         _ => Vec::new(),
       },

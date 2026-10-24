@@ -823,3 +823,49 @@ async fn additive_process_activity_and_missing_usage_remain_unreported() {
   );
   assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
 }
+
+#[tokio::test]
+async fn discovers_and_refreshes_runtime_models_without_running_a_task() {
+  let workspace = tempfile::tempdir().unwrap();
+  let executable = install_process_fixture(workspace.path());
+  let catalog_path = executable.with_extension("models");
+  fs::write(&catalog_path, json!({"data":[{"model":"Vendor/future:preview", "displayName":"Future preview", "supportedReasoningEfforts":[{"reasoningEffort":"low"},{"reasoningEffort":"high"}]}],"nextCursor":null}).to_string()).unwrap();
+  let (manager, plugin) = plugin_manager_with_codex(workspace.path(), executable.clone());
+  manager.start_plugin(&plugin).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let first = client.model_catalog().await.unwrap();
+  assert!(first.available);
+  assert_eq!(first.models[0].id, "Vendor/future:preview");
+  assert_eq!(
+    first.models[0].parameters["properties"]["reasoning_effort"]["enum"],
+    json!(["low", "high"])
+  );
+  fs::write(&catalog_path, json!({"data":[{"model":"next-model", "displayName":"Next model", "supportedReasoningEfforts":[]}],"nextCursor":null}).to_string()).unwrap();
+  let refreshed = client.model_catalog().await.unwrap();
+  assert_eq!(refreshed.models[0].id, "next-model");
+  assert_eq!(first.models[0].id, "Vendor/future:preview");
+  assert!(
+    !workspace.path().join(".octa").exists(),
+    "discovery must not produce a model invocation"
+  );
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[test]
+fn standalone_model_discovery_uses_the_same_plugin_contract() {
+  let workspace = tempfile::tempdir().unwrap();
+  let executable = install_process_fixture(workspace.path());
+  fs::write(
+    executable.with_extension("models"),
+    json!({"data":[],"nextCursor":null}).to_string(),
+  )
+  .unwrap();
+  let result = std::process::Command::new(env!("CARGO_BIN_EXE_octa_plugin_codex"))
+    .arg("--describe-models")
+    .env("OCTA_CODEX_EXECUTABLE", executable)
+    .output()
+    .unwrap();
+  assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+  let catalog: octa_plugin::protocol::ModelCatalog = serde_json::from_slice(&result.stdout).unwrap();
+  assert!(catalog.available && catalog.manual_model && catalog.models.is_empty());
+}

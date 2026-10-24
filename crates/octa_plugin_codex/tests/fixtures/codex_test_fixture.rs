@@ -47,6 +47,25 @@ fn main() {
     let heartbeat = arguments.get(1).expect("fixture descendant requires a heartbeat path");
     run_heartbeat(Path::new(heartbeat));
   }
+  if arguments.first().is_some_and(|argument| argument == "app-server") {
+    use std::io::BufRead;
+    let input = std::io::stdin();
+    for line in input.lock().lines() {
+      let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
+      match request["method"].as_str().unwrap() {
+        "initialize" => println!("{}", serde_json::json!({"id":request["id"],"result":{}})),
+        "initialized" => continue,
+        "model/list" => {
+          let models = std::fs::read_to_string(executable.with_extension("models")).unwrap();
+          let models: serde_json::Value = serde_json::from_str(&models).unwrap();
+          println!("{}", serde_json::json!({"id":request["id"],"result":models}));
+        },
+        other => panic!("discovery must not execute {other}"),
+      }
+      std::io::stdout().flush().unwrap();
+    }
+    return;
+  }
   if arguments == ["--version"] {
     let response_path = executable.with_extension("version");
     let response = std::fs::read_to_string(&response_path).unwrap_or_else(|_| "codex-cli 0.161.0\n".to_owned());
