@@ -302,7 +302,7 @@ async fn explicit_mcp_connection_uses_mapped_credentials_without_exposing_them_i
   let installation = tempfile::tempdir().unwrap();
   let fixture = configured_process_fixture(installation.path(), "invocation-settings");
   fs::write(fixture.with_extension("expected-invocation"), json!({
-    "arguments": ["exec", "--json", "--sandbox=workspace-write", "--ask-for-approval=never", "-"],
+    "arguments": ["exec", "--json", "--sandbox=workspace-write", "--ask-for-approval=never", "--ignore-user-config", "-"],
     "mcp_servers": {"tickets": {"url": "https://tickets.example/mcp", "bearer_token_env_var": "TICKET_TOKEN", "required": true}},
     "environment": {"TICKET_TOKEN": "managed-connection-private-canary"}
   }).to_string()).unwrap();
@@ -340,7 +340,7 @@ async fn explicit_stdio_mcp_preserves_arguments_selected_tools_and_only_mapped_e
   fs::write(
     fixture.with_extension("expected-invocation"),
     json!({
-      "arguments": ["exec", "--json", "--sandbox=workspace-write", "--ask-for-approval=never", "-"],
+      "arguments": ["exec", "--json", "--sandbox=workspace-write", "--ask-for-approval=never", "--ignore-user-config", "-"],
       "mcp_servers": {"local": {"command": fixture, "args": ["--tenant", "$(not-a-shell)"],
         "env_vars": ["WORKSPACE_MODE"], "enabled_tools": ["read_issue"], "required": true}},
       "environment": {"WORKSPACE_MODE": "review"}

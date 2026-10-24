@@ -452,6 +452,7 @@ fn build_arguments(
   }
   arguments.extend(config.cli_arguments.iter().map(OsString::from));
   if let Some(servers) = &config.mcp_servers {
+    arguments.push(OsString::from("--ignore-user-config"));
     let settings = crate::config::mcp_configuration(servers);
     arguments.push(OsString::from(format!("--config=mcp_servers={settings}")));
   }

@@ -143,7 +143,7 @@ fn strings(values: &[String]) -> toml::Value {
   toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect())
 }
 
-/// A single override replaces the MCP map instead of merging ambient server names.
+/// Encodes one typed MCP override; the caller owns isolation from other config layers.
 pub(crate) fn configuration(servers: &BTreeMap<String, McpServer>) -> toml::Value {
   toml::Value::Table(
     servers

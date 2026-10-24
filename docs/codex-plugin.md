@@ -45,9 +45,10 @@ records are read or created.
 ## Configuration
 
 A `codex` value is a strict object: unknown fields are rejected. Exactly one
-of `prompt` and `prompt_file` is required. All paths are portable,
-workspace-relative paths using `/`; absolute paths, traversal, ambiguous
-Windows names, and unsafe separators are rejected.
+of `prompt` and `prompt_file` is required. Prompt-file, run-record and
+deliverable paths are portable, workspace-relative paths using `/`; absolute
+paths, traversal, ambiguous Windows names, and unsafe separators are rejected.
+Operator-qualified stdio MCP executables instead use absolute paths.
 
 | Field | Meaning |
 | --- | --- |
@@ -56,7 +57,7 @@ Windows names, and unsafe separators are rejected.
 | `model` | Optional model name passed through the typed Codex invocation. |
 | `reasoning_effort` | Optional `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
 | `cli_arguments` | Ordered optional flags: `--ephemeral`, `--skip-git-repo-check`, and one `--color=never`, `--color=always` or `--color=auto`. Other flags and duplicate/conflicting values are rejected. |
-| `mcp_servers` | Optional explicit named MCP connections. HTTP uses `transport: http`, `url` and optional `bearer_token_env_var` from `environment.secret`. Stdio uses `transport: stdio`, an absolute `command`, ordered `args` and explicitly mapped `env_vars`. Both support an optional `enabled_tools` list. Connections are required; `{}` clears ambient MCP servers. Omission preserves legacy behavior. |
+| `mcp_servers` | Optional explicit named MCP connections. HTTP uses `transport: http`, `url` and optional `bearer_token_env_var` from `environment.secret`. Stdio uses `transport: stdio`, an absolute `command`, ordered `args` and explicitly mapped `env_vars`. Both support an optional `enabled_tools` list. Connections are required. An explicit map disables user-config loading; the caller must isolate other configuration layers. Omission preserves legacy behavior. |
 | `result_schema` | Optional JSON Schema. When present, Codex must produce a structured value satisfying it; prose is never parsed as a substitute. |
 | `run_records` | Root for audit records; defaults to `.octa/codex-runs`. |
 | `environment` | Explicit `public` and `secret` child-environment mappings from environment names to Octa variable names. |
@@ -122,8 +123,16 @@ replace model, schema, sandbox, approval, hooks, prompt or workspace settings, a
 it is passed as argv without a shell. MCP settings are typed and bounded to 64
 servers and 64 KiB of encoded configuration. Each selected server is required;
 startup failure must fail the invocation rather than silently removing a tool.
-An explicit map replaces the configured MCP map, including an empty map for no
-servers. Omitting `mcp_servers` preserves existing tasks' configuration behavior.
+An explicit map adds `--ignore-user-config`, which skips the user config while
+preserving authentication lookup. Codex still merges MCP tables from other
+configuration layers: `{}` does not clear those layers, and same-name settings
+can retain fields from them. For exact server/tool selection, the caller must
+exclude all ambient configuration sources, including project, system and
+authenticated cloud-managed MCP settings. Filesystem isolation addresses local
+sources only. In OctaCity, this qualification belongs to the existing
+Agent/backend isolation boundary. The plugin does not inspect or rewrite host
+configuration. Omitting `mcp_servers` preserves existing tasks' configuration
+behavior.
 HTTP authentication requires HTTPS and a name in `environment.secret`. Stdio
 commands use an explicit absolute executable and forward additional variables
 only through `env_vars` names already declared in `environment.public` or
