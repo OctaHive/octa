@@ -1097,7 +1097,7 @@ fn codex_operations_reach_the_original_runner_stream_without_private_metadata() 
   }
   let filename = format!("octa_plugin_codex{}", env::consts::EXE_SUFFIX);
   fs::copy(plugins_dir().join(&filename), plugins.join(&filename)).expect("build octa_plugin_codex first");
-  fs::write(plugins.join("codex.plugin.yml"), format!("manifest_version: 1\nname: codex\nversion: {}\nprotocol: 2\nplatforms: [{}]\nentrypoint: {}\nsha256: {}\ncapabilities: [codex.blocking-pre-tool-authorization.v1, public-command-file-observations.v1]\n", env!("CARGO_PKG_VERSION"), current_platform(), filename,
+  fs::write(plugins.join("codex.plugin.yml"), format!("manifest_version: 1\nname: codex\nversion: {}\nprotocol: 2\nplatforms: [{}]\nentrypoint: {}\nsha256: {}\ncapabilities: [codex.blocking-pre-tool-authorization.v1, public-command-file-observations.v1, codex.task-runtime-settings.v1]\n", env!("CARGO_PKG_VERSION"), current_platform(), filename,
     tokio::runtime::Runtime::new().unwrap().block_on(sha256_file(&plugins.join(&filename))).unwrap())).unwrap();
   let fixture = workspace
     .path()
