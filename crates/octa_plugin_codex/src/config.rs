@@ -14,6 +14,9 @@ use serde_json::{Map, Value};
 
 use crate::contract::{RECORDS_STAGING_DIRECTORY, RESERVED_RESOURCE_NAMES};
 
+mod mcp;
+pub(crate) use mcp::{configuration as mcp_configuration, McpServer};
+
 /// Maximum UTF-8 size of either an inline prompt or a loaded prompt file.
 pub(crate) const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 /// Maximum UTF-8 size of a complete portable workspace-relative path.
@@ -35,6 +38,14 @@ const MAX_RESULT_SCHEMA_BYTES: usize = 256 * 1024;
 const MAX_ENVIRONMENT_MAPPINGS: usize = 64;
 /// Maximum number of resources registered by one Codex invocation.
 const MAX_DELIVERABLES: usize = 64;
+const MAX_CLI_ARGUMENTS: usize = 64;
+const CLI_ARGUMENTS: &[&str] = &[
+  "--ephemeral",
+  "--skip-git-repo-check",
+  "--color=never",
+  "--color=always",
+  "--color=auto",
+];
 const DEFAULT_RUN_RECORDS: &str = ".octa/codex-runs";
 
 /// Validated task intent consumed by the invocation builder.
@@ -45,6 +56,9 @@ pub(crate) struct CodexConfig {
   pub(crate) prompt_file: Option<String>,
   pub(crate) model: Option<String>,
   pub(crate) reasoning_effort: Option<ReasoningEffort>,
+  #[serde(default)]
+  pub(crate) cli_arguments: Vec<String>,
+  pub(crate) mcp_servers: Option<BTreeMap<String, McpServer>>,
   pub(crate) result_schema: Option<Map<String, Value>>,
   #[serde(default = "default_run_records")]
   pub(crate) run_records: String,
@@ -143,11 +157,29 @@ impl CodexConfig {
     if let Some(model) = &self.model {
       validate_name("model", model)?;
     }
+    if self.cli_arguments.len() > MAX_CLI_ARGUMENTS
+      || self
+        .cli_arguments
+        .iter()
+        .any(|argument| !CLI_ARGUMENTS.contains(&argument.as_str()))
+      || self.cli_arguments.iter().collect::<HashSet<_>>().len() != self.cli_arguments.len()
+      || self
+        .cli_arguments
+        .iter()
+        .filter(|argument| argument.starts_with("--color="))
+        .count()
+        > 1
+    {
+      bail!("unsupported or conflicting Codex CLI arguments");
+    }
     if let Some(schema) = &self.result_schema {
       validate_result_schema(schema)?;
     }
     validate_path_with_limit("run_records", &self.run_records, MAX_RUN_RECORDS_BYTES)?;
     self.environment.validate()?;
+    if let Some(servers) = &self.mcp_servers {
+      mcp::validate(servers, &self.environment)?;
+    }
     if let Some(revision) = &self.source_revision {
       validate_bounded_text("source_revision", revision, MAX_SOURCE_REVISION_BYTES)?;
     }
@@ -323,6 +355,11 @@ pub(crate) fn input_schema() -> Map<String, Value> {
         "type": "string",
         "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
       },
+      "cli_arguments": {
+        "type": "array", "maxItems": MAX_CLI_ARGUMENTS, "uniqueItems": true,
+        "items": { "type": "string", "enum": CLI_ARGUMENTS }
+      },
+      "mcp_servers": mcp::schema(),
       "result_schema": { "type": "object" },
       "run_records": path_schema_with_maximum(MAX_RUN_RECORDS_BYTES),
       "environment": environment_schema(),

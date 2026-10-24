@@ -1,3 +1,16 @@
+## 0.7.0 - 2026-10-24
+
+### Added
+
+- Codex tasks accept a finite set of extra CLI arguments and explicit HTTP/stdio MCP servers with selected tools, required startup and existing public/secret environment mappings.
+- The plugin and release compatibility metadata advertise `codex.task-runtime-settings.v1` so callers can qualify support before dispatch.
+
+### Compatibility and security
+
+- Existing task fields, runner/plugin protocols, observations and usage records remain compatible. Omitting the new settings keeps the previous command; an explicit MCP map replaces ambient servers.
+- Task arguments cannot replace sandbox, approval, hook, model or output controls. MCP bearer credentials require an explicit secret mapping and HTTPS, and credential values stay out of argv and audit records.
+- External integration catalogs and authorization remain caller-owned; no OctaCity dependency or connection registry is introduced.
+
 ## 0.6.0 - 2026-10-20
 
 ### Added

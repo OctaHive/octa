@@ -450,6 +450,11 @@ fn build_arguments(
     argument.push(schema.path());
     arguments.push(argument);
   }
+  arguments.extend(config.cli_arguments.iter().map(OsString::from));
+  if let Some(servers) = &config.mcp_servers {
+    let settings = crate::config::mcp_configuration(servers);
+    arguments.push(OsString::from(format!("--config=mcp_servers={settings}")));
+  }
   // A single dash tells `codex exec` to read the prompt from stdin. It must
   // remain the final positional argument so no prompt bytes enter argv.
   arguments.push(OsString::from("-"));

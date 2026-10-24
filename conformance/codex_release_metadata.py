@@ -17,6 +17,7 @@ SELECTION_ENVIRONMENT = "OCTA_CODEX_EXECUTABLE"
 TOOL_AUTHORIZER_ENVIRONMENT = "OCTA_CODEX_TOOL_AUTHORIZER"
 TOOL_AUTHORIZATION_CAPABILITY = "codex.blocking-pre-tool-authorization.v1"
 PUBLIC_OPERATION_OBSERVATIONS_CAPABILITY = "public-command-file-observations.v1"
+RUNTIME_SETTINGS_CAPABILITY = "codex.task-runtime-settings.v1"
 MANIFEST_PATH = "plugins/codex.plugin.yml"
 _SUPPORTED_VERSIONS = re.compile(
     r'^const SUPPORTED_CODEX_VERSIONS: &\[&str\] = &\[(?P<versions>[^]]+)\];$',
@@ -45,7 +46,8 @@ def document(source: Path, plugin_version: str, plugin_protocol: int) -> dict[st
             "version": plugin_version,
             "protocol": plugin_protocol,
             "manifest": MANIFEST_PATH,
-            "capabilities": [TOOL_AUTHORIZATION_CAPABILITY, PUBLIC_OPERATION_OBSERVATIONS_CAPABILITY],
+            "capabilities": [TOOL_AUTHORIZATION_CAPABILITY, PUBLIC_OPERATION_OBSERVATIONS_CAPABILITY,
+                             RUNTIME_SETTINGS_CAPABILITY],
         },
         "executable": {
             "product": CODEX_PRODUCT,

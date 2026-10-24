@@ -265,6 +265,108 @@ async fn dry_run_uses_the_registered_contract_without_spawning_codex() {
 }
 
 #[tokio::test]
+async fn explicit_cli_settings_reach_the_process_without_replacing_protected_arguments() {
+  let workspace = tempfile::tempdir().unwrap();
+  let installation = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(installation.path(), "invocation-settings");
+  fs::write(
+    fixture.with_extension("expected-invocation"),
+    json!({
+      "arguments": ["exec", "--json", "--sandbox=workspace-write", "--ask-for-approval=never",
+        "--model=selected-model", "--config=model_reasoning_effort=\"high\"", "--ephemeral", "--color=never", "-"],
+      "environment": {}
+    })
+    .to_string(),
+  )
+  .unwrap();
+  let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture.clone());
+  manager.start_plugin(&name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let mut request = lifecycle_request(workspace.path());
+  request.params["model"] = json!("selected-model");
+  request.params["reasoning_effort"] = json!("high");
+  request.params["cli_arguments"] = json!(["--ephemeral", "--color=never"]);
+  let mut execution = client.start_execution(request, CancellationToken::new()).await.unwrap();
+  let response = receive_terminal(&mut execution).await;
+  assert!(
+    matches!(response, PluginResponse::Completed { code: 0, .. }),
+    "{response:?}"
+  );
+  assert!(fixture.with_extension("settings-verified").exists());
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn explicit_mcp_connection_uses_mapped_credentials_without_exposing_them_in_arguments_or_records() {
+  let workspace = tempfile::tempdir().unwrap();
+  let installation = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(installation.path(), "invocation-settings");
+  fs::write(fixture.with_extension("expected-invocation"), json!({
+    "arguments": ["exec", "--json", "--sandbox=workspace-write", "--ask-for-approval=never", "-"],
+    "mcp_servers": {"tickets": {"url": "https://tickets.example/mcp", "bearer_token_env_var": "TICKET_TOKEN", "required": true}},
+    "environment": {"TICKET_TOKEN": "managed-connection-private-canary"}
+  }).to_string()).unwrap();
+  let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture.clone());
+  manager.start_plugin(&name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let mut request = lifecycle_request(workspace.path());
+  request.params["mcp_servers"] = json!({"tickets": {"transport": "http", "url": "https://tickets.example/mcp", "bearer_token_env_var": "TICKET_TOKEN"}});
+  request.params["environment"] = json!({"secret": {"TICKET_TOKEN": "ticket_credential"}});
+  request
+    .vars
+    .insert("ticket_credential".into(), json!("managed-connection-private-canary"));
+  request.secret_vars.push("ticket_credential".into());
+  let mut execution = client.start_execution(request, CancellationToken::new()).await.unwrap();
+  let responses = receive_through_terminal(&mut execution).await;
+  assert!(
+    matches!(responses.last(), Some(PluginResponse::Completed { code: 0, .. })),
+    "{responses:?}"
+  );
+  assert!(fixture.with_extension("settings-verified").exists());
+  for entry in fs::read_dir(workspace.path().join(".octa/codex-runs")).unwrap() {
+    for name in ["trace.jsonl", "result.json", "provenance.json"] {
+      let record = fs::read_to_string(entry.as_ref().unwrap().path().join("records").join(name)).unwrap();
+      assert!(!record.contains("managed-connection-private-canary"));
+    }
+  }
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn explicit_stdio_mcp_preserves_arguments_selected_tools_and_only_mapped_environment() {
+  let workspace = tempfile::tempdir().unwrap();
+  let installation = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(installation.path(), "invocation-settings");
+  fs::write(
+    fixture.with_extension("expected-invocation"),
+    json!({
+      "arguments": ["exec", "--json", "--sandbox=workspace-write", "--ask-for-approval=never", "-"],
+      "mcp_servers": {"local": {"command": fixture, "args": ["--tenant", "$(not-a-shell)"],
+        "env_vars": ["WORKSPACE_MODE"], "enabled_tools": ["read_issue"], "required": true}},
+      "environment": {"WORKSPACE_MODE": "review"}
+    })
+    .to_string(),
+  )
+  .unwrap();
+  let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture.clone());
+  manager.start_plugin(&name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let mut request = lifecycle_request(workspace.path());
+  request.params["mcp_servers"] = json!({"local": {"transport": "stdio", "command": fixture,
+    "args": ["--tenant", "$(not-a-shell)"], "env_vars": ["WORKSPACE_MODE"], "enabled_tools": ["read_issue"]}});
+  request.params["environment"] = json!({"public": {"WORKSPACE_MODE": "mode"}});
+  request.vars.insert("mode".into(), json!("review"));
+  let mut execution = client.start_execution(request, CancellationToken::new()).await.unwrap();
+  let response = receive_terminal(&mut execution).await;
+  assert!(
+    matches!(response, PluginResponse::Completed { code: 0, .. }),
+    "{response:?}"
+  );
+  assert!(fixture.with_extension("settings-verified").exists());
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
 async fn compatibility_probe_fails_closed_without_path_or_shell_fallback() {
   let workspace = tempfile::tempdir().unwrap();
   let path_directory = tempfile::tempdir().unwrap();

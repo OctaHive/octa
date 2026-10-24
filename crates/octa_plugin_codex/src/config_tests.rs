@@ -101,6 +101,94 @@ fn accepts_inline_and_complete_file_configurations() {
 }
 
 #[test]
+fn runtime_cli_settings_cannot_replace_security_model_output_or_hook_controls() {
+  for argument in super::CLI_ARGUMENTS {
+    let value = json!({"prompt":"work", "cli_arguments":[argument]});
+    assert!(validator().is_valid(&value));
+    CodexConfig::parse(value).unwrap();
+  }
+  for arguments in [
+    vec!["--sandbox=danger-full-access"],
+    vec!["--ask-for-approval=on-request"],
+    vec!["--config=hooks.PreToolUse=[]"],
+    vec!["--model=other"],
+    vec!["--json=false"],
+    vec!["--output-schema=other"],
+    vec!["--"],
+    vec!["resume"],
+    vec!["--ephemeral", "--ephemeral"],
+  ] {
+    assert_schema_and_parser_reject(json!({"prompt":"work", "cli_arguments":arguments}));
+  }
+  assert!(CodexConfig::parse(json!({"prompt":"work", "cli_arguments":["--color=never","--color=always"]})).is_err());
+}
+
+#[test]
+fn mcp_credentials_require_explicit_secret_mappings_and_encrypted_transport() {
+  let valid = json!({"prompt":"work", "environment":{"secret":{"TOKEN":"credential"}},
+    "mcp_servers":{"tickets":{"transport":"http", "url":"https://tickets.example/mcp", "bearer_token_env_var":"TOKEN"}}});
+  assert!(validator().is_valid(&valid));
+  CodexConfig::parse(valid.clone()).unwrap();
+  let mut plaintext = valid.clone();
+  plaintext["mcp_servers"]["tickets"]["url"] = json!("http://tickets.example/mcp");
+  assert!(
+    CodexConfig::parse(plaintext).is_err(),
+    "authentication must not travel over plaintext HTTP"
+  );
+  let mut missing = valid.clone();
+  missing["environment"] = json!({});
+  assert!(CodexConfig::parse(missing).is_err());
+  let mut public = valid;
+  public["environment"] = json!({"public":{"TOKEN":"credential"}});
+  assert!(CodexConfig::parse(public).is_err());
+}
+
+#[test]
+fn mcp_rejects_unknown_settings_unbounded_content_and_ambient_environment() {
+  let value = |server: Value| json!({"prompt":"work", "mcp_servers":{"selected":server}});
+  for server in [
+    json!({"transport":"http", "url":"https://tickets.example/mcp", "http_headers":{"Authorization":"inline-secret"}}),
+    json!({"transport":"other", "url":"https://tickets.example/mcp"}),
+    json!({"transport":"stdio", "command":"/opt/mcp", "env_vars":["TOKEN","TOKEN"]}),
+    json!({"transport":"stdio", "command":"/opt/mcp", "args":["\u{0000}"]}),
+    json!({"transport":"http", "url":"https://tickets.example/mcp", "enabled_tools":["read","read"]}),
+  ] {
+    assert_schema_and_parser_reject(value(server));
+  }
+  for server in [
+    json!({"transport":"http", "url":"file:///private/token"}),
+    json!({"transport":"http", "url":"not-a-url"}),
+    json!({"transport":"http", "url":"https://user:password@tickets.example/mcp"}),
+    json!({"transport":"http", "url":"https://tickets.example/mcp#fragment"}),
+    json!({"transport":"stdio", "command":"ambient-mcp"}),
+    json!({"transport":"stdio", "command":std::env::current_exe().unwrap(), "env_vars":["UNMAPPED_SECRET"]}),
+  ] {
+    assert!(CodexConfig::parse(value(server)).is_err());
+  }
+  assert_schema_and_parser_reject(
+    json!({"prompt":"work", "mcp_servers":{"invalid.name":{"transport":"http","url":"https://example.com"}}}),
+  );
+  let oversized = (0..65)
+    .map(|i| {
+      (
+        format!("server-{i}"),
+        json!({"transport":"http","url":"https://example.com"}),
+      )
+    })
+    .collect::<serde_json::Map<_, _>>();
+  assert_schema_and_parser_reject(json!({"prompt":"work", "mcp_servers":oversized}));
+  let large = (0..64)
+    .map(|i| {
+      (
+        format!("server-{i}"),
+        json!({"transport":"http","url":format!("https://example.com/{}", "x".repeat(2048))}),
+      )
+    })
+    .collect::<serde_json::Map<_, _>>();
+  assert!(CodexConfig::parse(json!({"prompt":"work", "mcp_servers":large})).is_err());
+}
+
+#[test]
 fn tool_authorization_is_explicit_and_has_no_best_effort_mode() {
   let required = json!({ "prompt": "work", "tool_authorization": "required" });
   assert!(validator().is_valid(&required));

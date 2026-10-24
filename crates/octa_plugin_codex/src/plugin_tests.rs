@@ -81,7 +81,8 @@ fn exposes_the_codex_task_contract_without_raw_mode() {
     schema.capabilities,
     [
       contract::TOOL_AUTHORIZATION_CAPABILITY,
-      "public-command-file-observations.v1"
+      "public-command-file-observations.v1",
+      "codex.task-runtime-settings.v1"
     ]
   );
   assert!(schema.input_schema.is_some());

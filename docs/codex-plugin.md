@@ -55,6 +55,8 @@ Windows names, and unsafe separators are rejected.
 | `prompt_file` | File containing the prompt, relative to the effective task directory and limited to 1 MiB. |
 | `model` | Optional model name passed through the typed Codex invocation. |
 | `reasoning_effort` | Optional `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
+| `cli_arguments` | Ordered optional flags: `--ephemeral`, `--skip-git-repo-check`, and one `--color=never`, `--color=always` or `--color=auto`. Other flags and duplicate/conflicting values are rejected. |
+| `mcp_servers` | Optional explicit named MCP connections. HTTP uses `transport: http`, `url` and optional `bearer_token_env_var` from `environment.secret`. Stdio uses `transport: stdio`, an absolute `command`, ordered `args` and explicitly mapped `env_vars`. Both support an optional `enabled_tools` list. Connections are required; `{}` clears ambient MCP servers. Omission preserves legacy behavior. |
 | `result_schema` | Optional JSON Schema. When present, Codex must produce a structured value satisfying it; prose is never parsed as a substitute. |
 | `run_records` | Root for audit records; defaults to `.octa/codex-runs`. |
 | `environment` | Explicit `public` and `secret` child-environment mappings from environment names to Octa variable names. |
@@ -68,11 +70,19 @@ codex:
   prompt: Review the workspace and return a concise summary.
   model: gpt-codex
   reasoning_effort: high
+  cli_arguments: [--ephemeral, --color=never]
   environment:
     public:
       CI: CI_MODE
     secret:
       OPENAI_API_KEY: CODEX_AUTH
+      TICKET_TOKEN: TICKET_CREDENTIAL
+  mcp_servers:
+    tickets:
+      transport: http
+      url: https://tickets.example/mcp
+      bearer_token_env_var: TICKET_TOKEN
+      enabled_tools: [read_issue]
   source_revision: 8de7f1c
 ```
 
@@ -106,6 +116,28 @@ to an already resolved Octa variable name; they never contain the value. A
 secret mapping is accepted only when the source variable is marked secret by
 Octa. An unrelated variable, including another secret, is not inherited by the
 Codex process.
+
+`cli_arguments` is a finite extension of the fixed unattended command. It cannot
+replace model, schema, sandbox, approval, hooks, prompt or workspace settings, and
+it is passed as argv without a shell. MCP settings are typed and bounded to 64
+servers and 64 KiB of encoded configuration. Each selected server is required;
+startup failure must fail the invocation rather than silently removing a tool.
+An explicit map replaces the configured MCP map, including an empty map for no
+servers. Omitting `mcp_servers` preserves existing tasks' configuration behavior.
+HTTP authentication requires HTTPS and a name in `environment.secret`. Stdio
+commands use an explicit absolute executable and forward additional variables
+only through `env_vars` names already declared in `environment.public` or
+`environment.secret`. `enabled_tools` restricts the selected server's tools;
+an empty list exposes none. MCP configuration and credentials are not copied into
+run records. The outer operator/Agent still qualifies executables, endpoints,
+network and tool authority; selecting settings cannot grant that authority.
+
+Managed external integrations use these same MCP connections or the existing
+environment mappings. Octa receives prepared runtime settings, not OctaCity
+Project, Role/Profile or connection-registry identities. Connection resolution,
+access checks and credential ownership stay with the caller. See the official
+[Codex MCP settings](https://developers.openai.com/codex/mcp/) for the underlying
+transport and environment-name semantics.
 
 `tool_authorization: required` installs one synchronous `PreToolUse` hook for
 all Codex-supported local tool paths and enables it only for that invocation.

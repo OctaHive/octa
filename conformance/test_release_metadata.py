@@ -35,7 +35,8 @@ class ReleaseMetadataTests(unittest.TestCase):
         statement = statements[0].replace(
             "${{ matrix.platform.runtime_platform }}", "$RELEASE_PLATFORM")
         expected = ["codex.blocking-pre-tool-authorization.v1",
-                    "public-command-file-observations.v1"]
+                    "public-command-file-observations.v1",
+                    "codex.task-runtime-settings.v1"]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "release/plugins").mkdir(parents=True)

@@ -82,6 +82,29 @@ fn main() {
     std::fs::read_to_string(executable.with_extension("run-mode")).unwrap_or_else(|_| "complete".to_owned())
   });
   match mode.trim() {
+    "invocation-settings" => {
+      let expected: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(executable.with_extension("expected-invocation")).unwrap()).unwrap();
+      let mut actual = arguments
+        .iter()
+        .map(|argument| argument.to_str().unwrap())
+        .collect::<Vec<_>>();
+      if let Some(servers) = expected.get("mcp_servers") {
+        let index = actual
+          .iter()
+          .position(|argument| argument.starts_with("--config=mcp_servers="))
+          .unwrap();
+        let value = actual.remove(index).strip_prefix("--config=mcp_servers=").unwrap();
+        let parsed: toml::Table = format!("servers = {value}").parse().unwrap();
+        assert_eq!(&serde_json::to_value(&parsed["servers"]).unwrap(), servers);
+      }
+      assert_eq!(serde_json::json!(actual), expected["arguments"]);
+      for (name, value) in expected["environment"].as_object().unwrap() {
+        assert_eq!(std::env::var(name).unwrap(), value.as_str().unwrap());
+      }
+      std::fs::write(executable.with_extension("settings-verified"), b"verified").unwrap();
+      emit_event(r#"{"type":"turn.completed","message":"done"}"#);
+    },
     "public-operations" => {
       emit_event(
         r#"{"type":"item.started","item":{"id":"cmd-1","type":"command_execution","command":"private-command-arguments"}}"#,

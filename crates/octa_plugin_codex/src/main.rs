@@ -36,6 +36,7 @@ fn plugin_schema() -> PluginSchema {
     capabilities: vec![
       contract::TOOL_AUTHORIZATION_CAPABILITY.to_owned(),
       octa_runner_protocol::PUBLIC_OPERATION_OBSERVATIONS_V1.to_owned(),
+      contract::RUNTIME_SETTINGS_CAPABILITY.to_owned(),
     ],
     input_schema: Some(config::input_schema()),
     output_schema: Some(records::output_schema()),
