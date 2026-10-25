@@ -1,3 +1,13 @@
+## 0.7.2 - 2026-10-25
+
+### Fixed
+
+- Include Codex executable qualification and app-server model queries in one 10-second discovery deadline. A slow or stalled runtime returns unavailable model metadata and is terminated through the existing process owner; its stderr drain is cancelled as well.
+
+### Compatibility
+
+- Model catalogs, manual model entry, task execution and all plugin/runner protocol versions remain unchanged.
+
 ## 0.7.1 - 2026-10-25
 
 ### Added

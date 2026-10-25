@@ -16,7 +16,7 @@ class ReleaseMetadataTests(unittest.TestCase):
     def test_release_packages_match_the_documented_version(self):
         expected = re.search(r"^## ([0-9]+\.[0-9]+\.[0-9]+) -", (ROOT / "Changelog.md").read_text()).group(1)
         metadata = json.loads(subprocess.check_output(
-            ["cargo", "metadata", "--offline", "--format-version", "1", "--no-deps"], cwd=ROOT, text=True))
+            ["cargo", "metadata", "--offline", "--locked", "--format-version", "1", "--no-deps"], cwd=ROOT, text=True))
         packages = {package["name"]: package for package in metadata["packages"]}
         for identity in metadata["workspace_members"]:
             package = next(p for p in packages.values() if p["id"] == identity)
@@ -24,6 +24,9 @@ class ReleaseMetadataTests(unittest.TestCase):
                 continue
             with self.subTest(package=package["name"]):
                 self.assertEqual(package["version"], expected)
+                for dependency in package["dependencies"]:
+                    if dependency.get("path") and dependency["name"] in packages and dependency["name"] != "octa-cache-test-support":
+                        self.assertEqual(dependency["req"], f"^{expected}")
 
     @unittest.skipIf(os.name == "nt", "the manifest shell is exercised on Unix CI hosts")
     def test_codex_release_advertises_qualified_observations(self):
