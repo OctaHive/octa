@@ -235,21 +235,29 @@ impl PluginExecution {
     &mut self,
     cancel_token: &CancellationToken,
   ) -> Result<Option<PluginResponse>, PluginClientError> {
-    tokio::select! {
-      biased;
-      _ = cancel_token.cancelled() => Err(PluginClientError::Protocol("Command cancelled".into())),
-      _ = self.overflowed.cancelled() => Err(PluginClientError::ResponseQueueOverflow {
-        id: self.id.clone(),
-        capacity: COMMAND_RESPONSE_CAPACITY,
-      }),
-      response = self.response_rx.recv() => Ok(response),
-      changed = self.progress_rx.changed() => {
-        changed.map_err(|_| PluginClientError::ConnectionClosed)?;
-        Ok(self.progress_rx.borrow_and_update().clone().map(|progress| PluginResponse::Progress {
+    let mut progress_open = true;
+    loop {
+      tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => return Err(PluginClientError::Protocol("Command cancelled".into())),
+        _ = self.overflowed.cancelled() => return Err(PluginClientError::ResponseQueueOverflow {
           id: self.id.clone(),
-          progress,
-        }))
-      },
+          capacity: COMMAND_RESPONSE_CAPACITY,
+        }),
+        response = self.response_rx.recv() => return Ok(response),
+        changed = self.progress_rx.changed(), if progress_open => {
+          if changed.is_err() {
+            // Removing a completed route closes progress after queuing its terminal
+            // response. Recheck the reliable queue and cancellation guards.
+            progress_open = false;
+            continue;
+          }
+          return Ok(self.progress_rx.borrow_and_update().clone().map(|progress| PluginResponse::Progress {
+            id: self.id.clone(),
+            progress,
+          }));
+        },
+      }
     }
   }
 
@@ -2196,6 +2204,79 @@ mod tests {
 
     client.shutdown().await.unwrap();
     server_handle.await.unwrap();
+  }
+
+  #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+  async fn fast_terminal_responses_survive_progress_route_closure() {
+    let server = TestServer::new().await;
+    let listener = Arc::clone(&server.listener);
+    let peer = tokio::spawn(async move {
+      let stream = listener.accept().await.unwrap();
+      let (reader, writer) = tokio::io::split(stream);
+      let writer = Arc::new(Mutex::new(writer));
+      let mut reader = BufReader::new(reader);
+      let mut line = String::new();
+      loop {
+        line.clear();
+        assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+        match serde_json::from_str::<OctaCommand>(line.trim()).unwrap() {
+          OctaCommand::Hello(_) => {
+            write_response(
+              &writer,
+              PluginResponse::Hello(Version {
+                protocol_version: PLUGIN_PROTOCOL_VERSION,
+                version: env!("CARGO_PKG_VERSION").into(),
+                features: vec![],
+              }),
+            )
+            .await
+          },
+          OctaCommand::Execute { id, .. } => {
+            write_response(&writer, PluginResponse::Started { id: id.clone() }).await;
+            write_response(
+              &writer,
+              PluginResponse::Stdout {
+                id: id.clone(),
+                line: "rendered".into(),
+              },
+            )
+            .await;
+            write_response(
+              &writer,
+              PluginResponse::Completed {
+                id,
+                code: 0,
+                outputs: Default::default(),
+              },
+            )
+            .await;
+          },
+          OctaCommand::Shutdown => {
+            write_response(&writer, PluginResponse::Shutdown { message: "done".into() }).await;
+            return;
+          },
+          _ => panic!("unexpected command at the peer"),
+        }
+      }
+    });
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+      for _ in 0..2_000 {
+        let mut execution = client
+          .start_execution(execution_request("render"), CancellationToken::new())
+          .await
+          .unwrap();
+        let output = execution.receive_output(&CancellationToken::new()).await.unwrap();
+        assert!(matches!(output, Some(PluginResponse::Stdout { line, .. }) if line == "rendered"));
+        let terminal = execution.receive_output(&CancellationToken::new()).await.unwrap();
+        assert!(matches!(terminal, Some(PluginResponse::Completed { code: 0, .. })));
+      }
+    })
+    .await
+    .expect("bounded short-command stream did not finish");
+    client.shutdown().await.unwrap();
+    peer.await.unwrap();
   }
 
   #[tokio::test]

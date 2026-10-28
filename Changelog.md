@@ -4,6 +4,7 @@
 
 - Place the Codex root approval option before `exec`, so the pinned native CLI accepts generated invocations.
 - Accept the final completed assistant message preceding `turn.completed` as the native execution result. Reuse existing secret sanitization, byte limits and JSON Schema validation for plain and structured results.
+- Preserve queued command completion when its progress channel closes, preventing intermittent `Connection closed` failures after successful short commands.
 
 ### Security
 
