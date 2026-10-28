@@ -14,10 +14,10 @@ use crate::config;
 mod limits;
 mod normalize;
 mod writer;
-use limits::{
-  validate_encoded_size, MAX_FINAL_MESSAGE_BYTES, MAX_PLUGIN_OUTPUT_BYTES, MAX_STRUCTURED_RESULT_BYTES,
-  MAX_USAGE_METADATA_BYTES,
-};
+pub(crate) use limits::MAX_FINAL_MESSAGE_BYTES;
+use limits::{validate_encoded_size, MAX_PLUGIN_OUTPUT_BYTES, MAX_STRUCTURED_RESULT_BYTES, MAX_USAGE_METADATA_BYTES};
+pub(crate) use normalize::normalize_completion;
+#[cfg(test)]
 pub(crate) use normalize::normalize_terminal;
 use normalize::SemanticOutcome;
 pub(crate) use writer::{RunRecordPaths, RunRecords, TraceWriter};

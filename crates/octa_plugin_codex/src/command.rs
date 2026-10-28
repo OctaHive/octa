@@ -46,6 +46,7 @@ pub(crate) enum CommandOutcome {
 /// Evidence retained after a complete, well-formed harness stream.
 pub(crate) struct CommandCompletion {
   terminal_event: SanitizedEvent,
+  final_message: Option<String>,
 }
 
 /// References shared by event handling during one command invocation.
@@ -55,9 +56,15 @@ struct CommandContext<'a, W> {
   sanitizer: &'a RunSanitizer,
   trace: &'a mut TraceWriter,
   cancellation: &'a CancellationToken,
+  final_message: Option<String>,
 }
 
 impl CommandCompletion {
+  /// Last completed native assistant message, already sanitized and bounded.
+  pub(crate) fn final_message(&self) -> Option<&str> {
+    self.final_message.as_deref()
+  }
+
   /// Sanitized terminal event consumed later by result normalization.
   pub(crate) fn terminal_event(&self) -> &SanitizedEvent {
     &self.terminal_event
@@ -83,6 +90,7 @@ where
     sanitizer,
     trace,
     cancellation,
+    final_message: None,
   };
   run_with_grace_period(invocation, working_directory, context, CANCELLATION_GRACE_PERIOD).await
 }
@@ -201,7 +209,10 @@ where
     exit_status.is_some(),
     "the lifecycle loop exits only after process exit"
   );
-  Ok(CommandOutcome::Completed(CommandCompletion { terminal_event }))
+  Ok(CommandOutcome::Completed(CommandCompletion {
+    terminal_event,
+    final_message: context.final_message,
+  }))
 }
 
 enum LifecycleStep {
@@ -285,6 +296,21 @@ where
   }
   if context.cancellation.is_cancelled() {
     return Ok(ActivityFlow::Cancelled);
+  }
+  let message = event
+    .value()
+    .get("item")
+    .filter(|item| {
+      event.event_type() == "item.completed"
+        && item.get("type").and_then(serde_json::Value::as_str) == Some("agent_message")
+    })
+    .and_then(|item| item.get("text"))
+    .and_then(serde_json::Value::as_str);
+  if let Some(text) = message {
+    if text.len() > crate::records::MAX_FINAL_MESSAGE_BYTES {
+      anyhow::bail!("Codex final message exceeds the retention limit");
+    }
+    context.final_message = Some(text.to_owned());
   }
   if event.terminal().is_some() {
     *terminal_event = Some(event);
@@ -514,6 +540,7 @@ mod tests {
       sanitizer: &sanitizer,
       trace: records.trace(),
       cancellation: &cancellation,
+      final_message: None,
     };
 
     let flow = retain_event(event, &mut context, &mut terminal).await.unwrap();
@@ -542,6 +569,7 @@ mod tests {
       sanitizer: &sanitizer,
       trace: records.trace(),
       cancellation: &cancellation,
+      final_message: None,
     };
 
     let flow = process_stdout(&mut decoder, br#"{"type":"turn.started""#, &mut context, &mut terminal)
@@ -562,6 +590,7 @@ mod tests {
       sanitizer: &sanitizer,
       trace: records.trace(),
       cancellation: &cancellation,
+      final_message: None,
     };
     let flow = process_stdout(
       &mut decoder,
@@ -592,6 +621,7 @@ mod tests {
       sanitizer: &sanitizer,
       trace: records.trace(),
       cancellation: &cancellation,
+      final_message: None,
     };
     let flow = process_stdout(
       &mut decoder,
@@ -620,6 +650,7 @@ mod tests {
       sanitizer: &sanitizer,
       trace: records.trace(),
       cancellation: &cancellation,
+      final_message: None,
     };
     let flow = finish_stdout(&mut decoder, &mut context, &mut terminal).await.unwrap();
     assert_eq!(flow, ActivityFlow::Continue);
@@ -641,6 +672,7 @@ mod tests {
       sanitizer: &sanitizer,
       trace: records.trace(),
       cancellation: &cancellation,
+      final_message: None,
     };
     let outcome = run_with_grace_period(&invocation, workspace.path(), context, Duration::from_millis(20))
       .await
@@ -656,6 +688,7 @@ mod tests {
       sanitizer: &sanitizer,
       trace: records.trace(),
       cancellation: &cancellation,
+      final_message: None,
     };
     let error = run_with_grace_period(&invocation, workspace.path(), context, Duration::from_millis(20))
       .await

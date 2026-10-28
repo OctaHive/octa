@@ -428,10 +428,11 @@ fn build_arguments(
   tool_authorizer: Option<&ToolAuthorizer>,
 ) -> anyhow::Result<Vec<OsString>> {
   let mut arguments = vec![
+    // Approval policy belongs to the root CLI, before the exec subcommand.
+    OsString::from(format!("--ask-for-approval={APPROVAL_POLICY}")),
     OsString::from("exec"),
     OsString::from("--json"),
     OsString::from(format!("--sandbox={SANDBOX_MODE}")),
-    OsString::from(format!("--ask-for-approval={APPROVAL_POLICY}")),
   ];
   if let Some(authorizer) = tool_authorizer {
     arguments.extend(tool_authorization_arguments(authorizer)?);

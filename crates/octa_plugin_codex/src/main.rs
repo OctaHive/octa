@@ -147,7 +147,11 @@ impl Plugin for CodexPlugin {
     {
       command::CommandOutcome::Cancelled => send_cancelled(&writer, id).await,
       command::CommandOutcome::Completed(completion) => {
-        let normalized = records::normalize_terminal(completion.terminal_event(), config.result_schema.as_ref())?;
+        let normalized = records::normalize_completion(
+          completion.terminal_event(),
+          config.result_schema.as_ref(),
+          completion.final_message(),
+        )?;
         let committed = run_records.commit(normalized, &config, &invocation, &sanitizer).await?;
         resources::publish(&writer, &id, &dir, &committed.paths, &config.deliverables).await?;
         send_completed(&writer, id, 0, committed.outputs).await

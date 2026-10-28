@@ -111,9 +111,20 @@ impl NormalizedResult {
 /// payloads, contradictory terminal states, malformed metadata, and structured
 /// values rejected by the declared schema are execution-contract failures.
 /// Error messages remain static so rejected harness data cannot reach logs.
+#[cfg(test)]
 pub(crate) fn normalize_terminal(
   event: &SanitizedEvent,
   result_schema: Option<&Map<String, Value>>,
+) -> anyhow::Result<NormalizedResult> {
+  normalize_completion(event, result_schema, None)
+}
+
+/// Native exec emits its answer in item.completed; terminal-only fixtures and
+/// older supported streams retain their explicit terminal payload unchanged.
+pub(crate) fn normalize_completion(
+  event: &SanitizedEvent,
+  result_schema: Option<&Map<String, Value>>,
+  final_message: Option<&str>,
 ) -> anyhow::Result<NormalizedResult> {
   let terminal = event
     .terminal()
@@ -122,6 +133,23 @@ pub(crate) fn normalize_terminal(
     .value()
     .as_object()
     .expect("decoded harness events always contain JSON objects");
+  let fallback = final_message.filter(|_| {
+    terminal == TerminalEvent::Completed && !object.contains_key("message") && !object.contains_key("result")
+  });
+  let payload_object = if let Some(message) = fallback {
+    let mut payload = object.clone();
+    if result_schema.is_some() {
+      let result: Value = serde_json::from_str(message)
+        .map_err(|_| anyhow::anyhow!("Codex final message is not the configured JSON result"))?;
+      payload.insert("result".into(), result);
+    } else {
+      payload.insert("message".into(), Value::String(message.to_owned()));
+    }
+    Some(payload)
+  } else {
+    None
+  };
+  let object = payload_object.as_ref().unwrap_or(object);
   let outcome = normalize_outcome(object, terminal)?;
   let payload = match result_schema {
     Some(schema) => normalize_structured_result(object, schema)?,

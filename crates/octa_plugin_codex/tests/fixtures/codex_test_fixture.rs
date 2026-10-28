@@ -89,6 +89,15 @@ fn main() {
     }
     return;
   }
+  if let Ok(native) = std::fs::read_to_string(executable.with_extension("native-cli")) {
+    let mut syntax = arguments.clone();
+    assert_eq!(syntax.pop().unwrap(), "-");
+    syntax.push("--help".into());
+    let parsed = Command::new(native.trim()).args(syntax).output().unwrap();
+    if !parsed.status.success() {
+      std::process::exit(64);
+    }
+  }
   let marker = runtime_path(&executable, control_directory.as_deref(), "spawned");
   std::fs::write(marker, b"spawned").expect("fixture marker must be writable");
   let mut prompt = String::new();
@@ -101,6 +110,10 @@ fn main() {
     std::fs::read_to_string(executable.with_extension("run-mode")).unwrap_or_else(|_| "complete".to_owned())
   });
   match mode.trim() {
+    "native-final-message" => {
+      emit_event(r#"{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"true"}}"#);
+      emit_event(r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#);
+    },
     "invocation-settings" => {
       let expected: serde_json::Value =
         serde_json::from_slice(&std::fs::read(executable.with_extension("expected-invocation")).unwrap()).unwrap();

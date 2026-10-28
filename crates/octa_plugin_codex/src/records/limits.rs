@@ -11,7 +11,7 @@ use octa_plugin::protocol::MAX_PLUGIN_FRAME_BYTES;
 use serde::Serialize;
 
 /// Maximum UTF-8 bytes in the terminal plain-text response.
-pub(super) const MAX_FINAL_MESSAGE_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_FINAL_MESSAGE_BYTES: usize = 256 * 1024;
 /// Maximum encoded bytes in the terminal structured result.
 pub(super) const MAX_STRUCTURED_RESULT_BYTES: usize = 256 * 1024;
 /// Maximum encoded bytes in terminal usage metadata.

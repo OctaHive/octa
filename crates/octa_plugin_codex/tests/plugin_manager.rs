@@ -102,6 +102,53 @@ fn lifecycle_request(workspace: &Path) -> PluginExecutionRequest {
   }
 }
 
+#[tokio::test]
+async fn native_completed_agent_message_supplies_plain_and_schema_validated_results() {
+  for schema in [None, Some(json!({"type":"boolean"}))] {
+    let workspace = tempfile::tempdir().unwrap();
+    let fixture = configured_process_fixture(workspace.path(), "native-final-message");
+    let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture);
+    manager.start_plugin(&name).await.unwrap();
+    let client = manager.get_client("codex").await.unwrap();
+    let mut request = lifecycle_request(workspace.path());
+    if let Some(schema) = &schema {
+      request.params["result_schema"] = schema.clone();
+    }
+    let mut execution = client.start_execution(request, CancellationToken::new()).await.unwrap();
+    let terminal = receive_terminal(&mut execution).await;
+    let PluginResponse::Completed { code: 0, outputs, .. } = terminal else {
+      panic!("native completion rejected: {terminal:?}");
+    };
+    if schema.is_some() {
+      assert_eq!(outputs["structured_result"], true);
+    } else {
+      assert_eq!(outputs["final_message"], "true");
+    }
+    assert_eq!(outputs["usage"], json!({"input_tokens":1,"output_tokens":1}));
+  }
+}
+
+#[tokio::test]
+#[ignore = "requires the explicitly selected pinned native Codex executable"]
+async fn native_cli_accepts_global_approval_policy_before_the_exec_subcommand() {
+  let native = PathBuf::from(std::env::var_os("OCTA_TEST_CODEX_NATIVE").expect("select pinned Codex explicitly"));
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(workspace.path(), "complete");
+  fs::write(fixture.with_extension("native-cli"), native.to_str().unwrap()).unwrap();
+  let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture);
+  manager.start_plugin(&name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let mut execution = client
+    .start_execution(lifecycle_request(workspace.path()), CancellationToken::new())
+    .await
+    .unwrap();
+  let terminal = receive_terminal(&mut execution).await;
+  assert!(
+    matches!(terminal, PluginResponse::Completed { code: 0, .. }),
+    "pinned native CLI rejected generated arguments: {terminal:?}"
+  );
+}
+
 fn authorized_lifecycle_request(workspace: &Path) -> PluginExecutionRequest {
   let mut request = lifecycle_request(workspace);
   request.params["tool_authorization"] = json!("required");
@@ -272,7 +319,7 @@ async fn explicit_cli_settings_reach_the_process_without_replacing_protected_arg
   fs::write(
     fixture.with_extension("expected-invocation"),
     json!({
-      "arguments": ["exec", "--json", "--sandbox=workspace-write", "--ask-for-approval=never",
+      "arguments": ["--ask-for-approval=never", "exec", "--json", "--sandbox=workspace-write",
         "--model=selected-model", "--config=model_reasoning_effort=\"high\"", "--ephemeral", "--color=never", "-"],
       "environment": {}
     })
@@ -302,7 +349,7 @@ async fn explicit_mcp_connection_uses_mapped_credentials_without_exposing_them_i
   let installation = tempfile::tempdir().unwrap();
   let fixture = configured_process_fixture(installation.path(), "invocation-settings");
   fs::write(fixture.with_extension("expected-invocation"), json!({
-    "arguments": ["exec", "--json", "--sandbox=workspace-write", "--ask-for-approval=never", "--ignore-user-config", "-"],
+    "arguments": ["--ask-for-approval=never", "exec", "--json", "--sandbox=workspace-write", "--ignore-user-config", "-"],
     "mcp_servers": {"tickets": {"url": "https://tickets.example/mcp", "bearer_token_env_var": "TICKET_TOKEN", "required": true}},
     "environment": {"TICKET_TOKEN": "managed-connection-private-canary"}
   }).to_string()).unwrap();
@@ -340,7 +387,7 @@ async fn explicit_stdio_mcp_preserves_arguments_selected_tools_and_only_mapped_e
   fs::write(
     fixture.with_extension("expected-invocation"),
     json!({
-      "arguments": ["exec", "--json", "--sandbox=workspace-write", "--ask-for-approval=never", "--ignore-user-config", "-"],
+      "arguments": ["--ask-for-approval=never", "exec", "--json", "--sandbox=workspace-write", "--ignore-user-config", "-"],
       "mcp_servers": {"local": {"command": fixture, "args": ["--tenant", "$(not-a-shell)"],
         "env_vars": ["WORKSPACE_MODE"], "enabled_tools": ["read_issue"], "required": true}},
       "environment": {"WORKSPACE_MODE": "review"}

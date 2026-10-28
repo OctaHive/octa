@@ -88,10 +88,10 @@ async fn inline_unicode_prompt_has_a_stable_identity_and_is_delivered_only_over_
   assert_eq!(
     invocation.arguments(),
     [
+      "--ask-for-approval=never",
       "exec",
       "--json",
       "--sandbox=workspace-write",
-      "--ask-for-approval=never",
       "--model=gpt-codex",
       "--config=model_reasoning_effort=\"high\"",
       "-",
@@ -292,10 +292,10 @@ async fn structured_result_arguments_are_typed_and_never_accept_pass_through_fla
   assert_eq!(
     invocation.arguments(),
     [
+      OsString::from("--ask-for-approval=never"),
       OsString::from("exec"),
       OsString::from("--json"),
       OsString::from("--sandbox=workspace-write"),
-      OsString::from("--ask-for-approval=never"),
       OsString::from("--model=--untrusted-model-shaped-flag"),
       {
         let mut value = OsString::from("--output-schema=");
