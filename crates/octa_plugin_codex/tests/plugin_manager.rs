@@ -125,6 +125,42 @@ async fn native_completed_agent_message_supplies_plain_and_schema_validated_resu
       assert_eq!(outputs["final_message"], "true");
     }
     assert_eq!(outputs["usage"], json!({"input_tokens":1,"output_tokens":1}));
+    assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+  }
+}
+
+#[tokio::test]
+async fn native_completed_answers_reject_invalid_or_oversized_results_without_leaking_secrets() {
+  let canary = "private-native-answer-canary";
+  for (answer, schema) in [
+    (canary.to_owned(), Some(json!({"type":"boolean"}))),
+    ("true".to_owned(), Some(json!({"type":"string"}))),
+    ("x".repeat(256 * 1024 + 1), None),
+  ] {
+    let workspace = tempfile::tempdir().unwrap();
+    let fixture = configured_process_fixture(workspace.path(), "native-final-message");
+    fs::write(fixture.with_extension("native-answer"), answer).unwrap();
+    let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture);
+    manager.start_plugin(&name).await.unwrap();
+    let client = manager.get_client("codex").await.unwrap();
+    let mut request = lifecycle_request(workspace.path());
+    request.vars.insert("private_value".into(), json!(canary));
+    request.secret_vars.push("private_value".into());
+    if let Some(schema) = schema {
+      request.params["result_schema"] = schema;
+    }
+    let mut execution = client.start_execution(request, CancellationToken::new()).await.unwrap();
+    let responses = receive_through_terminal(&mut execution).await;
+    let Some(PluginResponse::Error { message, .. }) = responses.last() else {
+      panic!("invalid native answer must fail");
+    };
+    assert!(message.len() < 192, "native input must not become a decoder diagnostic");
+    assert!(!serde_json::to_string(&responses).unwrap().contains(canary));
+    assert!(!responses.iter().any(|response| matches!(
+      response,
+      PluginResponse::RegisterArtifact { .. } | PluginResponse::RegisterReport { .. }
+    )));
+    assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
   }
 }
 
@@ -147,6 +183,7 @@ async fn native_cli_accepts_global_approval_policy_before_the_exec_subcommand() 
     matches!(terminal, PluginResponse::Completed { code: 0, .. }),
     "pinned native CLI rejected generated arguments: {terminal:?}"
   );
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
 }
 
 fn authorized_lifecycle_request(workspace: &Path) -> PluginExecutionRequest {

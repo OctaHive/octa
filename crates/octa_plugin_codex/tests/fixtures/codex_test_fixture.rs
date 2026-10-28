@@ -111,7 +111,12 @@ fn main() {
   });
   match mode.trim() {
     "native-final-message" => {
-      emit_event(r#"{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"true"}}"#);
+      let answer =
+        std::fs::read_to_string(executable.with_extension("native-answer")).unwrap_or_else(|_| "true".into());
+      emit_event(
+        &serde_json::json!({"type":"item.completed","item":{"id":"answer","type":"agent_message","text":answer}})
+          .to_string(),
+      );
       emit_event(r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#);
     },
     "invocation-settings" => {
