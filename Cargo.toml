@@ -69,7 +69,7 @@ uuid = { version = "1.26", features = ["v4"] }
 tempfile = "3.27"
 same-file = "1.0.6"
 semver = "1.0.28"
-zstd = "0.13.3"
+zstd = "0.14.3"
 toml = "0.9"
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "stream"] }
 fastrand = "2.3.0"

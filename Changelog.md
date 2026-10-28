@@ -5,6 +5,10 @@
 - Place the Codex root approval option before `exec`, so the pinned native CLI accepts generated invocations.
 - Accept the final completed assistant message preceding `turn.completed` as the native execution result. Reuse existing secret sanitization, byte limits and JSON Schema validation for plain and structured results.
 
+### Security
+
+- Update the cache compression dependency to zstd 0.14.3 and its patched native bindings, resolving reported stream-context disclosure and decompression memory-safety vulnerabilities.
+
 ### Compatibility
 
 - Supported Codex CLI 0.161.0, sandbox/approval policy, MCP configuration and all plugin/runner protocol versions remain unchanged.
