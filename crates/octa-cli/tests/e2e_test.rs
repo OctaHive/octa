@@ -333,6 +333,7 @@ fn test_plugin_lock_and_verify_commands() {
           "public-command-file-observations.v1".to_owned(),
           "codex.task-runtime-settings.v1".to_owned(),
           "model-catalog.v1".to_owned(),
+          "codex.native-mcp-evidence.v1".to_owned(),
         ],
         _ => Vec::new(),
       },
@@ -731,6 +732,81 @@ tasks:
     .success()
     .stdout(predicate::str::contains("rendered by the configured default plugin"));
 
+  Ok(())
+}
+
+#[test]
+fn test_failed_codex_retains_trace_artifacts_without_a_result_report() -> Result<(), Box<dyn std::error::Error>> {
+  assert_stopped_codex_resources("native-final-message", None)
+}
+
+#[test]
+fn test_timed_out_codex_retains_trace_artifacts_without_a_result_report() -> Result<(), Box<dyn std::error::Error>> {
+  assert_stopped_codex_resources("hang", Some("5s"))
+}
+
+fn assert_stopped_codex_resources(mode: &str, timeout: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+  let workspace = TempDir::new()?;
+  let fixture = workspace
+    .path()
+    .join(format!("codex-fixture{}", env::consts::EXE_SUFFIX));
+  fs::copy(
+    validation_plugins_dir().join(format!("codex-test-fixture{}", env::consts::EXE_SUFFIX)),
+    &fixture,
+  )?;
+  fs::write(fixture.with_extension("run-mode"), mode)?;
+  fs::write(fixture.with_extension("native-answer"), "not-json")?;
+  fs::write(workspace.path().join("config.yml"), "plugins: [codex]\n")?;
+  let timeout_line = timeout
+    .map(|value| format!("    timeout: {value}\n"))
+    .unwrap_or_default();
+  fs::write(
+    workspace.path().join("Octafile.yml"),
+    format!(
+      r#"
+version: 1
+tasks:
+  inspect:
+{timeout_line}    codex:
+      prompt: inspect the fixture
+      result_schema: {{type: boolean}}
+"#
+    ),
+  )?;
+  let mut command = Command::cargo_bin("octa")?;
+  command
+    .current_dir(workspace.path())
+    .env("OCTA_PLUGINS_DIR", validation_plugins_dir())
+    .env("OCTA_CODEX_EXECUTABLE", &fixture)
+    .args(["--config", "config.yml", "--output", "json", "inspect"]);
+  let result = command.assert().failure();
+  let stdout = std::str::from_utf8(&result.get_output().stdout)?;
+  assert!(
+    fixture.with_extension("spawned").is_file(),
+    "the fixture must actually run: {stdout}"
+  );
+  let failure = if timeout.is_some() {
+    "exceeded timeout"
+  } else {
+    "Codex final message is not the configured JSON result"
+  };
+  assert!(stdout.contains(failure), "{stdout}");
+  let entries = stdout
+    .lines()
+    .map(serde_json::from_str::<ConsoleEntry>)
+    .collect::<Result<Vec<_>, _>>()?;
+  let artifacts = entries
+    .iter()
+    .filter_map(|entry| match entry.record() {
+      ConsoleRecord::Execution(ExecutionEvent::ArtifactRegistered { artifact, .. }) => Some(artifact.name.as_str()),
+      _ => None,
+    })
+    .collect::<Vec<_>>();
+  assert_eq!(artifacts, ["codex-run-trace", "codex-run-provenance"]);
+  assert!(!entries.iter().any(|entry| matches!(
+    entry.record(),
+    ConsoleRecord::Execution(ExecutionEvent::ReportRegistered { .. })
+  )));
   Ok(())
 }
 

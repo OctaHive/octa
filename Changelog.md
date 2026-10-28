@@ -1,3 +1,18 @@
+## 0.8.0 - 2026-10-28
+
+### Added
+
+- Advertise `codex.native-mcp-evidence.v1` for bounded native MCP calls and consumed results in ordinary run-record Artifacts, including after cancellation, timeout or failed native result validation.
+
+### Changed
+
+- Codex trace and provenance records use format 2. Trace events include local observation timestamps; provenance identifies capture lifecycle, coverage, terminal presence, record count and the exact trace digest. Consumers of these files must support format 2 before upgrading.
+- Failed and cancelled task results retain validated trace/provenance Artifact declarations for Agent output collection without publishing semantic outputs, result reports or cache entries.
+
+### Compatibility
+
+- Codex result format 1, plugin protocol 2, runner protocols, and supported Codex CLI 0.161.0 remain unchanged. Capture coverage describes only emitted native events; absent remote coverage or revisions remain unknown.
+
 ## 0.7.3 - 2026-10-28
 
 ### Fixed

@@ -19,6 +19,7 @@ TOOL_AUTHORIZATION_CAPABILITY = "codex.blocking-pre-tool-authorization.v1"
 PUBLIC_OPERATION_OBSERVATIONS_CAPABILITY = "public-command-file-observations.v1"
 RUNTIME_SETTINGS_CAPABILITY = "codex.task-runtime-settings.v1"
 MODEL_CATALOG_CAPABILITY = "model-catalog.v1"
+NATIVE_MCP_EVIDENCE_CAPABILITY = "codex.native-mcp-evidence.v1"
 MANIFEST_PATH = "plugins/codex.plugin.yml"
 _SUPPORTED_VERSIONS = re.compile(
     r'^const SUPPORTED_CODEX_VERSIONS: &\[&str\] = &\[(?P<versions>[^]]+)\];$',
@@ -48,7 +49,8 @@ def document(source: Path, plugin_version: str, plugin_protocol: int) -> dict[st
             "protocol": plugin_protocol,
             "manifest": MANIFEST_PATH,
             "capabilities": [TOOL_AUTHORIZATION_CAPABILITY, PUBLIC_OPERATION_OBSERVATIONS_CAPABILITY,
-                             RUNTIME_SETTINGS_CAPABILITY, MODEL_CATALOG_CAPABILITY],
+                             RUNTIME_SETTINGS_CAPABILITY, MODEL_CATALOG_CAPABILITY,
+                             NATIVE_MCP_EVIDENCE_CAPABILITY],
         },
         "executable": {
             "product": CODEX_PRODUCT,

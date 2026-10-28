@@ -184,13 +184,16 @@ impl PluginInvoker {
 
     let mut terminal_response = false;
     let result: ExecutorResult<PluginOutput> = async {
+      let drain_cancellation = CancellationToken::new();
+      let mut draining = false;
       let mut output = OutputCapture::default();
       let mut failure_location = None;
       let mut artifacts = Vec::new();
       let mut reports = Vec::new();
       let mut output_redactor = OutputRedactor::new(&redactions);
       loop {
-        match execution.receive_output(&cancel_token).await {
+        let receive_cancellation = if draining { &drain_cancellation } else { &cancel_token };
+        match execution.receive_output(receive_cancellation).await {
           Ok(Some(response)) => match route_plugin_response_redacted(
             response,
             &command_id,
@@ -246,6 +249,29 @@ impl PluginInvoker {
             },
             PluginResponseAction::Error(message) => {
               terminal_response = true;
+              if !artifacts.is_empty() {
+                // Technical failure cannot erase artifacts already declared by
+                // the plugin. No unvalidated semantic outputs are returned.
+                if let Some(target) = &request.output {
+                  target
+                    .diagnostic(octa_output::ConsoleLevel::Error, &message, failure_location.clone())
+                    .await?;
+                }
+                output
+                  .append_line(ConsoleStream::Stderr, &message)
+                  .await
+                  .map_err(|error| capture_error(&plugin_name, error))?;
+                let (stdout, stderr) = output.into_strings().await?;
+                break Ok(PluginOutput {
+                  code: 1,
+                  stdout,
+                  stderr,
+                  outputs: Map::new(),
+                  artifacts,
+                  reports: Vec::new(),
+                  failure_location,
+                });
+              }
               break Err(io::Error::other(format!("Plugin error: {message}")).into());
             },
           },
@@ -259,6 +285,13 @@ impl PluginInvoker {
             );
           },
           Err(error) => {
+            if cancel_token.is_cancelled() && !draining {
+              // The existing bounded cancel handshake waits for the terminal
+              // response. Consume its queued declarations before returning a stop.
+              execution.cancel_and_wait().await.map_err(io::Error::from)?;
+              draining = true;
+              continue;
+            }
             if cancel_token.is_cancelled() {
               break Err(io::Error::new(io::ErrorKind::Interrupted, "Command cancelled").into());
             }

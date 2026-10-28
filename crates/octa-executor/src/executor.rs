@@ -48,6 +48,7 @@ use crate::{
   execution_run::ExecutionRun,
   interactive_scope_tracker::InteractiveScopeTracker,
   runtime_coordinator::RuntimeCoordinator,
+  structured_output::CompletionOutputs,
   summary::{Summary, TaskSummaryItem},
   task::{Executable, ExecutionBinding, TaskOutcome, TaskRuntime},
 };
@@ -782,7 +783,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
       if let Err(error) = self.context.recorder.start_scope(binding).await {
         let result = self.handle_error(error.into(), Some(binding)).await;
         return self
-          .complete_scope(result, Some(binding))
+          .complete_scope(result, Some(binding), Default::default())
           .await
           .map(|output| NodeExecution {
             output: self.task.contributes_run_output().then_some(output),
@@ -797,7 +798,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
       Err(error) => {
         let result = self.handle_error(error, binding.as_ref()).await;
         return self
-          .complete_scope(result, binding.as_ref())
+          .complete_scope(result, binding.as_ref(), Default::default())
           .await
           .map(|output| NodeExecution {
             output: self.task.contributes_run_output().then_some(output),
@@ -812,7 +813,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
       if let Err(error) = self.context.recorder.start_step(binding).await {
         let result = self.handle_error(error.into(), Some(binding)).await;
         return self
-          .complete_scope(result, Some(binding))
+          .complete_scope(result, Some(binding), Default::default())
           .await
           .map(|output| NodeExecution {
             output: self.task.contributes_run_output().then_some(output),
@@ -870,20 +871,29 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
         .await
     };
 
+    let mut failure_outputs = CompletionOutputs::default();
     let result = match result {
       Ok(outcome) => {
         let status = outcome.status();
         let (output, outputs) = outcome.into_parts();
-        let recorded_outputs = outputs.clone();
-        self
-          .handle_success(output, outputs.into_task(), status, start_time)
-          .await
-          .map(|output| TaskOutcome::new(output, status).with_outputs(recorded_outputs))
+        match output {
+          Ok(output) => {
+            let recorded_outputs = outputs.clone();
+            self
+              .handle_success(output, outputs.into_task(), status, start_time)
+              .await
+              .map(|output| TaskOutcome::new(output, status).with_outputs(recorded_outputs))
+          },
+          Err(error) => {
+            failure_outputs = outputs;
+            self.handle_error(error, binding.as_ref()).await
+          },
+        }
       },
       Err(e) => self.handle_error(e, binding.as_ref()).await,
     };
     self
-      .complete_scope(result, binding.as_ref())
+      .complete_scope(result, binding.as_ref(), failure_outputs)
       .await
       .map(|output| NodeExecution {
         output: self.task.contributes_run_output().then_some(output),
@@ -895,16 +905,17 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
     &self,
     result: ExecutorResult<TaskOutcome>,
     binding: Option<&ExecutionBinding>,
+    failure_outputs: CompletionOutputs,
   ) -> ExecutorResult<Arc<str>> {
     let Some(binding) = binding else {
-      return result.map(TaskOutcome::into_output);
+      return result.and_then(TaskOutcome::into_output);
     };
     match result {
       Ok(outcome) => {
         let status = outcome.status();
         let (output, outputs) = outcome.into_parts();
         self.context.recorder.complete(binding, status, None, outputs).await?;
-        Ok(output)
+        output
       },
       Err(error) => {
         let status = if matches!(&error, ExecutorError::TaskCancelled(_)) {
@@ -918,7 +929,7 @@ impl<T: Executable + Hash + Eq + Send + Sync + Clone + 'static> TaskExecutor<T> 
         let _ = self
           .context
           .recorder
-          .complete(binding, status, Some(failure), Default::default())
+          .complete(binding, status, Some(failure), failure_outputs)
           .await;
         Err(error)
       },
@@ -1109,10 +1120,7 @@ mod tests {
   use tokio::time::sleep;
 
   use super::*;
-  use crate::{
-    structured_output::{CompletionOutputs, TaskOutputs},
-    ExecutionConclusion,
-  };
+  use crate::{structured_output::TaskOutputs, ExecutionConclusion};
   use octa_output::{ConsoleDiagnostic, ConsoleRecord};
 
   #[derive(Clone)]

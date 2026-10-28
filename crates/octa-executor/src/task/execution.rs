@@ -792,8 +792,14 @@ impl TaskNode {
           reports,
           failure_location,
         } = output;
-        if code != 0 && !cancel_token.is_cancelled() {
-          if self.ignore_errors {
+        if code != 0 || cancel_token.is_cancelled() {
+          let retained = CompletionOutputs::default().with_resources(
+            crate::resource::plugin_artifacts(&artifacts, &working_dir, &self.workspace)?,
+            Vec::new(),
+          );
+          if cancel_token.is_cancelled() {
+            (Err(ExecutorError::TaskCancelled(self.name.clone())), retained)
+          } else if self.ignore_errors {
             // Ignored failures are terminal successes with no structured
             // result. Failed completions are not output-schema validated, so
             // neither step results nor dependency exports may retain them.
@@ -803,7 +809,7 @@ impl TaskNode {
                 format!("Task {} failed but errors ignored. Error code: {}", self.name, code),
               )
               .await?;
-            (Ok("".to_string()), CompletionOutputs::default())
+            (Ok("".to_string()), retained)
           } else {
             (
               Err(ExecutorError::CommandFailed {
@@ -812,7 +818,7 @@ impl TaskNode {
                 stderr,
                 location: failure_location,
               }),
-              Default::default(),
+              retained,
             )
           }
         } else {
@@ -835,7 +841,11 @@ impl TaskNode {
         Default::default(),
       ),
     };
-    result.map(|output| TaskOutcome::success(output).with_outputs(outputs))
+    match result {
+      Ok(output) => Ok(TaskOutcome::success(output).with_outputs(outputs)),
+      Err(error) if !outputs.artifacts().is_empty() => Ok(TaskOutcome::failed(error).with_outputs(outputs)),
+      Err(error) => Err(error),
+    }
   }
 
   /// Converts an invocation error according to the task's `ignore_error` policy.
@@ -906,7 +916,11 @@ impl Executable for TaskNode {
       _ = time::sleep(timeout.duration()) => {
         command_token.cancel();
         // Wait for protocol cleanup so the plugin can accept another command immediately.
-        let _ = time::timeout(Duration::from_secs(5), &mut execution).await;
+        let retained = match time::timeout(Duration::from_secs(5), &mut execution).await {
+          Ok(Ok(outcome)) => CompletionOutputs::default()
+            .with_resources(outcome.into_parts().1.artifacts().to_vec(), Vec::new()),
+          _ => CompletionOutputs::default(),
+        };
         let error = ExecutorError::TaskTimedOut {
           task: self.name.clone(),
           timeout: timeout.to_string(),
@@ -918,7 +932,9 @@ impl Executable for TaskNode {
               format!("Task {} failed but errors ignored. Error: {error}", self.name),
             )
             .await?;
-          Ok(TaskOutcome::success(String::new()))
+          Ok(TaskOutcome::success(String::new()).with_outputs(retained))
+        } else if !retained.artifacts().is_empty() {
+          Ok(TaskOutcome::failed(error).with_outputs(retained))
         } else {
           Err(error)
         }

@@ -2,9 +2,10 @@
 //!
 //! A [`RunRecords`] value exclusively creates one invocation directory and
 //! owns every file name inside a hidden staging directory. Harness events are
-//! appended to an exclusive temporary trace as they arrive. Only after all
-//! three files are flushed and synchronized is that directory renamed to its
+//! appended to an exclusive temporary trace as they arrive. Only after the
+//! record set is flushed and synchronized is that directory renamed to its
 //! stable name, so readers can observe either no record set or the whole set.
+//! Interrupted runs retain trace/provenance without fabricating a result.
 //! Dropping an uncommitted value removes only those known files and the now
 //! empty directory; it never recursively deletes a path derived from input.
 
@@ -33,8 +34,8 @@ use crate::{
   sanitization::{RunSanitizer, SanitizedEvent},
 };
 
-const TRACE_FORMAT_VERSION: u16 = 1;
-const PROVENANCE_FORMAT_VERSION: u16 = 1;
+const TRACE_FORMAT_VERSION: u16 = 2;
+const PROVENANCE_FORMAT_VERSION: u16 = 2;
 const MAX_TRACE_BYTES: usize = 16 * 1024 * 1024;
 
 const TRACE_FILE: &str = "trace.jsonl";
@@ -65,8 +66,6 @@ pub(crate) struct RunRecords {
   relative_directory: String,
   schema_path: PathBuf,
   trace: TraceWriter,
-  started_unix_millis: u64,
-  started: Instant,
   committed: bool,
 }
 
@@ -74,6 +73,11 @@ pub(crate) struct RunRecords {
 pub(crate) struct TraceWriter {
   file: Option<tokio::fs::File>,
   encoded_bytes: usize,
+  started_unix_millis: u64,
+  started: Instant,
+  digest: blake3::Hasher,
+  record_count: u64,
+  terminal_observed: bool,
 }
 
 /// Stable relative paths created by one committed invocation.
@@ -83,7 +87,7 @@ pub(crate) struct TraceWriter {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RunRecordPaths {
   pub(crate) trace: String,
-  pub(crate) result: String,
+  pub(crate) result: Option<String>,
   pub(crate) provenance: String,
 }
 
@@ -98,6 +102,7 @@ pub(crate) struct CommittedRunRecords {
 struct TraceRecord<'a> {
   format_version: u16,
   sequence: u64,
+  observed_at_unix_millis: u64,
   event: &'a Value,
 }
 
@@ -127,6 +132,25 @@ struct ProvenanceRecord<'a> {
   timing: Timing,
   outcome: SemanticOutcome,
   usage: &'a BTreeMap<String, u64>,
+  capture: CaptureMetadata<'a>,
+}
+
+/// Describes the capture lifecycle, independently of the model's semantic outcome.
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CaptureStatus {
+  Complete,
+  Cancelled,
+  Failed,
+}
+
+#[derive(Serialize)]
+struct CaptureMetadata<'a> {
+  status: CaptureStatus,
+  coverage: &'static str,
+  terminal_observed: bool,
+  record_count: u64,
+  trace_digest: DigestIdentity<'a>,
 }
 
 #[derive(Serialize)]
@@ -188,9 +212,12 @@ impl RunRecords {
       trace: TraceWriter {
         file: Some(tokio::fs::File::from_std(prepared.trace)),
         encoded_bytes: 0,
+        started_unix_millis: unix_millis(SystemTime::now()),
+        started: Instant::now(),
+        digest: blake3::Hasher::new(),
+        record_count: 0,
+        terminal_observed: false,
       },
-      started_unix_millis: unix_millis(SystemTime::now()),
-      started: Instant::now(),
       committed: false,
     })
   }
@@ -213,39 +240,68 @@ impl RunRecords {
 
   /// Flushes and publishes all stable records, returning protocol outputs.
   pub(crate) async fn commit(
-    mut self,
+    self,
     result: NormalizedResult,
     config: &CodexConfig,
     invocation: &CodexInvocation,
     sanitizer: &RunSanitizer,
   ) -> anyhow::Result<CommittedRunRecords> {
-    let elapsed = self.started.elapsed();
-    let timing = Timing::from_elapsed(self.started_unix_millis, elapsed);
     let (outcome, payload, harness_identifiers, usage) = result.into_parts();
     let result_bytes = encode_result(outcome, &payload, &harness_identifiers, &usage)?;
-    let codex_version = invocation.codex_version();
-    let prompt_digest = invocation.prompt_identity().to_hex().to_string();
-    let provenance_bytes = encode_provenance(
-      outcome,
-      &usage,
-      config,
-      &codex_version,
-      &prompt_digest,
-      timing,
-      sanitizer,
-    )?;
+    let provenance_bytes =
+      self.encode_provenance(outcome, &usage, config, invocation, sanitizer, CaptureStatus::Complete)?;
 
+    let paths = self.commit_documents(Some(result_bytes), provenance_bytes).await?;
+    let outputs = build_outputs(outcome, payload, harness_identifiers, usage, &paths);
+    Ok(CommittedRunRecords { outputs, paths })
+  }
+
+  /// Retains observed events after interruption without inventing a harness result.
+  pub(crate) async fn commit_interrupted(
+    self,
+    status: CaptureStatus,
+    config: &CodexConfig,
+    invocation: &CodexInvocation,
+    sanitizer: &RunSanitizer,
+  ) -> anyhow::Result<RunRecordPaths> {
+    let provenance = self.encode_provenance(
+      SemanticOutcome::Failed,
+      &BTreeMap::new(),
+      config,
+      invocation,
+      sanitizer,
+      status,
+    )?;
+    self.commit_documents(None, provenance).await
+  }
+
+  async fn commit_documents(
+    mut self,
+    result_bytes: Option<Vec<u8>>,
+    provenance_bytes: Vec<u8>,
+  ) -> anyhow::Result<RunRecordPaths> {
     self.trace.finish().await?;
     remove_if_present(self.staging(), SCHEMA_FILE)?;
-    write_exclusive(self.staging().try_clone()?, RESULT_TEMP, result_bytes).await?;
+    let has_result = result_bytes.is_some();
+    if let Some(result_bytes) = result_bytes {
+      write_exclusive(self.staging().try_clone()?, RESULT_TEMP, result_bytes).await?;
+    }
     write_exclusive(self.staging().try_clone()?, PROVENANCE_TEMP, provenance_bytes).await?;
     let staging = self.staging.take().expect("record staging directory remains open");
-    publish_directory(self.root.try_clone()?, self.invocation().try_clone()?, staging).await?;
+    publish_directory(
+      self.root.try_clone()?,
+      self.invocation().try_clone()?,
+      staging,
+      has_result,
+    )
+    .await?;
 
-    let paths = RunRecordPaths::new(&self.relative_directory);
-    let outputs = build_outputs(outcome, payload, harness_identifiers, usage, &paths);
+    let mut paths = RunRecordPaths::new(&self.relative_directory);
+    if !has_result {
+      paths.result = None;
+    }
     self.committed = true;
-    Ok(CommittedRunRecords { outputs, paths })
+    Ok(paths)
   }
 
   #[cfg(test)]
@@ -268,11 +324,16 @@ impl RunRecords {
 }
 
 impl TraceWriter {
+  fn timing(&self) -> Timing {
+    Timing::from_elapsed(self.started_unix_millis, self.started.elapsed())
+  }
+
   /// Appends one versioned sanitized event without retaining the full trace.
   pub(crate) async fn append(&mut self, event: &SanitizedEvent) -> anyhow::Result<()> {
     let mut encoded = serde_json::to_vec(&TraceRecord {
       format_version: TRACE_FORMAT_VERSION,
       sequence: event.sequence(),
+      observed_at_unix_millis: self.timing().finished_unix_millis,
       event: event.value(),
     })
     .context("failed to encode a sanitized Codex trace event")?;
@@ -290,6 +351,9 @@ impl TraceWriter {
       .await
       .context("failed to write the sanitized Codex trace")?;
     self.encoded_bytes = total;
+    self.digest.update(&encoded);
+    self.record_count += 1;
+    self.terminal_observed |= event.terminal().is_some();
     Ok(())
   }
 
@@ -396,7 +460,7 @@ async fn write_exclusive(directory: Dir, name: &'static str, bytes: Vec<u8>) -> 
   .with_context(|| format!("failed to write temporary Codex run record '{name}'"))
 }
 
-async fn publish_directory(root: Dir, invocation: Dir, staging: Dir) -> anyhow::Result<()> {
+async fn publish_directory(root: Dir, invocation: Dir, staging: Dir, has_result: bool) -> anyhow::Result<()> {
   tokio::task::spawn_blocking(move || {
     match invocation.symlink_metadata(RECORDS_DIRECTORY) {
       Err(error) if error.kind() == io::ErrorKind::NotFound => {},
@@ -425,6 +489,9 @@ async fn publish_directory(root: Dir, invocation: Dir, staging: Dir) -> anyhow::
       (RESULT_TEMP, RESULT_FILE),
       (PROVENANCE_TEMP, PROVENANCE_FILE),
     ] {
+      if temporary == RESULT_TEMP && !has_result {
+        continue;
+      }
       staging.rename(temporary, &staging, final_name)?;
     }
     sync_directory(&staging)?;
@@ -497,48 +564,63 @@ fn encode_result(
   })
 }
 
-fn encode_provenance(
-  outcome: SemanticOutcome,
-  usage: &BTreeMap<String, u64>,
-  config: &CodexConfig,
-  codex_version: &str,
-  prompt_digest: &str,
-  timing: Timing,
-  sanitizer: &RunSanitizer,
-) -> anyhow::Result<Vec<u8>> {
-  // These task-authored values are legitimate provenance, but they can still
-  // equal a resolved secret scalar. Apply the same command-scoped redaction
-  // used for harness events before any provenance bytes are serialized.
-  let model = config.model.as_deref().map(|value| sanitizer.sanitize_text(value));
-  let source_revision = config
-    .source_revision
-    .as_deref()
-    .map(|value| sanitizer.sanitize_text(value));
-  encode_document(&ProvenanceRecord {
-    format_version: PROVENANCE_FORMAT_VERSION,
-    trace_format_version: TRACE_FORMAT_VERSION,
-    result_format_version: RESULT_FORMAT_VERSION,
-    plugin: SoftwareIdentity {
-      name: "octa_plugin_codex",
-      version: env!("CARGO_PKG_VERSION"),
-    },
-    codex: SoftwareIdentity {
-      name: "codex-cli",
-      version: codex_version,
-    },
-    settings: InvocationSettings {
-      model: model.as_deref(),
-      reasoning_effort: config.reasoning_effort.map(|effort| effort.as_str()),
-    },
-    prompt_digest: DigestIdentity {
-      algorithm: "blake3",
-      value: prompt_digest,
-    },
-    source_revision: source_revision.as_deref(),
-    timing,
-    outcome,
-    usage,
-  })
+impl RunRecords {
+  fn encode_provenance(
+    &self,
+    outcome: SemanticOutcome,
+    usage: &BTreeMap<String, u64>,
+    config: &CodexConfig,
+    invocation: &CodexInvocation,
+    sanitizer: &RunSanitizer,
+    status: CaptureStatus,
+  ) -> anyhow::Result<Vec<u8>> {
+    let codex_version = invocation.codex_version();
+    let prompt_digest = invocation.prompt_identity().to_hex();
+    let trace_digest = self.trace.digest.finalize().to_hex();
+    // These task-authored values are legitimate provenance, but they can still
+    // equal a resolved secret scalar. Apply the same command-scoped redaction
+    // used for harness events before any provenance bytes are serialized.
+    let model = config.model.as_deref().map(|value| sanitizer.sanitize_text(value));
+    let source_revision = config
+      .source_revision
+      .as_deref()
+      .map(|value| sanitizer.sanitize_text(value));
+    encode_document(&ProvenanceRecord {
+      format_version: PROVENANCE_FORMAT_VERSION,
+      trace_format_version: TRACE_FORMAT_VERSION,
+      result_format_version: RESULT_FORMAT_VERSION,
+      plugin: SoftwareIdentity {
+        name: "octa_plugin_codex",
+        version: env!("CARGO_PKG_VERSION"),
+      },
+      codex: SoftwareIdentity {
+        name: "codex-cli",
+        version: &codex_version,
+      },
+      settings: InvocationSettings {
+        model: model.as_deref(),
+        reasoning_effort: config.reasoning_effort.map(|effort| effort.as_str()),
+      },
+      prompt_digest: DigestIdentity {
+        algorithm: "blake3",
+        value: &prompt_digest,
+      },
+      source_revision: source_revision.as_deref(),
+      timing: self.trace.timing(),
+      outcome,
+      usage,
+      capture: CaptureMetadata {
+        status,
+        coverage: "emitted_native_events",
+        terminal_observed: self.trace.terminal_observed,
+        record_count: self.trace.record_count,
+        trace_digest: DigestIdentity {
+          algorithm: "blake3",
+          value: &trace_digest,
+        },
+      },
+    })
+  }
 }
 
 fn encode_document(value: &impl Serialize) -> anyhow::Result<Vec<u8>> {
@@ -588,7 +670,7 @@ impl RunRecordPaths {
     let relative_directory = format!("{relative_directory}/{RECORDS_DIRECTORY}");
     Self {
       trace: format!("{relative_directory}/{TRACE_FILE}"),
-      result: format!("{relative_directory}/{RESULT_FILE}"),
+      result: Some(format!("{relative_directory}/{RESULT_FILE}")),
       provenance: format!("{relative_directory}/{PROVENANCE_FILE}"),
     }
   }

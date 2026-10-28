@@ -20,7 +20,7 @@ pub(crate) use normalize::normalize_completion;
 #[cfg(test)]
 pub(crate) use normalize::normalize_terminal;
 use normalize::SemanticOutcome;
-pub(crate) use writer::{RunRecordPaths, RunRecords, TraceWriter};
+pub(crate) use writer::{CaptureStatus, RunRecordPaths, RunRecords, TraceWriter};
 
 /// Maximum number of characters advertised for a plain final message.
 ///

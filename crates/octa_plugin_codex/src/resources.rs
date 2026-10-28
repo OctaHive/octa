@@ -231,12 +231,14 @@ fn declarations(records: &RunRecordPaths, deliverables: &[Deliverable]) -> anyho
       path: PathBuf::from(&records.provenance),
       content_type: Some(JSON_CONTENT_TYPE.to_owned()),
     }),
-    ResourceDeclaration::Report(ReportDeclaration {
-      name: RESULT_REPORT_NAME.to_owned(),
-      path: PathBuf::from(&records.result),
-      format: result_report_format(),
-    }),
   ];
+  if let Some(result) = &records.result {
+    declarations.push(ResourceDeclaration::Report(ReportDeclaration {
+      name: RESULT_REPORT_NAME.to_owned(),
+      path: PathBuf::from(result),
+      format: result_report_format(),
+    }));
+  }
 
   for deliverable in deliverables {
     declarations.push(match deliverable {

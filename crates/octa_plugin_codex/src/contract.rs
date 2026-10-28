@@ -21,6 +21,8 @@ pub(crate) const RESULT_FORMAT_VERSION: u16 = 1;
 pub(crate) const TOOL_AUTHORIZATION_CAPABILITY: &str = "codex.blocking-pre-tool-authorization.v1";
 /// Explicit bounded CLI and typed MCP settings over existing environment/secret mappings.
 pub(crate) const RUNTIME_SETTINGS_CAPABILITY: &str = "codex.task-runtime-settings.v1";
+/// Timestamped sanitized native MCP events with complete/partial trace provenance.
+pub(crate) const NATIVE_MCP_EVIDENCE_CAPABILITY: &str = "codex.native-mcp-evidence.v1";
 /// Names task-authored deliverables may not shadow.
 pub(crate) const RESERVED_RESOURCE_NAMES: [&str; 3] =
   [TRACE_ARTIFACT_NAME, PROVENANCE_ARTIFACT_NAME, RESULT_REPORT_NAME];

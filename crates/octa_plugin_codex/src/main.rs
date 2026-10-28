@@ -39,6 +39,7 @@ fn plugin_schema() -> PluginSchema {
       octa_runner_protocol::PUBLIC_OPERATION_OBSERVATIONS_V1.to_owned(),
       contract::RUNTIME_SETTINGS_CAPABILITY.to_owned(),
       octa_runner_protocol::MODEL_CATALOG_CAPABILITY_V1.to_owned(),
+      contract::NATIVE_MCP_EVIDENCE_CAPABILITY.to_owned(),
     ],
     input_schema: Some(config::input_schema()),
     output_schema: Some(records::output_schema()),
@@ -134,7 +135,7 @@ impl Plugin for CodexPlugin {
       return send_cancelled(&writer, id).await;
     }
 
-    match command::run(
+    let completion = command::run(
       &id,
       &invocation,
       &dir,
@@ -143,18 +144,36 @@ impl Plugin for CodexPlugin {
       run_records.trace(),
       &cancel_token,
     )
-    .await?
-    {
-      command::CommandOutcome::Cancelled => send_cancelled(&writer, id).await,
-      command::CommandOutcome::Completed(completion) => {
-        let normalized = records::normalize_completion(
-          completion.terminal_event(),
-          config.result_schema.as_ref(),
-          completion.final_message(),
-        )?;
+    .await
+    .and_then(|outcome| match outcome {
+      command::CommandOutcome::Cancelled => Ok(None),
+      command::CommandOutcome::Completed(completion) => records::normalize_completion(
+        completion.terminal_event(),
+        config.result_schema.as_ref(),
+        completion.final_message(),
+      )
+      .map(Some),
+    });
+    match completion {
+      Ok(Some(normalized)) => {
         let committed = run_records.commit(normalized, &config, &invocation, &sanitizer).await?;
         resources::publish(&writer, &id, &dir, &committed.paths, &config.deliverables).await?;
         send_completed(&writer, id, 0, committed.outputs).await
+      },
+      interrupted => {
+        let status = if interrupted.is_err() {
+          records::CaptureStatus::Failed
+        } else {
+          records::CaptureStatus::Cancelled
+        };
+        let paths = run_records
+          .commit_interrupted(status, &config, &invocation, &sanitizer)
+          .await?;
+        resources::publish(&writer, &id, &dir, &paths, &[]).await?;
+        match interrupted {
+          Err(error) => Err(error),
+          Ok(_) => send_cancelled(&writer, id).await,
+        }
       },
     }
   }

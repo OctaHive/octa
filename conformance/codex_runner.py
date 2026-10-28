@@ -88,9 +88,32 @@ def wait_for_marker(process: subprocess.Popen, marker: Path) -> None:
     raise AssertionError(f"runner did not create {marker.name} within {MARKER_TIMEOUT_SECONDS}s")
 
 
-def assert_no_record_files(workspace: Path) -> None:
-    files = record_files(workspace)
-    assert not files, f"failure retained partial Codex records: {files}"
+def assert_partial_capture(workspace: Path, messages: list[dict], status: str) -> None:
+    """A stopped execution retains native evidence without a semantic result."""
+    events = resource_events(messages)
+    assert [row["event"]["data"]["type"] for row in events] == ["artifact_registered"] * 2, events
+    assert [row["event"]["data"]["artifact"]["name"] for row in events] == ["codex-run-trace", "codex-run-provenance"], events
+    # The Agent freezes declarations from terminal task results, not event text.
+    tasks = terminal_message(messages)["results"][0]["tasks"]
+    assert [row["name"] for task in tasks for row in task.get("artifacts", [])] == ["codex-run-trace", "codex-run-provenance"], tasks
+    assert not [row for task in tasks for row in task.get("reports", [])], tasks
+    assert not [task["outputs"] for task in tasks if task.get("outputs")], tasks
+    assert_capture_files(workspace, status)
+
+
+def assert_capture_files(workspace: Path, status: str) -> None:
+    """Validate files even when reliable response overflow blocks publication."""
+    files = {path.name: path for path in record_files(workspace)}
+    assert files.keys() == {"trace.jsonl", "provenance.json"}, files
+    provenance = json.loads(files["provenance.json"].read_text())
+    capture = provenance["capture"]
+    assert capture["status"] == status, capture
+    assert capture["coverage"] == "emitted_native_events", capture
+    trace = files["trace.jsonl"].read_bytes()
+    assert len(trace) <= 16 * 1024 * 1024
+    records = [json.loads(line) for line in trace.splitlines()]
+    assert capture["record_count"] == len(records), capture
+    assert [row["sequence"] for row in records] == list(range(len(records)))
 
 
 def assert_heartbeat_stopped(heartbeat: Path) -> None:
@@ -131,8 +154,7 @@ def cancellation_stops_the_process_tree(root: Path, runner: Path, plugins: Path,
     assert code == 130, f"unexpected cancellation code {code}\nstdout={stdout}\nstderr={stderr}"
     messages = decode_messages(stdout)
     assert terminal_message(messages)["status"] == "cancelled"
-    assert not resource_events(messages)
-    assert_no_record_files(workspace)
+    assert_partial_capture(workspace, messages, "cancelled")
     assert_heartbeat_stopped(heartbeat)
 
 
@@ -154,9 +176,11 @@ def task_timeout_stops_the_process_tree(root: Path, runner: Path, plugins: Path,
     finally:
         terminate(process)
 
-    messages = assert_failed_without_resources(code, stdout, stderr)
+    assert code == 1, (stdout, stderr)
+    messages = decode_messages(stdout)
+    assert terminal_message(messages)["status"] == "failed"
     assert terminal_message(messages)["results"][0]["conclusion"]["failure"]["kind"] == "timeout"
-    assert_no_record_files(workspace)
+    assert_partial_capture(workspace, messages, "cancelled")
     assert_heartbeat_stopped(heartbeat)
 
 
@@ -183,11 +207,14 @@ def slow_consumer_fails_boundedly(root: Path, runner: Path, plugins: Path, fixtu
 
     messages = assert_failed_without_resources(code, stdout, stderr)
     assert "produced output faster" in json.dumps(messages)
-    assert_no_record_files(workspace)
+    # An overflowed reliable channel cannot certify resource declarations.
+    # The ordinary output-overflow failure stays explicit; local sanitized files
+    # can remain, but must not be turned into a successful execution result.
+    assert_capture_files(workspace, "cancelled")
     assert_heartbeat_stopped(heartbeat)
 
 
-def trace_limit_removes_partial_records(root: Path, runner: Path, plugins: Path, fixture: Path) -> None:
+def trace_limit_retains_bounded_partial_records(root: Path, runner: Path, plugins: Path, fixture: Path) -> None:
     workspace = workspace_with(
         root,
         "trace-limit",
@@ -206,13 +233,11 @@ def trace_limit_removes_partial_records(root: Path, runner: Path, plugins: Path,
         stderr=subprocess.PIPE,
         timeout=PROCESS_TIMEOUT_SECONDS,
     )
-    messages = assert_failed_without_resources(
-        completed.returncode,
-        completed.stdout,
-        completed.stderr,
-    )
+    assert completed.returncode == 1, (completed.stdout, completed.stderr)
+    messages = decode_messages(completed.stdout)
+    assert terminal_message(messages)["status"] == "failed"
     assert "trace exceeds" in json.dumps(messages)
-    assert_no_record_files(workspace)
+    assert_partial_capture(workspace, messages, "failed")
     assert_heartbeat_stopped(heartbeat)
 
 
@@ -276,7 +301,7 @@ def main() -> None:
         cancellation_stops_the_process_tree(root, runner, plugins, fixture)
         task_timeout_stops_the_process_tree(root, runner, plugins, fixture)
         slow_consumer_fails_boundedly(root, runner, plugins, fixture)
-        trace_limit_removes_partial_records(root, runner, plugins, fixture)
+        trace_limit_retains_bounded_partial_records(root, runner, plugins, fixture)
         invalid_report_path_publishes_nothing(root, runner, plugins, fixture)
 
 

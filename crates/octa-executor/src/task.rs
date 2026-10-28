@@ -73,9 +73,9 @@ pub(crate) struct TaskRuntime {
 }
 
 /// Result of one DAG node, including whether it performed work or was skipped.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct TaskOutcome {
-  output: Arc<str>,
+  output: ExecutorResult<Arc<str>>,
   outputs: CompletionOutputs,
   status: ConsoleStatus,
 }
@@ -83,7 +83,7 @@ pub(crate) struct TaskOutcome {
 impl TaskOutcome {
   pub(crate) fn new(output: Arc<str>, status: ConsoleStatus) -> Self {
     Self {
-      output,
+      output: Ok(output),
       outputs: CompletionOutputs::default(),
       status,
     }
@@ -91,7 +91,7 @@ impl TaskOutcome {
 
   pub(crate) fn success(output: impl Into<Arc<str>>) -> Self {
     Self {
-      output: output.into(),
+      output: Ok(output.into()),
       outputs: CompletionOutputs::default(),
       status: ConsoleStatus::Success,
     }
@@ -99,7 +99,7 @@ impl TaskOutcome {
 
   pub(crate) fn skipped(output: impl Into<Arc<str>>) -> Self {
     Self {
-      output: output.into(),
+      output: Ok(output.into()),
       outputs: CompletionOutputs::default(),
       status: ConsoleStatus::Skipped,
     }
@@ -110,20 +110,34 @@ impl TaskOutcome {
     self
   }
 
+  /// Retains validated resources with a failed execution, never semantic output.
+  pub(crate) fn failed(error: ExecutorError) -> Self {
+    let status = if matches!(&error, ExecutorError::TaskCancelled(_)) {
+      ConsoleStatus::Cancelled
+    } else {
+      ConsoleStatus::Failed
+    };
+    Self {
+      output: Err(error),
+      outputs: CompletionOutputs::default(),
+      status,
+    }
+  }
+
   pub(crate) fn status(&self) -> ConsoleStatus {
     self.status
   }
 
   #[cfg(test)]
   pub(crate) fn output(&self) -> &str {
-    &self.output
+    self.output.as_deref().expect("successful task output")
   }
 
-  pub(crate) fn into_output(self) -> Arc<str> {
+  pub(crate) fn into_output(self) -> ExecutorResult<Arc<str>> {
     self.output
   }
 
-  pub(crate) fn into_parts(self) -> (Arc<str>, CompletionOutputs) {
+  pub(crate) fn into_parts(self) -> (ExecutorResult<Arc<str>>, CompletionOutputs) {
     (self.output, self.outputs)
   }
 }

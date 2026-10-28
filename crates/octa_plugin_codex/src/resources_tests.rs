@@ -23,7 +23,7 @@ fn record_paths(workspace: &Path) -> RunRecordPaths {
   }
   RunRecordPaths {
     trace: ".octa/codex-runs/run-fixture/trace.jsonl".to_owned(),
-    result: ".octa/codex-runs/run-fixture/result.json".to_owned(),
+    result: Some(".octa/codex-runs/run-fixture/result.json".to_owned()),
     provenance: ".octa/codex-runs/run-fixture/provenance.json".to_owned(),
   }
 }

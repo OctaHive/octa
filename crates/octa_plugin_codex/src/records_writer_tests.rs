@@ -131,8 +131,8 @@ async fn writes_stable_sanitized_records_with_prompt_and_source_identity() {
   assert!(trace.contains(&format!("\"text\":\"{REDACTION_MARKER}\"")));
 
   let provenance_value: Value = serde_json::from_str(&provenance).unwrap();
-  assert_eq!(provenance_value["format_version"], 1);
-  assert_eq!(provenance_value["trace_format_version"], 1);
+  assert_eq!(provenance_value["format_version"], 2);
+  assert_eq!(provenance_value["trace_format_version"], 2);
   assert_eq!(provenance_value["result_format_version"], 1);
   assert_eq!(provenance_value["source_revision"], REDACTION_MARKER);
   assert_eq!(provenance_value["settings"]["model"], REDACTION_MARKER);

@@ -223,15 +223,41 @@ on the exported `outcome`; semantic failure is data, while an invalid or
 unauditable execution is a task failure.
 
 Each normalized run atomically publishes a unique directory below
-`run_records` with these version-one records:
+`run_records` with these records:
 
 - `records/trace.jsonl` — ordered sanitized events, each carrying
-  `format_version`, `sequence`, and `event`;
-- `records/result.json` — semantic outcome, the final message or validated
+  `format_version: 2`, `sequence`, `observed_at_unix_millis`, and the native
+  `event` (including MCP call identifiers, server/tool, arguments and consumed
+  result/error when emitted by Codex);
+- `records/result.json` (version 1) — semantic outcome, the final message or validated
   structured result, harness identifiers, and usage counters; and
-- `records/provenance.json` — plugin and observed Codex versions, non-secret
+- `records/provenance.json` (version 2) — plugin and observed Codex versions, non-secret
   model settings, BLAKE3 prompt digest, optional source revision, timing,
-  outcome, and usage.
+  outcome, usage and `capture` metadata.
+
+The `codex.native-mcp-evidence.v1` capability declares this capture contract.
+`capture` records `status` (`complete`, `cancelled` or `failed`),
+`coverage: emitted_native_events`, `terminal_observed`, `record_count`, and the
+BLAKE3 digest of the exact trace bytes. Event observation times use a monotonic
+clock anchored to the run's start time and stay inside its provenance window;
+they do not assert remote server time. The existing 16 MiB trace limit and
+bounded native framing still apply. Consumers identify exact content through
+the ordinary Artifact digest plus record sequence and field path.
+
+Cancellation, timeout and native execution/normalization failure atomically
+retain the sanitized trace and provenance collected so far. They register those
+two Artifacts through the existing resource protocol, including on failed task
+completion, with no result report, deliverables or semantic outputs. Unknown
+usage stays empty. A trace can be empty when no valid native event arrived; a
+started MCP call without its completion has an unknown remote outcome.
+
+Successful empty tool content, tool refusal (`status: failed` with consumed
+result content), and a transport/protocol failure (`error` without a result)
+remain distinct native observations. Capture coverage describes only events
+Codex emitted: it cannot certify complete remote search coverage or invent a
+remote revision. MCP events remain private run-record Artifacts, independently
+of the public command/file observation categories below. Unsupported plugins
+must expose a capability gap instead of substituting model-authored evidence.
 
 The trace and provenance are registered as `codex-run-trace` and
 `codex-run-provenance` artifacts. The result is registered as the

@@ -125,6 +125,29 @@ async fn native_completed_agent_message_supplies_plain_and_schema_validated_resu
       assert_eq!(outputs["final_message"], "true");
     }
     assert_eq!(outputs["usage"], json!({"input_tokens":1,"output_tokens":1}));
+    let trace = fs::read_to_string(
+      workspace
+        .path()
+        .join(outputs["record_paths"]["trace"].as_str().unwrap()),
+    )
+    .unwrap();
+    let provenance: Value = serde_json::from_slice(
+      &fs::read(
+        workspace
+          .path()
+          .join(outputs["record_paths"]["provenance"].as_str().unwrap()),
+      )
+      .unwrap(),
+    )
+    .unwrap();
+    for line in trace.lines() {
+      let record: Value = serde_json::from_str(line).unwrap();
+      let observed = record["observed_at_unix_millis"]
+        .as_u64()
+        .expect("native evidence requires an observed time");
+      assert!(observed >= provenance["timing"]["started_unix_millis"].as_u64().unwrap());
+      assert!(observed <= provenance["timing"]["finished_unix_millis"].as_u64().unwrap());
+    }
     assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
   }
 }
@@ -156,10 +179,65 @@ async fn native_completed_answers_reject_invalid_or_oversized_results_without_le
     };
     assert!(message.len() < 192, "native input must not become a decoder diagnostic");
     assert!(!serde_json::to_string(&responses).unwrap().contains(canary));
-    assert!(!responses.iter().any(|response| matches!(
-      response,
-      PluginResponse::RegisterArtifact { .. } | PluginResponse::RegisterReport { .. }
-    )));
+    let artifacts = responses
+      .iter()
+      .filter_map(|response| match response {
+        PluginResponse::RegisterArtifact { artifact, .. } => Some(artifact.name.as_str()),
+        _ => None,
+      })
+      .collect::<Vec<_>>();
+    assert_eq!(artifacts, ["codex-run-trace", "codex-run-provenance"]);
+    assert!(!responses
+      .iter()
+      .any(|response| matches!(response, PluginResponse::RegisterReport { .. })));
+    assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+  }
+}
+
+#[tokio::test]
+async fn retained_capture_identifies_complete_cancelled_and_failed_native_streams() {
+  for (mode, status, terminal_observed) in [
+    ("native-final-message", "complete", true),
+    ("hang", "cancelled", false),
+    ("malformed", "failed", false),
+  ] {
+    let workspace = tempfile::tempdir().unwrap();
+    let fixture = configured_process_fixture(workspace.path(), mode);
+    let heartbeat = fixture.with_extension("run-heartbeat");
+    let (manager, mut execution) = start_lifecycle_execution(workspace.path(), fixture).await;
+    if mode == "hang" {
+      wait_for_file(&heartbeat).await;
+      execution.cancel_and_wait().await.unwrap();
+    }
+    let responses = receive_through_terminal(&mut execution).await;
+    let artifact_bytes = |name| {
+      let path = responses
+        .iter()
+        .find_map(|response| match response {
+          PluginResponse::RegisterArtifact { artifact, .. } if artifact.name == name => Some(&artifact.path),
+          _ => None,
+        })
+        .expect("native capture must publish its existing Artifact");
+      fs::read(workspace.path().join(path)).unwrap()
+    };
+    let trace = artifact_bytes("codex-run-trace");
+    let provenance: Value = serde_json::from_slice(&artifact_bytes("codex-run-provenance")).unwrap();
+    let capture = &provenance["capture"];
+    assert_eq!(capture["status"], status);
+    assert_eq!(capture["terminal_observed"], terminal_observed);
+    assert_eq!(capture["coverage"], "emitted_native_events");
+    assert_eq!(
+      capture["record_count"],
+      std::str::from_utf8(&trace).unwrap().lines().count()
+    );
+    assert_eq!(capture["trace_digest"]["algorithm"], "blake3");
+    assert_eq!(capture["trace_digest"]["value"], blake3::hash(&trace).to_hex().as_str());
+    if status != "complete" {
+      assert_eq!(provenance["usage"], json!({}), "missing measurements stay unknown");
+      assert!(!responses
+        .iter()
+        .any(|response| matches!(response, PluginResponse::RegisterReport { .. })));
+    }
     assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
   }
 }
