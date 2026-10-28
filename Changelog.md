@@ -1,3 +1,14 @@
+## 0.7.3 - 2026-10-28
+
+### Fixed
+
+- Place the Codex root approval option before `exec`, so the pinned native CLI accepts generated invocations.
+- Accept the final completed assistant message preceding `turn.completed` as the native execution result. Reuse existing secret sanitization, byte limits and JSON Schema validation for plain and structured results.
+
+### Compatibility
+
+- Supported Codex CLI 0.161.0, sandbox/approval policy, MCP configuration and all plugin/runner protocol versions remain unchanged.
+
 ## 0.7.2 - 2026-10-25
 
 ### Fixed
