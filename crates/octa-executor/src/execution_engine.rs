@@ -527,6 +527,109 @@ mod tests {
   }
 
   #[tokio::test]
+  async fn stopped_native_execution_retains_artifacts_without_semantic_outputs_in_library_results() {
+    use octa_plugin_manager::plugin_process::{
+      LocalPluginLauncher, PluginLaunchError, PluginLaunchRequest, PluginLauncher, PluginProcess,
+    };
+
+    struct CodexFixture(PathBuf);
+    #[async_trait::async_trait]
+    impl PluginLauncher for CodexFixture {
+      async fn launch(&self, mut request: PluginLaunchRequest) -> Result<PluginProcess, PluginLaunchError> {
+        request.environment.insert(
+          "OCTA_CODEX_EXECUTABLE".to_owned(),
+          self.0.to_string_lossy().into_owned(),
+        );
+        LocalPluginLauncher.launch(request).await
+      }
+    }
+
+    let plugins = crate::test_support::plugin_directory();
+    for (mode, timeout, ignore_error) in [
+      ("native-final-message", false, false),
+      ("native-final-message", false, true),
+      ("hang", true, false),
+      ("hang", true, true),
+    ] {
+      let workspace = TempDir::new().unwrap();
+      let fixture = workspace
+        .path()
+        .join(format!("codex-fixture{}", std::env::consts::EXE_SUFFIX));
+      fs::copy(
+        plugins.join(format!("codex-test-fixture{}", std::env::consts::EXE_SUFFIX)),
+        &fixture,
+      )
+      .unwrap();
+      fs::write(fixture.with_extension("run-mode"), mode).unwrap();
+      fs::write(fixture.with_extension("native-answer"), "not-json").unwrap();
+      let octafile_path = workspace.path().join("Octafile.yml");
+      let timeout_option = if timeout { "    timeout: 5s\n" } else { "" };
+      fs::write(&octafile_path, format!(
+        "version: 1\ntasks:\n  inspect:\n    ignore_error: {ignore_error}\n{timeout_option}    codex:\n      prompt: inspect the fixture\n      result_schema: {{type: boolean}}\n"
+      )).unwrap();
+      let manager = Arc::new(PluginManager::with_launcher(
+        &plugins,
+        workspace.path(),
+        Arc::new(CodexFixture(fixture.clone())),
+      ));
+      manager
+        .start_plugin(&format!("octa_plugin_codex{}", std::env::consts::EXE_SUFFIX))
+        .await
+        .unwrap();
+      let octafile = Octafile::load(Some(octafile_path), false, vec!["codex".to_owned()], "codex").unwrap();
+      let mut request = ExecutionRequest::new("inspect");
+      request.working_directory = Some(workspace.path().to_path_buf());
+      let result = ExecutionEngine::new(manager.clone(), octafile, Arc::new(Console::default()))
+        .start(request)
+        .wait()
+        .await
+        .unwrap();
+      assert!(
+        fixture.with_extension("spawned").is_file(),
+        "the native client must run"
+      );
+      assert_eq!(result.is_success(), ignore_error, "{mode}, ignore_error={ignore_error}");
+      if !ignore_error {
+        assert_eq!(
+          result.failure().unwrap().kind,
+          if timeout {
+            crate::ExecutionFailureKind::Timeout
+          } else {
+            crate::ExecutionFailureKind::Command
+          }
+        );
+      }
+      let task = &result.tasks[0];
+      assert_eq!(
+        task
+          .artifacts
+          .iter()
+          .map(|artifact| artifact.name.as_str())
+          .collect::<Vec<_>>(),
+        ["codex-run-trace", "codex-run-provenance"]
+      );
+      assert!(task.reports.is_empty());
+      assert!(task.outputs.is_empty());
+      assert!(task
+        .steps
+        .iter()
+        .all(|step| step.outputs.is_empty() && step.reports.is_empty()));
+      let provenance = task
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == "codex-run-provenance")
+        .unwrap();
+      let provenance: serde_json::Value =
+        serde_json::from_slice(&fs::read(workspace.path().join(&provenance.path)).unwrap()).unwrap();
+      assert_eq!(
+        provenance["capture"]["status"],
+        if timeout { "cancelled" } else { "failed" }
+      );
+      assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+    }
+  }
+
+  #[tokio::test]
   async fn headless_engine_rejects_raw_execution_without_a_terminal_connector() {
     let directory = TempDir::new().unwrap();
     let octafile_path = directory.path().join("Octafile.yml");
