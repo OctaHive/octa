@@ -383,13 +383,15 @@ fn executes_only_digest_verified_locked_plugins() {
   let shell_entrypoint = "octa_plugin_shell.exe";
   #[cfg(not(windows))]
   let shell_entrypoint = "octa_plugin_shell";
-  fs::write(
-    workspace.path().join("locked-plugins").join(shell_entrypoint),
-    "tampered",
-  )
-  .unwrap();
+  // Keep the tampering case independent of OS executable-handle lifetime.
+  let tampered = TempDir::new().unwrap();
+  let (tampered_plugins, tampered_lock) = locked_plugins(&tampered);
+  fs::write(tampered_plugins.join(shell_entrypoint), "tampered").unwrap();
+  let mut rejected_request: Value = serde_json::from_str(input.trim()).unwrap();
+  rejected_request["request"]["plugins_dir"] = json!(tampered_plugins);
+  rejected_request["request"]["plugin_lock"] = json!(tampered_lock);
   let mut command = Command::cargo_bin("octa-runner").unwrap();
-  let rejected = command.write_stdin(input).output().unwrap();
+  let rejected = command.write_stdin(format!("{rejected_request}\n")).output().unwrap();
   assert_eq!(rejected.status.code(), Some(2));
   assert!(messages(&rejected.stdout).last().unwrap()["message"]
     .as_str()
