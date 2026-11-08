@@ -112,7 +112,14 @@ async fn native_workspace_rejects_escape_missing_and_linked_directories_before_e
   let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture.clone());
   manager.start_plugin(&name).await.unwrap();
   let client = manager.get_client("codex").await.unwrap();
-  let paths = ["../outside", "/tmp", "scratch/../outside", "missing", "regular-file", "redirect"];
+  let paths = [
+    "../outside",
+    "/tmp",
+    "scratch/../outside",
+    "missing",
+    "regular-file",
+    "redirect",
+  ];
   #[cfg(unix)]
   {
     std::os::unix::fs::symlink(installation.path(), workspace.path().join("redirect")).unwrap();
