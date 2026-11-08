@@ -142,8 +142,8 @@ async fn required_tool_authorization_installs_one_blocking_pre_tool_hook() {
 async fn required_tool_authorization_preapproves_only_explicit_mcp_tools() {
   let workspace = tempfile::tempdir().unwrap();
   let servers = json!({
-    "factory": {"transport":"stdio", "command":"/qualified/reader", "enabled_tools":["verify_candidate"]},
-    "unbounded": {"transport":"stdio", "command":"/qualified/other"}
+    "factory": {"transport":"stdio", "command":workspace.path().join("reader"), "enabled_tools":["verify_candidate"]},
+    "unbounded": {"transport":"stdio", "command":workspace.path().join("other")}
   });
   for required in [false, true] {
     let mut input = json!({"prompt":"work", "mcp_servers":servers});
