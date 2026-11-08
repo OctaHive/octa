@@ -28,6 +28,13 @@ class ReleaseMetadataTests(unittest.TestCase):
                     if dependency.get("path") and dependency["name"] in packages and dependency["name"] != "octa-cache-test-support":
                         self.assertEqual(dependency["req"], f"^{expected}")
 
+    def test_macos_arm_release_uses_a_supported_arm_runner(self):
+        workflow = (ROOT / ".github/workflows/build.yml").read_text()
+        target = re.search(r"os_name: macOS-aarch64\s+os: ([^\s]+)\s+target: ([^\s]+)", workflow)
+        self.assertIsNotNone(target)
+        self.assertIn(target.group(1), {"macos-15", "macos-26"})
+        self.assertEqual(target.group(2), "aarch64-apple-darwin")
+
     @unittest.skipIf(os.name == "nt", "the manifest shell is exercised on Unix CI hosts")
     def test_codex_release_advertises_qualified_observations(self):
         workflow = (ROOT / ".github/workflows/build.yml").read_text()
@@ -40,7 +47,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         expected = ["codex.blocking-pre-tool-authorization.v1",
                     "public-command-file-observations.v1",
                     "codex.task-runtime-settings.v1", "model-catalog.v1",
-                    "codex.native-mcp-evidence.v1"]
+                    "codex.native-mcp-evidence.v1", "codex.execution-workspace.v1"]
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "release/plugins").mkdir(parents=True)

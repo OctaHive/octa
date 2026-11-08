@@ -103,6 +103,71 @@ fn lifecycle_request(workspace: &Path) -> PluginExecutionRequest {
 }
 
 #[tokio::test]
+async fn native_workspace_rejects_escape_missing_and_linked_directories_before_execution() {
+  let workspace = tempfile::tempdir().unwrap();
+  let installation = tempfile::tempdir().unwrap();
+  fs::create_dir(workspace.path().join("scratch")).unwrap();
+  fs::write(workspace.path().join("regular-file"), b"not a directory").unwrap();
+  let fixture = configured_process_fixture(installation.path(), "complete");
+  let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture.clone());
+  manager.start_plugin(&name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let paths = ["../outside", "/tmp", "scratch/../outside", "missing", "regular-file", "redirect"];
+  #[cfg(unix)]
+  {
+    std::os::unix::fs::symlink(installation.path(), workspace.path().join("redirect")).unwrap();
+  }
+  for path in paths {
+    let mut request = lifecycle_request(workspace.path());
+    request.params["execution_workspace"] = json!({"working_directory":"scratch", "writable_directories":[path]});
+    let mut execution = client.start_execution(request, CancellationToken::new()).await.unwrap();
+    assert!(
+      matches!(receive_terminal(&mut execution).await, PluginResponse::Error { .. }),
+      "accepted {path}"
+    );
+    assert!(!fixture.with_extension("spawned").exists());
+  }
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+/// Native workspace selection must not relocate plugin-owned records/resources.
+#[tokio::test]
+async fn native_workspace_writes_declared_output_and_keeps_task_resource_paths() {
+  let workspace = tempfile::tempdir().unwrap();
+  let installation = tempfile::tempdir().unwrap();
+  fs::create_dir(workspace.path().join("scratch")).unwrap();
+  fs::create_dir(workspace.path().join("output")).unwrap();
+  let fixture = configured_process_fixture(installation.path(), "execution-workspace");
+  let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture);
+  manager.start_plugin(&name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let mut request = lifecycle_request(workspace.path());
+  request.params["execution_workspace"] = json!({
+    "working_directory": "scratch", "writable_directories": ["output"]
+  });
+  request.params["run_records"] = json!("output/records");
+  request.params["deliverables"] = json!([{
+    "kind":"artifact", "name":"authored-test", "path":"output/check.sh"
+  }]);
+  let mut execution = client.start_execution(request, CancellationToken::new()).await.unwrap();
+  let responses = receive_through_terminal(&mut execution).await;
+  let Some(PluginResponse::Completed { code: 0, outputs, .. }) = responses.last() else {
+    panic!("native workspace rejected: {:?}", responses.last());
+  };
+  assert_eq!(
+    fs::read_to_string(workspace.path().join("output/check.sh")).unwrap(),
+    "test -f \"$1/Cargo.toml\"\n"
+  );
+  assert!(responses.iter().any(|response| matches!(response,
+    PluginResponse::RegisterArtifact { artifact, .. } if artifact.name == "authored-test")));
+  let records = outputs["record_paths"]["provenance"].as_str().unwrap();
+  assert!(records.starts_with("output/records/"));
+  assert!(workspace.path().join(records).is_file());
+  assert!(!workspace.path().join("scratch/output").exists());
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
 async fn native_completed_agent_message_supplies_plain_and_schema_validated_results() {
   for schema in [None, Some(json!({"type":"boolean"}))] {
     let workspace = tempfile::tempdir().unwrap();

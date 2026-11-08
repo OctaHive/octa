@@ -1,3 +1,19 @@
+## 0.9.0 - 2026-11-08
+
+### Added
+
+- Codex tasks can select an explicit task-relative execution workspace and bounded writable directories. Read-only task resources and plugin-owned output paths retain their original locations. Runtimes advertise `codex.execution-workspace.v1` for compatibility checks.
+
+### Fixed
+
+- Explicitly selected MCP tools can execute unattended when the required blocking host authorizer is installed. The host hook still authorizes every invocation; unlisted tools and invocations without that hook keep their existing approval behavior.
+- Build the macOS ARM64 release on the supported macOS 15 runner after retirement of macOS 14.
+
+### Compatibility
+
+- Existing task settings and plugin/runner protocols remain compatible. Omitting `execution_workspace` preserves the previous working-directory behavior. Workspace paths must name existing, link-free directories inside the task root; the outer execution owner remains responsible for filesystem isolation.
+- Supported Codex CLI remains 0.161.0. Release manifests and compatibility metadata include the new workspace capability.
+
 ## 0.8.0 - 2026-10-28
 
 ### Added

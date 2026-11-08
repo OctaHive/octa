@@ -139,6 +139,50 @@ async fn required_tool_authorization_installs_one_blocking_pre_tool_hook() {
 }
 
 #[tokio::test]
+async fn required_tool_authorization_preapproves_only_explicit_mcp_tools() {
+  let workspace = tempfile::tempdir().unwrap();
+  let servers = json!({
+    "factory": {"transport":"stdio", "command":"/qualified/reader", "enabled_tools":["verify_candidate"]},
+    "unbounded": {"transport":"stdio", "command":"/qualified/other"}
+  });
+  for required in [false, true] {
+    let mut input = json!({"prompt":"work", "mcp_servers":servers});
+    if required {
+      input["tool_authorization"] = json!("required");
+    }
+    let config = config(input);
+    let invocation = if required {
+      load_with_tool_authorizer(&config, workspace.path()).await.unwrap()
+    } else {
+      load_invocation(&config, workspace.path(), StructuredResultTarget::Disabled)
+        .await
+        .unwrap()
+    };
+    let settings = invocation
+      .arguments()
+      .iter()
+      .find_map(|arg| arg.to_str()?.strip_prefix("--config=mcp_servers="))
+      .unwrap();
+    let parsed = format!("value = {settings}").parse::<toml::Table>().unwrap();
+    let server = &parsed["value"]["factory"];
+    if required {
+      assert_eq!(
+        server["tools"]["verify_candidate"]["approval_mode"].as_str(),
+        Some("approve")
+      );
+      assert_eq!(server["tools"].as_table().unwrap().len(), 1);
+    } else {
+      assert!(server.get("tools").is_none());
+    }
+    assert!(parsed["value"]["unbounded"].get("tools").is_none());
+    assert!(parsed["value"]["unbounded"]
+      .get("default_tools_approval_mode")
+      .is_none());
+    assert_eq!(parsed["value"]["factory"]["enabled_tools"].as_array().unwrap().len(), 1);
+  }
+}
+
+#[tokio::test]
 async fn command_revalidates_the_tool_authorizer_before_spawn() {
   let workspace = tempfile::tempdir().unwrap();
   let helper_directory = tempfile::tempdir().unwrap();

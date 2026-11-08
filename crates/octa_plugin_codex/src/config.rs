@@ -68,6 +68,15 @@ pub(crate) struct CodexConfig {
   #[serde(default)]
   pub(crate) deliverables: Vec<Deliverable>,
   pub(crate) tool_authorization: Option<ToolAuthorizationMode>,
+  pub(crate) execution_workspace: Option<ExecutionWorkspace>,
+}
+
+/// Native sandbox roots, relative to the unchanged Octa task/resource directory.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExecutionWorkspace {
+  pub(crate) working_directory: DeliverablePath,
+  pub(crate) writable_directories: Vec<DeliverablePath>,
 }
 
 /// Opt-in request for the operator-owned blocking tool authorization hook.
@@ -182,6 +191,19 @@ impl CodexConfig {
     }
     if let Some(revision) = &self.source_revision {
       validate_bounded_text("source_revision", revision, MAX_SOURCE_REVISION_BYTES)?;
+    }
+    if let Some(workspace) = &self.execution_workspace {
+      if workspace.writable_directories.len() > 16
+        || workspace
+          .writable_directories
+          .iter()
+          .map(DeliverablePath::as_str)
+          .collect::<HashSet<_>>()
+          .len()
+          != workspace.writable_directories.len()
+      {
+        bail!("execution_workspace requires at most 16 distinct writable directories");
+      }
     }
     validate_deliverables(&self.deliverables)
   }
@@ -348,6 +370,16 @@ pub(crate) fn input_schema() -> Map<String, Value> {
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "execution_workspace": {
+        "type": "object", "additionalProperties": false,
+        "required": ["working_directory", "writable_directories"],
+        "properties": {
+          "working_directory": path_schema(),
+          "writable_directories": {
+            "type": "array", "maxItems": 16, "uniqueItems": true, "items": path_schema()
+          }
+        }
+      },
       "prompt": prompt_schema(),
       "prompt_file": path_schema(),
       "model": bounded_name_schema(),

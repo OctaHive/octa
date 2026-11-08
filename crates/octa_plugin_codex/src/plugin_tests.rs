@@ -85,6 +85,7 @@ fn exposes_the_codex_task_contract_without_raw_mode() {
       "codex.task-runtime-settings.v1",
       "model-catalog.v1",
       "codex.native-mcp-evidence.v1",
+      "codex.execution-workspace.v1",
     ]
   );
   assert!(schema.input_schema.is_some());

@@ -119,6 +119,24 @@ fn main() {
       );
       emit_event(r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#);
     },
+    "execution-workspace" => {
+      let cd = arguments
+        .iter()
+        .filter_map(|arg| arg.to_str()?.strip_prefix("--cd="))
+        .collect::<Vec<_>>();
+      let writes = arguments
+        .iter()
+        .filter_map(|arg| arg.to_str()?.strip_prefix("--add-dir="))
+        .collect::<Vec<_>>();
+      assert_eq!(cd.len(), 1);
+      assert_eq!(writes.len(), 1);
+      let task = std::env::current_dir().unwrap().canonicalize().unwrap();
+      assert_eq!(Path::new(cd[0]), task.join("scratch"));
+      assert_eq!(Path::new(writes[0]), task.join("output"));
+      assert!(arguments.iter().any(|arg| arg == "--sandbox=workspace-write"));
+      std::fs::write(Path::new(writes[0]).join("check.sh"), b"test -f \"$1/Cargo.toml\"\n").unwrap();
+      emit_event(r#"{"type":"turn.completed","message":"authored"}"#);
+    },
     "invocation-settings" => {
       let expected: serde_json::Value =
         serde_json::from_slice(&std::fs::read(executable.with_extension("expected-invocation")).unwrap()).unwrap();

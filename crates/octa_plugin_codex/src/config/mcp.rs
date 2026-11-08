@@ -24,7 +24,7 @@ pub(crate) enum McpServer {
 
 impl McpServer {
   /// Produces only documented Codex settings; credentials are environment names, never values.
-  pub(crate) fn configuration(&self) -> toml::Value {
+  pub(crate) fn configuration(&self, blocking_authorizer: bool) -> toml::Value {
     let mut table = toml::Table::from_iter([("required".into(), toml::Value::Boolean(true))]);
     let enabled_tools = match self {
       Self::Http {
@@ -52,6 +52,23 @@ impl McpServer {
     };
     if let Some(tools) = enabled_tools {
       table.insert("enabled_tools".into(), strings(tools));
+      if blocking_authorizer {
+        // The required host hook still authorizes each invocation. Prevent the
+        // unattended CLI from prompting before that existing owner can decide.
+        let approvals = tools
+          .iter()
+          .map(|name| {
+            (
+              name.clone(),
+              toml::Value::Table(toml::Table::from_iter([(
+                "approval_mode".into(),
+                toml::Value::String("approve".into()),
+              )])),
+            )
+          })
+          .collect();
+        table.insert("tools".into(), toml::Value::Table(approvals));
+      }
     }
     toml::Value::Table(table)
   }
@@ -133,7 +150,7 @@ pub(super) fn validate(
       }
     }
   }
-  if configuration(servers).to_string().len() > MAX_SETTINGS_BYTES {
+  if configuration(servers, true).to_string().len() > MAX_SETTINGS_BYTES {
     bail!("MCP settings exceed the byte limit");
   }
   Ok(())
@@ -144,11 +161,11 @@ fn strings(values: &[String]) -> toml::Value {
 }
 
 /// Encodes one typed MCP override; the caller owns isolation from other config layers.
-pub(crate) fn configuration(servers: &BTreeMap<String, McpServer>) -> toml::Value {
+pub(crate) fn configuration(servers: &BTreeMap<String, McpServer>, blocking_authorizer: bool) -> toml::Value {
   toml::Value::Table(
     servers
       .iter()
-      .map(|(name, server)| (name.clone(), server.configuration()))
+      .map(|(name, server)| (name.clone(), server.configuration(blocking_authorizer)))
       .collect(),
   )
 }

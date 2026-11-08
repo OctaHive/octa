@@ -334,6 +334,7 @@ fn test_plugin_lock_and_verify_commands() {
           "codex.task-runtime-settings.v1".to_owned(),
           "model-catalog.v1".to_owned(),
           "codex.native-mcp-evidence.v1".to_owned(),
+          "codex.execution-workspace.v1".to_owned(),
         ],
         _ => Vec::new(),
       },

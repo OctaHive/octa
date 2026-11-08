@@ -23,6 +23,8 @@ pub(crate) const TOOL_AUTHORIZATION_CAPABILITY: &str = "codex.blocking-pre-tool-
 pub(crate) const RUNTIME_SETTINGS_CAPABILITY: &str = "codex.task-runtime-settings.v1";
 /// Timestamped sanitized native MCP events with complete/partial trace provenance.
 pub(crate) const NATIVE_MCP_EVIDENCE_CAPABILITY: &str = "codex.native-mcp-evidence.v1";
+/// Bounded native working and writable directories within the task workspace.
+pub(crate) const EXECUTION_WORKSPACE_CAPABILITY: &str = "codex.execution-workspace.v1";
 /// Names task-authored deliverables may not shadow.
 pub(crate) const RESERVED_RESOURCE_NAMES: [&str; 3] =
   [TRACE_ARTIFACT_NAME, PROVENANCE_ARTIFACT_NAME, RESULT_REPORT_NAME];

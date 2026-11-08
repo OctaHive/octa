@@ -137,7 +137,23 @@ impl CodexInvocation {
     let environment = build_environment(&config.environment, environment_sources)?;
     let prompt = LoadedPrompt::load(config, working_directory).await?;
     let result_schema = ResultSchemaDocument::from_config(config, structured_result)?;
-    let arguments = build_arguments(config, result_schema.as_ref(), tool_authorizer.as_ref())?;
+    let mut arguments = build_arguments(config, result_schema.as_ref(), tool_authorizer.as_ref())?;
+    if let Some(workspace) = &config.execution_workspace {
+      let mut selected = vec![("--cd=", workspace.working_directory.as_str())];
+      selected.extend(
+        workspace
+          .writable_directories
+          .iter()
+          .map(|path| ("--add-dir=", path.as_str())),
+      );
+      for (flag, relative) in selected {
+        let path = execution_directory(working_directory, relative)?;
+        let mut argument = OsString::from(flag);
+        argument.push(path);
+        let before_stdin = arguments.len() - 1;
+        arguments.insert(before_stdin, argument);
+      }
+    }
     Ok(Self {
       executable,
       tool_authorizer,
@@ -422,6 +438,20 @@ async fn read_bounded_prompt(
   Ok(bytes)
 }
 
+/// Resolve existing directories without following task-controlled symlinks.
+/// Mount permissions remain the outer authority; these arguments only narrow
+/// the native sandbox within the task's already admitted filesystem view.
+fn execution_directory(root: &Path, relative: &str) -> anyhow::Result<PathBuf> {
+  let mut directory = Dir::open_ambient_dir(root, ambient_authority()).context("cannot open task workspace")?;
+  let mut path = root.canonicalize().context("cannot resolve task workspace")?;
+  for component in relative.split('/') {
+    directory = crate::filesystem::open_directory_no_follow(&directory, component)
+      .context("execution workspace requires existing link-free directories")?;
+    path.push(component);
+  }
+  Ok(path)
+}
+
 fn build_arguments(
   config: &CodexConfig,
   result_schema: Option<&ResultSchemaDocument>,
@@ -454,7 +484,7 @@ fn build_arguments(
   arguments.extend(config.cli_arguments.iter().map(OsString::from));
   if let Some(servers) = &config.mcp_servers {
     arguments.push(OsString::from("--ignore-user-config"));
-    let settings = crate::config::mcp_configuration(servers);
+    let settings = crate::config::mcp_configuration(servers, tool_authorizer.is_some());
     arguments.push(OsString::from(format!("--config=mcp_servers={settings}")));
   }
   // A single dash tells `codex exec` to read the prompt from stdin. It must

@@ -40,6 +40,7 @@ fn plugin_schema() -> PluginSchema {
       contract::RUNTIME_SETTINGS_CAPABILITY.to_owned(),
       octa_runner_protocol::MODEL_CATALOG_CAPABILITY_V1.to_owned(),
       contract::NATIVE_MCP_EVIDENCE_CAPABILITY.to_owned(),
+      contract::EXECUTION_WORKSPACE_CAPABILITY.to_owned(),
     ],
     input_schema: Some(config::input_schema()),
     output_schema: Some(records::output_schema()),

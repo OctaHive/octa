@@ -52,6 +52,7 @@ Operator-qualified stdio MCP executables instead use absolute paths.
 
 | Field | Meaning |
 | --- | --- |
+| `execution_workspace` | Optional native working directory and at most 16 writable directories, relative to the unchanged task directory. |
 | `prompt` | Non-empty inline prompt, limited to 1 MiB of UTF-8. |
 | `prompt_file` | File containing the prompt, relative to the effective task directory and limited to 1 MiB. |
 | `model` | Optional model name passed through the typed Codex invocation. |
@@ -137,7 +138,10 @@ HTTP authentication requires HTTPS and a name in `environment.secret`. Stdio
 commands use an explicit absolute executable and forward additional variables
 only through `env_vars` names already declared in `environment.public` or
 `environment.secret`. `enabled_tools` restricts the selected server's tools;
-an empty list exposes none. MCP configuration and credentials are not copied into
+an empty list exposes none. With `tool_authorization: required`, the explicitly
+listed tools delegate native CLI approval to the blocking host hook, which still
+authorizes each invocation. No override is emitted without that hook or without
+an explicit tool list. MCP configuration and credentials are not copied into
 run records. The outer operator/Agent still qualifies executables, endpoints,
 network and tool authority; selecting settings cannot grant that authority.
 
@@ -326,3 +330,22 @@ This model token cache is distinct from Octa's existing task-result cache
 lookup/hit/miss/restore events. Observation metadata introduces no price table,
 reservation accounting or additional record store. Existing independently
 authorized log readers supply content; generic operation rows contain no output.
+
+## Native execution workspace
+
+Optional `execution_workspace` keeps the Octa task directory (and resource and
+run-record paths) unchanged while selecting the native Codex sandbox roots:
+
+```yaml
+execution_workspace:
+  working_directory: scratch
+  writable_directories: [output]
+```
+
+Paths must be existing, normalized portable directories below the task directory;
+absolute paths, parent traversals, symlinks and reparse points are rejected.
+At most 16 distinct additional writable directories are accepted. Codex receives
+`--cd` and `--add-dir` arguments with `workspace-write` sandboxing and the fixed
+approval policy preserved. The task filesystem/mount policy remains the outer
+permission boundary. Do not select a read-only parent as the native working
+directory. Advertised capability: `codex.execution-workspace.v1`.
