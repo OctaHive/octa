@@ -175,6 +175,68 @@ async fn native_workspace_writes_declared_output_and_keeps_task_resource_paths()
 }
 
 #[tokio::test]
+async fn completed_agent_text_has_a_distinct_durable_progress_identity() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(workspace.path(), "native-final-message");
+  let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture);
+  manager.start_plugin(&name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let mut execution = client
+    .start_execution(lifecycle_request(workspace.path()), CancellationToken::new())
+    .await
+    .unwrap();
+  let responses = receive_through_terminal(&mut execution).await;
+  let messages: Vec<Value> = responses
+    .iter()
+    .map(|r| serde_json::to_value(r).unwrap())
+    .filter(|r| r["type"] == "Progress" && r["payload"]["progress"]["message_id"].is_string())
+    .collect();
+  assert_eq!(
+    messages.len(),
+    1,
+    "agent text must be distinguishable from command stdout"
+  );
+  assert_eq!(messages[0]["payload"]["progress"]["message"], "true");
+  assert_eq!(
+    messages[0]["payload"]["progress"]["message_id"].as_str().unwrap().len(),
+    64
+  );
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
+async fn delayed_consumer_keeps_every_agent_message_without_relabeling_command_stdout() {
+  let workspace = tempfile::tempdir().unwrap();
+  let fixture = configured_process_fixture(workspace.path(), "message-history");
+  let marker = fixture.with_extension("history-emitted");
+  let (manager, name) = plugin_manager_with_codex(workspace.path(), fixture);
+  manager.start_plugin(&name).await.unwrap();
+  let client = manager.get_client("codex").await.unwrap();
+  let mut execution = client
+    .start_execution(lifecycle_request(workspace.path()), CancellationToken::new())
+    .await
+    .unwrap();
+  wait_for_file(&marker).await;
+  let responses = receive_through_terminal(&mut execution).await;
+  let messages: Vec<_> = responses
+    .iter()
+    .filter_map(|r| match r {
+      PluginResponse::Progress { progress, .. } if progress.message_id.is_some() => Some(progress),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    messages.iter().map(|p| p.message.as_str()).collect::<Vec<_>>(),
+    ["Inspecting the project", "Waiting for test discovery"]
+  );
+  assert_ne!(messages[0].message_id, messages[1].message_id);
+  assert!(responses
+    .iter()
+    .any(|r| matches!(r, PluginResponse::Stdout { line, .. } if line == "tool stdout canary")));
+  assert!(manager.shutdown_all().await.into_iter().all(|result| result.is_ok()));
+}
+
+#[tokio::test]
 async fn native_completed_agent_message_supplies_plain_and_schema_validated_results() {
   for schema in [None, Some(json!({"type":"boolean"}))] {
     let workspace = tempfile::tempdir().unwrap();
@@ -854,9 +916,15 @@ async fn plugin_host_streams_an_auditable_completion_and_stops_its_runtime_desce
   let [PluginResponse::Progress { id, progress }, PluginResponse::Stdout {
     id: first_stdout_id,
     line: first_line,
+  }, PluginResponse::Progress {
+    id: first_message_id,
+    progress: first_message,
   }, PluginResponse::Stdout {
     id: second_stdout_id,
     line: second_line,
+  }, PluginResponse::Progress {
+    id: second_message_id,
+    progress: second_message,
   }, PluginResponse::RegisterArtifact {
     id: trace_id,
     artifact: trace,
@@ -875,7 +943,13 @@ async fn plugin_host_streams_an_auditable_completion_and_stops_its_runtime_desce
   assert_eq!(progress.message, "Codex turn started");
   assert_eq!(first_line, "working-1");
   assert_eq!(second_line, "working-2");
+  assert_eq!(first_message.message, "working-1");
+  assert_eq!(second_message.message, "working-2");
+  assert!(first_message.message_id.is_some());
+  assert_ne!(first_message.message_id, second_message.message_id);
   for response_id in [
+    first_message_id,
+    second_message_id,
     first_stdout_id,
     second_stdout_id,
     trace_id,

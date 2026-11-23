@@ -5,8 +5,8 @@ parse human output: terminal renderers may change their wording or layout withou
 contract.
 
 Every line is one UTF-8 JSON object described by the checked-in
-[version 4 JSON Schema](../crates/octa-output/schema/events-v4.schema.json). The current schema and
-the frozen version 1–3 schemas are embedded in `octa-output` as `EVENT_SCHEMA_V4` through
+[version 5 JSON Schema](../crates/octa-output/schema/events-v5.schema.json). The current schema and
+the frozen version 1–4 schemas are embedded in `octa-output` as `EVENT_SCHEMA_V5` through
 `EVENT_SCHEMA_V1`; `EVENT_SCHEMA_VERSION` is written to every new entry.
 
 ## Envelope and ordering
@@ -15,7 +15,7 @@ Every entry contains:
 
 | Field | Meaning |
 | --- | --- |
-| `schema_version` | Event contract version; currently `4` |
+| `schema_version` | Event contract version; currently `5` |
 | `sequence` | Strictly increasing position in this Octa process's output stream |
 | `timestamp` | RFC 3339 emission time |
 | `category` | `execution`, `diagnostic`, or `document` |
@@ -159,3 +159,19 @@ structured terminal `ExecutionResult`; infrastructure failures remain `ExecutorE
 declare several plans in order, inspect watch targets, or choose batch presentation before any plan
 starts. Plugin discovery, plugin startup, and loading the `Octafile` are application bootstrap and
 remain outside individual execution requests.
+
+## Retained model messages
+
+Version 5 adds optional `progress.message_id`: a bounded 64-character digest
+identifying one sanitized model-message chunk. These chunks are durable responses,
+not replaceable progress. They preserve input ordering and UTF-8 chunk boundaries;
+consumers concatenate chunks only when presenting their original message stream.
+Ordinary command stdout remains an `output` record and has no message identity.
+Legacy stdout copies remain for existing text consumers. Model text obeys stdout
+silence and the existing secret sanitizer; ordinary operation/status metadata
+remains available for silent steps. The frozen version-4 schema is unchanged.
+
+A message body remains private execution content. A message identity does not
+qualify prose as a public operation observation, test result or acceptance fact.
+This live history does not advertise the separate full ATIF capture capability,
+which requires its own qualified runtime source and coverage contract.

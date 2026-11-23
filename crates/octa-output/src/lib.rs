@@ -34,7 +34,7 @@ pub use quiet::QuietRenderer;
 pub use record::{
   CacheReason, ConsoleDiagnostic, ConsoleEntry, ConsoleLevel, ConsolePayload, ConsoleRecord, ConsoleStatus,
   ConsoleStream, ExecutionEvent, ProgressUpdate, SourceLocation, EVENT_SCHEMA_V1, EVENT_SCHEMA_V2, EVENT_SCHEMA_V3,
-  EVENT_SCHEMA_V4, EVENT_SCHEMA_VERSION,
+  EVENT_SCHEMA_V4, EVENT_SCHEMA_V5, EVENT_SCHEMA_VERSION,
 };
 pub use renderer::{ConsoleRenderer, NullRenderer};
 pub use replacing::ReplacingRenderer;

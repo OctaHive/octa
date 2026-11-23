@@ -1033,8 +1033,8 @@ octa --output jsonl build | jq -c 'select(.category == "execution")'
 ```
 
 JSON Lines includes run, task, and step lifecycle events, command output, progress, and diagnostics.
-Version 2 is the current stable contract. See the
-[JSON Schema](crates/octa-output/schema/events-v4.schema.json) and
+Version 5 is the current stable contract. See the
+[JSON Schema](crates/octa-output/schema/events-v5.schema.json) and
 [runtime event documentation](docs/events.md) for the complete field reference and compatibility
 policy.
 

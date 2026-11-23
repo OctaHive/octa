@@ -31,7 +31,7 @@ pub use octa_cache_protocol::{
 /// Current incompatible version of the runner command envelope.
 pub const RUNNER_PROTOCOL_VERSION: u16 = 3;
 /// Event schema version carried inside runner event messages.
-pub const RUNNER_EVENT_SCHEMA_VERSION: u16 = 4;
+pub const RUNNER_EVENT_SCHEMA_VERSION: u16 = 5;
 /// Maximum bytes accepted for one newline-delimited input command.
 pub const MAX_RUNNER_INPUT_FRAME_BYTES: usize = 1024 * 1024;
 /// Published JSON Schema for protocol-v3 input commands.
@@ -575,14 +575,14 @@ mod tests {
         "type": "hello",
         "protocol_version": RUNNER_PROTOCOL_VERSION,
         "octa_version": "0.4.0",
-        "event_schema_version": 4,
+        "event_schema_version": 5,
         "plugin_protocol_version": 2
       }),
       json!({
         "type": "capabilities",
         "octa_version": "0.4.0",
         "runner_protocols": [RUNNER_PROTOCOL_VERSION],
-        "event_schemas": [4],
+        "event_schemas": [5],
         "plugin_protocols": [2],
         "octafile_versions": [1],
         "platform": "linux-x86_64",
@@ -681,14 +681,14 @@ mod tests {
         "type": "hello",
         "protocol_version": RUNNER_PROTOCOL_VERSION,
         "octa_version": "0.4.0",
-        "event_schema_version": 4,
+        "event_schema_version": 5,
         "plugin_protocol_version": 2
       }),
       json!({
         "type": "capabilities",
         "octa_version": "0.4.0",
         "runner_protocols": [RUNNER_PROTOCOL_VERSION],
-        "event_schemas": [4],
+        "event_schemas": [5],
         "plugin_protocols": [2],
         "octafile_versions": [1],
         "platform": "linux-x86_64",
@@ -699,7 +699,7 @@ mod tests {
         "type": "event",
         "request_id": "job-1",
         "event": {
-          "schema_version": 4,
+          "schema_version": 5,
           "sequence": 0,
           "timestamp": "2026-09-10T00:00:00Z",
           "category": "execution",

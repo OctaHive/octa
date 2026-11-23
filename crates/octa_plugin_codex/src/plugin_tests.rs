@@ -225,6 +225,11 @@ async fn normalized_activity_is_forwarded_before_the_terminal_frame_is_received(
     PluginResponse::Stdout { line, .. } if line == "working"
   ));
 
+  frame.clear();
+  reader.read_line(&mut frame).await.unwrap();
+  assert!(matches!(serde_json::from_str::<PluginResponse>(&frame).unwrap(),
+    PluginResponse::Progress { progress, .. } if progress.message_id.is_some() && progress.message == "working"));
+
   forward_event_chunk(
     &mut decoder,
     &sanitizer,

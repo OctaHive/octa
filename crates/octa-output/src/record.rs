@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use super::{CliDocument, ConsoleScope, ConsoleStep, RegisteredArtifact, RegisteredReport};
 
 /// Version of the externally supported JSON Lines event contract.
-pub const EVENT_SCHEMA_VERSION: u16 = 4;
+pub const EVENT_SCHEMA_VERSION: u16 = 5;
 
 /// JSON Schema for [`ConsoleEntry`] version 1.
 pub const EVENT_SCHEMA_V1: &str = include_str!("../schema/events-v1.schema.json");
@@ -14,6 +14,8 @@ pub const EVENT_SCHEMA_V2: &str = include_str!("../schema/events-v2.schema.json"
 pub const EVENT_SCHEMA_V3: &str = include_str!("../schema/events-v3.schema.json");
 /// JSON Schema for the version-four stream with task-result cache lifecycle events.
 pub const EVENT_SCHEMA_V4: &str = include_str!("../schema/events-v4.schema.json");
+/// JSON Schema for retained model-message metadata in the version-five stream.
+pub const EVENT_SCHEMA_V5: &str = include_str!("../schema/events-v5.schema.json");
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -165,6 +167,10 @@ impl CacheReason {
 /// Transient progress reported by a concrete plugin command.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProgressUpdate {
+  /// Retained model-message chunk identity. Text remains private log content,
+  /// not an allowlisted public operation fact; absence means ordinary progress.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub message_id: Option<Box<str>>,
   /// Durable public observation; unlike ordinary progress this must not be coalesced.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub observation: Option<octa_runner_protocol::OperationObservation>,
@@ -427,6 +433,34 @@ mod tests {
   use crate::{ConsoleScopeAllocator, SummaryItem, TaskListItem};
 
   #[test]
+  fn model_message_metadata_uses_a_new_schema_without_rewriting_version_four() {
+    let entry = ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Progress {
+      run_id: 1,
+      scope: None,
+      step_id: None,
+      command_id: "message".into(),
+      progress: ProgressUpdate {
+        message_id: Some("ab".repeat(32).into_boxed_str()),
+        observation: None,
+        message: "Checking the project".into(),
+        current: None,
+        total: None,
+        unit: None,
+      },
+    }));
+    let mut value = serde_json::to_value(entry).unwrap();
+    assert_eq!(value["schema_version"], 5);
+    value["schema_version"] = serde_json::json!(4);
+    let legacy = jsonschema::validator_for(&serde_json::from_str(EVENT_SCHEMA_V4).unwrap()).unwrap();
+    assert!(
+      !legacy.is_valid(&value),
+      "the frozen v4 contract must not acquire model text metadata"
+    );
+    value["data"]["progress"].as_object_mut().unwrap().remove("message_id");
+    assert!(legacy.is_valid(&value));
+  }
+
+  #[test]
   fn records_have_stable_category_and_payload_tags() {
     let scope = ConsoleScopeAllocator::default().scope("build");
     let value = serde_json::to_value(ConsoleEntry::new(ConsoleRecord::Execution(ExecutionEvent::Output {
@@ -596,7 +630,7 @@ mod tests {
 
   #[test]
   fn current_schema_validates_every_public_record_shape() {
-    let schema = serde_json::from_str(EVENT_SCHEMA_V4).unwrap();
+    let schema = serde_json::from_str(EVENT_SCHEMA_V5).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     let allocator = ConsoleScopeAllocator::default();
     let parent = allocator.scope("build");
@@ -671,6 +705,7 @@ mod tests {
         step_id: Some(step.id()),
         command_id: "plugin-command-4".to_owned(),
         progress: ProgressUpdate {
+          message_id: None,
           observation: None,
           message: "Compiling".to_owned(),
           current: Some(3),
@@ -837,7 +872,7 @@ mod tests {
 
   #[test]
   fn current_schema_rejects_mismatched_categories_and_unknown_fields() {
-    let schema = serde_json::from_str(EVENT_SCHEMA_V4).unwrap();
+    let schema = serde_json::from_str(EVENT_SCHEMA_V5).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
     let mut value = serde_json::to_value(ConsoleEntry::new(ConsoleRecord::Execution(
       ExecutionEvent::RunStarted {
@@ -879,9 +914,9 @@ mod observation_contract_tests {
 
   #[test]
   fn current_event_schema_accepts_closed_public_operation_metadata() {
-    let schema = serde_json::from_str(EVENT_SCHEMA_V4).unwrap();
+    let schema = serde_json::from_str(EVENT_SCHEMA_V5).unwrap();
     let validator = jsonschema::validator_for(&schema).unwrap();
-    let mut value = json!({"schema_version":4,"sequence":7,"timestamp":"2026-10-20T08:00:00Z","category":"execution",
+    let mut value = json!({"schema_version":5,"sequence":7,"timestamp":"2026-10-20T08:00:00Z","category":"execution",
     "data":{"type":"progress","run_id":2,"scope":null,"command_id":"command-1","progress":{
       "message":"Reported operation", "observation":{"operation_id":"ab".repeat(32), "phase":"completed", "observed_at_unix_ms":1792483200000_i64,
         "operation":{"kind":"command","exit_code":17,"failed":true}}

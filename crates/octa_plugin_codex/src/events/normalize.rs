@@ -82,6 +82,7 @@ pub(crate) fn normalize_activity(
     responses.push(PluginResponse::Progress {
       id: command_id.to_owned(),
       progress: ProgressUpdate {
+        message_id: None,
         observation: Some(observation),
         message: "Reported operation".to_owned(),
         current: None,
@@ -212,11 +213,32 @@ fn normalize_completed_item(
 ) -> Result<Vec<PluginResponse>, EventNormalizationError> {
   let item = event_item(event)?;
   match item_type(event, item)? {
-    "agent_message" => Ok(output_responses(
-      command_id,
-      required_string(event, item, "text", "agent_message.text must be a string")?,
-      false,
-    )),
+    "agent_message" => {
+      let text = required_string(event, item, "text", "agent_message.text must be a string")?;
+      let mut responses = output_responses(command_id, text, false);
+      // Preserve legacy stdout while identifying actual model messages separately
+      // from tool output. Each UTF-8 chunk is durable and bounded, never coalesced.
+      let mut remaining = text;
+      let mut chunk = 0;
+      while !remaining.is_empty() {
+        let end = utf8_prefix(remaining, MAX_LIVE_TEXT_BYTES);
+        let identity = format!("{command_id}\0{}\0{chunk}", event.sequence());
+        responses.push(PluginResponse::Progress {
+          id: command_id.to_owned(),
+          progress: ProgressUpdate {
+            message_id: Some(blake3::hash(identity.as_bytes()).to_hex().to_string().into_boxed_str()),
+            message: remaining[..end].to_owned(),
+            observation: None,
+            current: None,
+            total: None,
+            unit: None,
+          },
+        });
+        remaining = &remaining[end..];
+        chunk += 1;
+      }
+      Ok(responses)
+    },
     "command_execution" => normalize_completed_command(command_id, event, item),
     "file_change" => Ok(vec![progress(command_id, "Codex finished applying file changes")]),
     "mcp_tool_call" => normalize_completed_mcp_call(command_id, event, item),
@@ -361,6 +383,7 @@ fn progress(command_id: &str, message: &str) -> PluginResponse {
   PluginResponse::Progress {
     id: command_id.to_owned(),
     progress: ProgressUpdate {
+      message_id: None,
       observation: None,
       message: message.to_owned(),
       current: None,

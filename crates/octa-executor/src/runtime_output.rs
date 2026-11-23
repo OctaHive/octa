@@ -199,6 +199,11 @@ impl RuntimeOutput {
   }
 
   pub(crate) async fn progress(&self, command_id: &str, progress: ProgressUpdate) -> io::Result<()> {
+    // Model text has the same disclosure policy as its legacy stdout copy.
+    // Ordinary status/operation metadata still works for silent steps.
+    if progress.message_id.is_some() && self.silence.hides_stdout() {
+      return Ok(());
+    }
     self
       .console
       .event(ExecutionEvent::Progress {
@@ -431,6 +436,7 @@ mod tests {
       .progress(
         "command",
         ProgressUpdate {
+          message_id: None,
           observation: None,
           message: "Compiling".to_owned(),
           current: Some(1),
@@ -451,6 +457,29 @@ mod tests {
         ..
       })] if actual_scope == &scope && *actual_step == step.id()
     ));
+  }
+
+  #[tokio::test]
+  async fn retained_model_messages_obey_stdout_silence() {
+    let records = Recording::default();
+    let console = Arc::new(Console::new(records.clone()));
+    let target = RuntimeOutput::with_silence(console.clone(), 1, None, Silence::Stdout);
+    target
+      .progress(
+        "command",
+        ProgressUpdate {
+          message_id: Some("a".repeat(64).into_boxed_str()),
+          observation: None,
+          message: "private model text".into(),
+          current: None,
+          total: None,
+          unit: None,
+        },
+      )
+      .await
+      .unwrap();
+    console.drain().await.unwrap();
+    assert!(records.records.lock().unwrap().is_empty());
   }
 
   #[tokio::test]

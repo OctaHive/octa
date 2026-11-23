@@ -110,6 +110,19 @@ fn main() {
     std::fs::read_to_string(executable.with_extension("run-mode")).unwrap_or_else(|_| "complete".to_owned())
   });
   match mode.trim() {
+    "message-history" => {
+      emit_event(
+        r#"{"type":"item.completed","item":{"id":"first","type":"agent_message","text":"Inspecting the project"}}"#,
+      );
+      emit_event(
+        r#"{"type":"item.completed","item":{"id":"command","type":"command_execution","aggregated_output":"tool stdout canary","exit_code":0,"status":"completed"}}"#,
+      );
+      emit_event(
+        r#"{"type":"item.completed","item":{"id":"second","type":"agent_message","text":"Waiting for test discovery"}}"#,
+      );
+      emit_event(r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}"#);
+      std::fs::write(executable.with_extension("history-emitted"), b"done").unwrap();
+    },
     "native-final-message" => {
       let answer =
         std::fs::read_to_string(executable.with_extension("native-answer")).unwrap_or_else(|_| "true".into());

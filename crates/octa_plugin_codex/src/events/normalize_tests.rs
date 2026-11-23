@@ -78,11 +78,13 @@ fn normalizes_messages_and_command_results_to_ordered_output() {
     "item": {"type": "agent_message", "text": "done"}
   }))
   .unwrap();
-  let [PluginResponse::Stdout { id, line }] = message.as_slice() else {
+  let [PluginResponse::Stdout { id, line }, PluginResponse::Progress { progress, .. }] = message.as_slice() else {
     panic!("expected agent stdout");
   };
   assert_eq!(id, "command");
   assert_eq!(line, "done");
+  assert_eq!(progress.message, "done");
+  assert!(progress.message_id.is_some());
 
   let success = normalize_json(json!({
     "type": "item.completed",
@@ -261,8 +263,12 @@ fn bounds_live_messages_and_preserves_unicode_when_chunking() {
     "item": {"type": "agent_message", "text": text}
   }))
   .unwrap();
-  assert_eq!(responses.len(), 2);
-  let reconstructed = responses
+  assert_eq!(responses.len(), 4);
+  let stdout: Vec<_> = responses
+    .iter()
+    .filter(|response| matches!(response, PluginResponse::Stdout { .. }))
+    .collect();
+  let reconstructed = stdout
     .iter()
     .map(|response| match response {
       PluginResponse::Stdout { line, .. } => line.as_str(),
@@ -270,7 +276,16 @@ fn bounds_live_messages_and_preserves_unicode_when_chunking() {
     })
     .collect::<String>();
   assert_eq!(reconstructed, text);
-  assert!(responses.iter().all(|response| match response {
+  let messages: Vec<_> = responses
+    .iter()
+    .filter_map(|response| match response {
+      PluginResponse::Progress { progress, .. } if progress.message_id.is_some() => Some(progress),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(messages.iter().map(|p| p.message.as_str()).collect::<String>(), text);
+  assert_ne!(messages[0].message_id, messages[1].message_id);
+  assert!(stdout.iter().all(|response| match response {
     PluginResponse::Stdout { line, .. } => line.len() <= MAX_LIVE_TEXT_BYTES,
     _ => false,
   }));

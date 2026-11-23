@@ -593,7 +593,7 @@ impl PluginClient {
     // Public observations are ordered facts, not replaceable UI progress.
     // Keep them in the same bounded queue as output and terminal responses.
     match response {
-      PluginResponse::Progress { id, progress } if progress.observation.is_none() => {
+      PluginResponse::Progress { id, progress } if progress.observation.is_none() && progress.message_id.is_none() => {
         let mut commands = inner.commands.lock().await;
         if let Some(route) = commands.get_mut(&id) {
           match route.state {
@@ -1239,6 +1239,7 @@ mod tests {
             Some(PluginResponse::Progress {
               id,
               progress: ProgressUpdate {
+                message_id: None,
                 observation: None,
                 message: "early".to_owned(),
                 current: None,
@@ -2103,6 +2104,7 @@ mod tests {
                   PluginResponse::Progress {
                     id: id.clone(),
                     progress: ProgressUpdate {
+                      message_id: None,
                       observation: None,
                       message: "working".to_owned(),
                       current: Some(current as u64),

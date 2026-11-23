@@ -141,6 +141,10 @@ pub struct SourceLocation {
 /// Transient command progress. It is intentionally separate from stdout/stderr.
 #[derive(Serialize, Deserialize, Debug, Clone, Eq, PartialEq)]
 pub struct ProgressUpdate {
+  /// Retained model-message chunk identity. Text remains private log content,
+  /// not an allowlisted public operation fact; absence means ordinary progress.
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub message_id: Option<Box<str>>,
   /// Durable public observation; unlike ordinary progress this must not be coalesced.
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub observation: Option<octa_runner_protocol::OperationObservation>,
@@ -431,6 +435,7 @@ mod tests {
     let response = PluginResponse::Progress {
       id: "command".to_owned(),
       progress: ProgressUpdate {
+        message_id: None,
         observation: None,
         message: "Compiling".to_owned(),
         current: Some(3),
@@ -446,6 +451,7 @@ mod tests {
       PluginResponse::Progress {
         id,
         progress: ProgressUpdate {
+          message_id: None,
           current: Some(3),
           total: Some(10),
           ..

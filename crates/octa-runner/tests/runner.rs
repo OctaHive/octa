@@ -218,7 +218,7 @@ fn reports_capabilities_without_starting_a_job() {
   assert_valid_output(&messages);
   assert_eq!(messages[0]["type"], "capabilities");
   assert_eq!(messages[0]["runner_protocols"], json!([RUNNER_PROTOCOL_VERSION]));
-  assert_eq!(messages[0]["event_schemas"], json!([4]));
+  assert_eq!(messages[0]["event_schemas"], json!([5]));
   assert_eq!(messages[0]["plugin_protocols"], json!([2]));
   assert_eq!(messages[0]["octafile_versions"], json!([1]));
 }
@@ -1147,7 +1147,7 @@ fn codex_operations_reach_the_original_runner_stream_without_private_metadata() 
     4,
     "actual plugin facts must survive runtime routing into the runner event channel"
   );
-  let validator = jsonschema::validator_for(&serde_json::from_str(octa_output::EVENT_SCHEMA_V4).unwrap()).unwrap();
+  let validator = jsonschema::validator_for(&serde_json::from_str(octa_output::EVENT_SCHEMA_V5).unwrap()).unwrap();
   for event in &observations {
     assert!(validator.is_valid(event));
     assert!(event["data"]["step_id"].as_u64().is_some());

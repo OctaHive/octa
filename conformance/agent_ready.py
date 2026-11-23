@@ -88,7 +88,7 @@ def main() -> None:
 
     capabilities = json.loads(subprocess.run([runner, "capabilities"], check=True, text=True, stdout=subprocess.PIPE).stdout)
     assert capabilities["runner_protocols"] == [RUNNER_PROTOCOL_VERSION]
-    assert capabilities["event_schemas"] == [4]
+    assert capabilities["event_schemas"] == [5]
     assert len(capabilities["plugin_protocols"]) == 1
     plugin_protocol = capabilities["plugin_protocols"][0]
     assert {"artifacts", "reports", "locked-plugins", "secret-providers"} <= set(capabilities["features"])
