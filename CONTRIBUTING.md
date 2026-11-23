@@ -124,3 +124,16 @@ Commit messages should be short and descriptive. If you are fixing an issue, ple
 
 ## Join The Project Team
 At the moment the only person working on this project is [me](https://github.com/KyKyPy3). I can be contacted at [email](mailto:roman.efremenko@gmail.com).
+
+## Release validation
+
+Release builds and coverage measurements use Rust 1.100.0. Keep their pinned
+toolchains aligned when upgrading: compiler/LLVM changes can alter instrumented
+line counts, so coverage baselines need an explicit comparison. Coverage thresholds
+remain 96.3% on Linux/macOS and 95.7% on Windows. Tests and Clippy also run on
+latest stable to detect forward compatibility problems.
+
+The release workflow derives the GitHub body from the exact tagged version's
+section in `Changelog.md`, using `conformance/release_notes.py`. It fails if the
+section is missing and excludes historical version entries. The repository
+changelog retains the complete history.
