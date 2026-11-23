@@ -26,11 +26,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            minimum_line_coverage: "96.3"
+            minimum_line_coverage: "95.9"
           - os: macos-latest
-            minimum_line_coverage: "96.3"
+            minimum_line_coverage: "95.9"
           - os: windows-latest
-            minimum_line_coverage: "95.7"
+            minimum_line_coverage: "95.2"
     runs-on: ${{ matrix.os }}
     env:
       CARGO_TERM_COLOR: always

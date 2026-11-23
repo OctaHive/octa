@@ -129,9 +129,26 @@ At the moment the only person working on this project is [me](https://github.com
 
 Release builds and coverage measurements use Rust 1.100.0. Keep their pinned
 toolchains aligned when upgrading: compiler/LLVM changes can alter instrumented
-line counts, so coverage baselines need an explicit comparison. Coverage thresholds
-remain 96.3% on Linux/macOS and 95.7% on Windows. Tests and Clippy also run on
-latest stable to detect forward compatibility problems.
+line counts, so coverage baselines need an explicit comparison. Tests and Clippy
+also run on latest stable to detect forward compatibility problems.
+
+The Rust 1.100 baseline was requalified on November 23, 2026 before changing the
+thresholds. The unchanged v0.9.0 source also falls below the old compiler's gates;
+this is not evidence of a regression in v0.10.0. No files or tests are excluded.
+
+| Measurement | v0.9.0 | v0.10.0 candidate | Rust 1.100 gate |
+| --- | ---: | ---: | ---: |
+| Linux CI | 95.91% | 95.95% | 95.9% |
+| macOS aarch64, paired local runs | 95.87% | 95.92% | 95.9% |
+| Windows CI | 95.26% | 95.27% | 95.2% |
+
+The [baseline CI run](https://github.com/OctaHive/octa/actions/runs/45255065125)
+uses the v0.9.0 production tree at `fc389ac`; the
+[candidate CI run](https://github.com/OctaHive/octa/actions/runs/45252282386)
+measures the Rust code at `c305f36`. The paired local macOS measurements ran all
+workspace tests with all features on the same host and Rust 1.100.0, with clean
+coverage counters for each version. CI separately qualifies the platform gates
+before tagging a release.
 
 The release workflow derives the GitHub body from the exact tagged version's
 section in `Changelog.md`, using `conformance/release_notes.py`. It fails if the
