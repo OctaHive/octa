@@ -48,18 +48,15 @@ pub(crate) fn open_directory_no_follow(parent: &Dir, component: &str) -> io::Res
 
 /// Reports links that Rust exposes either directly or as Windows reparse data.
 pub(crate) fn is_std_link_or_reparse(metadata: &Metadata) -> bool {
-  if metadata.file_type().is_symlink() {
-    return true;
-  }
   #[cfg(windows)]
   {
     use std::os::windows::fs::MetadataExt as _;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    metadata.file_type().is_symlink() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
   }
   #[cfg(not(windows))]
-  false
+  metadata.file_type().is_symlink()
 }
 
 #[cfg(unix)]

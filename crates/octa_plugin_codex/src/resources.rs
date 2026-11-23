@@ -322,18 +322,15 @@ pub(super) fn open_directory(parent: &Dir, component: &str, complete_path: &str)
 }
 
 fn is_cap_link_or_reparse(metadata: &cap_std::fs::Metadata) -> bool {
-  if metadata.is_symlink() {
-    return true;
-  }
   #[cfg(windows)]
   {
     use cap_std::fs::MetadataExt as _;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    metadata.is_symlink() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
   }
   #[cfg(not(windows))]
-  false
+  metadata.is_symlink()
 }
 
 #[cfg(unix)]
