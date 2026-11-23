@@ -268,6 +268,9 @@ Octa bounds every stage between a plugin and the task result:
 - each captured stream stays in memory through 1 MiB and then spills to a temporary file.
 - retained structured step and task outputs share a 64 MiB execution limit.
 
+The socket reader yields between frames so runnable consumers can drain their mailboxes even
+when an entire burst is already buffered. This does not wait for a stalled consumer.
+
 If one command fills its mailbox, Octa reports that command as failed, sends `Cancel`, and discards
 its remaining messages through the terminal response. Other commands on the same plugin connection
 continue normally; a noisy command therefore cannot block their routing or grow an unbounded host

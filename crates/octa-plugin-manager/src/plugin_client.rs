@@ -499,6 +499,10 @@ impl PluginClient {
             if !Self::dispatch_response(&inner, &control_tx, response).await {
               break;
             }
+            // Buffered socket frames can all be immediately ready. Let active
+            // consumers drain their bounded routes before reading another frame;
+            // a genuinely stalled consumer still fails without blocking peers.
+            tokio::task::yield_now().await;
           },
           Err(error) => {
             if let Some(inner) = inner.upgrade() {
@@ -2277,6 +2281,92 @@ mod tests {
     })
     .await
     .expect("bounded short-command stream did not finish");
+    client.shutdown().await.unwrap();
+    peer.await.unwrap();
+  }
+
+  #[tokio::test]
+  async fn active_consumer_receives_a_burst_without_scheduler_overflow() {
+    let server = TestServer::new().await;
+    let listener = Arc::clone(&server.listener);
+    let (ready, consumer_ready) = oneshot::channel();
+    let peer = tokio::spawn(async move {
+      let stream = listener.accept().await.unwrap();
+      let (reader, writer) = tokio::io::split(stream);
+      let mut reader = BufReader::new(reader);
+      let writer = Arc::new(Mutex::new(writer));
+      let mut line = String::new();
+      reader.read_line(&mut line).await.unwrap();
+      write_response(
+        &writer,
+        PluginResponse::Hello(Version {
+          protocol_version: PLUGIN_PROTOCOL_VERSION,
+          version: env!("CARGO_PKG_VERSION").to_owned(),
+          features: Vec::new(),
+        }),
+      )
+      .await;
+      line.clear();
+      reader.read_line(&mut line).await.unwrap();
+      let OctaCommand::Execute { id, .. } = serde_json::from_str::<OctaCommand>(line.trim()).unwrap() else {
+        panic!("expected execute");
+      };
+      write_response(&writer, PluginResponse::Started { id: id.clone() }).await;
+      consumer_ready.await.unwrap();
+      let mut burst = Vec::new();
+      for index in 0..128 {
+        let response = PluginResponse::Progress {
+          id: id.clone(),
+          progress: ProgressUpdate {
+            message_id: Some(format!("message-{index}").into_boxed_str()),
+            message: index.to_string(),
+            observation: None,
+            current: None,
+            total: None,
+            unit: None,
+          },
+        };
+        serde_json::to_writer(&mut burst, &response).unwrap();
+        burst.push(b'\n');
+      }
+      serde_json::to_writer(
+        &mut burst,
+        &PluginResponse::Completed {
+          id,
+          code: 0,
+          outputs: Default::default(),
+        },
+      )
+      .unwrap();
+      burst.push(b'\n');
+      writer.lock().await.write_all(&burst).await.unwrap();
+      line.clear();
+      reader.read_line(&mut line).await.unwrap();
+      write_response(
+        &writer,
+        PluginResponse::Shutdown {
+          message: "done".to_owned(),
+        },
+      )
+      .await;
+    });
+    let client = PluginClient::connect(server.socket_name()).await.unwrap();
+    client.handshake().await.unwrap();
+    let mut execution = client
+      .start_execution(execution_request("burst"), CancellationToken::new())
+      .await
+      .unwrap();
+    ready.send(()).unwrap();
+    let cancellation = CancellationToken::new();
+    for index in 0..128 {
+      let response = execution.receive_output(&cancellation).await.unwrap().unwrap();
+      assert!(matches!(response, PluginResponse::Progress { progress, .. }
+        if progress.message == index.to_string() && progress.message_id.as_deref() == Some(format!("message-{index}").as_str())));
+    }
+    assert!(matches!(
+      execution.receive_output(&cancellation).await.unwrap(),
+      Some(PluginResponse::Completed { code: 0, .. })
+    ));
     client.shutdown().await.unwrap();
     peer.await.unwrap();
   }
