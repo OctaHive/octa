@@ -7,11 +7,15 @@
 ### Fixed
 
 - Preserve model-message ordering for delayed consumers, UTF-8 chunk boundaries, stdout-silence settings and secret redaction without relabeling command output as model messages.
-
 - Let active consumers drain buffered plugin-message bursts without a false queue overflow; stalled consumers retain the bounded per-command failure policy.
+
+### Security
+
+- Update the locked QUIC and URL dependencies to address the vulnerabilities reported by the release security audit.
 
 ### Compatibility
 
+- Release artifacts and coverage checks use Rust 1.100.0; tests and Clippy also run on the latest stable compiler.
 - New runs advertise event schema v5 with optional `progress.message_id`. The frozen v4 schema remains available for historical readers; consumers must qualify support for v5 before selecting the updated runtime.
 - Runner protocol 3, plugin protocol 2, Codex result format and supported Codex CLI 0.161.0 remain unchanged. This message history does not claim full ATIF capture or turn private model text into public operation evidence.
 
