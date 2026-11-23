@@ -3,7 +3,7 @@ name: Coverage
 on:
   pull_request:
     branches:
-      - "*"
+      - "**"
     paths:
       - ".github/workflows/coverage.yml"
       - "crates/**"
@@ -11,7 +11,7 @@ on:
       - "Cargo.lock"
   push:
     branches:
-      - "*"
+      - "**"
     paths:
       - ".github/workflows/coverage.yml"
       - "crates/**"
