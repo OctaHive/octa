@@ -96,6 +96,37 @@ fn fixture_emits_terminal_structured_unknown_and_secret_scenarios_without_ambien
 }
 
 #[test]
+fn secret_spill_covers_model_and_command_output_in_bounded_native_frames() {
+  let secret = "fixture-spill-secret-sentinel";
+  let output = run_fixture("secret-spill", Some((FIXTURE_SECRET_ENV, secret)));
+  assert!(output.stdout.len() > DISK_SPILL_THRESHOLD_BYTES);
+  let events = json_lines(&output.stdout);
+  assert_eq!(
+    events.len(),
+    3,
+    "volume conformance must not become a message-rate overload scenario"
+  );
+  let command = events
+    .iter()
+    .find(|event| event["item"]["type"] == "command_execution")
+    .unwrap();
+  let model = events
+    .iter()
+    .find(|event| event["item"]["type"] == "agent_message")
+    .unwrap();
+  assert!(command["item"]["aggregated_output"].as_str().unwrap().contains(secret));
+  assert!(model["item"]["text"].as_str().unwrap().contains(secret));
+  assert!(
+    model["item"]["text"].as_str().unwrap().len() <= 256 * 1024,
+    "spooling must not exceed the independent final-message retention limit"
+  );
+  assert!(String::from_utf8(output.stderr).unwrap().contains(secret));
+  for event in events {
+    assert!(serde_json::to_vec(&event).unwrap().len() < 1024 * 1024);
+  }
+}
+
+#[test]
 fn example_modes_create_their_declared_deliverables() {
   let local = tempfile::tempdir().unwrap();
   let output = run_fixture_in("example-local", None, local.path());

@@ -65,7 +65,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
-          toolchain: 1.98.1
+          toolchain: 1.100.0
           targets: ${{ matrix.platform.target }}
 
       - name: Build binary (*nix)
@@ -219,11 +219,18 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: dist/*
+      - name: Prepare release notes
+        if: startsWith( github.ref, 'refs/tags/v' )
+        run: >-
+          python3 conformance/release_notes.py
+          --version "${GITHUB_REF_NAME#v}"
+          --changelog Changelog.md
+          --output release-notes.md
       - name: Publish GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           draft: true
           files: "dist/*"
           token: ${{ github.token }}
-          body_path: Changelog.md
+          body_path: release-notes.md
         if: startsWith( github.ref, 'refs/tags/v' )

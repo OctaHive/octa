@@ -28,6 +28,21 @@ class ReleaseMetadataTests(unittest.TestCase):
                     if dependency.get("path") and dependency["name"] in packages and dependency["name"] != "octa-cache-test-support":
                         self.assertEqual(dependency["req"], f"^{expected}")
 
+    def test_coverage_uses_the_release_compiler(self):
+        build = (ROOT / ".github/workflows/build.yml").read_text()
+        coverage = (ROOT / ".github/workflows/coverage.yml").read_text()
+        release_toolchain = re.search(r"toolchain: ([0-9.]+)", build).group(1)
+        measured_toolchain = re.search(r"toolchain: ([0-9.]+)", coverage)
+        self.assertIsNotNone(measured_toolchain, "coverage must measure the pinned release compiler")
+        self.assertEqual(measured_toolchain.group(1), release_toolchain)
+
+    def test_validation_runs_for_namespaced_release_branches(self):
+        for name in ("tests.yml", "coverage.yml"):
+            with self.subTest(workflow=name):
+                workflow = (ROOT / ".github/workflows" / name).read_text()
+                push = re.search(r"(?ms)^  push:\n(.*?)(?=^  [a-z_]+:|^jobs:|^env:)", workflow).group(1)
+                self.assertIn('- "**"', push, "validation must include codex/release branches")
+
     def test_macos_arm_release_uses_a_supported_arm_runner(self):
         workflow = (ROOT / ".github/workflows/build.yml").read_text()
         target = re.search(r"os_name: macOS-aarch64\s+os: ([^\s]+)\s+target: ([^\s]+)", workflow)

@@ -27,10 +27,10 @@ const TRACE_OVERFLOW_EVENT_COUNT: usize = 20;
 // Twenty frames at this size exceed the 16 MiB retained-trace limit while
 // each individual frame remains below the 1 MiB protocol-frame limit.
 const TRACE_OVERFLOW_PAYLOAD_BYTES: usize = 900 * 1024;
-const SECRET_SPILL_EVENT_COUNT: usize = 80;
 // The aggregate sanitized output exceeds both 1 MiB disk-spill thresholds but
 // remains below the independent trace and runner-capture limits.
-const SECRET_SPILL_PADDING_BYTES: usize = 16 * 1024;
+const SECRET_SPILL_COMMAND_BYTES: usize = 960 * 1024;
+const SECRET_SPILL_MESSAGE_BYTES: usize = 128 * 1024;
 
 fn main() {
   let executable = std::env::current_exe().expect("fixture executable path must be available");
@@ -349,17 +349,25 @@ fn emit_secret_echo() {
 
 fn emit_secret_spill() {
   let secret = std::env::var(SECRET_ENV).expect("secret-spill mode requires its explicit fixture variable");
-  let padding = "x".repeat(SECRET_SPILL_PADDING_BYTES);
-  for index in 0..SECRET_SPILL_EVENT_COUNT {
-    let event = serde_json::json!({
-      "type": "item.completed",
-      "item": {
-        "type": "agent_message",
-        "text": format!("event-{index} {secret} {padding}")
-      }
-    });
-    emit_event(&serde_json::to_string(&event).expect("fixture event must serialize"));
-  }
+  // Exercise disk spooling and both redaction surfaces without conflating
+  // aggregate volume with the separate runaway message-rate scenario.
+  let command = serde_json::json!({
+    "type": "item.completed",
+    "item": {
+      "id": "spill-command", "type": "command_execution",
+      "command": "fixture command", "status": "completed", "exit_code": 0,
+      "aggregated_output": format!("{secret} {}", "x".repeat(SECRET_SPILL_COMMAND_BYTES))
+    }
+  });
+  emit_event(&serde_json::to_string(&command).expect("fixture event must serialize"));
+  let message = serde_json::json!({
+    "type": "item.completed",
+    "item": {
+      "type": "agent_message",
+      "text": format!("{secret} {}", "x".repeat(SECRET_SPILL_MESSAGE_BYTES))
+    }
+  });
+  emit_event(&serde_json::to_string(&message).expect("fixture event must serialize"));
   eprintln!("stderr {secret}");
   emit_event(r#"{"type":"turn.completed","message":"done"}"#);
 }
