@@ -167,17 +167,14 @@ pub(crate) fn persistent_memo_scope(_path: &Path) -> Option<Vec<u8>> {
 /// Windows directory junctions are reparse points but are not always reported
 /// as ordinary symbolic links by the standard-library file type.
 pub(crate) fn is_link_or_reparse(metadata: &Metadata) -> bool {
-  if metadata.file_type().is_symlink() {
-    return true;
-  }
   #[cfg(windows)]
   {
     use std::os::windows::fs::MetadataExt as _;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    metadata.file_type().is_symlink() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
   }
   #[cfg(not(windows))]
-  false
+  metadata.file_type().is_symlink()
 }
 
 /// Confirms that an opened handle still denotes the current path entry.
