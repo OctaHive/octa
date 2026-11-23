@@ -116,6 +116,10 @@ fn secret_spill_covers_model_and_command_output_in_bounded_native_frames() {
     .unwrap();
   assert!(command["item"]["aggregated_output"].as_str().unwrap().contains(secret));
   assert!(model["item"]["text"].as_str().unwrap().contains(secret));
+  assert!(
+    model["item"]["text"].as_str().unwrap().len() <= 256 * 1024,
+    "spooling must not exceed the independent final-message retention limit"
+  );
   assert!(String::from_utf8(output.stderr).unwrap().contains(secret));
   for event in events {
     assert!(serde_json::to_vec(&event).unwrap().len() < 1024 * 1024);

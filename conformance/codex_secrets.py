@@ -93,11 +93,14 @@ def run_cli(octa: Path, workspace: Path, environment: dict[str, str], secret: st
     if completed.returncode != 0:
         # This command uses only the explicit synthetic credential above. Redact
         # before bounding the text so a truncated credential cannot survive.
-        diagnostic = completed.stderr.decode("utf-8", errors="replace").replace(secret, "<redacted>")
-        diagnostic = "".join(character for character in diagnostic if character.isprintable() or character in "\n\t")
+        diagnostics = []
+        for name, payload in (("stderr", completed.stderr), ("stdout", completed.stdout)):
+            diagnostic = payload.decode("utf-8", errors="replace").replace(secret, "<redacted>")
+            diagnostic = "".join(character for character in diagnostic if character.isprintable() or character in "\n\t")
+            diagnostics.append(f"{name}: {diagnostic[-1024:]}")
         raise AssertionError(
             f"CLI secret conformance failed with code {completed.returncode}; "
-            f"redacted fixture stderr: {diagnostic[-2048:]}"
+            f"redacted fixture diagnostics: {'; '.join(diagnostics)}"
         )
     if len(completed.stdout) <= DISK_SPILL_THRESHOLD_BYTES:
         raise AssertionError("CLI output did not cross the disk-spool threshold")

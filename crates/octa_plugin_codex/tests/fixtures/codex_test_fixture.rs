@@ -29,8 +29,8 @@ const TRACE_OVERFLOW_EVENT_COUNT: usize = 20;
 const TRACE_OVERFLOW_PAYLOAD_BYTES: usize = 900 * 1024;
 // The aggregate sanitized output exceeds both 1 MiB disk-spill thresholds but
 // remains below the independent trace and runner-capture limits.
-const SECRET_SPILL_COMMAND_BYTES: usize = 768 * 1024;
-const SECRET_SPILL_MESSAGE_BYTES: usize = 320 * 1024;
+const SECRET_SPILL_COMMAND_BYTES: usize = 960 * 1024;
+const SECRET_SPILL_MESSAGE_BYTES: usize = 128 * 1024;
 
 fn main() {
   let executable = std::env::current_exe().expect("fixture executable path must be available");

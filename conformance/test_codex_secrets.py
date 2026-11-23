@@ -25,6 +25,21 @@ class SecretConformanceDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("\x1b", diagnostic)
         self.assertLessEqual(len(diagnostic), 2200)
 
+    def test_failed_cli_retains_redacted_stdout_diagnostics_too(self):
+        secret = "synthetic-conformance-credential"
+        completion = subprocess.CompletedProcess([], 1,
+            ("padding" * 1000 + secret + "\x1b[31mnative fixture error marker\x1b[0m").encode(),
+            ("stderr" * 1000 + secret + "task failed").encode())
+        with mock.patch.object(codex_secrets.subprocess, "run", return_value=completion):
+            with self.assertRaises(AssertionError) as rejected:
+                codex_secrets.run_cli(Path("octa"), Path("workspace"), {}, secret)
+        diagnostic = str(rejected.exception)
+        self.assertIn("native fixture error marker", diagnostic)
+        self.assertIn("task failed", diagnostic)
+        self.assertNotIn(secret, diagnostic)
+        self.assertNotIn("\x1b", diagnostic)
+        self.assertLessEqual(len(diagnostic), 2200)
+
 
 if __name__ == "__main__":
     unittest.main()
